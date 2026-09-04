@@ -1,0 +1,118 @@
+-- ==========================================================
+-- ANTI-AFK  (Infinite Yield style, hardened)
+-- Defeats Roblox's ~20 minute idle disconnect.
+-- Re-running this file cleanly replaces any previous instance.
+-- ==========================================================
+local Players = game:GetService("Players")
+local lp = Players.LocalPlayer
+-- ---------- state (survives re-execution via getgenv) ----------
+local genv = getgenv()
+genv.AntiAFK = genv.AntiAFK or {
+    Enabled = false,
+    Generation = 0,
+    Connection = nil,
+    Triggers = 0,
+    LastTrigger = nil,
+    Verbose = true,
+}
+local state = genv.AntiAFK
+-- ---------- helpers (defined before anything that calls them) ----------
+local function log(msg)
+    if state.Verbose then
+        print("[AntiAFK] " .. tostring(msg))
+    end
+end
+-- VirtualUser is protected; executors expose it, but guard anyway.
+local function getVirtualUser()
+    local ok, service = pcall(function()
+        return game:GetService("VirtualUser")
+    end)
+    if ok and service then
+        return service
+    end
+    return nil
+end
+-- The actual "I'm not idle" nudge. ClickButton2 is a right-click,
+-- which no game binds to anything meaningful, so it's the safe choice.
+local function nudge()
+    local vu = getVirtualUser()
+    if not vu then
+        return false, "VirtualUser unavailable"
+    end
+    local ok, err = pcall(function()
+        vu:CaptureController()
+        vu:ClickButton2(Vector2.new())
+    end)
+    if not ok then
+        return false, tostring(err)
+    end
+    return true
+end
+local function disconnectCurrent()
+    if state.Connection then
+        pcall(function()
+            state.Connection:Disconnect()
+        end)
+        state.Connection = nil
+    end
+end
+-- ---------- public API ----------
+function state.Disable()
+    disconnectCurrent()
+    state.Enabled = false
+    state.Generation = state.Generation + 1
+    log("disabled")
+end
+function state.Enable()
+    -- Bump the generation so any older connection that somehow
+    -- survived becomes a no-op instead of double-firing.
+    disconnectCurrent()
+    state.Generation = state.Generation + 1
+    local myGen = state.Generation
+    state.Enabled = true
+    if not lp then
+        log("no LocalPlayer; aborting")
+        state.Enabled = false
+        return false
+    end
+    state.Connection = lp.Idled:Connect(function()
+        if not state.Enabled or state.Generation ~= myGen then
+            return
+        end
+        local ok, err = nudge()
+        if ok then
+            state.Triggers = state.Triggers + 1
+            state.LastTrigger = os.time()
+            log("idle detected - nudged (" .. state.Triggers .. " total)")
+        else
+            log("nudge failed: " .. tostring(err))
+        end
+    end)
+    log("enabled - you will not be idle-kicked")
+    return true
+end
+function state.Toggle()
+    if state.Enabled then
+        state.Disable()
+        return false
+    end
+    state.Enable()
+    return true
+end
+function state.Status()
+    local last = "never"
+    if state.LastTrigger then
+        last = os.date("%H:%M:%S", state.LastTrigger)
+    end
+    log(("enabled=%s  triggers=%d  last=%s")
+        :format(tostring(state.Enabled), state.Triggers, last))
+    return state.Enabled, state.Triggers, state.LastTrigger
+end
+-- ---------- start ----------
+state.Enable()
+-- Usage from the console afterwards:
+--   getgenv().AntiAFK.Disable()
+--   getgenv().AntiAFK.Enable()
+--   getgenv().AntiAFK.Toggle()
+--   getgenv().AntiAFK.Status()
+--   getgenv().AntiAFK.Verbose = false   -- silence the prints
