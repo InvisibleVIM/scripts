@@ -11,13 +11,16 @@ getfenv().PP_SCRAMBLE_STR = function(...) return ... end
 getfenv().PP_SCRAMBLE_RE_NUM = function(...) return ... end
 
 local AutoFarm = {
-	running = false,
-	stats = { rounds = 0, wins = 0, points = 0, blockedReports = 0, clusters = 0, retryWaves = 0 },
+	alive = false,
+	stats = { rounds = 0, wins = 0, points = 0, eggs = 0, spins = 0, blockedReports = 0, clusters = 0, retryWaves = 0 },
 
-	-- Live-tunable: edit shared.PotentAutoFarm.config while it runs.
+	-- Live-tunable: edit shared.PotentAutoFarm.config while it runs. The UI toggles flip these.
 	config = {
-		-- Seconds to hold a new spot before firing, so the server sees the teleport first.
-		settleTime = 0.1,
+		autoFarm = true,
+		godMode = true,
+		autoSpin = true,
+		-- Seconds to hold each spot so the server samples our position there (~0.1s tick + ping).
+		settleTime = 0.14,
 		-- Print a line per round with points and duration.
 		verbose = false,
 		-- Teleport back into the game if disconnected.
@@ -29,11 +32,12 @@ local AutoFarm = {
 
 -- Constants.
 local REPLICA_TOKEN = "TilesGame"
+local PLAYER_DATA_TOKEN = "PlayerData"
 local POINT_STATE = 2
 local SAFE_STATE = 3
 local HOVER_OFFSET = Vector3.new(0, 3, 0)
 local COLLECT_RADIUS = 14
-local MAX_WAVES = 3
+local ROUTE_MAX_STOPS = 12
 local DANGER_LOOKAHEAD_TIME = 0.35
 local STAND_DANGER_WINDOW = 0.3
 local TARGET_DANGER_BASE = 0.1
@@ -41,6 +45,12 @@ local RED_STAND_PENALTY = 0.1
 local LEVEL_LOAD_TIMEOUT = 6
 local WORLD_RESCAN_INTERVAL = 3
 local PREPOSITION_LEAD = 0.5
+local ANTICIPATE_STEP_TIME = 0.1
+local ANTICIPATE_STEPS = 15
+local SPIN_POLL_INTERVAL = 0.25
+local SPIN_FAIL_BACKOFF = 3
+local UI_REFRESH_INTERVAL = 0.25
+local UI_NAME = "PotentColorEscape"
 
 -- Services.
 local playersService = game:GetService("Players")
@@ -50,11 +60,22 @@ local virtualUser = game:GetService("VirtualUser")
 local statsService = game:GetService("Stats")
 local guiService = game:GetService("GuiService")
 local teleportService = game:GetService("TeleportService")
+local tweenService = game:GetService("TweenService")
+local coreGui = game:GetService("CoreGui")
 
 local localPlayer = playersService.LocalPlayer
 local clientModules = localPlayer:WaitForChild("PlayerScripts"):WaitForChild("ClientModules")
-local collectRemote = replicatedStorage:WaitForChild("RemoteFunctions"):WaitForChild("RequestCollectPointTile")
-local selfReportRemote = replicatedStorage:WaitForChild("Remotes"):WaitForChild("SelfReport")
+local sharedModules = replicatedStorage:WaitForChild("SharedModules")
+local remoteFunctions = replicatedStorage:WaitForChild("RemoteFunctions")
+local remoteEvents = replicatedStorage:WaitForChild("Remotes")
+
+local collectRemote = remoteFunctions:WaitForChild("RequestCollectPointTile")
+local eggRemote = remoteFunctions:WaitForChild("GetEggEvent")
+local eggPriceRemote = remoteFunctions:FindFirstChild("GetEggPrice")
+local lootBoxRemote = remoteFunctions:WaitForChild("RequestLootBoxOpen")
+local selfReportRemote = remoteEvents:WaitForChild("SelfReport")
+local penaltyRemote = remoteEvents:FindFirstChild("RequestKillerTilePenalty")
+local dailySpinRemote = remoteEvents:FindFirstChild("DailySpinUnlocked")
 
 -- State.
 local connections = {}
@@ -63,9 +84,18 @@ local worldsByModel = setmetatable({}, { __mode = "kv" })
 local lastWorldScanAt = -math.huge
 local pinnedCFrame = nil
 local lastRoundKey = nil
+local playerDataReplica = nil
+local spinning = false
+local spinBackoffUntil = 0
+local hitDetectionDisabledOn = setmetatable({}, { __mode = "k" })
+local interface = nil
 local WorldClass = nil
 local ReplicaClient = nil
 local NativeRagdoll = nil
+local LootBoxesConfig = nil
+local EggsData = nil
+local AFKController = nil
+local lastAfkFixAt = -math.huge
 
 ---Require a game module at identity 2 so it can't see our environment.
 ---@param module ModuleScript
@@ -103,6 +133,14 @@ end
 local function getRoot()
 	local character = localPlayer.Character
 	return character and character:FindFirstChild("HumanoidRootPart")
+end
+
+---Our currencies table from the player data replica.
+---@return table?
+local function getCurrencies()
+	local data = playerDataReplica and playerDataReplica.Data
+	local custom = data and data.Custom
+	return custom and custom.Currencies
 end
 
 ---Return the live match replica this player belongs to.
@@ -174,21 +212,23 @@ local function getCollectedSet(roundData)
 	return set
 end
 
----Is the tile killer now or at any point within `window` seconds?
+---Is the tile killer at any point within `window` seconds, starting `delay` seconds from now?
 ---@param world table
 ---@param tileId number
 ---@param window number?
+---@param delay number?
 ---@return boolean
-local function isDangerous(world, tileId, window)
+local function isDangerous(world, tileId, window, delay)
 	local frames = world._Frames
 	local count = #frames
 	if count == 0 then return false end
 
 	local refreshRate = math.max(world._PlayRefreshRate or 0.2, 0.01)
 	local lookahead = math.ceil((window or DANGER_LOOKAHEAD_TIME) / refreshRate)
+	local first = math.floor((delay or 0) / refreshRate)
 	local index = math.max(world._CurrentFrameIndex, 1)
 
-	for offset = 0, lookahead do
+	for offset = first, first + lookahead do
 		local frame = frames[((index - 1 + offset) % count) + 1]
 		local state = frame and frame[tileId]
 
@@ -200,10 +240,10 @@ local function isDangerous(world, tileId, window)
 	return false
 end
 
----Tiles that never appear in any killer frame for this level.
+---Pick a static tile that no frame ever turns killer.
 ---@param world table
----@return table
-local function getNeverKillerSet(world)
+---@return number?
+local function getParkingTile(world)
 	local touched = {}
 
 	for _, frame in ipairs(world._Frames) do
@@ -212,14 +252,6 @@ local function getNeverKillerSet(world)
 		end
 	end
 
-	return touched
-end
-
----Pick a static tile that no frame ever turns killer.
----@param world table
----@return number?
-local function getParkingTile(world)
-	local touched = getNeverKillerSet(world)
 	local fallback = nil
 
 	for tileId, state in pairs(world._StaticTiles) do
@@ -292,19 +324,20 @@ local function buildCoverage(world)
 	return coverage
 end
 
----Greedy set cover: the stand tile that reaches the most pending points.
+---Greedy set cover: the stand tile that reaches the most pending points that are blue `delay` seconds from now.
 ---@param world table
 ---@param coverage table
 ---@param pending table
+---@param delay number?
 ---@return number?, table?
-local function pickStandTile(world, coverage, pending)
+local function pickStandTile(world, coverage, pending, delay)
 	local bestId, bestScore, bestTargets = nil, 0, nil
 
-	-- Only blue points; firing at red ones floods the server queue and stalls every request.
+	-- Only blue points; the server refuses red ones and re-firing floods its queue.
 	local targetWindow = getTargetWindow()
 	local live = {}
 	for pointId in pairs(pending) do
-		if not isDangerous(world, pointId, targetWindow) then
+		if not isDangerous(world, pointId, targetWindow, delay) then
 			live[pointId] = true
 		end
 	end
@@ -318,14 +351,17 @@ local function pickStandTile(world, coverage, pending)
 			end
 		end
 
+		-- Cheap count check first; the footing check only matters for real contenders.
+		if #targets == 0 or #targets < bestScore then continue end
+
 		local score = #targets
 
-		-- Standing on red is harmless with reports swallowed, but prefer blue footing.
+		-- Standing on red is harmless with god mode, but prefer blue footing.
 		if isDangerous(world, standId, STAND_DANGER_WINDOW) then
 			score -= RED_STAND_PENALTY
 		end
 
-		if #targets > 0 and score > bestScore then
+		if score > bestScore then
 			bestId, bestScore, bestTargets = standId, score, targets
 		end
 	end
@@ -349,11 +385,23 @@ local function recoverCharacter()
 	end
 end
 
----Turn off client tile hit detection; it's what freezes and ragdolls us on red.
+---Turn off client tile hit detection; it's what reports, freezes and ragdolls us on red.
 ---@param world table
 local function disableHitDetection(world)
 	if rawget(world, "OnHeartbeatFunction") then
 		pcall(world.SetRunHitDetectionEnabled, world, false)
+		hitDetectionDisabledOn[world] = true
+	end
+end
+
+---Give hit detection back to a board we turned it off on, if a round is running there.
+---@param world table
+local function restoreHitDetection(world)
+	if not hitDetectionDisabledOn[world] then return end
+	hitDetectionDisabledOn[world] = nil
+
+	if rawget(world, "IsPlaying") and not rawget(world, "OnHeartbeatFunction") then
+		pcall(world.SetRunHitDetectionEnabled, world, true)
 	end
 end
 
@@ -373,39 +421,61 @@ local function pinTo(world, tileId)
 	root.CFrame = pinnedCFrame
 end
 
----Stand on a tile and collect every reachable point at once, in waves until accepted.
+---Greedy set cover over the live points: a route of stand tiles that together reach them.
 ---@param world table
----@param standId number
----@param targets table
+---@param coverage table
+---@param pending table
+---@return table
+local function planRoute(world, coverage, pending)
+	local remaining = table.clone(pending)
+	local route = {}
+
+	while #route < ROUTE_MAX_STOPS do
+		local standId, targets = pickStandTile(world, coverage, remaining)
+		if not standId then break end
+
+		table.insert(route, { standId = standId, targets = targets })
+
+		for _, pointId in ipairs(targets) do
+			remaining[pointId] = nil
+		end
+	end
+
+	return route
+end
+
+---Walk the route without waiting on replies. The server checks requests against a short
+---history of where we've been, so each stop only needs to be held long enough to be sampled.
+---@param world table
+---@param route table
 ---@param pending table
 ---@param confirmed table
 ---@param matchId string
-local function collectCluster(world, standId, targets, pending, confirmed, matchId)
+local function runRoute(world, route, pending, confirmed, matchId)
 	disableHitDetection(world)
 	recoverCharacter()
 
-	-- Already standing here (pre-positioned), no need to wait for the move to replicate.
-	local position = world.QuickReferences.TilePositionByTileId[standId]
-	local alreadyHere = pinnedCFrame and position and (pinnedCFrame.Position - (position + HOVER_OFFSET)).Magnitude < 0.1
+	local inFlight = 0
 
-	pinTo(world, standId)
+	for _, stop in ipairs(route) do
+		-- Already standing here (pre-positioned), no need to wait for the move to replicate.
+		local position = world.QuickReferences.TilePositionByTileId[stop.standId]
+		local alreadyHere = pinnedCFrame and position and (pinnedCFrame.Position - (position + HOVER_OFFSET)).Magnitude < 0.1
 
-	if alreadyHere then
-		task.wait()
-	else
-		task.wait(AutoFarm.config.settleTime)
-	end
+		pinTo(world, stop.standId)
 
-	AutoFarm.stats.clusters += 1
+		if alreadyHere then
+			task.wait()
+		else
+			task.wait(AutoFarm.config.settleTime)
+		end
 
-	for wave = 1, MAX_WAVES do
-		if wave > 1 then AutoFarm.stats.retryWaves += 1 end
+		AutoFarm.stats.clusters += 1
 
-		local inFlight = 0
-		local deadline = os.clock() + getWaveTimeout()
 		local targetWindow = getTargetWindow()
 
-		for _, pointId in ipairs(targets) do
+		for _, pointId in ipairs(stop.targets) do
+			-- The route was planned a moment ago; skip anything a sweep has turned red since.
 			if not pending[pointId] or isDangerous(world, pointId, targetWindow) then continue end
 
 			inFlight += 1
@@ -416,20 +486,19 @@ local function collectCluster(world, standId, targets, pending, confirmed, match
 					pending[pointId] = nil
 					confirmed[pointId] = true
 					AutoFarm.stats.points += 1
+				elseif pending[pointId] then
+					AutoFarm.stats.retryWaves += 1
 				end
 
 				inFlight -= 1
 			end)
 		end
+	end
 
-		if inFlight == 0 then return end
-
-		-- Stay put until every answer is back; moving early voids the check and queues dead requests.
-		while inFlight > 0 and os.clock() < deadline do
-			task.wait()
-		end
-
-		if inFlight > 0 then return end
+	-- Let the answers land before replanning so we don't re-fire points already taken.
+	local deadline = os.clock() + getWaveTimeout()
+	while inFlight > 0 and os.clock() < deadline do
+		task.wait()
 	end
 end
 
@@ -439,7 +508,11 @@ end
 ---@return boolean
 local function isSameRound(replica, roundNumber)
 	local current = replica.Data.CurrentRoundData
-	return AutoFarm.running and current ~= nil and current.RoundNumber == roundNumber and ReplicaClient.IsActive(replica)
+	return AutoFarm.alive
+		and AutoFarm.config.autoFarm
+		and current ~= nil
+		and current.RoundNumber == roundNumber
+		and ReplicaClient.IsActive(replica)
 end
 
 ---Collect every point tile in the current round as fast as the server allows.
@@ -471,6 +544,7 @@ local function farmRound(replica, roundData)
 	local coverage = buildCoverage(world)
 	local confirmed = {}
 	local skipped = {}
+	local refusals = {}
 	local prepositioned = false
 
 	-- Server rejects collections before the round starts, so sit on the best opening spot and wait.
@@ -500,21 +574,36 @@ local function farmRound(replica, roundData)
 
 		if next(pending) == nil and next(skipped) == nil then break end
 
-		-- Everything left is red right now, wait somewhere safe for it to clear.
-		local standId, targets = pickStandTile(world, coverage, pending)
-		if not standId then
-			local waitTile = parkingTile or findSafeTile(world)
+		-- Everything left is red right now: stand where the most points are about to turn blue,
+		-- so the server already has our position when they do.
+		local route = planRoute(world, coverage, pending)
+		if #route == 0 then
+			local waitTile = nil
+
+			for step = 1, ANTICIPATE_STEPS do
+				waitTile = pickStandTile(world, coverage, pending, step * ANTICIPATE_STEP_TIME)
+				if waitTile then break end
+			end
+
+			waitTile = waitTile or parkingTile or findSafeTile(world)
 			if waitTile then pinTo(world, waitTile) end
 			task.wait()
 			continue
 		end
 
-		collectCluster(world, standId, targets, pending, confirmed, matchId)
+		runRoute(world, route, pending, confirmed, matchId)
 
-		-- Refused while blue means something else is wrong with it, back off briefly.
-		for _, pointId in ipairs(targets) do
-			if pending[pointId] and not isDangerous(world, pointId, getTargetWindow()) then
-				skipped[pointId] = os.clock() + 0.3
+		-- Refused twice while blue means something else is wrong with it, back off briefly.
+		for _, stop in ipairs(route) do
+			for _, pointId in ipairs(stop.targets) do
+				if pending[pointId] and not isDangerous(world, pointId, getTargetWindow()) then
+					refusals[pointId] = (refusals[pointId] or 0) + 1
+
+					if refusals[pointId] >= 2 then
+						refusals[pointId] = 0
+						skipped[pointId] = os.clock() + 0.3
+					end
+				end
 			end
 		end
 	end
@@ -527,17 +616,32 @@ local function farmRound(replica, roundData)
 
 	-- Leave the last tile before the next level reveals.
 	local finalTile = parkingTile or findSafeTile(world)
-	if finalTile then
+	if finalTile and isSameRound(replica, roundNumber) then
 		pinTo(world, finalTile)
 	end
 end
 
----Main farming loop.
+---AFK players are kept out of matches, so switch it off through the game's own controller.
+local function ensureNotAfk()
+	if localPlayer:GetAttribute("PlayerAFK") ~= true then return end
+	if not AFKController or os.clock() - lastAfkFixAt < 3 then return end
+	lastAfkFixAt = os.clock()
+
+	setthreadidentity(2)
+	pcall(AFKController.SetAFK, AFKController, false)
+	setthreadidentity(8)
+end
+
+---Main farming loop. Idles while Auto Farm is toggled off.
 local function farmLoop()
 	local userId = tostring(localPlayer.UserId)
 
-	while AutoFarm.running do
-		local replica = getMatchReplica()
+	while AutoFarm.alive do
+		if AutoFarm.config.autoFarm then
+			ensureNotAfk()
+		end
+
+		local replica = AutoFarm.config.autoFarm and getMatchReplica()
 		local data = replica and replica.Data
 		local roundData = data and data.CurrentRoundData
 		local me = data and data.PlayingPlayers[userId]
@@ -555,6 +659,7 @@ local function farmLoop()
 				AutoFarm.stats.rounds += 1
 			end
 		else
+			-- Release the character whenever there's no round to farm (or farming is off).
 			pinnedCFrame = nil
 		end
 
@@ -562,10 +667,429 @@ local function farmLoop()
 	end
 end
 
----Stop the farm and clean up.
+---Keep the board's hit detection off while god mode is on, and hand it back when it's turned off.
+local function godModeLoop()
+	while AutoFarm.alive do
+		local replica = getMatchReplica()
+		local world = replica and getWorld(replica)
+
+		if world then
+			if AutoFarm.config.godMode then
+				disableHitDetection(world)
+				recoverCharacter()
+			else
+				restoreHitDetection(world)
+			end
+		end
+
+		task.wait(0.2)
+	end
+end
+
+---Do we have a spin to use right now? The daily free spin is a flag, bought spins are tickets.
+---@return boolean
+local function hasSpin()
+	local data = playerDataReplica and playerDataReplica.Data
+	local custom = data and data.Custom
+	if not custom then return false end
+
+	local wheel = custom.GameSpinWheel
+	if wheel and wheel.FreeSpinAvailable == true then return true end
+
+	local currencies = custom.Currencies
+	return currencies ~= nil and (currencies.GameSpinTickets or 0) > 0
+end
+
+---Use one spin on the active wheel. Guarded so overlapping triggers don't double-fire.
+local function trySpin()
+	if spinning or not AutoFarm.config.autoSpin or os.clock() < spinBackoffUntil or not hasSpin() then return end
+	spinning = true
+
+	local wheelId = LootBoxesConfig and LootBoxesConfig.ACTIVE_SPIN_WHEEL or "Halloween2026SpinWheel"
+	local ok, success, reason = pcall(lootBoxRemote.InvokeServer, lootBoxRemote, wheelId)
+
+	if ok and success then
+		AutoFarm.stats.spins += 1
+		print(string.format("[Potent] Spun the %s.", wheelId))
+	else
+		-- Data can lag the server for a moment; don't hammer it.
+		spinBackoffUntil = os.clock() + SPIN_FAIL_BACKOFF
+
+		if ok and reason ~= "NotEnoughTickets" then
+			warn("[Potent] Spin refused:", reason)
+		end
+	end
+
+	spinning = false
+end
+
+---Watch for spins and use them the moment they show up.
+local function spinLoop()
+	while AutoFarm.alive do
+		if AutoFarm.config.autoSpin and hasSpin() then
+			trySpin()
+		end
+
+		task.wait(SPIN_POLL_INTERVAL)
+	end
+end
+
+---Buy one egg without waiting on the server, so the button can be spammed.
+---@param eggKey string
+local function buyEgg(eggKey)
+	task.spawn(function()
+		local ok, success = pcall(eggRemote.InvokeServer, eggRemote, eggKey)
+
+		if ok and success then
+			AutoFarm.stats.eggs += 1
+		elseif interface then
+			interface.flash("Couldn't buy that egg (coins?)")
+		end
+	end)
+end
+
+---Eggs the shop sells for coins right now, cheapest first.
+---@return table
+local function getShopEggs()
+	local eggs = {}
+	local data = EggsData and EggsData.Data or {}
+
+	for eggKey, egg in pairs(data) do
+		if egg.OnSale and egg.CurrencyType == "Coins" and (egg.CurrencyCost or 0) > 0 then
+			table.insert(eggs, { key = eggKey, name = egg.DisplayName or eggKey, cost = egg.CurrencyCost })
+		end
+	end
+
+	table.sort(eggs, function(a, b)
+		return a.cost < b.cost
+	end)
+
+	return eggs
+end
+
+---Format big numbers with commas.
+---@param value number
+---@return string
+local function commas(value)
+	local text = tostring(math.floor(value))
+	local formatted = text:reverse():gsub("(%d%d%d)", "%1,"):reverse()
+	return (formatted:gsub("^,", ""))
+end
+
+---Build the window. Returns a table with refresh/flash/destroy.
+---@return table
+local function createInterface()
+	local palette = {
+		background = Color3.fromRGB(22, 22, 30),
+		header = Color3.fromRGB(88, 101, 242),
+		row = Color3.fromRGB(32, 32, 43),
+		egg = Color3.fromRGB(40, 40, 54),
+		eggHover = Color3.fromRGB(52, 52, 70),
+		on = Color3.fromRGB(67, 196, 120),
+		off = Color3.fromRGB(70, 72, 86),
+		text = Color3.fromRGB(236, 238, 245),
+		subtle = Color3.fromRGB(150, 153, 168),
+		coins = Color3.fromRGB(255, 205, 80),
+	}
+
+	local function corner(instance, radius)
+		local uiCorner = Instance.new("UICorner")
+		uiCorner.CornerRadius = UDim.new(0, radius)
+		uiCorner.Parent = instance
+	end
+
+	local function label(parent, text, size, color, font)
+		local textLabel = Instance.new("TextLabel")
+		textLabel.BackgroundTransparency = 1
+		textLabel.Font = font or Enum.Font.GothamMedium
+		textLabel.Text = text
+		textLabel.TextSize = size
+		textLabel.TextColor3 = color or palette.text
+		textLabel.TextXAlignment = Enum.TextXAlignment.Left
+		textLabel.Parent = parent
+		return textLabel
+	end
+
+	-- Replace any window left over from a previous run.
+	local container = (gethui and gethui()) or coreGui
+	local old = container:FindFirstChild(UI_NAME)
+	if old then old:Destroy() end
+
+	local screenGui = Instance.new("ScreenGui")
+	screenGui.Name = UI_NAME
+	screenGui.ResetOnSpawn = false
+	screenGui.IgnoreGuiInset = true
+	screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	screenGui.Parent = container
+
+	local window = Instance.new("Frame")
+	window.AnchorPoint = Vector2.new(0, 0.5)
+	window.Position = UDim2.new(0, 20, 0.5, 0)
+	window.Size = UDim2.new(0, 250, 0, 0)
+	window.AutomaticSize = Enum.AutomaticSize.Y
+	window.BackgroundColor3 = palette.background
+	window.BorderSizePixel = 0
+	window.Active = true
+	window.Draggable = true
+	window.Parent = screenGui
+	corner(window, 12)
+
+	local header = Instance.new("Frame")
+	header.Size = UDim2.new(1, 0, 0, 40)
+	header.BackgroundColor3 = palette.header
+	header.BorderSizePixel = 0
+	header.Parent = window
+	corner(header, 12)
+
+	local title = label(header, "Potent · Color Escape", 14, Color3.new(1, 1, 1), Enum.Font.GothamBold)
+	title.Position = UDim2.new(0, 14, 0, 0)
+	title.Size = UDim2.new(1, -60, 1, 0)
+
+	local minimizeButton = Instance.new("TextButton")
+	minimizeButton.BackgroundTransparency = 1
+	minimizeButton.Position = UDim2.new(1, -64, 0, 0)
+	minimizeButton.Size = UDim2.new(0, 30, 1, 0)
+	minimizeButton.Font = Enum.Font.GothamBold
+	minimizeButton.Text = "-"
+	minimizeButton.TextSize = 20
+	minimizeButton.TextColor3 = Color3.new(1, 1, 1)
+	minimizeButton.Parent = header
+
+	local closeButton = Instance.new("TextButton")
+	closeButton.BackgroundTransparency = 1
+	closeButton.Position = UDim2.new(1, -34, 0, 0)
+	closeButton.Size = UDim2.new(0, 30, 1, 0)
+	closeButton.Font = Enum.Font.GothamBold
+	closeButton.Text = "×"
+	closeButton.TextSize = 20
+	closeButton.TextColor3 = Color3.new(1, 1, 1)
+	closeButton.Parent = header
+
+	local body = Instance.new("Frame")
+	body.BackgroundTransparency = 1
+	body.Position = UDim2.new(0, 0, 0, 40)
+	body.Size = UDim2.new(1, 0, 0, 0)
+	body.AutomaticSize = Enum.AutomaticSize.Y
+	body.Parent = window
+
+	local padding = Instance.new("UIPadding")
+	padding.PaddingTop = UDim.new(0, 10)
+	padding.PaddingBottom = UDim.new(0, 12)
+	padding.PaddingLeft = UDim.new(0, 12)
+	padding.PaddingRight = UDim.new(0, 12)
+	padding.Parent = body
+
+	local layout = Instance.new("UIListLayout")
+	layout.Padding = UDim.new(0, 8)
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Parent = body
+
+	local order = 0
+	local function nextOrder()
+		order += 1
+		return order
+	end
+
+	local toggleRefreshers = {}
+
+	---A row with a switch bound to a config key.
+	local function makeToggle(text, configKey, onChanged)
+		local row = Instance.new("TextButton")
+		row.Size = UDim2.new(1, 0, 0, 36)
+		row.BackgroundColor3 = palette.row
+		row.BorderSizePixel = 0
+		row.AutoButtonColor = false
+		row.Text = ""
+		row.LayoutOrder = nextOrder()
+		row.Parent = body
+		corner(row, 8)
+
+		local rowLabel = label(row, text, 13)
+		rowLabel.Position = UDim2.new(0, 12, 0, 0)
+		rowLabel.Size = UDim2.new(1, -70, 1, 0)
+
+		local track = Instance.new("Frame")
+		track.AnchorPoint = Vector2.new(1, 0.5)
+		track.Position = UDim2.new(1, -10, 0.5, 0)
+		track.Size = UDim2.new(0, 40, 0, 22)
+		track.BorderSizePixel = 0
+		track.Parent = row
+		corner(track, 11)
+
+		local knob = Instance.new("Frame")
+		knob.AnchorPoint = Vector2.new(0, 0.5)
+		knob.Size = UDim2.new(0, 16, 0, 16)
+		knob.BackgroundColor3 = Color3.fromRGB(245, 245, 250)
+		knob.BorderSizePixel = 0
+		knob.Parent = track
+		corner(knob, 8)
+
+		local function refresh()
+			local on = AutoFarm.config[configKey] == true
+			local info = TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+			tweenService:Create(track, info, { BackgroundColor3 = on and palette.on or palette.off }):Play()
+			tweenService:Create(knob, info, { Position = on and UDim2.new(1, -19, 0.5, 0) or UDim2.new(0, 3, 0.5, 0) }):Play()
+		end
+
+		row.MouseButton1Click:Connect(function()
+			AutoFarm.config[configKey] = not AutoFarm.config[configKey]
+			if onChanged then onChanged(AutoFarm.config[configKey]) end
+
+			for _, refresher in ipairs(toggleRefreshers) do
+				refresher()
+			end
+		end)
+
+		table.insert(toggleRefreshers, refresh)
+		refresh()
+	end
+
+	-- The farm dies without god mode, so the two toggles stay linked.
+	makeToggle("Auto Farm", "autoFarm", function(on)
+		if on then AutoFarm.config.godMode = true end
+	end)
+
+	makeToggle("God Mode", "godMode", function(on)
+		if not on then AutoFarm.config.autoFarm = false end
+	end)
+
+	makeToggle("Auto Spin", "autoSpin", function(on)
+		if on then
+			spinBackoffUntil = 0
+			task.spawn(trySpin)
+		end
+	end)
+
+	local statusLabel = label(body, "", 12, palette.subtle)
+	statusLabel.Size = UDim2.new(1, 0, 0, 32)
+	statusLabel.TextWrapped = true
+	statusLabel.TextYAlignment = Enum.TextYAlignment.Top
+	statusLabel.LayoutOrder = nextOrder()
+
+	local eggsHeader = label(body, "EGGS", 11, palette.subtle, Enum.Font.GothamBold)
+	eggsHeader.Size = UDim2.new(1, 0, 0, 14)
+	eggsHeader.LayoutOrder = nextOrder()
+
+	local eggCounts = {}
+	local eggs = getShopEggs()
+
+	if #eggs == 0 then
+		local none = label(body, "No coin eggs on sale right now.", 12, palette.subtle)
+		none.Size = UDim2.new(1, 0, 0, 18)
+		none.LayoutOrder = nextOrder()
+	end
+
+	for _, egg in ipairs(eggs) do
+		local button = Instance.new("TextButton")
+		button.Size = UDim2.new(1, 0, 0, 36)
+		button.BackgroundColor3 = palette.egg
+		button.BorderSizePixel = 0
+		button.AutoButtonColor = false
+		button.Text = ""
+		button.LayoutOrder = nextOrder()
+		button.Parent = body
+		corner(button, 8)
+
+		local nameLabel = label(button, egg.name, 13, palette.text, Enum.Font.GothamSemibold)
+		nameLabel.Position = UDim2.new(0, 12, 0, 0)
+		nameLabel.Size = UDim2.new(1, -110, 1, 0)
+
+		local costLabel = label(button, commas(egg.cost) .. " coins", 12, palette.coins, Enum.Font.GothamBold)
+		costLabel.AnchorPoint = Vector2.new(1, 0)
+		costLabel.Position = UDim2.new(1, -12, 0, 0)
+		costLabel.Size = UDim2.new(0, 100, 1, 0)
+		costLabel.TextXAlignment = Enum.TextXAlignment.Right
+
+		-- Prices are dynamic server-side; keep the label on the live price.
+		if eggPriceRemote then
+			task.spawn(function()
+				while screenGui.Parent do
+					local ok, price = pcall(eggPriceRemote.InvokeServer, eggPriceRemote, egg.key)
+					if ok and type(price) == "number" then
+						costLabel.Text = commas(price) .. " coins"
+					end
+
+					task.wait(60)
+				end
+			end)
+		end
+
+		-- No debounce: every click fires its own purchase immediately.
+		button.MouseButton1Down:Connect(function()
+			eggCounts[egg.key] = (eggCounts[egg.key] or 0) + 1
+			nameLabel.Text = string.format("%s  ×%d", egg.name, eggCounts[egg.key])
+			button.BackgroundColor3 = palette.eggHover
+			buyEgg(egg.key)
+		end)
+
+		button.MouseButton1Up:Connect(function()
+			button.BackgroundColor3 = palette.egg
+		end)
+
+		button.MouseLeave:Connect(function()
+			button.BackgroundColor3 = palette.egg
+		end)
+	end
+
+	local flashText, flashUntil = nil, 0
+
+	local minimized = false
+	minimizeButton.MouseButton1Click:Connect(function()
+		minimized = not minimized
+		body.Visible = not minimized
+		minimizeButton.Text = minimized and "+" or "-"
+	end)
+
+	closeButton.MouseButton1Click:Connect(function()
+		AutoFarm.detach()
+	end)
+
+	local ui = {}
+
+	---Update the status line.
+	function ui.refresh()
+		local currencies = getCurrencies() or {}
+		local custom = playerDataReplica and playerDataReplica.Data and playerDataReplica.Data.Custom
+		local freeSpin = custom and custom.GameSpinWheel and custom.GameSpinWheel.FreeSpinAvailable == true
+		local text = string.format(
+			"Coins %s · Spins %d\nWins +%d · Eggs +%d · Spun %d",
+			commas(currencies.Coins or 0),
+			(currencies.GameSpinTickets or 0) + (freeSpin and 1 or 0),
+			AutoFarm.stats.wins,
+			AutoFarm.stats.eggs,
+			AutoFarm.stats.spins
+		)
+
+		if flashText and os.clock() < flashUntil then
+			text = flashText
+		end
+
+		statusLabel.Text = text
+	end
+
+	---Show a short message in the status line.
+	---@param message string
+	function ui.flash(message)
+		flashText = message
+		flashUntil = os.clock() + 2
+	end
+
+	function ui.destroy()
+		screenGui:Destroy()
+	end
+
+	ui.refresh()
+	return ui
+end
+
+---Stop everything, hand hit detection back and remove the window.
 function AutoFarm.detach()
-	AutoFarm.running = false
+	AutoFarm.alive = false
 	pinnedCFrame = nil
+
+	for world in pairs(hitDetectionDisabledOn) do
+		restoreHitDetection(world)
+	end
 
 	for _, connection in ipairs(connections) do
 		pcall(function()
@@ -574,25 +1098,28 @@ function AutoFarm.detach()
 	end
 
 	table.clear(connections)
+
+	if interface then
+		interface.destroy()
+		interface = nil
+	end
 end
 
----Start the farm.
-function AutoFarm.init()
-	WorldClass = safeRequire(clientModules:WaitForChild("Objects"):WaitForChild("ClientWorldObject"))
-	ReplicaClient = safeRequire(clientModules:WaitForChild("ReplicaClient"))
-	assert(WorldClass and ReplicaClient, "Failed to load game modules.")
-
-	AutoFarm.running = true
-
-	-- Swallow killer self-reports; the client is the authority on tile deaths.
-	if not shared.PotentSelfReportHook then
+---Hooks are installed once per client and read the live instance through shared, so re-running is safe.
+local function installHooks()
+	-- Swallow killer reports while god mode is on: the old SelfReport and the newer penalty remote.
+	if not shared.PotentGodHookV2 then
 		local oldNamecall
 		local hook = newcclosure(function(self, ...)
-			if self == selfReportRemote and not checkcaller() and getnamecallmethod() == "FireServer" then
+			if not checkcaller() and (self == selfReportRemote or self == penaltyRemote) then
 				local farm = shared.PotentAutoFarm
-				if farm and farm.running and (...) == "Killer" then
-					farm.stats.blockedReports += 1
-					return
+				local method = getnamecallmethod()
+
+				if farm and farm.alive and farm.config.godMode and method == "FireServer" then
+					if self == penaltyRemote or (...) == "Killer" then
+						farm.stats.blockedReports += 1
+						return
+					end
 				end
 			end
 
@@ -601,31 +1128,48 @@ function AutoFarm.init()
 
 		pcall(setstackhidden, hook, true)
 		oldNamecall = hookmetamethod(game, "__namecall", hook)
-		shared.PotentSelfReportHook = true
+		shared.PotentGodHookV2 = true
 	end
 
-	NativeRagdoll = safeRequire(replicatedStorage:WaitForChild("SharedModules"):WaitForChild("Utils"):WaitForChild("NativeRagdoll"))
+	-- Never let the optimistic death presentation anchor our character while god mode is on.
+	if not shared.PotentRagdollHookV2 and NativeRagdoll and NativeRagdoll.FreezeThenRagdoll then
+		local oldFreeze
+		oldFreeze = hookfunction(NativeRagdoll.FreezeThenRagdoll, newcclosure(function(character, ...)
+			local farm = shared.PotentAutoFarm
+			if farm and farm.alive and farm.config.godMode and character == localPlayer.Character then
+				return
+			end
 
-	-- Backup: never let the optimistic death presentation anchor our character.
-	if not shared.PotentRagdollHook then
-		if NativeRagdoll and NativeRagdoll.FreezeThenRagdoll then
-			local oldFreeze
-			oldFreeze = hookfunction(NativeRagdoll.FreezeThenRagdoll, newcclosure(function(character, ...)
-				local farm = shared.PotentAutoFarm
-				if farm and farm.running and character == localPlayer.Character then
-					return
-				end
+			return oldFreeze(character, ...)
+		end))
 
-				return oldFreeze(character, ...)
-			end))
-
-			shared.PotentRagdollHook = true
-		end
+		shared.PotentRagdollHookV2 = true
 	end
+end
 
-	-- Track every match replica, including ones that already exist.
+---Start everything.
+function AutoFarm.init()
+	WorldClass = safeRequire(clientModules:WaitForChild("Objects"):WaitForChild("ClientWorldObject"))
+	ReplicaClient = safeRequire(clientModules:WaitForChild("ReplicaClient"))
+	NativeRagdoll = safeRequire(sharedModules:WaitForChild("Utils"):WaitForChild("NativeRagdoll"))
+	LootBoxesConfig = safeRequire(sharedModules:WaitForChild("LootBoxesConfig"))
+	EggsData = safeRequire(sharedModules:WaitForChild("GameData"):WaitForChild("Eggs"))
+	AFKController = safeRequire(clientModules:FindFirstChild("AFKController", true))
+	assert(WorldClass and ReplicaClient, "Failed to load game modules.")
+
+	AutoFarm.alive = true
+	installHooks()
+
+	-- Track every match replica and our own player data, including ones that already exist.
 	table.insert(connections, ReplicaClient.OnNew(REPLICA_TOKEN, function(replica)
 		replicas[replica] = true
+	end))
+
+	table.insert(connections, ReplicaClient.OnNew(PLAYER_DATA_TOKEN, function(replica)
+		local tags = replica.Tags
+		if tags and tags.UserId == localPlayer.UserId and replica.Data and replica.Data.Custom then
+			playerDataReplica = replica
+		end
 	end))
 
 	-- Keep the character glued to the target tile so it doesn't fall onto neighbours.
@@ -639,10 +1183,32 @@ function AutoFarm.init()
 		root.CFrame = pinnedCFrame
 	end))
 
-	-- Prevent the idle kick.
+	-- The server announces the daily free spin; react right away instead of waiting for the poll.
+	if dailySpinRemote then
+		table.insert(connections, dailySpinRemote.OnClientEvent:Connect(function()
+			spinBackoffUntil = 0
+			task.delay(0.3, trySpin)
+		end))
+	end
+
+	-- Infinite Yield anti-AFK: kill the Idled listeners that run the 20 minute kick, then click on every idle.
+	if getconnections then
+		for _, connection in getconnections(localPlayer.Idled) do
+			pcall(function() connection:Disable() end)
+			pcall(function() connection:Disconnect() end)
+		end
+	end
+
 	table.insert(connections, localPlayer.Idled:Connect(function()
-		virtualUser:CaptureController()
-		virtualUser:ClickButton2(Vector2.zero)
+		local virtualInputManager = Instance.new("VirtualInputManager")
+		virtualInputManager:SendMouseButtonEvent(0, 0, 0, true, game, 0)
+		virtualInputManager:SendMouseButtonEvent(0, 0, 0, false, game, 0)
+		virtualInputManager:Destroy()
+
+		pcall(function()
+			virtualUser:CaptureController()
+			virtualUser:ClickButton2(Vector2.zero)
+		end)
 	end))
 
 	-- Disconnect prompt means the session is dead; hop back in and reload the farm.
@@ -667,13 +1233,24 @@ function AutoFarm.init()
 	table.insert(connections, winsValue.Changed:Connect(function(value)
 		if value > lastWins then
 			AutoFarm.stats.wins += value - lastWins
-			print(string.format("[Potent] Win! %d this session, %d total.", AutoFarm.stats.wins, value))
 		end
 
 		lastWins = value
 	end))
 
+	interface = createInterface()
+
 	task.spawn(farmLoop)
+	task.spawn(godModeLoop)
+	task.spawn(spinLoop)
+
+	-- Status line refresh.
+	task.spawn(function()
+		while AutoFarm.alive and interface do
+			interface.refresh()
+			task.wait(UI_REFRESH_INTERVAL)
+		end
+	end)
 end
 
 ---This is called when initialization errors.
@@ -686,7 +1263,7 @@ local function onInitializeError(error)
 end
 
 -- Detach any previous instance before starting a new one.
-if shared.PotentAutoFarm then
+if shared.PotentAutoFarm and shared.PotentAutoFarm.detach then
 	shared.PotentAutoFarm.detach()
 end
 
