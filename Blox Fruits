@@ -1,0 +1,3843 @@
+-- Check for table that is shared between executions.
+if not shared then
+	return warn("No shared, no script.")
+end
+
+local Potent = {}
+
+-- Constants.
+local SETTINGS_FOLDER = "Potent"
+local SETTINGS_PATH = "Potent/FruitSwitcher.json"
+
+-- Quick panel layout and shared UI timing.
+local UI = {
+	DEFAULT_POSITION = { 0.5, -385, 1, -61 },
+	WINDOW_WIDTH = 250,
+	HEADER_HEIGHT = 46,
+	ACTIONS_HEIGHT = 104,
+	ROW_HEIGHT = 28,
+	MAX_CONTENT_HEIGHT = 340,
+	CONFIRM_WINDOW = 3,
+	CLOSED_ORDER_OFFSET = 100,
+}
+
+-- Random fruit gacha.
+local GACHA = {
+	BOX = "ZiolesGacha",
+	POLL_INTERVAL = 30,
+}
+
+local DEFAULT_AURA_KEY = "AURASKINdefault"
+
+-- Hub window layout.
+local HUB_LAYOUT = {
+	WIDTH = 720,
+	HEIGHT = 440,
+	HEADER_HEIGHT = 54,
+	SIDEBAR_WIDTH = 176,
+	DEFAULT_POSITION = { 0.5, 0, 0.5, 0 },
+	GRID_COLUMNS = 3,
+}
+
+-- Defaults for what the quick panel shows and which keys open things.
+local DEFAULT_QUICK_SECTIONS = { "Fruits" }
+local DEFAULT_KEYBINDS = { quick = "Delete" }
+
+-- Repair minigame tuning: release within this fraction of the goal's half-width.
+local REPAIR = {
+	GOAL_PADDING = 0.015,
+	GOAL_TOLERANCE = 0.6,
+	RESWING_DELAY = 0.5,
+	SEARCH_INTERVAL = 1,
+	HAMMER_NAME = "_RepairHammer",
+}
+
+-- Fishing: the game counts a cast of 98+ as perfect. The reel steer looks this
+-- many seconds ahead; tuned against a simulation of the game's own reel physics.
+local FISHING = {
+	PERFECT_CAST = 98,
+	LOOKAHEAD = 0.35,
+	VELOCITY_SMOOTHING = 0.3,
+	RELEASE_COOLDOWN = 0.3,
+	REACTION_MIN = 0.15,
+	REACTION_MAX = 0.35,
+	RECAST_DELAY = 1.5,
+	AIM_TIMEOUT = 4,
+	CATCH_DIALOGUE_WINDOW = 10,
+	SKIP_TAP_WINDOW = 6,
+	INSTANT_CATCH_DELAY = 1,
+	BAIT_RECIPE = "Basic Bait",
+	BAIT_PER_CRAFT = 10,
+	BAIT_LOW_THRESHOLD = 10,
+	BAIT_CHECK_INTERVAL = 30,
+}
+
+-- Boat speed slider range.
+local BOAT = {
+	SPEED_MIN = 10,
+	SPEED_MAX = 500,
+	SPEED_DEFAULT = 200,
+	HINT_INTERVAL = 0.25,
+}
+
+-- Hub button.
+local TOGGLE = {
+	SIZE = 30,
+	DEFAULT_POSITION = { 0, 40, 0.5, 0 },
+	DRAG_THRESHOLD = 4,
+}
+
+-- Weather suppression: sea zone 6 on the HUD is danger level 7 (500+).
+local WEATHER = {
+	LOCK_KEY = "Potent",
+	UPDATE_INTERVAL = 0.25,
+	DARK_SEA_DANGER = 500,
+	FOG_LAYERS = { DarkFog = true },
+}
+
+-- Fruits that show as multiple selectable variants.
+local FRUIT_VARIANTS = {
+	["Dragon-Dragon"] = {
+		{ key = "East", label = "Dragon (East)", dragonType = "East" },
+		{ key = "West", label = "Dragon (West)", dragonType = "West" },
+	},
+	["Kitsune-Kitsune"] = {
+		{ key = "Base", label = "Kitsune", mutationKey = "KITSUNEMUTKyukon", mutationEquipped = false },
+		{ key = "Galaxy", label = "Kitsune (Galaxy)", mutationKey = "KITSUNEMUTKyukon", mutationEquipped = true },
+	},
+}
+
+local THEME = {
+	background = Color3.fromRGB(16, 16, 22),
+	header = Color3.fromRGB(22, 22, 30),
+	section = Color3.fromRGB(21, 21, 29),
+	row = Color3.fromRGB(28, 28, 38),
+	rowHover = Color3.fromRGB(38, 38, 52),
+	rowEquipped = Color3.fromRGB(42, 52, 84),
+	stroke = Color3.fromRGB(55, 55, 75),
+	accent = Color3.fromRGB(120, 140, 255),
+	accentAlt = Color3.fromRGB(200, 110, 255),
+	text = Color3.fromRGB(235, 235, 245),
+	subText = Color3.fromRGB(140, 140, 160),
+	star = Color3.fromRGB(255, 196, 70),
+	good = Color3.fromRGB(90, 220, 140),
+	bad = Color3.fromRGB(255, 95, 110),
+}
+
+local RARITY_COLORS = {
+	[0] = Color3.fromRGB(170, 170, 180),
+	[1] = Color3.fromRGB(80, 160, 255),
+	[2] = Color3.fromRGB(170, 90, 255),
+	[3] = Color3.fromRGB(255, 80, 120),
+	[4] = Color3.fromRGB(255, 200, 60),
+}
+
+local BRACKET_COLORS = {
+	Swords = Color3.fromRGB(120, 200, 255),
+	Guns = Color3.fromRGB(255, 160, 90),
+	Accessories = Color3.fromRGB(170, 130, 255),
+	Trinkets = Color3.fromRGB(90, 220, 170),
+}
+
+-- Services.
+local playersService = game:GetService("Players")
+local replicatedStorage = game:GetService("ReplicatedStorage")
+local userInputService = game:GetService("UserInputService")
+local tweenService = game:GetService("TweenService")
+local httpService = game:GetService("HttpService")
+local runService = game:GetService("RunService")
+
+local localPlayer = playersService.LocalPlayer
+local commF = replicatedStorage:WaitForChild("Remotes"):WaitForChild("CommF_")
+local netFolder = replicatedStorage:WaitForChild("Modules"):WaitForChild("Net")
+local gachaRemote = netFolder:WaitForChild("RF/GachaNetworkRF")
+local modificationRemote = netFolder:WaitForChild("RF/ModificationFunction")
+
+-- State.
+local settings = {
+	position = UI.DEFAULT_POSITION,
+	expanded = { Fruits = true },
+	openOrder = { "Fruits" },
+	lastHaki = nil,
+	autoRepair = false,
+	hidden = false,
+	togglePosition = TOGGLE.DEFAULT_POSITION,
+	boatSpeedEnabled = false,
+	boatSpeed = BOAT.SPEED_DEFAULT,
+	disableWeather = false,
+	fishMode = "Off",
+	autoBuyBait = false,
+	instantCatch = false,
+	hubPosition = HUB_LAYOUT.DEFAULT_POSITION,
+	hubTab = "Home",
+	quickSections = table.clone(DEFAULT_QUICK_SECTIONS),
+	keybinds = table.clone(DEFAULT_KEYBINDS),
+}
+local fruitFavorites = {}
+local hakiFavorites = {}
+local ownedFruits = {}
+local inventory = { haki = {}, swords = {}, guns = {}, wardrobe = {}, equipped = {}, preferred = {}, mutations = {} }
+local itemDataCache = {}
+local sections = {}
+local connections = {}
+local dragonType = nil
+local itemReplication = nil
+local itemConfig = nil
+local inventoryRemoteUtil = nil
+local repairShip = nil
+local weatherUtil = nil
+local fishingComponents = nil
+local dialogueController = nil
+local craftRemote = nil
+local jobsReplicated = nil
+local rollCooldownEnds = 0
+local rollCooldownKnown = false
+local rollBlocked = false
+local rollReadyConfirmed = false
+local busy = false
+local alive = true
+local minimized = false
+
+-- Labels refreshed from loops. Strong references on purpose: weak tables let Lua
+-- drop a live label's wrapper and the label silently stops updating.
+local rollTimerLabels = {}
+local statusLabels = {}
+
+-- Which keybind the Settings tab is waiting on, if any.
+local rebindTarget = nil
+
+-- Forward declarations for functions that UI callbacks call before they're defined.
+local renderAll, renderHub, rebuildQuickSections, setHubOpen
+
+-- Auto repair state.
+local repairState = {
+	hammer = nil,
+	searchedInstance = nil,
+	lastSearch = 0,
+	swinging = false,
+	ownsSwing = false,
+	nextActionAt = 0,
+	perfectCount = 0,
+}
+
+-- Boat speed state; dead seats and labels are pruned by hand.
+local boatState = {
+	originals = {},
+	hintLabels = {},
+	lastHint = 0,
+}
+
+-- Perfect fishing state.
+local fishState = {
+	hookedController = nil,
+	originalIsReeling = nil,
+	originalOnPrimaryAction = nil,
+	lastFishPos = nil,
+	lastClock = nil,
+	fishVelocity = 0,
+	lastRelease = 0,
+	perfectCasts = 0,
+	catches = 0,
+	catchCounted = false,
+	wasPlaying = false,
+	reelStartedAt = nil,
+	lastCatchAt = -math.huge,
+	nextCastAt = 0,
+	castStartedAt = nil,
+	lastBaitCheck = -math.huge,
+	buyingBait = false,
+}
+
+-- Weather suppression state, kept so everything can be put back exactly.
+local weatherState = {
+	locked = false,
+	hiddenLayers = {},
+	reducerCharacter = nil,
+	reducerOriginal = nil,
+	changedSeaTheme = false,
+	lastUpdate = 0,
+}
+
+---Convert a set into a list for saving.
+---@param set table
+---@return table
+local function setToList(set)
+	local list = {}
+	for key in pairs(set) do
+		table.insert(list, key)
+	end
+	return list
+end
+
+---Check that a saved value is a list of strings.
+---@param value any
+---@return boolean
+local function isStringList(value)
+	if typeof(value) ~= "table" then
+		return false
+	end
+
+	for _, entry in ipairs(value) do
+		if typeof(entry) ~= "string" then
+			return false
+		end
+	end
+
+	return true
+end
+
+---Load settings from disk.
+local function loadSettings()
+	if not isfolder(SETTINGS_FOLDER) then
+		makefolder(SETTINGS_FOLDER)
+	end
+
+	if not isfile(SETTINGS_PATH) then
+		return
+	end
+
+	local ok, decoded = pcall(httpService.JSONDecode, httpService, readfile(SETTINGS_PATH))
+	if not ok or typeof(decoded) ~= "table" then
+		return
+	end
+
+	if typeof(decoded.position) == "table" and #decoded.position == 4 then
+		settings.position = decoded.position
+	end
+
+	if typeof(decoded.expanded) == "table" then
+		settings.expanded = decoded.expanded
+	end
+
+	-- Keep open order consistent with what's actually expanded.
+	local openOrder = {}
+	for _, name in ipairs(typeof(decoded.openOrder) == "table" and decoded.openOrder or {}) do
+		if settings.expanded[name] and not table.find(openOrder, name) then
+			table.insert(openOrder, name)
+		end
+	end
+	for name, isOpen in pairs(settings.expanded) do
+		if isOpen and not table.find(openOrder, name) then
+			table.insert(openOrder, name)
+		end
+	end
+	settings.openOrder = openOrder
+
+	settings.lastHaki = decoded.lastHaki
+	settings.autoRepair = decoded.autoRepair == true
+	settings.hidden = decoded.hidden == true
+	settings.boatSpeedEnabled = decoded.boatSpeedEnabled == true
+	settings.disableWeather = decoded.disableWeather == true
+	settings.autoBuyBait = decoded.autoBuyBait == true
+	settings.instantCatch = decoded.instantCatch == true
+
+	-- Fishing mode: Off, Assist (you cast) or Auto (fully hands-free).
+	if decoded.fishMode == "Assist" or decoded.fishMode == "Auto" then
+		settings.fishMode = decoded.fishMode
+	elseif decoded.autoFish == true then
+		settings.fishMode = "Assist"
+	end
+
+	if typeof(decoded.togglePosition) == "table" and #decoded.togglePosition == 4 then
+		settings.togglePosition = decoded.togglePosition
+	end
+
+	if typeof(decoded.hubPosition) == "table" and #decoded.hubPosition == 4 then
+		settings.hubPosition = decoded.hubPosition
+	end
+
+	if typeof(decoded.hubTab) == "string" then
+		settings.hubTab = decoded.hubTab
+	end
+
+	if isStringList(decoded.quickSections) then
+		settings.quickSections = decoded.quickSections
+	end
+
+	if typeof(decoded.keybinds) == "table" then
+		for action in pairs(DEFAULT_KEYBINDS) do
+			if typeof(decoded.keybinds[action]) == "string" then
+				settings.keybinds[action] = decoded.keybinds[action]
+			end
+		end
+	end
+
+	if typeof(decoded.boatSpeed) == "number" then
+		settings.boatSpeed = math.clamp(math.floor(decoded.boatSpeed + 0.5), BOAT.SPEED_MIN, BOAT.SPEED_MAX)
+	end
+
+	for _, name in ipairs(decoded.favorites or {}) do
+		fruitFavorites[name] = true
+	end
+
+	-- Carry an old whole-fruit favorite over to each of its variants.
+	for fruitName, variants in pairs(FRUIT_VARIANTS) do
+		if fruitFavorites[fruitName] then
+			fruitFavorites[fruitName] = nil
+			for _, variant in ipairs(variants) do
+				fruitFavorites[fruitName .. "|" .. variant.key] = true
+			end
+		end
+	end
+
+	for _, id in ipairs(decoded.hakiFavorites or {}) do
+		hakiFavorites[id] = true
+	end
+end
+
+---Persist settings to disk. An unloaded instance must never overwrite a newer one.
+local function saveSettings()
+	if not alive then
+		return
+	end
+
+	settings.favorites = setToList(fruitFavorites)
+	settings.hakiFavorites = setToList(hakiFavorites)
+	writefile(SETTINGS_PATH, httpService:JSONEncode(settings))
+end
+
+---Resolve a keybind setting to a KeyCode, falling back to the default.
+---@param action string
+---@return EnumItem
+local function getKeybind(action)
+	local ok, keyCode = pcall(function()
+		return Enum.KeyCode[settings.keybinds[action]]
+	end)
+
+	if ok and keyCode then
+		return keyCode
+	end
+
+	return Enum.KeyCode[DEFAULT_KEYBINDS[action]]
+end
+
+---Run a function at game identity so required modules can't see our env.
+---@return any
+local function withGameIdentity(callback)
+	setthreadidentity(2)
+	local results = table.pack(pcall(callback))
+	setthreadidentity(8)
+
+	if not results[1] then
+		warn("Game call failed: " .. tostring(results[2]))
+		return nil
+	end
+
+	return table.unpack(results, 2, results.n)
+end
+
+---Load the game's modules once.
+local function loadGameModules()
+	withGameIdentity(function()
+		itemReplication = require(replicatedStorage.ItemReplicationService)
+		itemConfig = require(replicatedStorage.ItemConfig)
+		inventoryRemoteUtil = require(replicatedStorage.Controllers.UI.Inventory.RemoteUtil)
+		repairShip = require(replicatedStorage.Controllers.UI.RepairShip)
+	end)
+
+	-- Separate calls so a weather or fishing failure can't block the other modules.
+	withGameIdentity(function()
+		weatherUtil = require(replicatedStorage.Controllers.WeatherController.WeatherUtil)
+	end)
+
+	-- FishingClient is a Script, so its controller is reached through the shared state.
+	withGameIdentity(function()
+		fishingComponents = require(replicatedStorage.FishReplicated.FishingClient.Components)
+	end)
+
+	withGameIdentity(function()
+		dialogueController = require(replicatedStorage.DialogueController)
+		jobsReplicated = require(replicatedStorage.JobsReplicated)
+		craftRemote = require(replicatedStorage.Modules.Net):RemoteFunction("Craft")
+	end)
+end
+
+---Resolve and cache item config data.
+---@param itemId number
+---@return table?
+local function getItemData(itemId)
+	if itemDataCache[itemId] ~= nil then
+		return itemDataCache[itemId] or nil
+	end
+
+	local ok, result = pcall(itemConfig.tryGet, itemId)
+	if ok and typeof(result) == "table" and result.unwrap then
+		ok, result = pcall(result.unwrap, result)
+	end
+
+	local data = ok and typeof(result) == "table" and result.Index and result or false
+	itemDataCache[itemId] = data
+	return data or nil
+end
+
+---Fetch owned permanent fruits in shop order.
+local function fetchOwnedFruits()
+	local fruits = commF:InvokeServer("GetFruits", false)
+	if typeof(fruits) ~= "table" then
+		return
+	end
+
+	table.clear(ownedFruits)
+
+	for shopIndex, fruit in ipairs(fruits) do
+		if fruit.HasPermanent then
+			table.insert(ownedFruits, { name = fruit.Name, rarity = fruit.Rarity, shopIndex = shopIndex })
+		end
+	end
+
+	dragonType = commF:InvokeServer("DragonType")
+end
+
+---Sort items alphabetically by display name.
+local function sortByName(list)
+	table.sort(list, function(a, b)
+		return a.name < b.name
+	end)
+end
+
+---Read haki colors, mutations and game-favorited items from item replication.
+local function fetchInventory()
+	if not itemReplication then
+		return
+	end
+
+	withGameIdentity(function()
+		local entries = itemReplication:GetItems()
+		if typeof(entries) ~= "table" then
+			return
+		end
+
+		local favorited, equipped, preferred, owned, uids, seen = {}, {}, {}, {}, {}, {}
+		local haki, swords, guns, wardrobe, mutations = {}, {}, {}, {}, {}
+
+		for _, entry in pairs(entries) do
+			if entry.NetworkedUID and not uids[entry.ItemId] then
+				uids[entry.ItemId] = entry.NetworkedUID
+			end
+
+			if entry.Value == true then
+				if entry.Key == "IsFavorited" then
+					favorited[entry.ItemId] = true
+				elseif entry.Key == "IsEquipped" then
+					equipped[entry.ItemId] = true
+				elseif entry.Key == "IsPreferred" then
+					preferred[entry.ItemId] = true
+				elseif entry.Key == "IsOwned" then
+					owned[entry.ItemId] = true
+				end
+			end
+		end
+
+		for _, entry in pairs(entries) do
+			local itemId = entry.ItemId
+			if not itemId or seen[itemId] then
+				continue
+			end
+			seen[itemId] = true
+
+			local data = getItemData(itemId)
+			if not data then
+				continue
+			end
+
+			local index, inventoryData = data.Index, data.Inventory or {}
+			local bracket = inventoryData.Brackets and inventoryData.Brackets[1]
+			local groups = inventoryData.Groups or {}
+
+			-- Owned fruit mutations, looked up by storage key.
+			if index.IdType == "Mutation" then
+				if owned[itemId] then
+					mutations[index.StorageKey] = itemId
+				end
+				continue
+			end
+
+			-- Aura skins are the haki colors.
+			if index.IdType == "Skin" and inventoryData.StackKey == "Aura" then
+				local isDefault = index.StorageKey == DEFAULT_AURA_KEY
+				table.insert(haki, {
+					id = itemId,
+					name = isDefault and "Default" or (data.Display and data.Display.Name) or index.StorageKey,
+					isDefault = isDefault,
+				})
+				continue
+			end
+
+			if not favorited[itemId] then
+				continue
+			end
+
+			local item = { id = itemId, uid = uids[itemId], name = index.StorageKey, bracket = bracket }
+
+			if index.IdType == "Moveset" and bracket == "Swords" then
+				table.insert(swords, item)
+			elseif index.IdType == "Moveset" and bracket == "Guns" then
+				table.insert(guns, item)
+			elseif table.find(groups, "Wardrobe") then
+				table.insert(wardrobe, item)
+			end
+		end
+
+		sortByName(swords)
+		sortByName(guns)
+		sortByName(wardrobe)
+
+		-- Default color first, the rest alphabetical.
+		table.sort(haki, function(a, b)
+			if a.isDefault ~= b.isDefault then
+				return a.isDefault
+			end
+			return a.name < b.name
+		end)
+
+		inventory.haki = haki
+		inventory.swords = swords
+		inventory.guns = guns
+		inventory.wardrobe = wardrobe
+		inventory.equipped = equipped
+		inventory.preferred = preferred
+		inventory.mutations = mutations
+	end)
+end
+
+---Current server time in whole seconds; the cooldown end comes from the server clock.
+---@return number
+local function serverNow()
+	return math.floor(workspace:GetServerTimeNow())
+end
+
+---Poll the random fruit cooldown.
+local function checkRollCooldown()
+	local ok, result = pcall(gachaRemote.InvokeServer, gachaRemote, { Context = "Check", BoxName = GACHA.BOX })
+	if not ok or typeof(result) ~= "table" or typeof(result.Cooldown) ~= "table" then
+		return
+	end
+
+	local cooldown = result.Cooldown
+	local timeEnds = tonumber(cooldown.TimeEnds) or 0
+
+	-- The server can say "not yet" after the timestamp passes; show that instead of Ready.
+	rollBlocked = cooldown.RequirementMet == false and timeEnds <= serverNow()
+	rollReadyConfirmed = timeEnds <= serverNow() and not rollBlocked
+	rollCooldownEnds = timeEnds
+	rollCooldownKnown = true
+end
+
+---Get the currently equipped fruit.
+---@return string?
+local function getCurrentFruit()
+	local data = localPlayer:FindFirstChild("Data")
+	local devilFruit = data and data:FindFirstChild("DevilFruit")
+	return devilFruit and devilFruit.Value
+end
+
+---Return a readable fruit name ("T-Rex-T-Rex" -> "T-Rex").
+---@param name string
+---@return string
+local function prettyName(name)
+	local half = (#name - 1) / 2
+	if half % 1 == 0 and name:sub(1, half) == name:sub(half + 2) then
+		return name:sub(1, half)
+	end
+	return name
+end
+
+---Expand a fruit into its selectable entries (variants for Dragon / Kitsune).
+---@param fruit table
+---@return table
+local function expandFruit(fruit)
+	local variants = FRUIT_VARIANTS[fruit.name]
+	if not variants then
+		return { { key = fruit.name, name = fruit.name, label = prettyName(fruit.name), rarity = fruit.rarity } }
+	end
+
+	local entries = {}
+	for _, variant in ipairs(variants) do
+		-- Hide a mutation variant the player doesn't own.
+		if variant.mutationEquipped and not inventory.mutations[variant.mutationKey] then
+			continue
+		end
+
+		table.insert(entries, {
+			key = fruit.name .. "|" .. variant.key,
+			name = fruit.name,
+			label = variant.label,
+			rarity = fruit.rarity,
+			dragonType = variant.dragonType,
+			mutationKey = variant.mutationKey,
+			mutationEquipped = variant.mutationEquipped,
+		})
+	end
+
+	return entries
+end
+
+---Check whether a fruit entry matches what's equipped right now.
+---@param entry table
+---@return boolean
+local function isCurrentEntry(entry)
+	if getCurrentFruit() ~= entry.name then
+		return false
+	end
+
+	if entry.dragonType then
+		return dragonType == entry.dragonType
+	end
+
+	if entry.mutationKey then
+		local mutationId = inventory.mutations[entry.mutationKey]
+		local isEquipped = mutationId ~= nil and inventory.preferred[mutationId] == true
+		return isEquipped == entry.mutationEquipped
+	end
+
+	return true
+end
+
+---Return the label for the equipped fruit, including its variant.
+---@return string
+local function getCurrentFruitLabel()
+	local current = getCurrentFruit()
+	if not current or current == "" then
+		return "None"
+	end
+
+	for _, fruit in ipairs(ownedFruits) do
+		if fruit.name == current then
+			for _, entry in ipairs(expandFruit(fruit)) do
+				if isCurrentEntry(entry) then
+					return entry.label
+				end
+			end
+		end
+	end
+
+	return prettyName(current)
+end
+
+---Format seconds as m:ss or h:mm:ss.
+---@param seconds number
+---@return string
+local function formatTime(seconds)
+	local hours = math.floor(seconds / 3600)
+	local minutes = math.floor(seconds % 3600 / 60)
+	local secs = seconds % 60
+
+	if hours > 0 then
+		return string.format("%d:%02d:%02d", hours, minutes, secs)
+	end
+
+	return string.format("%d:%02d", minutes, secs)
+end
+
+---Create an instance with properties.
+---@param className string
+---@param properties table
+---@return Instance
+local function create(className, properties)
+	local instance = Instance.new(className)
+	for key, value in pairs(properties) do
+		if key ~= "Parent" then
+			instance[key] = value
+		end
+	end
+	instance.Parent = properties.Parent
+	return instance
+end
+
+---Tween helper.
+local function tween(instance, goal, duration)
+	tweenService:Create(instance, TweenInfo.new(duration or 0.15, Enum.EasingStyle.Quad), goal):Play()
+end
+
+---Add rounded corners.
+local function corner(parent, radius)
+	return create("UICorner", { CornerRadius = UDim.new(0, radius), Parent = parent })
+end
+
+---Check for a primary pointer press.
+---@param input InputObject
+---@return boolean
+local function isPointerPress(input)
+	return input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch
+end
+
+---Check for pointer movement.
+---@param input InputObject
+---@return boolean
+local function isPointerMove(input)
+	return input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch
+end
+
+---Pull a GUI object back on screen if it hangs past an edge.
+---@param object GuiObject
+---@param size Vector2
+local function clampToScreen(object, size)
+	local screenSize = object.Parent and object.Parent.AbsoluteSize
+	if not screenSize or screenSize.X <= 0 or screenSize.Y <= 0 then
+		return
+	end
+
+	local position = object.Position
+	local anchor = object.AnchorPoint
+	local anchorX = position.X.Scale * screenSize.X + position.X.Offset
+	local anchorY = position.Y.Scale * screenSize.Y + position.Y.Offset
+
+	-- Keep the whole box inside the screen given where it's anchored.
+	local minX, maxX = size.X * anchor.X, screenSize.X - size.X * (1 - anchor.X)
+	local minY, maxY = size.Y * anchor.Y, screenSize.Y - size.Y * (1 - anchor.Y)
+	local clampedX = math.clamp(anchorX, minX, math.max(minX, maxX))
+	local clampedY = math.clamp(anchorY, minY, math.max(minY, maxY))
+
+	if clampedX == anchorX and clampedY == anchorY then
+		return
+	end
+
+	object.Position = UDim2.new(
+		position.X.Scale,
+		position.X.Offset + (clampedX - anchorX),
+		position.Y.Scale,
+		position.Y.Offset + (clampedY - anchorY)
+	)
+end
+
+---Convert a saved {xs, xo, ys, yo} table into a UDim2.
+---@param values table
+---@return UDim2
+local function toUDim2(values)
+	return UDim2.new(values[1], values[2], values[3], values[4])
+end
+
+---Convert a UDim2 into a saveable table.
+---@param value UDim2
+---@return table
+local function fromUDim2(value)
+	return { value.X.Scale, value.X.Offset, value.Y.Scale, value.Y.Offset }
+end
+
+---Make a frame draggable by a handle, saving its position on release.
+---@param handle GuiObject
+---@param object GuiObject
+---@param onReleased function
+---@param onMoved function?
+local function makeDraggable(handle, object, onReleased, onMoved)
+	local dragging, dragStart, startPosition
+
+	handle.InputBegan:Connect(function(input)
+		if not isPointerPress(input) then
+			return
+		end
+
+		dragging = true
+		dragStart = input.Position
+		startPosition = object.Position
+
+		input.Changed:Connect(function()
+			if input.UserInputState ~= Enum.UserInputState.End or not dragging then
+				return
+			end
+
+			dragging = false
+			onReleased()
+		end)
+	end)
+
+	table.insert(connections, userInputService.InputChanged:Connect(function(input)
+		if not dragging or not isPointerMove(input) then
+			return
+		end
+
+		local delta = input.Position - dragStart
+		object.Position = UDim2.new(startPosition.X.Scale, startPosition.X.Offset + delta.X, startPosition.Y.Scale, startPosition.Y.Offset + delta.Y)
+
+		if onMoved then
+			onMoved()
+		end
+	end))
+end
+
+-- Shared ScreenGui for both windows and the hub button.
+local screenGui = create("ScreenGui", {
+	Name = httpService:GenerateGUID(false),
+	ResetOnSpawn = false,
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+})
+
+---Create a styled action button.
+---@param parent Instance
+---@param text string
+---@param position UDim2
+---@param size UDim2
+---@param accentColor Color3
+---@return TextButton
+local function actionButton(parent, text, position, size, accentColor)
+	local button = create("TextButton", {
+		Position = position,
+		Size = size,
+		BackgroundColor3 = THEME.row,
+		AutoButtonColor = false,
+		Font = Enum.Font.GothamBold,
+		Text = text,
+		TextColor3 = THEME.text,
+		TextSize = 12,
+		Parent = parent,
+	})
+	corner(button, 8)
+	local stroke = create("UIStroke", {
+		Color = accentColor,
+		Transparency = 0.55,
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+		Parent = button,
+	})
+
+	button.MouseEnter:Connect(function()
+		tween(button, { BackgroundColor3 = THEME.rowHover })
+		tween(stroke, { Transparency = 0.1 })
+	end)
+	button.MouseLeave:Connect(function()
+		tween(button, { BackgroundColor3 = THEME.row })
+		tween(stroke, { Transparency = 0.55 })
+	end)
+
+	return button
+end
+
+---Create the roll button with its label and live countdown.
+---@param parent Instance
+---@param position UDim2
+---@param size UDim2
+---@param title string
+---@param textSize number
+---@return TextButton
+local function createRollButton(parent, position, size, title, textSize)
+	local button = actionButton(parent, "", position, size, THEME.accent)
+
+	create("TextLabel", {
+		Position = UDim2.fromOffset(12, 0),
+		Size = UDim2.new(0.65, 0, 1, 0),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamBold,
+		Text = title,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextColor3 = THEME.text,
+		TextSize = textSize,
+		Parent = button,
+	})
+
+	local timer = create("TextLabel", {
+		AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, -12, 0, 0),
+		Size = UDim2.new(0.35, 0, 1, 0),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamMedium,
+		Text = "…",
+		TextXAlignment = Enum.TextXAlignment.Right,
+		TextColor3 = THEME.subText,
+		TextSize = textSize - 1,
+		Parent = button,
+	})
+	rollTimerLabels[timer] = true
+
+	return button
+end
+
+---Create a small square header icon button.
+---@param parent Instance
+---@param text string
+---@param offset number
+---@return TextButton
+local function headerButton(parent, text, offset)
+	local button = create("TextButton", {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, offset, 0.5, 1),
+		Size = UDim2.fromOffset(24, 24),
+		BackgroundColor3 = THEME.row,
+		AutoButtonColor = false,
+		Font = Enum.Font.GothamBold,
+		Text = text,
+		TextColor3 = THEME.subText,
+		TextSize = 14,
+		Parent = parent,
+	})
+	corner(button, 6)
+
+	button.MouseEnter:Connect(function()
+		tween(button, { BackgroundColor3 = THEME.rowHover, TextColor3 = THEME.text })
+	end)
+	button.MouseLeave:Connect(function()
+		tween(button, { BackgroundColor3 = THEME.row, TextColor3 = THEME.subText })
+	end)
+
+	return button
+end
+
+---Give a header bar the shared gradient and accent strip.
+---@param bar Frame
+local function decorateHeader(bar)
+	create("UIGradient", {
+		Color = ColorSequence.new(Color3.fromRGB(40, 40, 62), THEME.header),
+		Rotation = 90,
+		Parent = bar,
+	})
+
+	local accentBar = create("Frame", {
+		Size = UDim2.new(1, 0, 0, 2),
+		BackgroundColor3 = THEME.accent,
+		BorderSizePixel = 0,
+		Parent = bar,
+	})
+	create("UIGradient", { Color = ColorSequence.new(THEME.accent, THEME.accentAlt), Parent = accentBar })
+end
+
+-- Quick panel window.
+local mainFrame = create("Frame", {
+	AnchorPoint = Vector2.new(0.5, 1),
+	Size = UDim2.fromOffset(UI.WINDOW_WIDTH, 400),
+	BackgroundColor3 = THEME.background,
+	BorderSizePixel = 0,
+	ClipsDescendants = true,
+	Parent = screenGui,
+})
+corner(mainFrame, 10)
+create("UIStroke", { Color = THEME.stroke, Transparency = 0.2, Parent = mainFrame })
+
+local header = create("Frame", {
+	Size = UDim2.new(1, 0, 0, UI.HEADER_HEIGHT),
+	BackgroundColor3 = THEME.header,
+	BorderSizePixel = 0,
+	Parent = mainFrame,
+})
+decorateHeader(header)
+
+create("TextLabel", {
+	Position = UDim2.fromOffset(12, 7),
+	Size = UDim2.new(1, -100, 0, 18),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.GothamBold,
+	Text = "Potent",
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextColor3 = THEME.text,
+	TextSize = 14,
+	Parent = header,
+})
+
+local currentLabel = create("TextLabel", {
+	Position = UDim2.fromOffset(12, 25),
+	Size = UDim2.new(1, -100, 0, 14),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.Gotham,
+	Text = "Fruit: —",
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextTruncate = Enum.TextTruncate.AtEnd,
+	TextColor3 = THEME.subText,
+	TextSize = 11,
+	Parent = header,
+})
+
+local minimizeButton = headerButton(header, "–", -10)
+local refreshButton = headerButton(header, "↻", -40)
+
+-- Quick actions shared by every section.
+local actionsFrame = create("Frame", {
+	Position = UDim2.fromOffset(8, UI.HEADER_HEIGHT + 8),
+	Size = UDim2.new(1, -16, 0, UI.ACTIONS_HEIGHT - 8),
+	BackgroundTransparency = 1,
+	Parent = mainFrame,
+})
+
+local rollButton = createRollButton(actionsFrame, UDim2.fromOffset(0, 0), UDim2.new(1, 0, 0, 34), "🎲  Roll Fruit", 13)
+local refundButton = actionButton(actionsFrame, "Refund Stats", UDim2.fromOffset(0, 40), UDim2.new(0.5, -3, 0, 30), THEME.star)
+local rerollButton = actionButton(actionsFrame, "Reroll Race", UDim2.new(0.5, 3, 0, 40), UDim2.new(0.5, -3, 0, 30), THEME.accentAlt)
+
+local statusLabel = create("TextLabel", {
+	Position = UDim2.fromOffset(2, 76),
+	Size = UDim2.new(1, -4, 0, 14),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.Gotham,
+	Text = "",
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextColor3 = THEME.subText,
+	TextSize = 11,
+	TextTruncate = Enum.TextTruncate.AtEnd,
+	Parent = actionsFrame,
+})
+table.insert(statusLabels, statusLabel)
+
+local contentList = create("ScrollingFrame", {
+	Position = UDim2.fromOffset(8, UI.HEADER_HEIGHT + UI.ACTIONS_HEIGHT),
+	Size = UDim2.new(1, -16, 1, -(UI.HEADER_HEIGHT + UI.ACTIONS_HEIGHT + 8)),
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+	ScrollBarThickness = 3,
+	ScrollBarImageColor3 = THEME.stroke,
+	AutomaticCanvasSize = Enum.AutomaticSize.Y,
+	CanvasSize = UDim2.new(),
+	Parent = mainFrame,
+})
+local contentLayout = create("UIListLayout", {
+	Padding = UDim.new(0, 6),
+	SortOrder = Enum.SortOrder.LayoutOrder,
+	Parent = contentList,
+})
+create("UIPadding", { PaddingRight = UDim.new(0, 6), Parent = contentList })
+
+-- Shown when nothing is pinned to the quick panel.
+local quickEmptyLabel = create("TextLabel", {
+	LayoutOrder = 0,
+	Size = UDim2.new(1, 0, 0, 34),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.Gotham,
+	Text = "Nothing pinned. Open the hub to add sections.",
+	TextWrapped = true,
+	TextColor3 = THEME.subText,
+	TextSize = 11,
+	Visible = false,
+	Parent = contentList,
+})
+
+---Fit the quick panel to its content, growing upward from the anchor.
+---The quick panel is allowed off screen, so it is never clamped.
+local function updateWindowSize(animate)
+	local height = minimized and UI.HEADER_HEIGHT
+		or UI.HEADER_HEIGHT + UI.ACTIONS_HEIGHT + math.min(contentLayout.AbsoluteContentSize.Y, UI.MAX_CONTENT_HEIGHT) + 8
+	local goal = UDim2.fromOffset(UI.WINDOW_WIDTH, height)
+
+	if animate then
+		tween(mainFrame, { Size = goal }, 0.2)
+	else
+		mainFrame.Size = goal
+	end
+end
+
+contentLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+	updateWindowSize(false)
+end)
+
+-- Hub window: one table keeps the many widgets out of the local limit.
+local hub = { tabButtons = {} }
+
+hub.frame = create("Frame", {
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Size = UDim2.fromOffset(HUB_LAYOUT.WIDTH, HUB_LAYOUT.HEIGHT),
+	BackgroundColor3 = THEME.background,
+	BorderSizePixel = 0,
+	ClipsDescendants = true,
+	Visible = false,
+	ZIndex = 2,
+	-- Active so clicks on empty hub space don't fall through to the quick panel.
+	Active = true,
+	Parent = screenGui,
+})
+corner(hub.frame, 12)
+create("UIStroke", { Color = THEME.stroke, Transparency = 0.1, Parent = hub.frame })
+
+hub.header = create("Frame", {
+	Size = UDim2.new(1, 0, 0, HUB_LAYOUT.HEADER_HEIGHT),
+	BackgroundColor3 = THEME.header,
+	BorderSizePixel = 0,
+	Parent = hub.frame,
+})
+decorateHeader(hub.header)
+
+create("TextLabel", {
+	Position = UDim2.fromOffset(18, 10),
+	Size = UDim2.fromOffset(200, 20),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.GothamBlack,
+	Text = "POTENT",
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextColor3 = THEME.text,
+	TextSize = 17,
+	Parent = hub.header,
+})
+
+create("TextLabel", {
+	Position = UDim2.fromOffset(18, 31),
+	Size = UDim2.fromOffset(200, 14),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.Gotham,
+	Text = "Blox Fruits hub",
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextColor3 = THEME.subText,
+	TextSize = 11,
+	Parent = hub.header,
+})
+
+hub.fruitLabel = create("TextLabel", {
+	AnchorPoint = Vector2.new(1, 0),
+	Position = UDim2.new(1, -48, 0, 11),
+	Size = UDim2.fromOffset(320, 16),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.GothamMedium,
+	Text = "",
+	TextXAlignment = Enum.TextXAlignment.Right,
+	TextTruncate = Enum.TextTruncate.AtEnd,
+	TextColor3 = THEME.text,
+	TextSize = 12,
+	Parent = hub.header,
+})
+
+hub.statusLabel = create("TextLabel", {
+	AnchorPoint = Vector2.new(1, 0),
+	Position = UDim2.new(1, -48, 0, 29),
+	Size = UDim2.fromOffset(320, 14),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.Gotham,
+	Text = "",
+	TextXAlignment = Enum.TextXAlignment.Right,
+	TextTruncate = Enum.TextTruncate.AtEnd,
+	TextColor3 = THEME.subText,
+	TextSize = 11,
+	Parent = hub.header,
+})
+table.insert(statusLabels, hub.statusLabel)
+
+hub.refreshButton = headerButton(hub.header, "↻", -14)
+
+hub.sidebar = create("Frame", {
+	Position = UDim2.fromOffset(0, HUB_LAYOUT.HEADER_HEIGHT),
+	Size = UDim2.new(0, HUB_LAYOUT.SIDEBAR_WIDTH, 1, -HUB_LAYOUT.HEADER_HEIGHT),
+	BackgroundColor3 = THEME.section,
+	BorderSizePixel = 0,
+	Active = true,
+	Parent = hub.frame,
+})
+
+hub.tabList = create("ScrollingFrame", {
+	Size = UDim2.new(1, 0, 1, -48),
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+	ScrollBarThickness = 0,
+	AutomaticCanvasSize = Enum.AutomaticSize.Y,
+	CanvasSize = UDim2.new(),
+	Parent = hub.sidebar,
+})
+create("UIListLayout", { Padding = UDim.new(0, 2), SortOrder = Enum.SortOrder.LayoutOrder, Parent = hub.tabList })
+create("UIPadding", {
+	PaddingTop = UDim.new(0, 10),
+	PaddingLeft = UDim.new(0, 10),
+	PaddingRight = UDim.new(0, 10),
+	Parent = hub.tabList,
+})
+
+hub.keyHint = create("TextLabel", {
+	AnchorPoint = Vector2.new(0, 1),
+	Position = UDim2.new(0, 14, 1, -10),
+	Size = UDim2.new(1, -28, 0, 30),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.Gotham,
+	Text = "",
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextYAlignment = Enum.TextYAlignment.Bottom,
+	TextColor3 = THEME.subText,
+	TextSize = 11,
+	Parent = hub.sidebar,
+})
+
+hub.body = create("Frame", {
+	Position = UDim2.fromOffset(HUB_LAYOUT.SIDEBAR_WIDTH, HUB_LAYOUT.HEADER_HEIGHT),
+	Size = UDim2.new(1, -HUB_LAYOUT.SIDEBAR_WIDTH, 1, -HUB_LAYOUT.HEADER_HEIGHT),
+	BackgroundTransparency = 1,
+	Active = true,
+	Parent = hub.frame,
+})
+create("UIPadding", {
+	PaddingTop = UDim.new(0, 16),
+	PaddingLeft = UDim.new(0, 18),
+	PaddingRight = UDim.new(0, 18),
+	PaddingBottom = UDim.new(0, 12),
+	Parent = hub.body,
+})
+
+hub.title = create("TextLabel", {
+	Size = UDim2.new(1, -190, 0, 22),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.GothamBold,
+	Text = "",
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextColor3 = THEME.text,
+	TextSize = 18,
+	Parent = hub.body,
+})
+
+hub.description = create("TextLabel", {
+	Position = UDim2.fromOffset(0, 26),
+	Size = UDim2.new(1, -190, 0, 16),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.Gotham,
+	Text = "",
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextTruncate = Enum.TextTruncate.AtEnd,
+	TextColor3 = THEME.subText,
+	TextSize = 12,
+	Parent = hub.body,
+})
+
+hub.pinButton = create("TextButton", {
+	AnchorPoint = Vector2.new(1, 0),
+	Position = UDim2.new(1, 0, 0, 4),
+	Size = UDim2.fromOffset(176, 30),
+	BackgroundColor3 = THEME.row,
+	AutoButtonColor = false,
+	Font = Enum.Font.GothamBold,
+	Text = "",
+	TextColor3 = THEME.text,
+	TextSize = 12,
+	Parent = hub.body,
+})
+corner(hub.pinButton, 15)
+hub.pinStroke = create("UIStroke", {
+	Color = THEME.accent,
+	Transparency = 0.5,
+	ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+	Parent = hub.pinButton,
+})
+
+create("Frame", {
+	Position = UDim2.fromOffset(0, 52),
+	Size = UDim2.new(1, 0, 0, 1),
+	BackgroundColor3 = THEME.stroke,
+	BackgroundTransparency = 0.4,
+	BorderSizePixel = 0,
+	Parent = hub.body,
+})
+
+hub.content = create("ScrollingFrame", {
+	Position = UDim2.fromOffset(0, 62),
+	Size = UDim2.new(1, 0, 1, -62),
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+	ScrollBarThickness = 3,
+	ScrollBarImageColor3 = THEME.stroke,
+	AutomaticCanvasSize = Enum.AutomaticSize.Y,
+	CanvasSize = UDim2.new(),
+	Parent = hub.body,
+})
+create("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder, Parent = hub.content })
+create("UIPadding", { PaddingRight = UDim.new(0, 8), PaddingBottom = UDim.new(0, 6), Parent = hub.content })
+
+-- Floating hub button; drags on its own and a short press counts as a click.
+local toggleButton = create("TextButton", {
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Size = UDim2.fromOffset(TOGGLE.SIZE, TOGGLE.SIZE),
+	BackgroundColor3 = THEME.header,
+	AutoButtonColor = false,
+	Font = Enum.Font.GothamBlack,
+	Text = "P",
+	TextColor3 = THEME.accent,
+	TextSize = 15,
+	ZIndex = 3,
+	Parent = screenGui,
+})
+corner(toggleButton, 8)
+local toggleStroke = create("UIStroke", {
+	Color = THEME.accent,
+	Transparency = 0.4,
+	ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+	Parent = toggleButton,
+})
+
+---Style the hub button to show whether the hub is open.
+local function updateToggleButton()
+	local open = hub.frame.Visible
+	toggleButton.TextColor3 = open and THEME.text or THEME.accent
+	toggleButton.BackgroundColor3 = open and THEME.rowEquipped or THEME.header
+	toggleStroke.Transparency = open and 0.1 or 0.4
+end
+
+---Show or hide the quick panel.
+---@param state boolean
+local function setHidden(state)
+	settings.hidden = state
+	mainFrame.Visible = not state
+	saveSettings()
+end
+
+---Open or close the hub window.
+---@param state boolean
+function setHubOpen(state)
+	hub.frame.Visible = state
+	updateToggleButton()
+
+	-- A pending rebind must not capture keys once the hub is gone.
+	if not state then
+		rebindTarget = nil
+	end
+
+	if state then
+		clampToScreen(hub.frame, Vector2.new(HUB_LAYOUT.WIDTH, HUB_LAYOUT.HEIGHT))
+		renderHub()
+	end
+end
+
+do
+	local pressStart, startPosition, dragged
+
+	toggleButton.InputBegan:Connect(function(input)
+		if not isPointerPress(input) then
+			return
+		end
+
+		pressStart = input.Position
+		startPosition = toggleButton.Position
+		dragged = false
+
+		input.Changed:Connect(function()
+			if input.UserInputState ~= Enum.UserInputState.End or not pressStart then
+				return
+			end
+
+			pressStart = nil
+
+			if dragged then
+				clampToScreen(toggleButton, Vector2.new(TOGGLE.SIZE, TOGGLE.SIZE))
+				settings.togglePosition = fromUDim2(toggleButton.Position)
+				saveSettings()
+			else
+				setHubOpen(not hub.frame.Visible)
+			end
+		end)
+	end)
+
+	table.insert(connections, userInputService.InputChanged:Connect(function(input)
+		if not pressStart or not isPointerMove(input) then
+			return
+		end
+
+		local delta = input.Position - pressStart
+		if not dragged and delta.Magnitude < TOGGLE.DRAG_THRESHOLD then
+			return
+		end
+
+		dragged = true
+		toggleButton.Position = UDim2.new(startPosition.X.Scale, startPosition.X.Offset + delta.X, startPosition.Y.Scale, startPosition.Y.Offset + delta.Y)
+	end))
+end
+
+-- Status messages fade back to empty.
+local statusToken = 0
+
+---Show a short status message in both windows.
+---@param text string
+---@param color Color3?
+local function setStatus(text, color)
+	statusToken += 1
+	local token = statusToken
+
+	for _, label in ipairs(statusLabels) do
+		label.Text = text
+		label.TextColor3 = color or THEME.subText
+	end
+
+	task.delay(4, function()
+		if statusToken ~= token then
+			return
+		end
+
+		for _, label in ipairs(statusLabels) do
+			label.Text = ""
+		end
+	end)
+end
+
+---Require a second click within the confirm window.
+---@param button TextButton
+---@param action function
+local function bindConfirm(button, action)
+	local originalText = button.Text
+	local armedAt = 0
+
+	button.MouseButton1Click:Connect(function()
+		if os.clock() - armedAt > UI.CONFIRM_WINDOW then
+			armedAt = os.clock()
+			button.Text = "Click to confirm"
+			button.TextColor3 = THEME.star
+
+			task.delay(UI.CONFIRM_WINDOW, function()
+				if os.clock() - armedAt >= UI.CONFIRM_WINDOW then
+					button.Text = originalText
+					button.TextColor3 = THEME.text
+				end
+			end)
+			return
+		end
+
+		armedAt = 0
+		button.Text = originalText
+		button.TextColor3 = THEME.text
+		action()
+	end)
+end
+
+---Start a render pass into a container; grid canvases lay rows out in columns.
+---@param body Instance
+---@param grid boolean
+---@return table
+local function newCanvas(body, grid)
+	return { body = body, grid = grid == true, order = 0 }
+end
+
+---Next layout order within a canvas.
+---@param canvas table
+---@return number
+local function nextOrder(canvas)
+	canvas.order += 1
+	return canvas.order
+end
+
+---Get a container for a run of rows: the body itself, or a grid block.
+---@param canvas table
+---@return Instance
+local function canvasGroup(canvas)
+	if not canvas.grid then
+		return canvas.body
+	end
+
+	local group = create("Frame", {
+		LayoutOrder = nextOrder(canvas),
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		Parent = canvas.body,
+	})
+	create("UIGridLayout", {
+		CellSize = UDim2.new(1 / HUB_LAYOUT.GRID_COLUMNS, -6, 0, UI.ROW_HEIGHT + 2),
+		CellPadding = UDim2.fromOffset(8, 6),
+		SortOrder = Enum.SortOrder.LayoutOrder,
+		Parent = group,
+	})
+
+	return group
+end
+
+---Create a section divider label.
+local function createDivider(parent, text, order)
+	create("TextLabel", {
+		LayoutOrder = order,
+		Size = UDim2.new(1, 0, 0, 16),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamBold,
+		Text = "  " .. text,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextColor3 = THEME.subText,
+		TextSize = 10,
+		Parent = parent,
+	})
+end
+
+---Create an empty-state or hint label.
+---@return TextLabel
+local function createEmpty(parent, text, order)
+	return create("TextLabel", {
+		LayoutOrder = order or 1,
+		Size = UDim2.new(1, 0, 0, 30),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.Gotham,
+		Text = text,
+		TextWrapped = true,
+		TextColor3 = THEME.subText,
+		TextSize = 11,
+		Parent = parent,
+	})
+end
+
+---Create one clickable list row.
+---@param parent Instance
+---@param order number
+---@param options table
+local function createRow(parent, order, options)
+	local baseColor = options.highlighted and THEME.rowEquipped or THEME.row
+
+	local row = create("TextButton", {
+		LayoutOrder = order,
+		Size = UDim2.new(1, 0, 0, UI.ROW_HEIGHT),
+		BackgroundColor3 = baseColor,
+		AutoButtonColor = false,
+		Text = "",
+		Parent = parent,
+	})
+	corner(row, 7)
+
+	if options.highlighted then
+		create("UIStroke", { Color = THEME.accent, Transparency = 0.4, ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Parent = row })
+	end
+
+	local dot = create("Frame", {
+		AnchorPoint = Vector2.new(0, 0.5),
+		Position = UDim2.new(0, 10, 0.5, 0),
+		Size = UDim2.fromOffset(6, 6),
+		BackgroundColor3 = options.dotColor or THEME.subText,
+		BorderSizePixel = 0,
+		Parent = row,
+	})
+	corner(dot, 3)
+
+	create("TextLabel", {
+		Position = UDim2.fromOffset(24, 0),
+		Size = UDim2.new(1, options.onStar and -56 or -32, 1, 0),
+		BackgroundTransparency = 1,
+		Font = options.highlighted and Enum.Font.GothamBold or Enum.Font.GothamMedium,
+		Text = options.text,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		TextColor3 = THEME.text,
+		TextSize = 13,
+		Parent = row,
+	})
+
+	if options.onStar then
+		local starButton = create("TextButton", {
+			AnchorPoint = Vector2.new(1, 0.5),
+			Position = UDim2.new(1, -6, 0.5, 0),
+			Size = UDim2.fromOffset(24, 24),
+			BackgroundTransparency = 1,
+			Font = Enum.Font.GothamBold,
+			Text = options.starred and "★" or "☆",
+			TextColor3 = options.starred and THEME.star or THEME.subText,
+			TextSize = 16,
+			Parent = row,
+		})
+		starButton.MouseButton1Click:Connect(options.onStar)
+	end
+
+	row.MouseEnter:Connect(function()
+		if not options.highlighted then
+			tween(row, { BackgroundColor3 = THEME.rowHover })
+		end
+	end)
+	row.MouseLeave:Connect(function()
+		tween(row, { BackgroundColor3 = baseColor })
+	end)
+
+	row.MouseButton1Click:Connect(options.onClick)
+end
+
+---Create a row with a label, optional subtitle and an on/off switch.
+---@param parent Instance
+---@param order number
+---@param options table
+---@return TextButton
+local function createSwitchRow(parent, order, options)
+	local height = options.subtitle and 42 or UI.ROW_HEIGHT + 4
+	local rightInset = 64 + (options.rightInset or 0)
+
+	local row = create("TextButton", {
+		LayoutOrder = order,
+		Size = UDim2.new(1, 0, 0, height),
+		BackgroundColor3 = THEME.row,
+		AutoButtonColor = false,
+		Text = "",
+		Parent = parent,
+	})
+	corner(row, 8)
+
+	create("TextLabel", {
+		Position = UDim2.fromOffset(12, options.subtitle and 6 or 0),
+		Size = UDim2.new(1, -(12 + rightInset), 0, options.subtitle and 18 or height),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamMedium,
+		Text = options.text,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		TextColor3 = THEME.text,
+		TextSize = 13,
+		Parent = row,
+	})
+
+	if options.subtitle then
+		create("TextLabel", {
+			Position = UDim2.fromOffset(12, 23),
+			Size = UDim2.new(1, -(12 + rightInset), 0, 14),
+			BackgroundTransparency = 1,
+			Font = Enum.Font.Gotham,
+			Text = options.subtitle,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+			TextColor3 = THEME.subText,
+			TextSize = 11,
+			Parent = row,
+		})
+	end
+
+	local track = create("Frame", {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -12, 0.5, 0),
+		Size = UDim2.fromOffset(38, 20),
+		BackgroundColor3 = options.enabled and THEME.accent or THEME.section,
+		BorderSizePixel = 0,
+		Parent = row,
+	})
+	corner(track, 10)
+
+	local knob = create("Frame", {
+		AnchorPoint = Vector2.new(0, 0.5),
+		Position = options.enabled and UDim2.new(1, -18, 0.5, 0) or UDim2.new(0, 2, 0.5, 0),
+		Size = UDim2.fromOffset(16, 16),
+		BackgroundColor3 = options.enabled and THEME.text or THEME.subText,
+		BorderSizePixel = 0,
+		Parent = track,
+	})
+	corner(knob, 8)
+
+	row.MouseEnter:Connect(function()
+		tween(row, { BackgroundColor3 = THEME.rowHover })
+	end)
+	row.MouseLeave:Connect(function()
+		tween(row, { BackgroundColor3 = THEME.row })
+	end)
+
+	row.MouseButton1Click:Connect(options.onToggle)
+
+	return row
+end
+
+---Order quick sections: most recently opened on top, closed ones below in pinned order.
+local function applySectionOrder()
+	for _, section in ipairs(sections) do
+		local rank = table.find(settings.openOrder, section.name)
+		section.container.LayoutOrder = (section.expanded and rank) or UI.CLOSED_ORDER_OFFSET + section.defaultOrder
+	end
+end
+
+---@module Section
+local Section = {}
+Section.__index = Section
+
+---Create a collapsible quick panel section for a feature.
+---@param feature table
+---@param defaultOrder number
+function Section.new(feature, defaultOrder)
+	local self = setmetatable({}, Section)
+	self.name = feature.id
+	self.defaultOrder = defaultOrder
+	self.populate = feature.populate
+	self.expanded = settings.expanded[feature.id] == true
+
+	self.container = create("Frame", {
+		LayoutOrder = UI.CLOSED_ORDER_OFFSET + defaultOrder,
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundColor3 = THEME.section,
+		BorderSizePixel = 0,
+		Parent = contentList,
+	})
+	corner(self.container, 8)
+	create("UIStroke", { Color = THEME.stroke, Transparency = 0.6, Parent = self.container })
+	create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Parent = self.container })
+
+	local sectionHeader = create("TextButton", {
+		LayoutOrder = 0,
+		Size = UDim2.new(1, 0, 0, 32),
+		BackgroundTransparency = 1,
+		Text = "",
+		Parent = self.container,
+	})
+
+	self.arrow = create("TextLabel", {
+		Position = UDim2.fromOffset(10, 0),
+		Size = UDim2.fromOffset(14, 32),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamBold,
+		Text = self.expanded and "▾" or "▸",
+		TextColor3 = THEME.accent,
+		TextSize = 13,
+		Parent = sectionHeader,
+	})
+
+	create("TextLabel", {
+		Position = UDim2.fromOffset(28, 0),
+		Size = UDim2.new(1, -70, 1, 0),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamBold,
+		Text = feature.icon .. "  " .. feature.title,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextColor3 = THEME.text,
+		TextSize = 13,
+		Parent = sectionHeader,
+	})
+
+	self.countLabel = create("TextLabel", {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -10, 0.5, 0),
+		Size = UDim2.fromOffset(32, 18),
+		BackgroundColor3 = THEME.row,
+		Font = Enum.Font.GothamBold,
+		Text = "0",
+		TextColor3 = THEME.subText,
+		TextSize = 10,
+		Parent = sectionHeader,
+	})
+	corner(self.countLabel, 9)
+
+	self.body = create("Frame", {
+		LayoutOrder = 1,
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		Visible = self.expanded,
+		Parent = self.container,
+	})
+	create("UIListLayout", { Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder, Parent = self.body })
+	create("UIPadding", {
+		PaddingLeft = UDim.new(0, 6),
+		PaddingRight = UDim.new(0, 6),
+		PaddingBottom = UDim.new(0, 6),
+		Parent = self.body,
+	})
+
+	sectionHeader.MouseButton1Click:Connect(function()
+		self:setExpanded(not self.expanded)
+	end)
+
+	return self
+end
+
+---Open or close the section; newly opened sections jump to the top.
+---@param state boolean
+function Section:setExpanded(state)
+	self.expanded = state
+	self.body.Visible = state
+	self.arrow.Text = state and "▾" or "▸"
+	settings.expanded[self.name] = state or nil
+
+	local index = table.find(settings.openOrder, self.name)
+	if index then
+		table.remove(settings.openOrder, index)
+	end
+
+	if state then
+		table.insert(settings.openOrder, 1, self.name)
+		contentList.CanvasPosition = Vector2.zero
+	end
+
+	applySectionOrder()
+	saveSettings()
+end
+
+---Rebuild the section's rows.
+function Section:render()
+	for _, child in ipairs(self.body:GetChildren()) do
+		if child:IsA("GuiObject") then
+			child:Destroy()
+		end
+	end
+
+	self.countLabel.Text = tostring(self.populate(newCanvas(self.body, false)) or 0)
+end
+
+---Remove the section from the quick panel.
+function Section:destroy()
+	self.container:Destroy()
+end
+
+---Run a server action without overlapping others.
+---@param callback function
+---@param refetch function?
+local function runAction(callback, refetch)
+	if busy then
+		return setStatus("Busy, wait a moment…", THEME.subText)
+	end
+
+	busy = true
+	task.spawn(function()
+		local ok, err = pcall(callback)
+		if not ok then
+			setStatus("Error: " .. tostring(err), THEME.bad)
+		end
+
+		if refetch then
+			task.wait(0.3)
+			pcall(refetch)
+		end
+
+		busy = false
+		renderAll()
+	end)
+end
+
+---Re-read dragon type and mutation state after a fruit switch.
+local function refetchFruitState()
+	dragonType = commF:InvokeServer("DragonType")
+	fetchInventory()
+end
+
+---Switch to a permanent fruit entry, applying its dragon form or mutation.
+---@param entry table
+local function switchFruit(entry)
+	if isCurrentEntry(entry) then
+		return
+	end
+
+	local character = localPlayer.Character
+	if character and character:GetAttribute("TransparencyMode") ~= nil then
+		return setStatus("Can't switch fruits while transformed.", THEME.bad)
+	end
+
+	runAction(function()
+		-- Dragon re-switches even when equipped, since the form is part of the switch.
+		if getCurrentFruit() ~= entry.name or entry.dragonType then
+			local success, err = commF:InvokeServer("SwitchFruit", entry.name, entry.dragonType or dragonType)
+			if success == false then
+				return setStatus(err or "Switch failed.", THEME.bad)
+			end
+		end
+
+		-- Mutations can only change while the fruit is equipped, so apply after switching.
+		if entry.mutationKey then
+			local mutationId = inventory.mutations[entry.mutationKey]
+			if mutationId then
+				local result = modificationRemote:InvokeServer({
+					Type = "SetEquip",
+					ItemId = mutationId,
+					IsEquipped = entry.mutationEquipped,
+				})
+
+				if typeof(result) == "table" and result.Success == false then
+					return setStatus("Couldn't change mutation for " .. entry.label .. ".", THEME.bad)
+				end
+			end
+		end
+
+		setStatus("Switched to " .. entry.label .. ".", THEME.good)
+	end, refetchFruitState)
+end
+
+---Equip a stored sword, gun, or wardrobe item through the game's inventory action.
+---@param item table
+local function equipItem(item)
+	if not inventoryRemoteUtil then
+		return setStatus("Inventory module not loaded.", THEME.bad)
+	end
+
+	runAction(function()
+		local result = withGameIdentity(function()
+			local response = inventoryRemoteUtil.invokeAction("EquipItem", item.id, item.uid, inventory.equipped[item.id] == true)
+			if typeof(response) == "table" and response.await then
+				response = response:await()
+			end
+			return response
+		end)
+
+		if result == nil or tostring(result):find("^Err") then
+			setStatus("Couldn't equip " .. item.name .. ".", THEME.bad)
+		else
+			setStatus("Equipped " .. item.name .. ".", THEME.good)
+		end
+	end, fetchInventory)
+end
+
+---Equip a haki color.
+---@param item table
+local function equipHaki(item)
+	runAction(function()
+		modificationRemote:InvokeServer({ Type = "SetEquip", ItemId = item.id, IsEquipped = true })
+		settings.lastHaki = item.id
+		saveSettings()
+		setStatus("Haki set to " .. item.name .. ".", THEME.good)
+	end)
+end
+
+---Run a Blackbeard fragment trade.
+---@param tradeName string
+---@param label string
+local function blackbeardTrade(tradeName, label)
+	runAction(function()
+		local result = commF:InvokeServer("BlackbeardReward", tradeName, "2")
+
+		if result == 1 or result == true then
+			setStatus(label .. " complete.", THEME.good)
+		elseif result == 2 then
+			setStatus("Not enough fragments.", THEME.bad)
+		else
+			setStatus(label .. ": " .. tostring(result), THEME.subText)
+		end
+	end)
+end
+
+---Buy a random fruit from the gacha.
+local function rollFruit()
+	local remaining = rollCooldownEnds - serverNow()
+	if rollCooldownKnown and remaining > 0 then
+		return setStatus("Roll ready in " .. formatTime(remaining) .. ".", THEME.subText)
+	end
+
+	runAction(function()
+		local result = gachaRemote:InvokeServer({ Context = "Purchase", BoxName = GACHA.BOX })
+
+		if typeof(result) == "table" and typeof(result.ErrorMessage) == "string" then
+			setStatus(result.ErrorMessage, THEME.bad)
+		else
+			setStatus("Fruit rolled! Check your inventory.", THEME.good)
+		end
+	end, checkRollCooldown)
+end
+
+---Update every roll countdown label, dropping ones that were destroyed.
+local function updateRollTimer()
+	local remaining = rollCooldownEnds - serverNow()
+	local ready = rollCooldownKnown and remaining <= 0 and not rollBlocked
+	local text = "…"
+
+	if rollCooldownKnown then
+		text = rollBlocked and "Not yet" or ready and "Ready" or formatTime(remaining)
+	end
+
+	for label in pairs(rollTimerLabels) do
+		if not label.Parent then
+			rollTimerLabels[label] = nil
+			continue
+		end
+
+		label.Text = text
+		label.TextColor3 = ready and THEME.good or THEME.subText
+	end
+end
+
+---@module Repair
+local Repair = {}
+
+---Find the live RepairHammer component for our equipped hammer.
+---@return table?
+function Repair.findRepairHammer()
+	local character = localPlayer.Character
+	local hammerInstance = character and character:FindFirstChild(REPAIR.HAMMER_NAME)
+
+	if not hammerInstance then
+		repairState.hammer = nil
+		repairState.searchedInstance = nil
+		return nil
+	end
+
+	local cached = repairState.hammer
+	if cached and cached.Instance == hammerInstance and not cached.destroyed then
+		return cached
+	end
+
+	-- Don't walk the GC every frame if the component isn't constructed yet.
+	if repairState.searchedInstance == hammerInstance and os.clock() - repairState.lastSearch < REPAIR.SEARCH_INTERVAL then
+		return nil
+	end
+
+	repairState.searchedInstance = hammerInstance
+	repairState.lastSearch = os.clock()
+	repairState.hammer = nil
+
+	for _, value in ipairs(getgc(true)) do
+		if typeof(value) == "table" and rawget(value, "Instance") == hammerInstance and rawget(value, "markerInVoid") ~= nil then
+			repairState.hammer = value
+			break
+		end
+	end
+
+	return repairState.hammer
+end
+
+---Begin a swing the same way the hammer's InputBegan handler does.
+---@param hammer table
+function Repair.startRepairSwing(hammer)
+	repairState.swinging = true
+	repairState.ownsSwing = true
+
+	task.spawn(function()
+		hammer.holding = true
+
+		local elapsed = 0
+		local minSwingTime = hammer.data and hammer.data.MinSwingTime or 0
+		while elapsed < minSwingTime and hammer.holding do
+			elapsed += task.wait()
+		end
+
+		if hammer.holding and not hammer.destroyed and hammer.mode == "Minigame" then
+			hammer.down = true
+			hammer.Instance.M1Down:FireServer(hammer.mode)
+		else
+			hammer.holding = false
+		end
+
+		repairState.swinging = false
+	end)
+end
+
+---Release a swing the same way the hammer's InputEnded handler does.
+---@param hammer table
+function Repair.releaseRepairSwing(hammer)
+	repairState.ownsSwing = false
+
+	withGameIdentity(function()
+		hammer.holding = false
+		hammer:Freeze(false)
+
+		if not hammer.down then
+			return
+		end
+
+		hammer.down = false
+		repairShip:M1Up()
+	end)
+end
+
+---Check whether the fill bar sits inside the goal zone right now.
+---@return boolean
+function Repair.isFillInGoal()
+	local bar = repairShip.bar
+	if not bar or not bar:FindFirstChild("Goal") or not bar:FindFirstChild("Fill") then
+		return false
+	end
+
+	local goalCenter = bar.Goal.Position.X.Scale
+	local halfWidth = (bar.Goal.Size.X.Scale + REPAIR.GOAL_PADDING) * 0.5
+	local fill = bar.Fill.Size.X.Scale
+
+	return math.abs(fill - goalCenter) <= halfWidth * REPAIR.GOAL_TOLERANCE
+end
+
+---Drive the repair minigame: swing, then release dead-center in the goal.
+function Repair.updateAutoRepair()
+	if not settings.autoRepair or not repairShip then
+		return
+	end
+
+	local hammer = Repair.findRepairHammer()
+	if not hammer or hammer.destroyed then
+		return
+	end
+
+	-- Left the repair spot mid-swing: let go so the hammer isn't stuck down.
+	if hammer.mode ~= "Minigame" then
+		if repairState.ownsSwing and not repairState.swinging then
+			Repair.releaseRepairSwing(hammer)
+		end
+		return
+	end
+
+	if os.clock() < repairState.nextActionAt then
+		return
+	end
+
+	if not hammer.down then
+		if not repairState.swinging and not hammer.holding then
+			Repair.startRepairSwing(hammer)
+		end
+		return
+	end
+
+	-- Only judge the bar once the fill is running and the goal has settled.
+	if repairShip.mode ~= "Minigame" or not repairShip.fillTween or repairShip.goalTween then
+		return
+	end
+
+	if Repair.isFillInGoal() then
+		Repair.releaseRepairSwing(hammer)
+		repairState.nextActionAt = os.clock() + REPAIR.RESWING_DELAY
+		repairState.perfectCount += 1
+		setStatus(("Perfect repair x%d"):format(repairState.perfectCount), THEME.good)
+	end
+end
+
+---Stop auto repair and release any swing we started.
+function Repair.stopAutoRepair()
+	local hammer = repairState.hammer
+	if hammer and repairState.ownsSwing and not hammer.destroyed then
+		Repair.releaseRepairSwing(hammer)
+	end
+
+	repairState.ownsSwing = false
+	repairState.swinging = false
+end
+
+---@module Boat
+local Boat = {}
+
+---Get the VehicleSeat we're currently driving.
+---@return VehicleSeat?
+function Boat.getDrivenSeat()
+	local character = localPlayer.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	local seat = humanoid and humanoid.SeatPart
+
+	if seat and seat:IsA("VehicleSeat") then
+		return seat
+	end
+
+	return nil
+end
+
+---Put every boat we touched back to its original speed.
+function Boat.restoreBoatSpeeds()
+	for seat, original in pairs(boatState.originals) do
+		if seat.Parent then
+			seat.MaxSpeed = original
+		end
+	end
+
+	table.clear(boatState.originals)
+end
+
+---Clamp and store a new boat speed.
+---@param value number
+function Boat.setBoatSpeed(value)
+	settings.boatSpeed = math.clamp(math.floor(value + 0.5), BOAT.SPEED_MIN, BOAT.SPEED_MAX)
+end
+
+---Refresh the hint under each boat slider with the current boat's speeds.
+function Boat.updateBoatHint()
+	local seat = Boat.getDrivenSeat()
+	local text = "Sit in your boat's driver seat to apply."
+
+	if seat then
+		local original = boatState.originals[seat] or seat.MaxSpeed
+		text = ("Boat default: %d  •  Current: %d"):format(math.floor(original + 0.5), math.floor(seat.MaxSpeed + 0.5))
+	end
+
+	for label in pairs(boatState.hintLabels) do
+		if not label.Parent then
+			boatState.hintLabels[label] = nil
+			continue
+		end
+
+		label.Text = text
+	end
+end
+
+---Apply the custom speed to the seat we're driving.
+function Boat.updateBoatSpeed()
+	if os.clock() - boatState.lastHint >= BOAT.HINT_INTERVAL then
+		boatState.lastHint = os.clock()
+		Boat.updateBoatHint()
+	end
+
+	if not settings.boatSpeedEnabled then
+		return
+	end
+
+	local seat = Boat.getDrivenSeat()
+	if not seat then
+		return
+	end
+
+	-- Forget boats that despawned so the table can't grow forever.
+	for knownSeat in pairs(boatState.originals) do
+		if not knownSeat.Parent then
+			boatState.originals[knownSeat] = nil
+		end
+	end
+
+	-- Remember the boat's own speed the first time we drive it.
+	if boatState.originals[seat] == nil then
+		boatState.originals[seat] = seat.MaxSpeed
+	end
+
+	if seat.MaxSpeed ~= settings.boatSpeed then
+		seat.MaxSpeed = settings.boatSpeed
+	end
+end
+
+---@module Weather
+local Weather = {}
+
+---Lock or unlock every weather type through the game's own weather locks.
+---@param state boolean
+function Weather.setWeatherLocks(state)
+	if not weatherUtil or weatherState.locked == state then
+		return
+	end
+
+	-- Lock callbacks run the game's enable/disable code, so keep game identity.
+	withGameIdentity(function()
+		for name, lock in pairs(weatherUtil.locks) do
+			if name ~= "Global" then
+				if state then
+					lock:Lock(WEATHER.LOCK_KEY)
+				else
+					lock:Unlock(WEATHER.LOCK_KEY)
+				end
+			end
+		end
+	end)
+
+	weatherState.locked = state
+end
+
+---Hide the dark-sea fog, theme and camera sway while suppression is on.
+function Weather.applyWeatherSuppression()
+	Weather.setWeatherLocks(true)
+
+	local layers = game:GetService("Lighting"):FindFirstChild("LightingLayers")
+	if layers then
+		for _, layer in ipairs(layers:GetChildren()) do
+			if WEATHER.FOG_LAYERS[layer.Name] and layer:GetAttribute("Enabled") ~= false then
+				weatherState.hiddenLayers[layer] = true
+				layer:SetAttribute("Enabled", false)
+			end
+		end
+	end
+
+	if workspace.Terrain:GetAttribute("SeaTheme") == "Dark" then
+		workspace.Terrain:SetAttribute("SeaTheme", "Default")
+		weatherState.changedSeaTheme = true
+	end
+
+	-- The game scales its sea camera sway by (1 - TerrorReducer); 1 removes it.
+	local character = localPlayer.Character
+	if character and character:GetAttribute("TerrorReducer") ~= 1 then
+		if weatherState.reducerCharacter ~= character then
+			weatherState.reducerCharacter = character
+			weatherState.reducerOriginal = character:GetAttribute("TerrorReducer")
+		end
+		character:SetAttribute("TerrorReducer", 1)
+	end
+end
+
+---Put every weather change back the way the game had it.
+function Weather.restoreWeather()
+	Weather.setWeatherLocks(false)
+
+	for layer in pairs(weatherState.hiddenLayers) do
+		if layer.Parent then
+			layer:SetAttribute("Enabled", nil)
+		end
+	end
+	table.clear(weatherState.hiddenLayers)
+
+	-- Only restore the dark theme if we're still in the dark sea.
+	local danger = localPlayer:GetAttribute("DangerLevel") or 0
+	if weatherState.changedSeaTheme and danger >= WEATHER.DARK_SEA_DANGER and workspace.Terrain:GetAttribute("SeaTheme") == "Default" then
+		workspace.Terrain:SetAttribute("SeaTheme", "Dark")
+	end
+	weatherState.changedSeaTheme = false
+
+	local character = weatherState.reducerCharacter
+	if character and character.Parent then
+		character:SetAttribute("TerrorReducer", weatherState.reducerOriginal)
+	end
+	weatherState.reducerCharacter = nil
+	weatherState.reducerOriginal = nil
+end
+
+---Re-apply suppression on an interval, since the game re-enables effects as you move.
+function Weather.updateWeather()
+	if not settings.disableWeather then
+		return
+	end
+
+	if os.clock() - weatherState.lastUpdate < WEATHER.UPDATE_INTERVAL then
+		return
+	end
+
+	weatherState.lastUpdate = os.clock()
+	Weather.applyWeatherSuppression()
+end
+
+---@module Fishing
+local Fishing = {}
+
+---Get the game's shared fishing state table.
+---@return table?
+function Fishing.getFishingState()
+	return fishingComponents and fishingComponents.state
+end
+
+---Get the game's fishing controller (the FishingClient's own table).
+---@return table?
+function Fishing.getFishingController()
+	local state = Fishing.getFishingState()
+	local controller = state and state.Controller
+	return typeof(controller) == "table" and controller or nil
+end
+
+---Whether any fishing mode is on.
+---@return boolean
+function Fishing.isFishingOn()
+	return settings.fishMode == "Assist" or settings.fishMode == "Auto"
+end
+
+---Decide whether to reel this frame, or nil to defer to the real input.
+---Leads the fish: predicts both bars a short time ahead and pushes toward the fish.
+---@return boolean?
+function Fishing.getReelDecision()
+	local state = Fishing.getFishingState()
+	if not Fishing.isFishingOn() or not state then
+		return nil
+	end
+
+	-- The reel is won but `playing` stays true until the catch dialogue closes.
+	local reelFinished = state.playing and (state.progress or 0) >= 1
+
+	if not state.playing or reelFinished then
+		fishState.lastFishPos = nil
+		fishState.fishVelocity = 0
+
+		-- Full Auto: answer the game's "tap to continue" wait right after a catch.
+		if settings.fishMode == "Auto" and os.clock() - fishState.lastCatchAt < FISHING.SKIP_TAP_WINDOW then
+			return true
+		end
+
+		return nil
+	end
+
+	local now = os.clock()
+	local fishPos = state.fishPos or 0.5
+
+	-- The game may ask more than once per frame; only sample when time moved.
+	if fishState.lastFishPos and fishState.lastClock then
+		local dt = now - fishState.lastClock
+		if dt > 0.001 and dt < 0.5 then
+			local rawVelocity = (fishPos - fishState.lastFishPos) / dt
+			fishState.fishVelocity += (rawVelocity - fishState.fishVelocity) * FISHING.VELOCITY_SMOOTHING
+		end
+	end
+
+	fishState.lastFishPos = fishPos
+	fishState.lastClock = now
+
+	-- playerPos moves by velocity * dt * 30 in the game's loop.
+	local predictedFish = fishPos + fishState.fishVelocity * FISHING.LOOKAHEAD
+	local predictedPlayer = (state.playerPos or 0.5) + (state.velocity or 0) * 30 * FISHING.LOOKAHEAD
+
+	return predictedFish > predictedPlayer
+end
+
+---Route the controller's reel check and bite reaction through the helpers.
+---Re-runs safely; it hooks whichever controller instance is current.
+function Fishing.installFishingHooks()
+	local controller = Fishing.getFishingController()
+	if not controller or fishState.hookedController == controller then
+		return
+	end
+
+	local originalIsReeling = controller.IsReeling
+	local originalOnPrimaryAction = controller.OnPrimaryAction
+	if typeof(originalIsReeling) ~= "function" or typeof(originalOnPrimaryAction) ~= "function" then
+		return
+	end
+
+	fishState.hookedController = controller
+	fishState.originalIsReeling = originalIsReeling
+	fishState.originalOnPrimaryAction = originalOnPrimaryAction
+
+	controller.IsReeling = function(self, ...)
+		local ok, decision = pcall(Fishing.getReelDecision)
+		if ok and decision ~= nil then
+			return decision
+		end
+
+		return originalIsReeling(self, ...)
+	end
+
+	-- The bite waits on a click; answer it after a short, human-like delay.
+	controller.OnPrimaryAction = function(self, callback, ...)
+		if Fishing.isFishingOn() and typeof(callback) == "function" then
+			local delay = FISHING.REACTION_MIN + math.random() * (FISHING.REACTION_MAX - FISHING.REACTION_MIN)
+			task.delay(delay, function()
+				if Fishing.isFishingOn() then
+					pcall(callback)
+				end
+			end)
+		end
+
+		return originalOnPrimaryAction(self, callback, ...)
+	end
+end
+
+---Put the game's own fishing functions back.
+function Fishing.uninstallFishingHooks()
+	local controller = fishState.hookedController
+	if controller then
+		if fishState.originalIsReeling then
+			controller.IsReeling = fishState.originalIsReeling
+		end
+		if fishState.originalOnPrimaryAction then
+			controller.OnPrimaryAction = fishState.originalOnPrimaryAction
+		end
+	end
+
+	fishState.hookedController = nil
+	fishState.originalIsReeling = nil
+	fishState.originalOnPrimaryAction = nil
+end
+
+---Ask the server how much of the equipped bait is left.
+---@return number?, string?
+function Fishing.getBaitInfo()
+	if not jobsReplicated then
+		return nil, nil
+	end
+
+	local info = withGameIdentity(function()
+		return jobsReplicated.InvokeServer("FishingNPC", "Bait", "Check", "Fisherman")
+	end)
+
+	if typeof(info) ~= "table" then
+		return nil, nil
+	end
+
+	return tonumber(info.Total), info.Equipped
+end
+
+---Craft Basic Bait from anywhere; the Fisherman doesn't need to be nearby.
+---@param crafts number
+---@return boolean
+function Fishing.buyBait(crafts)
+	if not craftRemote then
+		return false
+	end
+
+	local result = withGameIdentity(function()
+		return craftRemote:InvokeServer("Craft", FISHING.BAIT_RECIPE, crafts, {})
+	end)
+
+	return typeof(result) == "table" and typeof(result.Result) == "table" and result.Result.Could ~= false
+end
+
+---Top up Basic Bait in the background when Full Auto runs low.
+function Fishing.checkBaitSupply()
+	if fishState.buyingBait or not settings.autoBuyBait or os.clock() - fishState.lastBaitCheck < FISHING.BAIT_CHECK_INTERVAL then
+		return
+	end
+
+	fishState.lastBaitCheck = os.clock()
+	fishState.buyingBait = true
+
+	task.spawn(function()
+		local total, equipped = Fishing.getBaitInfo()
+
+		-- Only Basic Bait can be bought with Beli; other bait needs crafting materials.
+		if total and total < FISHING.BAIT_LOW_THRESHOLD and (equipped == FISHING.BAIT_RECIPE or equipped == nil or equipped == "None") then
+			if Fishing.buyBait(1) then
+				setStatus(("Bought %d Basic Bait."):format(FISHING.BAIT_PER_CRAFT), THEME.good)
+			else
+				setStatus("Couldn't buy bait.", THEME.bad)
+			end
+		end
+
+		fishState.buyingBait = false
+	end)
+end
+
+---Let go of a cast the moment the bar is perfect, through the game's own release.
+---@param state table
+---@param controller table
+function Fishing.releaseAtPerfect(state, controller)
+	if not state.holding or state.isThrowing or state.playing then
+		fishState.castStartedAt = nil
+		return
+	end
+
+	fishState.castStartedAt = fishState.castStartedAt or os.clock()
+
+	local castBar = fishingComponents.Objects and fishingComponents.Objects.LineCastBar
+	if not castBar or not castBar.Modal then
+		return
+	end
+
+	-- Full Auto: give up on a cast that never points at water so it can't hang.
+	local validSurface = state.surfaceData and state.surfaceData.Valid
+	if settings.fishMode == "Auto" and not validSurface and os.clock() - fishState.castStartedAt > FISHING.AIM_TIMEOUT then
+		fishState.castStartedAt = nil
+		fishState.nextCastAt = os.clock() + FISHING.RECAST_DELAY * 2
+		setStatus("Face the water (and point at it) to auto fish.", THEME.bad)
+		task.spawn(function()
+			withGameIdentity(function()
+				controller:Cleanup()
+			end)
+		end)
+		return
+	end
+
+	if (castBar.CastStrength or 0) < FISHING.PERFECT_CAST or not validSurface then
+		return
+	end
+
+	-- The game rejects releases in the first 0.2s of a cast.
+	if tick() - (state.StartedCastingAt or tick()) < 0.2 or os.clock() - fishState.lastRelease < FISHING.RELEASE_COOLDOWN then
+		return
+	end
+
+	fishState.lastRelease = os.clock()
+	fishState.castStartedAt = nil
+	fishState.perfectCasts += 1
+	setStatus(("Perfect cast x%d"):format(fishState.perfectCasts), THEME.good)
+
+	-- The release yields on the server call, so keep it off the frame loop.
+	task.spawn(function()
+		withGameIdentity(function()
+			controller:Deactivated()
+		end)
+	end)
+end
+
+---Full Auto: close the catch dialogue and start the next cast.
+---@param state table
+---@param controller table
+function Fishing.runFullAuto(state, controller)
+	Fishing.checkBaitSupply()
+
+	-- Close only the dialogue a catch just opened, never one you started.
+	if dialogueController and dialogueController.Active then
+		if os.clock() - fishState.lastCatchAt < FISHING.CATCH_DIALOGUE_WINDOW then
+			withGameIdentity(function()
+				dialogueController.close()
+			end)
+			fishState.nextCastAt = os.clock() + FISHING.RECAST_DELAY
+		end
+		return
+	end
+
+	if os.clock() < fishState.nextCastAt or not state.currentFishingRod then
+		return
+	end
+
+	local idle = withGameIdentity(function()
+		return controller:IsIdle()
+	end)
+	if not idle or state.bobber then
+		return
+	end
+
+	fishState.nextCastAt = os.clock() + FISHING.RECAST_DELAY
+
+	-- Activated is the same entry point a mouse press uses; it yields while casting.
+	task.spawn(function()
+		withGameIdentity(function()
+			controller:Activated()
+		end)
+	end)
+end
+
+---Instant catch: fill the reel shortly after the minigame really starts playing.
+---The short wait keeps the reported reel time from being a single frame.
+---@param state table
+function Fishing.applyInstantCatch(state)
+	if not settings.instantCatch or not state.playing then
+		return
+	end
+
+	local minigame = fishingComponents.Objects and fishingComponents.Objects.CatchingMinigame
+	if not minigame or not minigame.FinallyPlaying then
+		return
+	end
+
+	fishState.reelStartedAt = fishState.reelStartedAt or os.clock()
+	if os.clock() - fishState.reelStartedAt < FISHING.INSTANT_CATCH_DELAY then
+		return
+	end
+
+	local maxProgress = state.currentFish and tonumber(state.currentFish.MaxProgress) or 1
+	if (state.progress or 0) < maxProgress then
+		state.progress = maxProgress
+	end
+end
+
+---Per-frame fishing driver for both modes.
+function Fishing.updateAutoFish()
+	local state = Fishing.getFishingState()
+	local controller = Fishing.getFishingController()
+	if not state or not controller then
+		return
+	end
+
+	-- The controller can be rebuilt by the game; keep hooks on the live one.
+	Fishing.installFishingHooks()
+
+	-- A won reel keeps `playing` true until its dialogue closes, so mark the catch
+	-- as soon as progress fills; that's what lets Full Auto close the dialogue.
+	if state.playing and (state.progress or 0) >= 1 then
+		if not fishState.catchCounted then
+			fishState.catchCounted = true
+			fishState.catches += 1
+			if Fishing.isFishingOn() then
+				setStatus(("Caught x%d"):format(fishState.catches), THEME.good)
+			end
+		end
+		fishState.lastCatchAt = os.clock()
+	end
+
+	if fishState.wasPlaying and not state.playing then
+		fishState.catchCounted = false
+		fishState.reelStartedAt = nil
+		fishState.nextCastAt = os.clock() + FISHING.RECAST_DELAY
+	end
+	fishState.wasPlaying = state.playing == true
+
+	if not Fishing.isFishingOn() then
+		return
+	end
+
+	Fishing.applyInstantCatch(state)
+
+	Fishing.releaseAtPerfect(state, controller)
+
+	if settings.fishMode == "Auto" then
+		Fishing.runFullAuto(state, controller)
+	end
+end
+
+---Switch fishing modes; turning one on turns the other off.
+---@param mode string
+function Fishing.setFishMode(mode)
+	settings.fishMode = settings.fishMode == mode and "Off" or mode
+	fishState.lastFishPos = nil
+	fishState.fishVelocity = 0
+	fishState.castStartedAt = nil
+	fishState.nextCastAt = os.clock() + 0.5
+	saveSettings()
+	renderAll()
+end
+
+---Build the fishing toggles.
+---@param canvas table
+function Fishing.populateFishing(canvas)
+	if not Fishing.getFishingController() then
+		createEmpty(canvas.body, "Fishing isn't available in this server.", nextOrder(canvas))
+		return "N/A"
+	end
+
+	createSwitchRow(canvas.body, nextOrder(canvas), {
+		text = "Assist (you cast)",
+		subtitle = "Hold to cast; it lets go at perfect, hooks and reels.",
+		enabled = settings.fishMode == "Assist",
+		onToggle = function()
+			Fishing.setFishMode("Assist")
+		end,
+	})
+
+	createSwitchRow(canvas.body, nextOrder(canvas), {
+		text = "Full Auto",
+		subtitle = "Casts, hooks, reels and repeats on its own.",
+		enabled = settings.fishMode == "Auto",
+		onToggle = function()
+			Fishing.setFishMode("Auto")
+		end,
+	})
+
+	createSwitchRow(canvas.body, nextOrder(canvas), {
+		text = "Instant catch",
+		subtitle = "Skips the reel ~1s in. Riskier: very short catches stand out.",
+		enabled = settings.instantCatch,
+		onToggle = function()
+			settings.instantCatch = not settings.instantCatch
+			fishState.reelStartedAt = nil
+			saveSettings()
+			renderAll()
+		end,
+	})
+
+	createSwitchRow(canvas.body, nextOrder(canvas), {
+		text = "Auto-buy bait",
+		subtitle = ("Buys %d Basic Bait (1,000 Beli) when under %d."):format(FISHING.BAIT_PER_CRAFT, FISHING.BAIT_LOW_THRESHOLD),
+		enabled = settings.autoBuyBait,
+		onToggle = function()
+			settings.autoBuyBait = not settings.autoBuyBait
+			fishState.lastBaitCheck = -math.huge
+			saveSettings()
+			renderAll()
+		end,
+	})
+
+	local buyButton = actionButton(canvas.body, ("Buy %d Basic Bait  ·  1,000 Beli"):format(FISHING.BAIT_PER_CRAFT), UDim2.new(), UDim2.new(1, 0, 0, 32), THEME.star)
+	buyButton.LayoutOrder = nextOrder(canvas)
+	buyButton.MouseButton1Click:Connect(function()
+		runAction(function()
+			if Fishing.buyBait(1) then
+				local total = Fishing.getBaitInfo()
+				setStatus(("Bought %d Basic Bait%s."):format(FISHING.BAIT_PER_CRAFT, total and (" (" .. total .. " total)") or ""), THEME.good)
+			else
+				setStatus("Couldn't buy bait.", THEME.bad)
+			end
+		end)
+	end)
+
+	createEmpty(
+		canvas.body,
+		"Full Auto: equip your rod, face the water and keep your cursor over it.",
+		nextOrder(canvas)
+	)
+
+	return settings.fishMode == "Off" and "OFF" or settings.fishMode == "Auto" and "AUTO" or "ON"
+end
+
+---Build the fruit rows: favorites on top, both groups in shop order.
+---@param canvas table
+local function populateFruits(canvas)
+	local favorites, others = {}, {}
+	local total = 0
+
+	for _, fruit in ipairs(ownedFruits) do
+		for _, entry in ipairs(expandFruit(fruit)) do
+			total += 1
+			table.insert(fruitFavorites[entry.key] and favorites or others, entry)
+		end
+	end
+
+	if total == 0 then
+		createEmpty(canvas.body, "No permanent fruits found yet. Press ↻ to refresh.", nextOrder(canvas))
+		return 0
+	end
+
+	local function addRow(container, entry)
+		createRow(container, nextOrder(canvas), {
+			text = entry.label,
+			dotColor = RARITY_COLORS[entry.rarity],
+			highlighted = isCurrentEntry(entry),
+			starred = fruitFavorites[entry.key] == true,
+			onClick = function()
+				switchFruit(entry)
+			end,
+			onStar = function()
+				fruitFavorites[entry.key] = not fruitFavorites[entry.key] or nil
+				saveSettings()
+				renderAll()
+			end,
+		})
+	end
+
+	if #favorites > 0 then
+		createDivider(canvas.body, "FAVORITES", nextOrder(canvas))
+		local group = canvasGroup(canvas)
+		for _, entry in ipairs(favorites) do
+			addRow(group, entry)
+		end
+		createDivider(canvas.body, "ALL FRUITS", nextOrder(canvas))
+	end
+
+	local group = canvasGroup(canvas)
+	for _, entry in ipairs(others) do
+		addRow(group, entry)
+	end
+
+	return total
+end
+
+---Build the haki color rows.
+---@param canvas table
+local function populateHaki(canvas)
+	if #inventory.haki == 0 then
+		createEmpty(canvas.body, "No haki colors found.", nextOrder(canvas))
+		return 0
+	end
+
+	local favorites, others = {}, {}
+	for _, item in ipairs(inventory.haki) do
+		table.insert(hakiFavorites[tostring(item.id)] and favorites or others, item)
+	end
+
+	local function addRow(container, item)
+		local key = tostring(item.id)
+		createRow(container, nextOrder(canvas), {
+			text = item.name,
+			dotColor = THEME.accentAlt,
+			highlighted = settings.lastHaki == item.id,
+			starred = hakiFavorites[key] == true,
+			onClick = function()
+				equipHaki(item)
+			end,
+			onStar = function()
+				hakiFavorites[key] = not hakiFavorites[key] or nil
+				saveSettings()
+				renderAll()
+			end,
+		})
+	end
+
+	if #favorites > 0 then
+		createDivider(canvas.body, "FAVORITES", nextOrder(canvas))
+		local group = canvasGroup(canvas)
+		for _, item in ipairs(favorites) do
+			addRow(group, item)
+		end
+		createDivider(canvas.body, "ALL COLORS", nextOrder(canvas))
+	end
+
+	local group = canvasGroup(canvas)
+	for _, item in ipairs(others) do
+		addRow(group, item)
+	end
+
+	return #inventory.haki
+end
+
+---Make a populator for a game-favorited item list.
+---@param listKey string
+---@param emptyText string
+local function itemPopulator(listKey, emptyText)
+	return function(canvas)
+		local items = inventory[listKey]
+		if #items == 0 then
+			createEmpty(canvas.body, emptyText, nextOrder(canvas))
+			return 0
+		end
+
+		local group = canvasGroup(canvas)
+		for _, item in ipairs(items) do
+			createRow(group, nextOrder(canvas), {
+				text = item.name,
+				dotColor = BRACKET_COLORS[item.bracket],
+				highlighted = inventory.equipped[item.id] == true,
+				onClick = function()
+					equipItem(item)
+				end,
+			})
+		end
+
+		return #items
+	end
+end
+
+---Build the automation toggles.
+---@param canvas table
+local function populateAutomation(canvas)
+	local enabled = settings.autoRepair
+
+	createSwitchRow(canvas.body, nextOrder(canvas), {
+		text = "Perfect Boat Repair",
+		subtitle = "Equip the hammer and stand on the repair spot.",
+		enabled = enabled,
+		onToggle = function()
+			settings.autoRepair = not settings.autoRepair
+			if not settings.autoRepair then
+				Repair.stopAutoRepair()
+			end
+			repairState.perfectCount = 0
+			saveSettings()
+			renderAll()
+		end,
+	})
+
+	return enabled and "ON" or "OFF"
+end
+
+---Build the boat speed toggle, slider and number box.
+---@param canvas table
+local function populateBoat(canvas)
+	local enabled = settings.boatSpeedEnabled
+
+	createSwitchRow(canvas.body, nextOrder(canvas), {
+		text = "Custom Boat Speed",
+		subtitle = "Applies to the boat you're driving.",
+		enabled = enabled,
+		onToggle = function()
+			settings.boatSpeedEnabled = not settings.boatSpeedEnabled
+			if not settings.boatSpeedEnabled then
+				Boat.restoreBoatSpeeds()
+			end
+			saveSettings()
+			renderAll()
+		end,
+	})
+
+	local holder = create("Frame", {
+		LayoutOrder = nextOrder(canvas),
+		Size = UDim2.new(1, 0, 0, 46),
+		BackgroundColor3 = THEME.row,
+		BorderSizePixel = 0,
+		Parent = canvas.body,
+	})
+	corner(holder, 8)
+
+	create("TextLabel", {
+		Position = UDim2.fromOffset(12, 5),
+		Size = UDim2.new(1, -90, 0, 18),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamMedium,
+		Text = "Speed",
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextColor3 = THEME.text,
+		TextSize = 12,
+		Parent = holder,
+	})
+
+	local valueBox = create("TextBox", {
+		AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, -10, 0, 5),
+		Size = UDim2.fromOffset(56, 18),
+		BackgroundColor3 = THEME.section,
+		ClearTextOnFocus = false,
+		Font = Enum.Font.GothamBold,
+		Text = "",
+		TextColor3 = THEME.accent,
+		TextSize = 12,
+		Parent = holder,
+	})
+	corner(valueBox, 5)
+
+	local track = create("TextButton", {
+		Position = UDim2.new(0, 12, 0, 31),
+		Size = UDim2.new(1, -24, 0, 6),
+		BackgroundColor3 = THEME.section,
+		AutoButtonColor = false,
+		Text = "",
+		Parent = holder,
+	})
+	corner(track, 3)
+
+	local fill = create("Frame", {
+		Size = UDim2.fromScale(0, 1),
+		BackgroundColor3 = Color3.new(1, 1, 1),
+		BorderSizePixel = 0,
+		Parent = track,
+	})
+	corner(fill, 3)
+	create("UIGradient", { Color = ColorSequence.new(THEME.accent, THEME.accentAlt), Parent = fill })
+
+	local knob = create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0, 0.5),
+		Size = UDim2.fromOffset(12, 12),
+		BackgroundColor3 = THEME.text,
+		BorderSizePixel = 0,
+		Parent = track,
+	})
+	corner(knob, 6)
+
+	---Sync the slider and box to the stored speed.
+	local function display()
+		local alpha = (settings.boatSpeed - BOAT.SPEED_MIN) / (BOAT.SPEED_MAX - BOAT.SPEED_MIN)
+		fill.Size = UDim2.fromScale(alpha, 1)
+		knob.Position = UDim2.fromScale(alpha, 0.5)
+		valueBox.Text = tostring(settings.boatSpeed)
+	end
+
+	---Set speed from a screen X position on the track.
+	local function setFromX(x)
+		local width = track.AbsoluteSize.X
+		if width <= 0 then
+			return
+		end
+
+		local alpha = math.clamp((x - track.AbsolutePosition.X) / width, 0, 1)
+		Boat.setBoatSpeed(BOAT.SPEED_MIN + alpha * (BOAT.SPEED_MAX - BOAT.SPEED_MIN))
+		display()
+	end
+
+	-- Drag connections live only for the duration of one drag.
+	track.InputBegan:Connect(function(input)
+		if not isPointerPress(input) then
+			return
+		end
+
+		setFromX(input.Position.X)
+
+		local moveConnection, endConnection
+		moveConnection = userInputService.InputChanged:Connect(function(moveInput)
+			-- A re-render destroyed the slider mid-drag; keep the speed it reached.
+			if not track.Parent then
+				moveConnection:Disconnect()
+				endConnection:Disconnect()
+				saveSettings()
+				return
+			end
+
+			if isPointerMove(moveInput) then
+				setFromX(moveInput.Position.X)
+			end
+		end)
+
+		endConnection = userInputService.InputEnded:Connect(function(endInput)
+			if endInput.UserInputType ~= input.UserInputType then
+				return
+			end
+
+			moveConnection:Disconnect()
+			endConnection:Disconnect()
+			saveSettings()
+			renderAll()
+		end)
+	end)
+
+	valueBox.FocusLost:Connect(function()
+		local value = tonumber(valueBox.Text)
+		if value then
+			Boat.setBoatSpeed(value)
+			saveSettings()
+		end
+		renderAll()
+	end)
+
+	display()
+
+	boatState.hintLabels[createEmpty(canvas.body, "", nextOrder(canvas))] = true
+	Boat.updateBoatHint()
+
+	return enabled and "ON" or "OFF"
+end
+
+---Build the world toggles.
+---@param canvas table
+local function populateWorld(canvas)
+	local enabled = settings.disableWeather
+
+	createSwitchRow(canvas.body, nextOrder(canvas), {
+		text = "Disable Weather",
+		subtitle = "Weather, sea zone 6 fog and camera sway.",
+		enabled = enabled,
+		onToggle = function()
+			settings.disableWeather = not settings.disableWeather
+			if settings.disableWeather then
+				Weather.applyWeatherSuppression()
+			else
+				Weather.restoreWeather()
+			end
+			saveSettings()
+			renderAll()
+		end,
+	})
+
+	return enabled and "ON" or "OFF"
+end
+
+-- Every feature can live as a hub tab and, when pinned, a quick panel section.
+local FEATURES = {
+	{
+		id = "Fruits",
+		title = "Fruits",
+		icon = "🍎",
+		grid = true,
+		description = "Switch permanent fruits instantly. Star one to keep it on top.",
+		populate = populateFruits,
+	},
+	{
+		id = "Haki",
+		title = "Haki",
+		icon = "✨",
+		grid = true,
+		description = "Swap your haki color. Star colors to keep them on top.",
+		populate = populateHaki,
+	},
+	{
+		id = "Sword",
+		title = "Swords",
+		icon = "⚔️",
+		grid = true,
+		description = "Swords you've favorited in the game's inventory.",
+		populate = itemPopulator("swords", "Favorite swords in your inventory to see them here."),
+	},
+	{
+		id = "Gun",
+		title = "Guns",
+		icon = "🎯",
+		grid = true,
+		description = "Guns you've favorited in the game's inventory.",
+		populate = itemPopulator("guns", "Favorite guns in your inventory to see them here."),
+	},
+	{
+		id = "Wardrobe",
+		title = "Wardrobe",
+		icon = "👕",
+		grid = true,
+		description = "Wardrobe items you've favorited in the game's inventory.",
+		populate = itemPopulator("wardrobe", "Favorite wardrobe items in your inventory to see them here."),
+	},
+	{
+		id = "Automation",
+		title = "Automation",
+		icon = "🔨",
+		description = "Hands-free helpers.",
+		populate = populateAutomation,
+	},
+	{
+		id = "Fishing",
+		title = "Fishing",
+		icon = "🎣",
+		description = "Perfect casts every time, and reeling that steers itself.",
+		populate = Fishing.populateFishing,
+	},
+	{
+		id = "Boat",
+		title = "Boat",
+		icon = "⛵",
+		description = "Set how fast the boat you're driving goes.",
+		populate = populateBoat,
+	},
+	{
+		id = "World",
+		title = "World",
+		icon = "🌦️",
+		description = "Visual tweaks for the world around you.",
+		populate = populateWorld,
+	},
+}
+
+local FEATURE_BY_ID = {}
+for _, feature in ipairs(FEATURES) do
+	feature.pinnable = true
+	FEATURE_BY_ID[feature.id] = feature
+end
+
+---Check whether a feature is pinned to the quick panel.
+---@param id string
+---@return boolean
+local function isPinned(id)
+	return table.find(settings.quickSections, id) ~= nil
+end
+
+---Pin or unpin a feature on the quick panel.
+---@param id string
+local function togglePin(id)
+	local index = table.find(settings.quickSections, id)
+	if index then
+		table.remove(settings.quickSections, index)
+	else
+		table.insert(settings.quickSections, id)
+	end
+
+	saveSettings()
+	rebuildQuickSections()
+	renderAll()
+end
+
+---Move a pinned feature up or down in the quick panel.
+---@param id string
+---@param delta number
+local function movePin(id, delta)
+	local list = settings.quickSections
+	local index = table.find(list, id)
+	local target = index and index + delta
+	if not target or target < 1 or target > #list then
+		return
+	end
+
+	list[index], list[target] = list[target], list[index]
+	saveSettings()
+	rebuildQuickSections()
+	renderAll()
+end
+
+---Build the Home tab: the same quick actions as the quick panel.
+---@param canvas table
+local function populateHome(canvas)
+	local actions = create("Frame", {
+		LayoutOrder = nextOrder(canvas),
+		Size = UDim2.new(1, 0, 0, 98),
+		BackgroundTransparency = 1,
+		Parent = canvas.body,
+	})
+
+	local homeRoll = createRollButton(actions, UDim2.fromOffset(0, 0), UDim2.new(1, 0, 0, 50), "🎲  Roll Random Fruit", 15)
+	homeRoll.MouseButton1Click:Connect(rollFruit)
+	updateRollTimer()
+
+	local homeRefund = actionButton(actions, "Refund Stats", UDim2.fromOffset(0, 58), UDim2.new(0.5, -4, 0, 40), THEME.star)
+	local homeReroll = actionButton(actions, "Reroll Race", UDim2.new(0.5, 4, 0, 58), UDim2.new(0.5, -4, 0, 40), THEME.accentAlt)
+	homeRefund.TextSize = 13
+	homeReroll.TextSize = 13
+
+	bindConfirm(homeRefund, function()
+		blackbeardTrade("Refund", "Stat refund")
+	end)
+	bindConfirm(homeReroll, function()
+		blackbeardTrade("Reroll", "Race reroll")
+	end)
+
+	createDivider(canvas.body, "QUICK PANEL", nextOrder(canvas))
+
+	-- Emergency button for when the quick panel has been dragged out of sight.
+	local resetQuick = actionButton(canvas.body, "Reset quick panel position", UDim2.new(), UDim2.new(1, 0, 0, 36), THEME.accent)
+	resetQuick.LayoutOrder = nextOrder(canvas)
+	resetQuick.TextSize = 13
+	resetQuick.MouseButton1Click:Connect(function()
+		settings.position = UI.DEFAULT_POSITION
+		mainFrame.Position = toUDim2(UI.DEFAULT_POSITION)
+		setHidden(false)
+		updateWindowSize(false)
+		setStatus("Quick panel moved back to its default spot.", THEME.good)
+	end)
+
+	local pinnedNames = {}
+	for _, id in ipairs(settings.quickSections) do
+		local feature = FEATURE_BY_ID[id]
+		if feature then
+			table.insert(pinnedNames, feature.title)
+		end
+	end
+
+	createEmpty(
+		canvas.body,
+		("Pinned: %s.  Press %s to show or hide it. The P button opens and closes this hub."):format(
+			#pinnedNames > 0 and table.concat(pinnedNames, ", ") or "nothing",
+			settings.keybinds.quick
+		),
+		nextOrder(canvas)
+	)
+
+	return nil
+end
+
+---Build the Quick Panel tab: choose sections and their order.
+---@param canvas table
+local function populateQuickPanel(canvas)
+	createDivider(canvas.body, "PINNED  (TOP TO BOTTOM)", nextOrder(canvas))
+
+	if #settings.quickSections == 0 then
+		createEmpty(canvas.body, "Nothing pinned yet. Switch a section on below.", nextOrder(canvas))
+	end
+
+	for index, id in ipairs(settings.quickSections) do
+		local feature = FEATURE_BY_ID[id]
+		if not feature then
+			continue
+		end
+
+		local row = createSwitchRow(canvas.body, nextOrder(canvas), {
+			text = feature.icon .. "  " .. feature.title,
+			enabled = true,
+			rightInset = 60,
+			onToggle = function()
+				togglePin(id)
+			end,
+		})
+
+		-- Up / down arrows reorder the quick panel.
+		for slot, arrow in ipairs({ { "▲", -1 }, { "▼", 1 } }) do
+			local canMove = (arrow[2] < 0 and index > 1) or (arrow[2] > 0 and index < #settings.quickSections)
+			local arrowButton = create("TextButton", {
+				AnchorPoint = Vector2.new(1, 0.5),
+				Position = UDim2.new(1, -60 - (2 - slot) * 28, 0.5, 0),
+				Size = UDim2.fromOffset(24, 22),
+				BackgroundColor3 = THEME.section,
+				AutoButtonColor = canMove,
+				Font = Enum.Font.GothamBold,
+				Text = arrow[1],
+				TextColor3 = canMove and THEME.text or THEME.stroke,
+				TextSize = 11,
+				Parent = row,
+			})
+			corner(arrowButton, 5)
+
+			if canMove then
+				arrowButton.MouseButton1Click:Connect(function()
+					movePin(id, arrow[2])
+				end)
+			end
+		end
+	end
+
+	createDivider(canvas.body, "AVAILABLE", nextOrder(canvas))
+
+	local available = 0
+	for _, feature in ipairs(FEATURES) do
+		if isPinned(feature.id) then
+			continue
+		end
+
+		available += 1
+		createSwitchRow(canvas.body, nextOrder(canvas), {
+			text = feature.icon .. "  " .. feature.title,
+			subtitle = feature.description,
+			enabled = false,
+			onToggle = function()
+				togglePin(feature.id)
+			end,
+		})
+	end
+
+	if available == 0 then
+		createEmpty(canvas.body, "Everything is already pinned.", nextOrder(canvas))
+	end
+
+	local reset = actionButton(canvas.body, "Reset quick panel to default", UDim2.new(), UDim2.new(1, 0, 0, 32), THEME.stroke)
+	reset.LayoutOrder = nextOrder(canvas)
+	reset.MouseButton1Click:Connect(function()
+		settings.quickSections = table.clone(DEFAULT_QUICK_SECTIONS)
+		saveSettings()
+		rebuildQuickSections()
+		renderAll()
+	end)
+
+	return nil
+end
+
+---Create a row showing a keybind with a button to change it.
+---@param canvas table
+---@param action string
+---@param text string
+local function createKeybindRow(canvas, action, text)
+	local row = create("Frame", {
+		LayoutOrder = nextOrder(canvas),
+		Size = UDim2.new(1, 0, 0, UI.ROW_HEIGHT + 4),
+		BackgroundColor3 = THEME.row,
+		BorderSizePixel = 0,
+		Parent = canvas.body,
+	})
+	corner(row, 8)
+
+	create("TextLabel", {
+		Position = UDim2.fromOffset(12, 0),
+		Size = UDim2.new(1, -140, 1, 0),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamMedium,
+		Text = text,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextColor3 = THEME.text,
+		TextSize = 13,
+		Parent = row,
+	})
+
+	local listening = rebindTarget == action
+	local keyButton = create("TextButton", {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -10, 0.5, 0),
+		Size = UDim2.fromOffset(118, 22),
+		BackgroundColor3 = listening and THEME.rowEquipped or THEME.section,
+		AutoButtonColor = false,
+		Font = Enum.Font.GothamBold,
+		Text = listening and "Press a key…" or settings.keybinds[action],
+		TextColor3 = listening and THEME.star or THEME.accent,
+		TextSize = 12,
+		Parent = row,
+	})
+	corner(keyButton, 6)
+
+	keyButton.MouseButton1Click:Connect(function()
+		rebindTarget = rebindTarget ~= action and action or nil
+		renderHub()
+	end)
+end
+
+---Build the Settings tab.
+---@param canvas table
+local function populateSettings(canvas)
+	createDivider(canvas.body, "KEYBINDS", nextOrder(canvas))
+	createKeybindRow(canvas, "quick", "Show / hide quick panel")
+	createEmpty(canvas.body, "Click the key, then press the new one. Esc cancels. The hub only opens from the P button.", nextOrder(canvas))
+
+	createDivider(canvas.body, "WINDOWS", nextOrder(canvas))
+	local resetPositions = actionButton(canvas.body, "Reset window positions", UDim2.new(), UDim2.new(1, 0, 0, 32), THEME.accent)
+	resetPositions.LayoutOrder = nextOrder(canvas)
+	resetPositions.MouseButton1Click:Connect(function()
+		settings.position = UI.DEFAULT_POSITION
+		settings.hubPosition = HUB_LAYOUT.DEFAULT_POSITION
+		settings.togglePosition = TOGGLE.DEFAULT_POSITION
+		mainFrame.Position = toUDim2(UI.DEFAULT_POSITION)
+		hub.frame.Position = toUDim2(HUB_LAYOUT.DEFAULT_POSITION)
+		toggleButton.Position = toUDim2(TOGGLE.DEFAULT_POSITION)
+		updateWindowSize(false)
+		saveSettings()
+		setStatus("Window positions reset.", THEME.good)
+	end)
+
+	createDivider(canvas.body, "SCRIPT", nextOrder(canvas))
+	local unload = actionButton(canvas.body, "Unload Potent", UDim2.new(), UDim2.new(1, 0, 0, 32), THEME.bad)
+	unload.LayoutOrder = nextOrder(canvas)
+	bindConfirm(unload, function()
+		Potent.detach()
+	end)
+
+	return nil
+end
+
+-- Hub tabs in sidebar order; group entries are just headings.
+local HUB_TABS = {
+	{ id = "Home", title = "Home", icon = "🏠", description = "Roll a fruit, refund stats or reroll your race.", populate = populateHome },
+	{ group = "FEATURES" },
+}
+for _, feature in ipairs(FEATURES) do
+	table.insert(HUB_TABS, feature)
+end
+table.insert(HUB_TABS, { group = "CUSTOMIZE" })
+table.insert(HUB_TABS, {
+	id = "QuickPanel",
+	title = "Quick Panel",
+	icon = "📌",
+	description = "Choose which sections the quick panel shows, and their order.",
+	populate = populateQuickPanel,
+})
+table.insert(HUB_TABS, {
+	id = "Settings",
+	title = "Settings",
+	icon = "⚙️",
+	description = "Keybinds, buttons and window positions.",
+	populate = populateSettings,
+})
+
+local TAB_BY_ID = {}
+for _, tab in ipairs(HUB_TABS) do
+	if tab.id then
+		TAB_BY_ID[tab.id] = tab
+	end
+end
+
+-- Build the sidebar once; renderHub only restyles it.
+for order, tab in ipairs(HUB_TABS) do
+	if tab.group then
+		create("TextLabel", {
+			LayoutOrder = order,
+			Size = UDim2.new(1, 0, 0, 24),
+			BackgroundTransparency = 1,
+			Font = Enum.Font.GothamBold,
+			Text = "  " .. tab.group,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			TextYAlignment = Enum.TextYAlignment.Bottom,
+			TextColor3 = THEME.subText,
+			TextSize = 10,
+			Parent = hub.tabList,
+		})
+		continue
+	end
+
+	local button = create("TextButton", {
+		LayoutOrder = order,
+		Size = UDim2.new(1, 0, 0, 32),
+		BackgroundColor3 = THEME.rowEquipped,
+		BackgroundTransparency = 1,
+		AutoButtonColor = false,
+		Text = "",
+		Parent = hub.tabList,
+	})
+	corner(button, 7)
+
+	local indicator = create("Frame", {
+		AnchorPoint = Vector2.new(0, 0.5),
+		Position = UDim2.new(0, 0, 0.5, 0),
+		Size = UDim2.fromOffset(3, 16),
+		BackgroundColor3 = THEME.accent,
+		BorderSizePixel = 0,
+		Visible = false,
+		Parent = button,
+	})
+	corner(indicator, 2)
+
+	create("TextLabel", {
+		Position = UDim2.fromOffset(12, 0),
+		Size = UDim2.fromOffset(20, 32),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamBold,
+		Text = tab.icon,
+		TextColor3 = THEME.text,
+		TextSize = 14,
+		Parent = button,
+	})
+
+	local name = create("TextLabel", {
+		Position = UDim2.fromOffset(38, 0),
+		Size = UDim2.new(1, -52, 1, 0),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamMedium,
+		Text = tab.title,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextColor3 = THEME.subText,
+		TextSize = 13,
+		Parent = button,
+	})
+
+	-- Small dot marks features currently on the quick panel.
+	local pinDot = create("Frame", {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -10, 0.5, 0),
+		Size = UDim2.fromOffset(6, 6),
+		BackgroundColor3 = THEME.accent,
+		BorderSizePixel = 0,
+		Visible = false,
+		Parent = button,
+	})
+	corner(pinDot, 3)
+
+	button.MouseEnter:Connect(function()
+		if settings.hubTab ~= tab.id then
+			tween(button, { BackgroundTransparency = 0.6 })
+		end
+	end)
+	button.MouseLeave:Connect(function()
+		if settings.hubTab ~= tab.id then
+			tween(button, { BackgroundTransparency = 1 })
+		end
+	end)
+
+	button.MouseButton1Click:Connect(function()
+		if settings.hubTab == tab.id then
+			return
+		end
+
+		settings.hubTab = tab.id
+		rebindTarget = nil
+		hub.content.CanvasPosition = Vector2.zero
+		saveSettings()
+		renderHub()
+	end)
+
+	hub.tabButtons[tab.id] = { button = button, indicator = indicator, name = name, pinDot = pinDot }
+end
+
+hub.pinButton.MouseButton1Click:Connect(function()
+	local tab = TAB_BY_ID[settings.hubTab]
+	if tab and tab.pinnable then
+		togglePin(tab.id)
+	end
+end)
+
+---Redraw the hub's sidebar state and active tab.
+function renderHub()
+	if not hub.frame.Visible then
+		return
+	end
+
+	local tab = TAB_BY_ID[settings.hubTab]
+	if not tab then
+		settings.hubTab = "Home"
+		tab = TAB_BY_ID.Home
+	end
+
+	for id, widgets in pairs(hub.tabButtons) do
+		local active = id == tab.id
+		widgets.button.BackgroundTransparency = active and 0 or 1
+		widgets.indicator.Visible = active
+		widgets.name.TextColor3 = active and THEME.text or THEME.subText
+		widgets.name.Font = active and Enum.Font.GothamBold or Enum.Font.GothamMedium
+		widgets.pinDot.Visible = isPinned(id)
+	end
+
+	hub.title.Text = tab.icon .. "  " .. tab.title
+	hub.description.Text = tab.description or ""
+	hub.keyHint.Text = ("%s  ·  Quick panel\nP button  ·  Hub"):format(settings.keybinds.quick)
+
+	hub.pinButton.Visible = tab.pinnable == true
+	if tab.pinnable then
+		local pinned = isPinned(tab.id)
+		hub.pinButton.Text = pinned and "📌  On quick panel" or "＋  Add to quick panel"
+		hub.pinButton.BackgroundColor3 = pinned and THEME.rowEquipped or THEME.row
+		hub.pinStroke.Transparency = pinned and 0.1 or 0.5
+	end
+
+	for _, child in ipairs(hub.content:GetChildren()) do
+		if child:IsA("GuiObject") then
+			child:Destroy()
+		end
+	end
+
+	tab.populate(newCanvas(hub.content, tab.grid))
+end
+
+---Recreate the quick panel sections from the pinned list.
+function rebuildQuickSections()
+	-- Drop unknown or repeated ids so indexes match what's actually shown.
+	local cleaned, seen = {}, {}
+	for _, id in ipairs(settings.quickSections) do
+		if FEATURE_BY_ID[id] and not seen[id] then
+			seen[id] = true
+			table.insert(cleaned, id)
+		end
+	end
+	settings.quickSections = cleaned
+
+	for _, section in ipairs(sections) do
+		section:destroy()
+	end
+	table.clear(sections)
+
+	for index, id in ipairs(settings.quickSections) do
+		local feature = FEATURE_BY_ID[id]
+		if feature then
+			table.insert(sections, Section.new(feature, index))
+		end
+	end
+
+	quickEmptyLabel.Visible = #sections == 0
+	applySectionOrder()
+end
+
+---Re-render every quick section and the hub.
+function renderAll()
+	-- Late server replies can land after Unload or a re-run.
+	if not alive then
+		return
+	end
+
+	local fruitLabel = getCurrentFruitLabel()
+	currentLabel.Text = "Fruit: " .. fruitLabel
+	hub.fruitLabel.Text = "Equipped  ·  " .. fruitLabel
+
+	for _, section in ipairs(sections) do
+		section:render()
+	end
+
+	renderHub()
+end
+
+---Refetch everything from the server and redraw.
+local function refreshAll()
+	task.spawn(function()
+		pcall(fetchInventory)
+		pcall(fetchOwnedFruits)
+		pcall(checkRollCooldown)
+		saveSettings()
+		renderAll()
+	end)
+end
+
+-- Collapse the quick panel to its header.
+minimizeButton.MouseButton1Click:Connect(function()
+	minimized = not minimized
+	minimizeButton.Text = minimized and "+" or "–"
+	updateWindowSize(true)
+end)
+
+-- Both windows drag by their headers and remember where they were left.
+makeDraggable(header, mainFrame, function()
+	settings.position = fromUDim2(mainFrame.Position)
+	saveSettings()
+end)
+
+-- The hub is held on screen the whole time it's dragged.
+makeDraggable(hub.header, hub.frame, function()
+	settings.hubPosition = fromUDim2(hub.frame.Position)
+	saveSettings()
+end, function()
+	clampToScreen(hub.frame, Vector2.new(HUB_LAYOUT.WIDTH, HUB_LAYOUT.HEIGHT))
+end)
+
+---Handle keybinds, including capturing a new key from the Settings tab.
+---@param input InputObject
+---@param gameProcessed boolean
+local function onInputBegan(input, gameProcessed)
+	if input.UserInputType ~= Enum.UserInputType.Keyboard then
+		return
+	end
+
+	if rebindTarget then
+		-- Typing in chat or a text box shouldn't become the new key.
+		if gameProcessed and input.KeyCode ~= Enum.KeyCode.Escape then
+			return
+		end
+
+		if input.KeyCode ~= Enum.KeyCode.Escape and input.KeyCode ~= Enum.KeyCode.Unknown then
+			settings.keybinds[rebindTarget] = input.KeyCode.Name
+			saveSettings()
+			setStatus("Keybind set to " .. input.KeyCode.Name .. ".", THEME.good)
+		end
+
+		rebindTarget = nil
+		renderHub()
+		return
+	end
+
+	-- Ignore keys typed into chat or text boxes.
+	if gameProcessed then
+		return
+	end
+
+	if input.KeyCode == getKeybind("quick") then
+		setHidden(not settings.hidden)
+	end
+end
+
+---Remove the UI and stop loops.
+function Potent.detach()
+	alive = false
+	pcall(Repair.stopAutoRepair)
+	pcall(Boat.restoreBoatSpeeds)
+	pcall(Weather.restoreWeather)
+	pcall(Fishing.uninstallFishingHooks)
+	for _, connection in ipairs(connections) do
+		connection:Disconnect()
+	end
+	screenGui:Destroy()
+end
+
+---Main entry point.
+local function initializeScript()
+	loadSettings()
+	loadGameModules()
+
+	mainFrame.Position = toUDim2(settings.position)
+	hub.frame.Position = toUDim2(settings.hubPosition)
+	toggleButton.Position = toUDim2(settings.togglePosition)
+	screenGui.Parent = gethui()
+
+	clampToScreen(toggleButton, Vector2.new(TOGGLE.SIZE, TOGGLE.SIZE))
+	setHidden(settings.hidden)
+	updateToggleButton()
+	rebuildQuickSections()
+
+	refreshButton.MouseButton1Click:Connect(refreshAll)
+	hub.refreshButton.MouseButton1Click:Connect(refreshAll)
+	rollButton.MouseButton1Click:Connect(rollFruit)
+
+	bindConfirm(refundButton, function()
+		blackbeardTrade("Refund", "Stat refund")
+	end)
+
+	bindConfirm(rerollButton, function()
+		blackbeardTrade("Reroll", "Race reroll")
+	end)
+
+	table.insert(connections, userInputService.InputBegan:Connect(onInputBegan))
+
+	-- Keep the equipped fruit in sync when it changes elsewhere.
+	local devilFruit = localPlayer:WaitForChild("Data"):WaitForChild("DevilFruit")
+	table.insert(connections, devilFruit.Changed:Connect(renderAll))
+
+	-- Check the repair bar every frame so the release lands inside the goal.
+	table.insert(connections, runService.RenderStepped:Connect(function()
+		local ok, err = pcall(Repair.updateAutoRepair)
+		if not ok then
+			warn("Auto repair error: " .. tostring(err))
+		end
+	end))
+
+	-- Re-apply boat speed every physics step in case the game resets it.
+	table.insert(connections, runService.Heartbeat:Connect(function()
+		local ok, err = pcall(Boat.updateBoatSpeed)
+		if not ok then
+			warn("Boat speed error: " .. tostring(err))
+		end
+
+		local weatherOk, weatherErr = pcall(Weather.updateWeather)
+		if not weatherOk then
+			warn("Weather error: " .. tostring(weatherErr))
+		end
+
+		local fishOk, fishErr = pcall(Fishing.updateAutoFish)
+		if not fishOk then
+			warn("Fishing error: " .. tostring(fishErr))
+		end
+	end))
+
+	Fishing.installFishingHooks()
+
+	-- Keep the hub and P button on screen if the Roblox window is resized.
+	table.insert(connections, screenGui:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+		if hub.frame.Visible then
+			clampToScreen(hub.frame, Vector2.new(HUB_LAYOUT.WIDTH, HUB_LAYOUT.HEIGHT))
+		end
+		clampToScreen(toggleButton, Vector2.new(TOGGLE.SIZE, TOGGLE.SIZE))
+	end))
+
+	-- Tick the roll countdown and re-sync it with the server periodically.
+	task.spawn(function()
+		local lastPoll = -math.huge
+		while alive do
+			-- Poll on the interval, and again right when the countdown hits zero
+			-- (or every few seconds while the server still says "not yet").
+			local dueAtZero = rollCooldownKnown and not rollReadyConfirmed and rollCooldownEnds <= serverNow()
+			if os.clock() - lastPoll >= GACHA.POLL_INTERVAL or (dueAtZero and os.clock() - lastPoll >= 5) then
+				lastPoll = os.clock()
+				task.spawn(checkRollCooldown)
+			end
+
+			updateRollTimer()
+			task.wait(1)
+		end
+	end)
+
+	refreshAll()
+	updateWindowSize(false)
+end
+
+---This is called when initialization errors.
+---@param error string
+local function onInitializeError(error)
+	warn("Failed to initialize.")
+	warn(error)
+	warn(debug.traceback())
+	Potent.detach()
+end
+
+-- Clean up any previous instance (including the old fruit switcher).
+for _, key in ipairs({ "Potent", "FruitSwitcher" }) do
+	if shared[key] then
+		pcall(shared[key].detach)
+		shared[key] = nil
+	end
+end
+
+shared.Potent = Potent
+
+xpcall(initializeScript, onInitializeError)
