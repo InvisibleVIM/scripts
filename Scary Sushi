@@ -1,0 +1,3593 @@
+-- Check for table that is shared between executions.
+if not shared then
+	return warn("No shared, no script.")
+end
+
+-- Initialize Luraph globals if they do not exist.
+loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
+
+getfenv().PP_SCRAMBLE_NUM = function(...) return ... end
+getfenv().PP_SCRAMBLE_STR = function(...) return ... end
+getfenv().PP_SCRAMBLE_RE_NUM = function(...) return ... end
+
+local ScarySushi = { running = false, delivered = 0, detached = false }
+
+-- Constants.
+--- Tunables grouped in one table: Luau allows at most 200 locals per scope.
+local Tune = {}
+
+local CHAPTER1_PLACE_ID = 16454414227
+local CHAPTER2_PLACE_ID = 17821427181
+local SURVIVAL_PLACE_ID = 17820412646
+local PRO_LOBBY_PLACE_ID = 17646166259
+local LOBBY_PLACE_IDS = { [16454399300] = true, [17646166259] = true }
+local SETTINGS_FILE = "PotentScarySushi.json"
+local LOG_FILE = "PotentScarySushi.log"
+local DEFAULT_SETTINGS = { Chapter1 = false, Chapter2 = false, Survival = false, Fly = true }
+
+local REQUEUE_VIA_LOBBY = true -- Hop via the Pro Lobby so a fresh server is used (escaped servers keep running).
+Tune.LOBBY_TELEPORT_DELAY = 2 -- Grace period in the lobby so a toggle can still be switched off.
+local SOLO_ONLY = true -- Reroll the server if anyone else is in it before the first delivery.
+local DUAL_PLATE = true -- Build up to two orders at once on both plates.
+--- The server starts each course when the client reports its cutscene done (FinishedCutscene), and the client
+--- only reports after the ~24s animation. Reporting right away starts the course early.
+local CUTSCENE_SKIP = true
+Tune.CUTSCENE_SKIP_TRIES = { 0.5, 1.5, 3 } -- Seconds into the cutscene to replay the skip signal.
+Tune.CUTSCENE_REPORT_DELAY = 0.5
+Tune.LAST_COURSE = 4
+Tune.ORDERS_PER_COURSE = 4 -- Both chapters end a course on its 4th completed order.
+Tune.COURSE_START_GRACE = 2.5 -- A course change wipes cuts in progress; no pre-loads until this long after its cutscene.
+Tune.STALL_REQUEUE = 120 -- Requeue if a run makes no progress (no new order, no server verdict) for this long.
+local DELIVERY_VERIFY = 4 -- Rebuild an order if the server hasn't completed it this long after delivery.
+local WORK_HEIGHT = 4
+local READY_SETTLE = 0.75
+local IDLE_TICK = 0.05
+local MACHINE_CAPS = { Rice = 8, Nori = 8, Cut = 10 }
+
+-- Chapter 1 sludge: the 30s wait is mostly client animation; the server hands over the cup ~17s after the lever.
+local SLUDGE_CAP = 35
+local SLUDGE_FAST = true
+local SLUDGE_FAST_FROM = 16
+local SLUDGE_RETRY = 0.2
+local SLUDGE_COURSE = 4
+local SLUDGE_LOCKED_RETRY = 5
+
+-- Machines that remember their last cooked item (CookedFood) hand it out again for free, any number of times.
+-- Copies go on the station's placeboards as a small cache before the machine is switched to another item.
+local STASH = true
+
+--- Placeboard dupe: firing a board's pickup prompt twice in quick succession hands over the item and drops a
+--- second copy into the Backpack. Spare copies wait there (equipping one makes it held server-side, unequipping
+--- puts it back), so sludge comes from the lever once and from the Backpack after that.
+local DUPE = true
+Tune.DUPE_GAP = 0.05
+-- The server refuses to hand out anything once the Backpack holds 3 Tools, so keep at most 2 spares.
+Tune.DUPE_LOW = 2 -- Refill once the Backpack drops below this many copies...
+Tune.DUPE_TARGET = 2 -- ...up to this many.
+local BACKPACK_LIMIT = 2
+Tune.DUPE_FAIL_RETRY = 5
+Tune.BOARD_PATIENCE = 0.6 -- Placeboard prompts: wait this long for the server before re-firing.
+Tune.DUPE_PLACE_SETTLE = 0.3 -- The board needs a moment after a place before the double pickup works.
+Tune.DUPE_MOVE_SETTLE = 0.15
+local PRELOAD = true
+Tune.PRELOAD_DELIVERY_WINDOW = 3
+Tune.PRELOAD_CUTSCENE_FROM = 11
+Tune.PRELOAD_CUTSCENE_UNTIL = 14
+
+-- Chapter 1 ending: sit on the portal from chase start; the server credits it ~49s in.
+local PORTAL_RUSH = true
+Tune.RUSH_CAP = 150
+Tune.ENDING_CAP = 240
+Tune.ELEVATOR_CAP = 150
+Tune.PORTAL_CAP = 30
+Tune.ESCAPE_GRACE = 1
+
+-- Services.
+local playersService = game:GetService("Players")
+local replicatedStorage = game:GetService("ReplicatedStorage")
+local teleportService = game:GetService("TeleportService")
+local virtualUser = game:GetService("VirtualUser")
+local userInputService = game:GetService("UserInputService")
+local tweenService = game:GetService("TweenService")
+local httpService = game:GetService("HttpService")
+local coreGui = game:GetService("CoreGui")
+
+-- Autoexec runs before the game has loaded: wait for it, the local player and the game's event folder,
+-- or everything captured below is nil for the whole server.
+if not game:IsLoaded() then
+	game.Loaded:Wait()
+end
+while not playersService.LocalPlayer do
+	playersService:GetPropertyChangedSignal("LocalPlayer"):Wait()
+end
+
+-- State.
+local localPlayer = playersService.LocalPlayer
+-- Lobbies route straight out, so only game places wait for the event folder.
+local events = LOBBY_PLACE_IDS[game.PlaceId] and replicatedStorage:FindFirstChild("Events")
+	or replicatedStorage:WaitForChild("Events", 30)
+local connections = {}
+local farmConnections = {}
+local settings = {}
+local chapter = nil
+local orders = {}
+local activeTasks = {}
+local promptCache = {}
+local learnedCooked = {}
+local stash = {}
+local dirtyPlates = {}
+local bag = {} -- Stash entries kept as Tools in the Backpack: { tool, cooked, item, machine, at }
+local endingStarted = false
+local lastProgressAt = os.clock()
+local reportedCutscenes = {}
+local courseDeliveries = 0
+local courseDoneAt = nil
+local courseStartedAt = {}
+local carriedOrder = nil
+local lastWorkstation = nil
+local stationLostAt = nil
+local currentCourse = 0
+local lastDeliveryAt = -math.huge
+local cutsceneAt = -math.huge
+local sludgeRetryAt = 0
+local sludgeSeen = false
+local sludgeLeverAt = nil
+local sludgeTakenAt = nil
+local sludgeCupUntracked
+local grabDupe
+local uiInstance = nil
+
+---Print a tagged line and append it to a log file that survives teleports.
+---@param message string
+local function log(message)
+	local tag = chapter and chapter.tag or "Sushi"
+	print("[" .. tag .. "] " .. message)
+
+	-- Potassium's appendfile errors on a missing file, so create it first.
+	local line = os.date("%H:%M:%S ") .. tostring(game.JobId):sub(1, 8) .. " [" .. tag .. "] " .. message .. "\n"
+	pcall(function()
+		if isfile(LOG_FILE) then
+			appendfile(LOG_FILE, line)
+		else
+			writefile(LOG_FILE, line)
+		end
+	end)
+end
+
+-- The log only ever grows; once per server, keep just the recent end of it.
+pcall(function()
+	if isfile(LOG_FILE) then
+		local contents = readfile(LOG_FILE)
+		if #contents > 512 * 1024 then
+			local keep = contents:sub(-256 * 1024)
+			local firstBreak = keep:find("\n", 1, true)
+			writefile(LOG_FILE, firstBreak and keep:sub(firstBreak + 1) or keep)
+		end
+	end
+end)
+
+---Warn with the chapter tag and mirror it to the log file.
+---@param message string
+local function logWarn(message)
+	local tag = chapter and chapter.tag or "Sushi"
+	warn("[" .. tag .. "] " .. message)
+	pcall(function()
+		local line = os.date("%H:%M:%S ") .. tostring(game.JobId):sub(1, 8) .. " [" .. tag .. "] WARN " .. message .. "\n"
+		if isfile(LOG_FILE) then
+			appendfile(LOG_FILE, line)
+		else
+			writefile(LOG_FILE, line)
+		end
+	end)
+end
+
+---Load saved toggles, falling back to defaults for anything missing.
+local function loadSettings()
+	for key, value in pairs(DEFAULT_SETTINGS) do
+		settings[key] = value
+	end
+
+	local success, decoded = pcall(function()
+		return httpService:JSONDecode(readfile(SETTINGS_FILE))
+	end)
+
+	if success and type(decoded) == "table" then
+		for key in pairs(DEFAULT_SETTINGS) do
+			if type(decoded[key]) == "boolean" then
+				settings[key] = decoded[key]
+			end
+		end
+	end
+end
+
+---Persist the toggles so they survive teleports and re-executions.
+local function saveSettings()
+	pcall(function()
+		writefile(SETTINGS_FILE, httpService:JSONEncode(settings))
+	end)
+end
+
+---Whether we're inside an actual chapter (not a lobby).
+---@return boolean
+local function inGame()
+	return game.PlaceId == CHAPTER1_PLACE_ID or game.PlaceId == CHAPTER2_PLACE_ID or game.PlaceId == SURVIVAL_PLACE_ID
+end
+
+---Connect to a remote or bindable by name, whichever kind this chapter uses.
+---@param name string
+---@param callback function
+---@param bucket table?
+local function onEvent(name, callback, bucket)
+	local instance = events and events:FindFirstChild(name)
+	if not instance then
+		return
+	end
+
+	local signal = instance:IsA("RemoteEvent") and instance.OnClientEvent or instance:IsA("BindableEvent") and instance.Event
+	if signal then
+		table.insert(bucket or farmConnections, signal:Connect(callback))
+	end
+end
+
+---Return the local HumanoidRootPart, if spawned.
+---@return BasePart?
+local function getRoot()
+	local character = localPlayer and localPlayer.Character
+	return character and character:FindFirstChild("HumanoidRootPart")
+end
+
+---Teleport the character to a CFrame.
+---@param cframe CFrame
+local function teleportTo(cframe)
+	local root = getRoot()
+	if not (root and cframe) then
+		return
+	end
+
+	root.CFrame = cframe
+	root.AssemblyLinearVelocity = Vector3.zero
+end
+
+---Poll a predicate until it passes or the timeout runs out.
+---@param predicate function
+---@param timeout number
+---@param interval number?
+---@return boolean
+local function waitUntil(predicate, timeout, interval)
+	local deadline = os.clock() + timeout
+	while os.clock() < deadline do
+		if predicate() then
+			return true
+		end
+		task.wait(interval or 0.1)
+	end
+	return predicate()
+end
+
+---Teleport onto a part and register a touch with it.
+---@param part BasePart?
+local function touchPart(part)
+	local root = getRoot()
+	if not (root and part) then
+		return
+	end
+
+	teleportTo(part.CFrame)
+	pcall(firetouchinterest, root, part, 0)
+	task.wait()
+	pcall(firetouchinterest, root, part, 1)
+end
+
+-- Fly: a direct port of Infinite Yield's `fly` / `unfly` (sFLY / NOFLY).
+local Fly = { flying = false, speed = 1, keyDown = nil, keyUp = nil }
+
+---Stop flying (IY NOFLY).
+function Fly.stop()
+	Fly.flying = false
+	if Fly.keyDown or Fly.keyUp then
+		Fly.keyDown:Disconnect()
+		Fly.keyUp:Disconnect()
+		Fly.keyDown = nil
+		Fly.keyUp = nil
+	end
+
+	local character = localPlayer.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if humanoid then
+		humanoid.PlatformStand = false
+	end
+	pcall(function()
+		workspace.CurrentCamera.CameraType = Enum.CameraType.Custom
+	end)
+end
+
+---Start flying (IY sFLY): BodyGyro + BodyVelocity driven by WASD/QE relative to the camera.
+function Fly.start()
+	Fly.stop()
+	task.wait()
+
+	local character = localPlayer.Character or localPlayer.CharacterAdded:Wait()
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	if not humanoid then
+		repeat
+			task.wait()
+		until character:FindFirstChildOfClass("Humanoid")
+		humanoid = character:FindFirstChildOfClass("Humanoid")
+	end
+
+	local root = humanoid.RootPart
+	if not root then
+		return
+	end
+
+	local control = { F = 0, B = 0, L = 0, R = 0, Q = 0, E = 0 }
+	local lastControl = { F = 0, B = 0, L = 0, R = 0, Q = 0, E = 0 }
+	local speed = 0
+
+	Fly.flying = true
+
+	-- Fly's own BodyVelocity holds position when idle; drop the farm hover so they don't fight.
+	local hover = root:FindFirstChild("PotentHover")
+	if hover then
+		hover:Destroy()
+	end
+
+	local gyro = Instance.new("BodyGyro")
+	local velocity = Instance.new("BodyVelocity")
+	gyro.P = 9e4
+	gyro.Parent = root
+	velocity.Parent = root
+	gyro.MaxTorque = Vector3.new(9e9, 9e9, 9e9)
+	gyro.CFrame = root.CFrame
+	velocity.Velocity = Vector3.new(0, 0, 0)
+	velocity.MaxForce = Vector3.new(9e9, 9e9, 9e9)
+
+	task.spawn(function()
+		repeat
+			task.wait()
+			local camera = workspace.CurrentCamera
+			if humanoid then
+				humanoid.PlatformStand = true
+			end
+
+			local moving = control.L + control.R ~= 0 or control.F + control.B ~= 0 or control.Q + control.E ~= 0
+			if moving then
+				speed = 50
+			elseif speed ~= 0 then
+				speed = 0
+			end
+
+			if moving then
+				velocity.Velocity = ((camera.CFrame.LookVector * (control.F + control.B)) + ((camera.CFrame * CFrame.new(control.L + control.R, (control.F + control.B + control.Q + control.E) * 0.2, 0).p) - camera.CFrame.p)) * speed
+				lastControl = { F = control.F, B = control.B, L = control.L, R = control.R }
+			elseif speed ~= 0 then
+				velocity.Velocity = ((camera.CFrame.LookVector * (lastControl.F + lastControl.B)) + ((camera.CFrame * CFrame.new(lastControl.L + lastControl.R, (lastControl.F + lastControl.B + control.Q + control.E) * 0.2, 0).p) - camera.CFrame.p)) * speed
+			else
+				velocity.Velocity = Vector3.new(0, 0, 0)
+			end
+			gyro.CFrame = camera.CFrame
+		until not Fly.flying or not gyro.Parent
+
+		gyro:Destroy()
+		velocity:Destroy()
+		if humanoid then
+			humanoid.PlatformStand = false
+		end
+	end)
+
+	Fly.keyDown = userInputService.InputBegan:Connect(function(input, processed)
+		if processed then
+			return
+		end
+
+		if input.KeyCode == Enum.KeyCode.W then
+			control.F = Fly.speed
+		elseif input.KeyCode == Enum.KeyCode.S then
+			control.B = -Fly.speed
+		elseif input.KeyCode == Enum.KeyCode.A then
+			control.L = -Fly.speed
+		elseif input.KeyCode == Enum.KeyCode.D then
+			control.R = Fly.speed
+		elseif input.KeyCode == Enum.KeyCode.E then
+			control.Q = Fly.speed * 2
+		elseif input.KeyCode == Enum.KeyCode.Q then
+			control.E = -Fly.speed * 2
+		end
+	end)
+
+	Fly.keyUp = userInputService.InputEnded:Connect(function(input, processed)
+		if processed then
+			return
+		end
+
+		if input.KeyCode == Enum.KeyCode.W then
+			control.F = 0
+		elseif input.KeyCode == Enum.KeyCode.S then
+			control.B = 0
+		elseif input.KeyCode == Enum.KeyCode.A then
+			control.L = 0
+		elseif input.KeyCode == Enum.KeyCode.D then
+			control.R = 0
+		elseif input.KeyCode == Enum.KeyCode.E then
+			control.Q = 0
+		elseif input.KeyCode == Enum.KeyCode.Q then
+			control.E = 0
+		end
+	end)
+end
+
+---Apply the Fly toggle: only ever flies inside a chapter, never in the lobby.
+local function applyFly()
+	if settings.Fly and inGame() then
+		task.spawn(Fly.start)
+	else
+		Fly.stop()
+	end
+end
+
+---IY `thirdp`, re-applied whenever the game forces first person (cutscenes, deaths).
+local function applyThirdPerson()
+	if not inGame() then
+		return
+	end
+
+	localPlayer.CameraMode = Enum.CameraMode.Classic
+	table.insert(connections, localPlayer:GetPropertyChangedSignal("CameraMode"):Connect(function()
+		if localPlayer.CameraMode ~= Enum.CameraMode.Classic then
+			localPlayer.CameraMode = Enum.CameraMode.Classic
+		end
+	end))
+end
+
+---Hold the character in place between teleports when not flying. Anchoring would drop network ownership.
+---@param enabled boolean
+local function setHover(enabled)
+	local root = getRoot()
+	if not root then
+		return
+	end
+
+	local hover = root:FindFirstChild("PotentHover")
+	if not enabled or Fly.flying then
+		if hover then
+			hover:Destroy()
+		end
+		return
+	end
+
+	if hover then
+		return
+	end
+
+	hover = Instance.new("BodyVelocity")
+	hover.Name = "PotentHover"
+	hover.MaxForce = Vector3.one * 9e9
+	hover.Velocity = Vector3.zero
+	hover.Parent = root
+end
+
+---Resolve a world CFrame for whatever hosts a prompt.
+---@param prompt ProximityPrompt
+---@return CFrame?
+local function promptCFrame(prompt)
+	local node = prompt.Parent
+	while node and node ~= workspace do
+		if node:IsA("BasePart") then
+			return node.CFrame
+		end
+
+		if node:IsA("Attachment") then
+			return node.WorldCFrame
+		end
+
+		if node:IsA("Model") then
+			local part = node:FindFirstChildWhichIsA("BasePart", true)
+			return part and part.CFrame
+		end
+
+		node = node.Parent
+	end
+	return nil
+end
+
+---Whether the player is holding an item (Tool in hand or the game's own ItemStatus).
+---@return boolean
+local function isHolding()
+	local character = localPlayer.Character
+	if character and character:FindFirstChildWhichIsA("Tool") then
+		return true
+	end
+
+	local status = localPlayer:FindFirstChild("ItemStatus")
+	return status ~= nil and status.Value ~= "None" and status.Value ~= ""
+end
+
+---Current held item status, for logs.
+---@return string
+local function heldStatus()
+	local status = localPlayer:FindFirstChild("ItemStatus")
+	return status and tostring(status.Value) or "?"
+end
+
+---Force a prompt on client-side. The server re-sends prompt states with ActivatePrompt, and transitions can
+---leave a prompt disabled locally even though the server still accepts it.
+---@param prompt ProximityPrompt?
+---@return ProximityPrompt?
+local function enablePrompt(prompt)
+	if prompt then
+		prompt.Enabled = true
+	end
+	return prompt
+end
+
+---Fire a prompt from on top of it until verify() passes.
+---@param prompt ProximityPrompt?
+---@param verify function
+---@param attempts number?
+---@param patience number? Seconds to wait for verify() before firing again (default ~0.18).
+---@return boolean
+local function firePromptUntil(prompt, verify, attempts, patience)
+	if not prompt then
+		return false
+	end
+
+	for _ = 1, attempts or 6 do
+		if verify() then
+			return true
+		end
+
+		if not prompt.Parent then
+			break
+		end
+
+		local cframe = promptCFrame(prompt)
+		if cframe then
+			teleportTo(cframe + Vector3.new(0, WORK_HEIGHT, 0))
+		end
+
+		task.wait()
+		pcall(fireproximityprompt, prompt)
+
+		-- A re-fire before the server answers counts twice on some prompts (placeboards), so be patient there.
+		local deadline = os.clock() + (patience or 0.3)
+		repeat
+			if verify() then
+				return true
+			end
+			task.wait(0.03)
+		until os.clock() >= deadline
+	end
+
+	return verify()
+end
+
+---Machine an order ingredient is processed on, per chapter.
+---@param itemName string
+---@return string
+local function machineFor(itemName)
+	return chapter.machines[itemName] or chapter.defaultMachine
+end
+
+---Name a machine's CookedFood shows for an item (learned live, then config, then the item name).
+---@param itemName string
+---@return string
+local function cookedNameOf(itemName)
+	return learnedCooked[itemName] or chapter.cookedNames[itemName] or itemName
+end
+
+---Return the player's own assigned workstation model.
+---@return Model?
+local function getWorkstation()
+	local value = localPlayer:FindFirstChild("Workstation")
+	local model = value and value.Value
+	if model and model.Parent and model:FindFirstChild("RiceCooker", true) then
+		lastWorkstation = model
+		stationLostAt = nil
+		return model
+	end
+
+	-- The server can drop ownership at course transitions; keep driving the last station we owned.
+	if not stationLostAt then
+		stationLostAt = os.clock()
+		log("Workstation unassigned by server, falling back to last owned station.")
+	end
+
+	if lastWorkstation and lastWorkstation.Parent and lastWorkstation:FindFirstChild("RiceCooker", true) then
+		return lastWorkstation
+	end
+
+	-- Last resort: our equipped station is the only one not named EmptyWorkstation.
+	local kitchen = workspace:FindFirstChild("Kitchen")
+	local spawns = kitchen and kitchen:FindFirstChild("WorkstationSpawns")
+	for _, slot in ipairs(spawns and spawns:GetChildren() or {}) do
+		for _, station in ipairs(slot:GetChildren()) do
+			if station.Name ~= "EmptyWorkstation" and station:FindFirstChild("RiceCooker", true) then
+				lastWorkstation = station
+				return station
+			end
+		end
+	end
+	return nil
+end
+
+---Find a named part of the station, tolerating stations that nest their machines differently.
+---@param workstation Instance
+---@param name string
+---@return Instance?
+local function stationChild(workstation, name)
+	return workstation:FindFirstChild(name) or workstation:FindFirstChild(name, true)
+end
+
+---Return the insert prompt, finish prompt and isReady value for a station machine.
+---@param machine string
+---@return ProximityPrompt?, ProximityPrompt?, BoolValue?
+local function getStationParts(machine)
+	local workstation = getWorkstation()
+	if not workstation then
+		return nil
+	end
+
+	if machine == "Rice" then
+		local cooker = stationChild(workstation, "RiceCooker")
+		local pot = cooker and cooker:FindFirstChild("Pot")
+		return pot and pot:FindFirstChild("RiceProximetyPrompt"), pot and pot:FindFirstChild("FinishedProximetyPrompt"), pot and pot:FindFirstChild("isReady")
+	end
+
+	if machine == "Nori" then
+		local noriMachine = stationChild(workstation, "NoriMachine")
+		local funnel = noriMachine and noriMachine:FindFirstChild("Funnel")
+		local noriEnd = noriMachine and noriMachine:FindFirstChild("NoriEnd")
+		return funnel and funnel:FindFirstChild("ProximityPrompt"), noriEnd and noriEnd:FindFirstChild("ProximityPrompt"), noriMachine and noriMachine:FindFirstChild("isReady")
+	end
+
+	if machine == "Cut" then
+		local board = stationChild(workstation, "CuttingBoard")
+		return board and board:FindFirstChild("ProximityPrompt"), board and board:FindFirstChild("FinishedProximityPrompt"), board and board:FindFirstChild("isReady")
+	end
+
+	return nil
+end
+
+---Return the insert prompt, finish prompt and ready value for any machine, including chapter-specific ones.
+---@param machine string
+---@return ProximityPrompt?, ProximityPrompt?, BoolValue?
+local function getMachineParts(machine)
+	local custom = chapter.machineParts and chapter.machineParts[machine]
+	if custom then
+		return custom()
+	end
+	return getStationParts(machine)
+end
+
+---Return the instance (board or pot) that owns a machine's CookedFood / busy flags.
+---@param machine string
+---@return Instance?
+local function getMachineBody(machine)
+	local workstation = getWorkstation()
+	if not workstation then
+		return nil
+	end
+
+	if machine == "Cut" then
+		return stationChild(workstation, "CuttingBoard")
+	end
+
+	if machine == "Rice" then
+		local cooker = stationChild(workstation, "RiceCooker")
+		return cooker and cooker:FindFirstChild("Pot")
+	end
+
+	if machine == "Nori" then
+		return stationChild(workstation, "NoriMachine")
+	end
+	return nil
+end
+
+---A machine's remembered output (CookedFood StringValue), if it's a memory machine in this chapter.
+---@param machine string
+---@return StringValue?
+local function getMemory(machine)
+	if not chapter.memory[machine] then
+		return nil
+	end
+
+	local body = getMachineBody(machine)
+	return body and body:FindFirstChild("CookedFood")
+end
+
+---Whether the server still has a machine busy cooking.
+---@param machine string
+---@return boolean
+local function isMachineBusy(machine)
+	local body = getMachineBody(machine)
+	if not body then
+		return false
+	end
+
+	local flag = body:FindFirstChild("isActive") or body:FindFirstChild("isCooking")
+	return flag ~= nil and flag.Value == true
+end
+
+---Find an enabled prompt among spawner nodes with a given name, under a folder.
+---@param folder Instance?
+---@param spawnerName string
+---@return ProximityPrompt?
+local function findSpawnerPrompt(folder, spawnerName)
+	if not folder then
+		return nil
+	end
+
+	for _, node in ipairs(folder:GetChildren()) do
+		if node.Name ~= spawnerName then
+			continue
+		end
+
+		local prompt = node:FindFirstChildWhichIsA("ProximityPrompt", true)
+		if prompt and prompt.Enabled then
+			return prompt
+		end
+	end
+	return nil
+end
+
+---Search a folder for an enabled prompt whose text or ancestry matches all keywords.
+---@param folder Instance?
+---@param keywords table
+---@return ProximityPrompt?
+local function findPromptByKeywords(folder, keywords)
+	if not folder then
+		return nil
+	end
+
+	for _, descendant in ipairs(folder:GetDescendants()) do
+		if not descendant:IsA("ProximityPrompt") or not descendant.Enabled then
+			continue
+		end
+
+		local text = (descendant.ActionText .. " " .. descendant.ObjectText .. " " .. descendant.Parent.Name .. " " .. (descendant.Parent.Parent and descendant.Parent.Parent.Name or "")):lower()
+		local matches = true
+		for _, keyword in ipairs(keywords) do
+			if not text:find(keyword, 1, true) then
+				matches = false
+				break
+			end
+		end
+
+		if matches then
+			return descendant
+		end
+	end
+	return nil
+end
+
+---Return a plate on our workstation by side.
+---@param side string
+---@return BasePart?
+local function getPlate(side)
+	local workstation = getWorkstation()
+	local holder = workstation and stationChild(workstation, side)
+	return holder and holder:FindFirstChild("Plate")
+end
+
+---Return the station's placeboards (put-down spots) in a stable order.
+---@return table
+local deadBoards = {}
+
+local function getPlaceboards()
+	local workstation = getWorkstation()
+	local holder = workstation and stationChild(workstation, "PlaceBoards")
+	local boards = {}
+	for _, board in ipairs(holder and holder:GetChildren() or {}) do
+		if board:FindFirstChild("PlacePrompt") and board:FindFirstChild("PickupPrompt") and not deadBoards[board] then
+			table.insert(boards, board)
+		end
+	end
+
+	table.sort(boards, function(a, b)
+		return a:GetPivot().Position.X + a:GetPivot().Position.Z < b:GetPivot().Position.X + b:GetPivot().Position.Z
+	end)
+	return boards
+end
+
+---Return the kitchen trash prompt.
+---@return ProximityPrompt?
+local function getTrashPrompt()
+	local kitchen = workspace:FindFirstChild("Kitchen")
+	local cans = kitchen and kitchen:FindFirstChild("Trashcans")
+	local can = cans and cans:FindFirstChild("TrashCan")
+	local promptPart = can and can:FindFirstChild("PromptPart")
+	return promptPart and promptPart:FindFirstChildWhichIsA("ProximityPrompt")
+end
+
+---Throw away whatever is in hand.
+---@return boolean
+local function trashHeld()
+	return firePromptUntil(getTrashPrompt(), function()
+		return not isHolding()
+	end, 6)
+end
+
+---Mirror the live order GUI into our order table. Frames are parented only after all
+---ingredient icons are cloned in, so a parented frame is always complete.
+local function syncOrders()
+	local gui = localPlayer.PlayerGui:FindFirstChild("Orders")
+	local container = gui and gui:FindFirstChild("Orders")
+	if not container then
+		return
+	end
+
+	local live = {}
+	for _, slotName in ipairs({ "Slot1Order", "Slot2Order" }) do
+		local slotValue = container:FindFirstChild(slotName)
+		local frame = slotValue and slotValue.Value
+		if not (frame and frame.Parent and frame:FindFirstChild("Ingredients")) then
+			continue
+		end
+
+		-- Key by frame instance: the game reuses order names after a failed order.
+		live[frame] = true
+		if orders[frame] then
+			continue
+		end
+
+		local items = {}
+		for _, child in ipairs(frame.Ingredients:GetChildren()) do
+			if child:IsA("GuiObject") and child.Visible and child.Name ~= "IngredientTemplate" then
+				table.insert(items, { name = child.Name, state = "pending" })
+
+				if child.Name == "Sludge" then
+					sludgeSeen = true
+				end
+
+				-- Infer the course from ingredients in case we started mid-run and missed CourseStart.
+				local floor = chapter.courseFloor[child.Name]
+				if floor then
+					currentCourse = math.max(currentCourse, floor)
+				end
+			end
+		end
+
+		orders[frame] = {
+			frame = frame,
+			id = frame.Name,
+			number = tonumber(frame.Name) or math.huge,
+			plate = nil,
+			items = items,
+			delivered = false,
+		}
+
+		local names = {}
+		for _, item in ipairs(items) do
+			table.insert(names, item.name)
+		end
+		log("Order " .. frame.Name .. ": " .. table.concat(names, ", ") .. " (course " .. currentCourse .. ")")
+		lastProgressAt = os.clock()
+	end
+
+	for frame, order in pairs(orders) do
+		if not live[frame] then
+			-- An order can vanish without a verdict (Chapter 2's RedEye trip clears every order). Whatever was
+			-- already on its plate would make that plate refuse the next order, so wipe it first.
+			if not order.delivered and not order.failed and order.plate then
+				for _, item in ipairs(order.items) do
+					if item.state == "plated" then
+						dirtyPlates[order.plate] = true
+						log("Order " .. order.id .. " vanished with food on " .. order.plate .. "; clearing it.")
+						break
+					end
+				end
+			end
+			orders[frame] = nil
+		end
+	end
+end
+
+---Whether a task still belongs to a live order (pre-cooked tasks have none until adopted).
+---@param taskData table
+---@return boolean
+local function isTaskLive(taskData)
+	return taskData.order ~= nil and orders[taskData.order.frame] == taskData.order and not taskData.order.failed
+end
+
+---Undelivered orders, oldest first.
+---@return table
+local function sortedOrders()
+	local list = {}
+	for _, order in pairs(orders) do
+		if not order.delivered and not order.failed then
+			table.insert(list, order)
+		end
+	end
+
+	table.sort(list, function(a, b)
+		return a.number < b.number
+	end)
+	return list
+end
+
+---Which plate an order is assembled on, or nil if it has to wait for one.
+---@param order table
+---@return string?
+local function plateSideFor(order)
+	-- Orders shift between GUI slots as earlier ones finish, so pin each order to a free plate once.
+	if order.plate then
+		return order.plate
+	end
+
+	local used = {}
+	for _, other in pairs(orders) do
+		if other.plate and not other.delivered and not other.failed then
+			used[other.plate] = true
+		end
+	end
+
+	if carriedOrder and carriedOrder.plate then
+		used[carriedOrder.plate] = true
+	end
+
+	for _, side in ipairs(DUAL_PLATE and { "PlateLeft", "PlateRight" } or { "PlateLeft" }) do
+		if not used[side] and not dirtyPlates[side] then
+			order.plate = side
+			return side
+		end
+	end
+	return nil
+end
+
+---Whether every item of an order is on its plate.
+---@param order table
+---@return boolean
+local function isOrderPlated(order)
+	if #order.items == 0 then
+		return false
+	end
+
+	for _, item in ipairs(order.items) do
+		if item.state ~= "plated" then
+			return false
+		end
+	end
+	return true
+end
+
+---Hand machine output from an expired/failed order (or a pre-load) to the next order needing the same item.
+---@param taskData table
+local function adoptTask(taskData)
+	for _, order in ipairs(sortedOrders()) do
+		for _, item in ipairs(order.items) do
+			if item.state == "pending" and item.name == taskData.itemName then
+				item.state = "cooking"
+				taskData.order = order
+				taskData.item = item
+				return
+			end
+		end
+	end
+end
+
+---Whether a machine has finished processing.
+---@param taskData table
+---@return boolean
+local function isTaskFinished(taskData)
+	local elapsed = os.clock() - taskData.startedAt
+	if taskData.machine == "Sludge" then
+		if SLUDGE_FAST then
+			return elapsed > SLUDGE_FAST_FROM and os.clock() >= (taskData.nextTry or 0)
+		end
+
+		local _, cupPrompt = getMachineParts("Sludge")
+		return (cupPrompt ~= nil and cupPrompt.Enabled and elapsed > READY_SETTLE) or elapsed > SLUDGE_CAP
+	end
+
+	local ready = taskData.readyValue
+	if ready and ready.Parent and ready.Value == true then
+		taskData.readySeen = true
+	end
+
+	-- A memory machine is done once the server has switched CookedFood away from what it held before.
+	local memory = taskData.memory
+	if memory then
+		local switched = memory.Value ~= taskData.memoryBefore or memory.Value == cookedNameOf(taskData.itemName)
+		if switched and taskData.readySeen and elapsed > READY_SETTLE then
+			if memory.Value ~= "" and learnedCooked[taskData.itemName] ~= memory.Value then
+				learnedCooked[taskData.itemName] = memory.Value
+				log("Learned: " .. taskData.itemName .. " cooks as " .. memory.Value .. " on " .. taskData.machine .. ".")
+			end
+			return true
+		end
+
+		if elapsed > (MACHINE_CAPS[taskData.machine] or 10) then
+			-- Still showing what it held before: the load never took, and taking now would hand over the old item
+			-- (which the plate then refuses). Load it again instead.
+			if memory.Value == taskData.memoryBefore and memory.Value ~= cookedNameOf(taskData.itemName) and not taskData.held then
+				logWarn(taskData.machine .. " never switched to " .. taskData.itemName .. " (load didn't take); reloading it.")
+				if taskData.item then
+					taskData.item.state = "pending"
+				end
+				activeTasks[taskData.key or taskData.machine] = nil
+				return false
+			end
+			return true
+		end
+		return false
+	end
+
+	-- Measured live: rice 5.2s, nori 5.5s, cutting 7.2s. Caps only matter if isReady is missed.
+	return (taskData.readySeen and elapsed > READY_SETTLE) or elapsed > (MACHINE_CAPS[taskData.machine] or 10)
+end
+
+---Where an item can be had without cooking: "machine" (its memory) or a stash index.
+---@param itemName string
+---@return any
+local function backpackTools(toolName)
+	local backpack = localPlayer:FindFirstChildOfClass("Backpack")
+	local tools = {}
+	for _, tool in ipairs(backpack and backpack:GetChildren() or {}) do
+		if tool:IsA("Tool") and tool.Name == toolName then
+			table.insert(tools, tool)
+		end
+	end
+	return tools
+end
+
+---Tool name of a machine's duplicable output, if the chapter dupes it.
+---@param machine string
+---@return string?
+local function dupeToolFor(machine)
+	return DUPE and chapter.dupe and chapter.dupe[machine] or nil
+end
+
+---Equip a spare copy from the Backpack and wait for the server to count it as held.
+---@param toolName string
+---@return boolean
+local function equipFromBackpack(toolName)
+	local tool = backpackTools(toolName)[1]
+	local character = localPlayer.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if not (tool and humanoid) then
+		return false
+	end
+
+	humanoid:EquipTool(tool)
+	return waitUntil(function()
+		return heldStatus() ~= "None" and heldStatus() ~= ""
+	end, 1.5, 0.05)
+end
+
+---Put the held tool back into the Backpack.
+---@return boolean
+local function stowHeld()
+	local character = localPlayer.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if humanoid then
+		humanoid:UnequipTools()
+	end
+	return waitUntil(function()
+		return not isHolding()
+	end, 1.5, 0.05)
+end
+
+---Every Tool in the Backpack (the server stops handing anything out at 3).
+---@return number
+local function backpackCount()
+	local backpack = localPlayer:FindFirstChildOfClass("Backpack")
+	local count = 0
+	for _, tool in ipairs(backpack and backpack:GetChildren() or {}) do
+		if tool:IsA("Tool") then
+			count += 1
+		end
+	end
+	return count
+end
+
+---Drop bag entries whose Tool left the Backpack.
+local function pruneBag()
+	local backpack = localPlayer:FindFirstChildOfClass("Backpack")
+	for index = #bag, 1, -1 do
+		local entry = bag[index]
+		if not (entry.tool and entry.tool.Parent == backpack) then
+			table.remove(bag, index)
+		end
+	end
+end
+
+---Backpack slots free for stashing. One stays free once sludge is in play, for its dupe copies.
+---@return number
+local function bagRoom()
+	local reserve = (dupeToolFor("Sludge") and currentCourse >= SLUDGE_COURSE) and 1 or 0
+	return BACKPACK_LIMIT - backpackCount() - reserve
+end
+
+---Return "machine", a stash index or "backpack" when an item can be had without cooking.
+---@param itemName string
+---@return any
+local function freeSource(itemName)
+	local machine = machineFor(itemName)
+	local memory = getMemory(machine)
+	local cooked = cookedNameOf(itemName)
+	local inMemory = memory ~= nil and memory.Value ~= "" and memory.Value == cooked
+
+	-- Taking from a memory machine cancels whatever it's cutting, so while it's busy try the other caches first.
+	local cooking = activeTasks[machine]
+	local busy = cooking ~= nil and not cooking.held and cooking.itemName ~= itemName
+	if inMemory and not busy then
+		return "machine"
+	end
+
+	-- Stashed in the Backpack (survives the board wipe at course ends).
+	pruneBag()
+	for _, entry in ipairs(bag) do
+		if entry.cooked == cooked and entry.machine == machine then
+			return "bag"
+		end
+	end
+
+	-- Duped items: Backpack copies are instant, the seed on a placeboard costs one double pickup.
+	local toolName = dupeToolFor(machine)
+	if toolName and #backpackTools(toolName) > 0 then
+		return "backpack"
+	end
+
+	if STASH or toolName then
+		local boards = getPlaceboards()
+		for index, entry in pairs(stash) do
+			if entry.cooked == cooked and entry.machine == machine then
+				-- A board that shows empty was wiped (course end) or emptied some other way: forget the entry.
+				local active = boards[index] and boards[index]:FindFirstChild("isActive")
+				if active and not active.Value then
+					stash[index] = nil
+				else
+					return index
+				end
+			end
+		end
+	end
+
+	if inMemory then
+		return "machine"
+	end
+	return nil
+end
+
+---Whether an item is already cached (machine memory, stash, or cooking right now).
+---@param itemName string
+---@return boolean
+local function isCached(itemName)
+	if freeSource(itemName) then
+		return true
+	end
+
+	local taskData = activeTasks[machineFor(itemName)]
+	return taskData ~= nil and taskData.itemName == itemName
+end
+
+---Take an item from a machine's memory or the stash, as a held task in the machine's Free slot.
+---@param order table
+---@param item table
+---@param source any
+---@return boolean
+local function takeFree(order, item, source)
+	if isHolding() then
+		return false
+	end
+
+	local machine = machineFor(item.name)
+	local got = false
+	if source == "backpack" or (stash[source] and stash[source].dupeSeed) then
+		got = grabDupe(machine)
+	elseif source == "bag" then
+		local cooked = cookedNameOf(item.name)
+		for index, entry in ipairs(bag) do
+			if entry.cooked == cooked and entry.machine == machine then
+				table.remove(bag, index)
+				local character = localPlayer.Character
+				local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+				if humanoid and entry.tool.Parent then
+					humanoid:EquipTool(entry.tool)
+					got = waitUntil(function()
+						return heldStatus() ~= "None" and heldStatus() ~= ""
+					end, 1.5, 0.05)
+				end
+				log((got and "Used bagged " or "Bagged item missing: ") .. item.name .. ".")
+				break
+			end
+		end
+	elseif source == "machine" then
+		local _, finishPrompt = getMachineParts(machine)
+		local cooking = activeTasks[machine]
+		got = firePromptUntil(enablePrompt(finishPrompt), isHolding, 3)
+		if got then
+			log("Free " .. item.name .. " from the " .. machine .. " machine.")
+			-- That take cancelled any cut in progress: requeue it now instead of waiting out its timer.
+			if cooking and not cooking.held and cooking.itemName ~= item.name and activeTasks[machine] == cooking then
+				log("That cancelled the " .. cooking.itemName .. " cut; requeueing it.")
+				if cooking.item then
+					cooking.item.state = "pending"
+				end
+				activeTasks[machine] = nil
+			end
+		end
+	else
+		local spot = getPlaceboards()[source]
+		stash[source] = nil
+		got = spot ~= nil and firePromptUntil(enablePrompt(spot.PickupPrompt), isHolding, 3, Tune.BOARD_PATIENCE)
+		if got then
+			log("Used stashed " .. item.name .. " from placeboard " .. tostring(source) .. ".")
+		else
+			log("Stashed " .. item.name .. " was gone from placeboard " .. tostring(source) .. " (wiped).")
+		end
+	end
+
+	if not got then
+		return false
+	end
+
+	item.state = "cooking"
+	local key = machine .. "Free"
+	activeTasks[key] = {
+		key = key,
+		machine = machine,
+		itemName = item.name,
+		order = order,
+		item = item,
+		startedAt = os.clock(),
+		readySeen = true,
+		held = true,
+	}
+	return true
+end
+
+---Rank an item for the current course (lower is more likely); unknown items rank last.
+---@param itemName string?
+---@return number
+local function rankOf(itemName)
+	-- Dupe seeds stay put: copies of them are worth more than any cached cut item.
+	if itemName and dupeToolFor(machineFor(itemName)) then
+		return 0
+	end
+	for position, poolName in ipairs(chapter.pools[currentCourse] or chapter.pools[4] or {}) do
+		if poolName == itemName then
+			return position
+		end
+	end
+	return math.huge
+end
+
+---Item name for a machine's cooked name, so stash entries can be ranked.
+---@param machine string
+---@param cooked string
+---@return string
+local function itemForCooked(machine, cooked)
+	for itemName, cookedName in pairs(learnedCooked) do
+		if cookedName == cooked and machineFor(itemName) == machine then
+			return itemName
+		end
+	end
+
+	for itemName, cookedName in pairs(chapter.cookedNames) do
+		if cookedName == cooked and machineFor(itemName) == machine then
+			return itemName
+		end
+	end
+	return cooked
+end
+
+---Before a memory machine switches away from its current item, keep a copy on a placeboard
+---(evicting the least likely stashed item when both spots are full).
+---@param machine string
+---@param nextItemName string
+local function stashCurrent(machine, nextItemName)
+	if not STASH or isHolding() then
+		return
+	end
+
+	local memory = getMemory(machine)
+	local current = memory and memory.Value or ""
+	if current == "" or current == cookedNameOf(nextItemName) then
+		return
+	end
+
+	for _, entry in pairs(stash) do
+		if entry.cooked == current and entry.machine == machine then
+			return
+		end
+	end
+	pruneBag()
+	for _, entry in ipairs(bag) do
+		if entry.cooked == current and entry.machine == machine then
+			return
+		end
+	end
+
+	-- Prefer the Backpack: the server clears both placeboards whenever a course ends but leaves the Backpack alone.
+	if bagRoom() > 0 then
+		local currentItemName = itemForCooked(machine, current)
+		local _, finishPrompt = getMachineParts(machine)
+		local backpack = localPlayer:FindFirstChildOfClass("Backpack")
+		local before = {}
+		for _, tool in ipairs(backpack and backpack:GetChildren() or {}) do
+			before[tool] = true
+		end
+		if not (finishPrompt and firePromptUntil(enablePrompt(finishPrompt), isHolding, 3)) then
+			return
+		end
+		waitUntil(function()
+			local character = localPlayer.Character
+			return character ~= nil and character:FindFirstChildWhichIsA("Tool") ~= nil
+		end, 1, 0.05)
+		if stowHeld() then
+			for _, tool in ipairs(backpack and backpack:GetChildren() or {}) do
+				if tool:IsA("Tool") and not before[tool] then
+					table.insert(bag, { tool = tool, cooked = current, item = currentItemName, machine = machine, at = os.clock() })
+					log("Bagged " .. currentItemName .. " (" .. #bag .. " in the Backpack).")
+					return
+				end
+			end
+		end
+		logWarn("Couldn't bag " .. currentItemName .. "; binning it.")
+		if isHolding() then
+			trashHeld()
+		end
+		return
+	end
+
+	local placeboards = getPlaceboards()
+	local currentItem = itemForCooked(machine, current)
+	local target = nil
+	for index = 1, #placeboards do
+		if not stash[index] then
+			target = index
+			break
+		end
+	end
+
+	if not target then
+		local worst = nil
+		for index, entry in pairs(stash) do
+			local worse = not worst or rankOf(entry.item) > rankOf(stash[worst].item)
+				or (rankOf(entry.item) == rankOf(stash[worst].item) and entry.at < stash[worst].at)
+			if worse then
+				worst = index
+			end
+		end
+
+		-- Keep the current item instead if it's less likely than everything stashed.
+		if not worst or rankOf(currentItem) > rankOf(stash[worst].item) then
+			return
+		end
+
+		target = worst
+		local evicted = stash[target].item
+		stash[target] = nil
+		if firePromptUntil(enablePrompt(placeboards[target].PickupPrompt), isHolding, 3, Tune.BOARD_PATIENCE) then
+			trashHeld()
+			log("Evicted stashed " .. tostring(evicted) .. " from placeboard " .. target .. ".")
+		end
+	end
+
+	local _, finishPrompt = getMachineParts(machine)
+	if not finishPrompt then
+		return
+	end
+
+	if firePromptUntil(enablePrompt(finishPrompt), isHolding, 3) then
+		if firePromptUntil(enablePrompt(placeboards[target].PlacePrompt), function()
+			return not isHolding()
+		end, 3, Tune.BOARD_PATIENCE) then
+			stash[target] = { cooked = current, item = currentItem, machine = machine, at = os.clock() }
+			log("Stashed " .. currentItem .. " on placeboard " .. target .. ".")
+		else
+			trashHeld()
+		end
+	end
+end
+
+local dupeRetryAt = 0
+
+---Fire a placeboard's pickup prompt twice back to back; the second lands a copy in the Backpack.
+---@param board BasePart
+---@return boolean
+local function doublePickup(board)
+	local prompt = enablePrompt(board:FindFirstChild("PickupPrompt"))
+	local cframe = prompt and promptCFrame(prompt)
+	if not cframe then
+		return false
+	end
+
+	teleportTo(cframe + Vector3.new(0, WORK_HEIGHT, 0))
+	task.wait(Tune.DUPE_MOVE_SETTLE)
+	-- The game re-disables board prompts after a place, so switch it on right before each fire.
+	enablePrompt(prompt)
+	pcall(fireproximityprompt, prompt)
+	task.wait(Tune.DUPE_GAP)
+	enablePrompt(prompt)
+	pcall(fireproximityprompt, prompt)
+	return waitUntil(isHolding, 1, 0.05)
+end
+
+---A placeboard can end up marked occupied with nothing on it (a doubled place). The server then refuses
+---both pickup and place there, so drop it from the board list for the rest of the run.
+---@param board BasePart
+local function markBoardDead(board)
+	if deadBoards[board] then
+		return
+	end
+	deadBoards[board] = true
+	-- Stash slots are list indexes, so they shift once a board leaves the list.
+	table.clear(stash)
+	logWarn("Placeboard " .. board:GetFullName():match("[^.]+$") .. " is stuck occupied with nothing on it; skipping it.")
+end
+
+---Whether a placeboard currently holds something.
+---@param board BasePart
+---@return boolean
+local function boardFull(board)
+	local active = board:FindFirstChild("isActive")
+	return active ~= nil and active.Value
+end
+
+---Empty a placeboard into the trash. Returns false (and retires the board) if it claims to hold
+---something that can't be picked up.
+---@param board BasePart
+---@return boolean
+local function clearBoard(board)
+	if not boardFull(board) then
+		return true
+	end
+	if isHolding() then
+		return false
+	end
+
+	if firePromptUntil(enablePrompt(board.PickupPrompt), isHolding, 3, Tune.BOARD_PATIENCE) then
+		trashHeld()
+		return not boardFull(board) or clearBoard(board)
+	end
+
+	markBoardDead(board)
+	return false
+end
+
+---Pick a placeboard for duping: an empty one the stash isn't using, else evict the least likely stash entry.
+---@return BasePart?
+local function dupeBoard()
+	local boards = getPlaceboards()
+	for index, board in ipairs(boards) do
+		if not stash[index] and not boardFull(board) then
+			return board
+		end
+	end
+
+	-- Something untracked on a board: bin it (or find out the board is dead).
+	for index, board in ipairs(boards) do
+		if not stash[index] and clearBoard(board) then
+			return board
+		end
+	end
+
+	boards = getPlaceboards()
+	local worst, worstRank = nil, -1
+	for index, entry in pairs(stash) do
+		local rank = rankOf(entry.item)
+		if boards[index] and rank > worstRank then
+			worst, worstRank = index, rank
+		end
+	end
+	if not worst then
+		return nil
+	end
+
+	local board = boards[worst]
+	local entry = stash[worst]
+	stash[worst] = nil
+	if not clearBoard(board) then
+		return nil
+	end
+	log("Evicted stashed " .. tostring(entry.item) .. " from placeboard " .. worst .. " for duping.")
+	return board
+end
+
+---Put the held item down on a placeboard; true only once it has actually left the hand.
+---@param board BasePart
+---@return boolean
+local function placeOnBoard(board)
+	local placed = firePromptUntil(enablePrompt(board.PlacePrompt), function()
+		return not isHolding() and boardFull(board)
+	end, 4, Tune.BOARD_PATIENCE)
+	if not placed and isHolding() and boardFull(board) then
+		-- Shows occupied but won't take the item: the board is dead.
+		markBoardDead(board)
+	end
+	return placed
+end
+
+---Stash index of the dupe seed for a machine, if one sits on a placeboard.
+---@param machine string
+---@return number?
+local function seedIndex(machine)
+	for index, entry in pairs(stash) do
+		if entry.dupeSeed and entry.machine == machine then
+			return index
+		end
+	end
+	return nil
+end
+
+---Put the held copy (or a Backpack one) down as the machine's seed. Leaves the hands empty.
+---@param machine string
+---@return number? index
+local function plantSeed(machine)
+	local toolName = dupeToolFor(machine)
+
+	-- Hands must be free to clear a board; only stow when the Backpack has room for it.
+	if isHolding() and backpackCount() < BACKPACK_LIMIT then
+		stowHeld()
+	end
+
+	local board
+	if isHolding() then
+		for index, candidate in ipairs(getPlaceboards()) do
+			if not stash[index] and not boardFull(candidate) then
+				board = candidate
+				break
+			end
+		end
+	else
+		board = dupeBoard()
+	end
+	if not board then
+		return nil
+	end
+
+	if not isHolding() and not equipFromBackpack(toolName) then
+		return nil
+	end
+	if not placeOnBoard(board) then
+		if backpackCount() < BACKPACK_LIMIT then
+			stowHeld()
+		else
+			trashHeld()
+		end
+		return nil
+	end
+
+	local index = table.find(getPlaceboards(), board)
+	if index then
+		stash[index] = { cooked = cookedNameOf(machine), item = machine, machine = machine, at = os.clock(), dupeSeed = true }
+		log("Planted a " .. machine .. " seed on placeboard " .. index .. ".")
+	end
+	return index
+end
+
+---Double pickup on the seed: one copy lands in the Backpack, the seed goes back down.
+---Returns whether a copy was made; the hands end empty unless the seed couldn't be put back.
+---@param machine string
+---@param index number
+---@return boolean
+local function dupeFromSeed(machine, index)
+	local toolName = dupeToolFor(machine)
+	local board = getPlaceboards()[index]
+	if not board or not boardFull(board) then
+		stash[index] = nil
+		return false
+	end
+
+	local count = #backpackTools(toolName)
+	task.wait(Tune.DUPE_PLACE_SETTLE)
+	if not doublePickup(board) then
+		stash[index] = nil
+		return false
+	end
+
+	local copied = waitUntil(function()
+		return #backpackTools(toolName) > count
+	end, 1, 0.05)
+	if not placeOnBoard(board) then
+		stash[index] = nil
+	end
+	return copied
+end
+
+---Get one copy of a duped item into the hand: a Backpack copy, else a fresh copy off the seed.
+---@param machine string
+---@return boolean
+grabDupe = function(machine)
+	local toolName = dupeToolFor(machine)
+	if not toolName or isHolding() then
+		return false
+	end
+
+	if #backpackTools(toolName) > 0 then
+		if equipFromBackpack(toolName) then
+			log("Backpack " .. machine .. " (" .. #backpackTools(toolName) .. " left).")
+			return true
+		end
+		return false
+	end
+
+	local index = seedIndex(machine)
+	if not index then
+		return false
+	end
+
+	local copied = dupeFromSeed(machine, index)
+	if isHolding() then
+		-- The seed couldn't go back down: use it directly.
+		log("Used the " .. machine .. " seed itself.")
+		return true
+	end
+	if copied and equipFromBackpack(toolName) then
+		log("Duped " .. machine .. " off the seed on placeboard " .. index .. ".")
+		return true
+	end
+
+	-- No copy this time: take the seed itself rather than leave the order waiting.
+	local board = getPlaceboards()[index]
+	if board and firePromptUntil(enablePrompt(board.PickupPrompt), isHolding, 3, Tune.BOARD_PATIENCE) then
+		stash[index] = nil
+		log("Took the " .. machine .. " seed itself (no copy).")
+		return true
+	end
+	return false
+end
+
+---Keep a seed planted and the Backpack at its cap of copies.
+---@param machine string
+---@return boolean
+local function refillDupes(machine)
+	local toolName = dupeToolFor(machine)
+	if not toolName then
+		return false
+	end
+
+	local before = #backpackTools(toolName)
+	local index = seedIndex(machine)
+	if not index then
+		index = plantSeed(machine)
+		if not index then
+			logWarn("Dupe: couldn't plant a " .. machine .. " seed.")
+			dupeRetryAt = os.clock() + Tune.DUPE_FAIL_RETRY
+			return false
+		end
+	end
+
+	local misses = 0
+	while seedIndex(machine) and #backpackTools(toolName) < Tune.DUPE_TARGET and backpackCount() < BACKPACK_LIMIT and misses < 2 do
+		if not dupeFromSeed(machine, index) then
+			misses += 1
+		end
+		if isHolding() then
+			break
+		end
+	end
+
+	-- A seed that couldn't go back down is still worth keeping.
+	if isHolding() then
+		if backpackCount() < BACKPACK_LIMIT then
+			stowHeld()
+		else
+			trashHeld()
+		end
+	end
+
+	local after = #backpackTools(toolName)
+	if after <= before and misses > 0 then
+		logWarn("Dupe round missed; trying again shortly.")
+		dupeRetryAt = os.clock() + Tune.DUPE_FAIL_RETRY
+	end
+	log(string.format("Duped %s: Backpack %d -> %d, seed %s.", machine, before, after, seedIndex(machine) and "planted" or "missing"))
+	return after > before or seedIndex(machine) ~= nil
+end
+
+---Whether the sludge machine is running or holding a cup that no task tracks.
+---@return boolean
+sludgeCupUntracked = function()
+	if sludgeLeverAt and (not sludgeTakenAt or sludgeTakenAt < sludgeLeverAt) then
+		return true
+	end
+
+	-- No lever seen this session (e.g. a reload mid-cook): a lit last stage means a full cup.
+	local sludgeRoom = workspace:FindFirstChild("SludgeRoom")
+	local machine = sludgeRoom and sludgeRoom:FindFirstChild("MachineRoom") and sludgeRoom.MachineRoom:FindFirstChild("Machine")
+	local stage = machine and machine:FindFirstChild("Stage5")
+	local light = stage and stage:FindFirstChild("StatusLight")
+	return light ~= nil and light:IsA("BasePart") and light.BrickColor == BrickColor.new("Lime green")
+end
+
+---Grab an ingredient and load it into its machine (or run the chapter's special handler).
+---@param order table?
+---@param item table
+---@return boolean
+local function startItem(order, item)
+	local machine = machineFor(item.name)
+
+	-- Chapter-specific ingredients (spores, placeholders) have their own handlers.
+	local special = chapter.special and chapter.special[machine]
+	if special then
+		return special(order, item)
+	end
+
+	local insertPrompt, finishPrompt, readyValue = getMachineParts(machine)
+
+	-- Machines whose finish prompt hands out output even when empty.
+	if chapter.freeFinish[machine] and order then
+		if not firePromptUntil(enablePrompt(finishPrompt), isHolding, 4) then
+			return false
+		end
+
+		item.state = "cooking"
+		activeTasks[machine] = {
+			machine = machine,
+			itemName = item.name,
+			order = order,
+			item = item,
+			startedAt = os.clock(),
+			readySeen = true,
+			held = true,
+		}
+		return true
+	end
+
+	-- Memory machines and the stash can hand some items over right now.
+	if order then
+		local source = freeSource(item.name)
+		if source then
+			return takeFree(order, item, source)
+		end
+	end
+
+	if not insertPrompt then
+		return false
+	end
+
+	local startedAt = os.clock()
+	if machine == "Sludge" then
+		-- The lever is the whole input step for sludge; it only works from course 4.
+		if not insertPrompt.Enabled then
+			-- A cup we lost track of (the server's echo came back late) keeps the lever down forever: adopt it.
+			if activeTasks.Sludge or not sludgeCupUntracked() then
+				return false
+			end
+			startedAt = sludgeLeverAt or (os.clock() - SLUDGE_FAST_FROM)
+			logWarn(string.format("Adopted an untracked Sludge cup (%.1fs in).", os.clock() - startedAt))
+		else
+			local pulledAt = os.clock()
+			local function leverWent()
+				return not insertPrompt.Enabled or (sludgeLeverAt ~= nil and sludgeLeverAt >= pulledAt)
+			end
+			if not firePromptUntil(insertPrompt, leverWent, 3) then
+				-- Under lag the echo can trail the pull by seconds; give it a moment before calling it a miss.
+				local deadline = os.clock() + 4
+				while not leverWent() and os.clock() < deadline do
+					task.wait(0.1)
+				end
+				if not leverWent() then
+					sludgeRetryAt = os.clock() + SLUDGE_LOCKED_RETRY
+					return false
+				end
+			end
+			if sludgeLeverAt and sludgeLeverAt >= pulledAt then
+				startedAt = sludgeLeverAt
+			end
+		end
+	else
+		-- The server keeps a machine busy until its own timer ends.
+		if isMachineBusy(machine) then
+			return false
+		end
+
+		-- About to switch a memory machine to another item: keep its current one on a placeboard.
+		if chapter.memory[machine] then
+			stashCurrent(machine, item.name)
+		end
+
+		-- Untracked output sitting in the machine blocks loading; bin it first.
+		if readyValue and readyValue.Value and not isHolding() then
+			if firePromptUntil(enablePrompt(finishPrompt), isHolding, 3) then
+				log("Cleared untracked " .. machine .. " output before loading.")
+				trashHeld()
+			end
+		end
+
+		local source = chapter.findSource(item.name)
+		if not source then
+			item.noSource = true
+			if order and not item.sourceWarned then
+				item.sourceWarned = true
+				logWarn("No source found for " .. item.name .. " yet.")
+			end
+			return false
+		end
+
+		if not firePromptUntil(source, isHolding, 6) then
+			return false
+		end
+
+		if not firePromptUntil(enablePrompt(insertPrompt), function()
+			return not isHolding()
+		end, 6) then
+			-- ItemStatus can lag the insert; one last look before calling it a refusal.
+			task.wait(0.3)
+			if isHolding() then
+				logWarn(machine .. " refused " .. item.name .. " (held " .. heldStatus() .. "), trashing it.")
+				trashHeld()
+				return false
+			end
+		end
+	end
+
+	item.state = "cooking"
+	local memory = getMemory(machine)
+	activeTasks[machine] = {
+		machine = machine,
+		itemName = item.name,
+		order = order,
+		item = item,
+		readyValue = readyValue,
+		memory = memory,
+		memoryBefore = memory and memory.Value or nil,
+		preload = order == nil,
+		startedAt = startedAt,
+		held = false,
+	}
+	return true
+end
+
+---Take whatever is on a plate and bin it, so a fresh order can be built there.
+---@param side string
+---@return boolean
+local function plateHasFood(side)
+	local plate = getPlate(side)
+	for _, descendant in ipairs(plate and plate:GetDescendants() or {}) do
+		if descendant:IsA("BasePart") and descendant.Transparency < 1 then
+			return true
+		end
+	end
+	return false
+end
+
+Tune.PLATE_CLEAR_TRIES = 3
+local plateClearTries = {}
+
+local function clearPlate(side)
+	if isHolding() then
+		trashHeld()
+	end
+
+	local plate = getPlate(side)
+	local takePrompt = plate and plate:FindFirstChild("TakePrompt")
+	if firePromptUntil(enablePrompt(takePrompt), isHolding, 4) then
+		trashHeld()
+		log("Cleared stale food from " .. side .. ".")
+	end
+
+	-- The take can miss (food still replicating); keep the plate dirty and retry a few times rather than
+	-- hand it to the next order with food still on it.
+	if plateHasFood(side) then
+		plateClearTries[side] = (plateClearTries[side] or 0) + 1
+		if plateClearTries[side] < Tune.PLATE_CLEAR_TRIES then
+			return true
+		end
+		logWarn("Couldn't clear " .. side .. " after " .. Tune.PLATE_CLEAR_TRIES .. " tries; using it anyway.")
+	end
+
+	plateClearTries[side] = nil
+	dirtyPlates[side] = nil
+	return true
+end
+
+---Bring the station to a known state on start: bin leftovers, keep machine memory, adopt a ready sludge cup.
+local function flushMachines()
+	if isHolding() then
+		trashHeld()
+	end
+
+	-- A non-memory machine's ready output is unknown; memory machines just keep dispensing their item.
+	for _, machine in ipairs({ "Cut", "Rice" }) do
+		local _, finishPrompt, readyValue = getMachineParts(machine)
+		if not chapter.memory[machine] and not chapter.freeFinish[machine] and readyValue and readyValue.Value then
+			if firePromptUntil(enablePrompt(finishPrompt), isHolding, 2) then
+				log("Flushed leftover " .. machine .. " output.")
+				trashHeld()
+			end
+		end
+	end
+
+	-- Placeboards may hold unknown items from a previous run; clear them so the stash starts empty.
+	-- Ingredients already in the Backpack (e.g. after a reload) are stash entries we forgot; adopt them so the
+	-- stray cleanup doesn't bin them.
+	table.clear(bag)
+	local backpack = localPlayer:FindFirstChildOfClass("Backpack")
+	for _, tool in ipairs(backpack and backpack:GetChildren() or {}) do
+		if tool:IsA("Tool") then
+			-- Most ingredients aren't listed in chapter.machines (they default to the cutter), so check the pools too.
+			local candidates = {}
+			for itemName in pairs(chapter.machines) do
+				candidates[itemName] = true
+			end
+			for _, pool in pairs(chapter.pools) do
+				for _, itemName in ipairs(pool) do
+					candidates[itemName] = true
+				end
+			end
+			for itemName in pairs(candidates) do
+				local machine = machineFor(itemName)
+				if chapter.memory[machine] and cookedNameOf(itemName) == tool.Name then
+					table.insert(bag, { tool = tool, cooked = tool.Name, item = itemName, machine = machine, at = os.clock() })
+					log("Adopted " .. itemName .. " already in the Backpack.")
+					break
+				end
+			end
+		end
+	end
+
+	-- Boards get destroyed and rebuilt when a course ends, so one may be mid-rebuild here: look things up
+	-- defensively, and don't retire a board on this one failed pickup.
+	for index, spot in ipairs(getPlaceboards()) do
+		local pickup = spot.Parent and spot:FindFirstChild("PickupPrompt")
+		if pickup and not isHolding() and firePromptUntil(enablePrompt(pickup), isHolding, 2, Tune.BOARD_PATIENCE) then
+			log("Cleared leftover item from placeboard " .. index .. ".")
+			trashHeld()
+		end
+	end
+	table.clear(stash)
+
+	-- A filled sludge cup locks the lever until collected, so adopt it as ready sludge.
+	if chapter.machineParts and chapter.machineParts.Sludge then
+		-- The cup prompt is force-enabled by us, so judge by the machine's ready light instead.
+		if sludgeCupUntracked() then
+			activeTasks.Sludge = {
+				machine = "Sludge",
+				itemName = "Sludge",
+				item = { name = "", state = "cooking" },
+				startedAt = os.clock() - SLUDGE_CAP,
+				held = false,
+			}
+			log("Adopted ready Sludge from previous run.")
+		end
+	end
+
+	-- A half-built plate from a previous run would block the order assigned to it.
+	for _, side in ipairs({ "PlateLeft", "PlateRight" }) do
+		local plate = getPlate(side)
+		if not plate then
+			continue
+		end
+
+		local hasFood = false
+		for _, descendant in ipairs(plate:GetDescendants()) do
+			if descendant:IsA("BasePart") and descendant.Transparency < 1 then
+				hasFood = true
+				break
+			end
+		end
+
+		if hasFood and firePromptUntil(enablePrompt(plate:FindFirstChild("TakePrompt")), isHolding, 4) then
+			log("Flushed leftover food on " .. side .. ".")
+			trashHeld()
+		end
+	end
+end
+
+---Pull finished output from its machine and plate it.
+---@param taskData table
+---@param side string
+---@return boolean
+local function plateTask(taskData, side)
+	if not taskData.held then
+		local _, finishPrompt = getMachineParts(taskData.machine)
+		enablePrompt(finishPrompt)
+
+		-- Fast sludge: the cup prompt is only gated client-side, so switch it on and try from ~17s.
+		if SLUDGE_FAST and taskData.machine == "Sludge" and finishPrompt then
+			local elapsed = os.clock() - taskData.startedAt
+			if not firePromptUntil(finishPrompt, isHolding, 1) then
+				if elapsed < SLUDGE_CAP then
+					taskData.nextTry = os.clock() + SLUDGE_RETRY
+					return false
+				end
+			else
+				log(string.format("Sludge taken %.1fs after the lever.", elapsed))
+			end
+		end
+
+		-- A fresh cup seeds the Backpack: dupe it, then plate one of the copies.
+		if isHolding() and dupeToolFor(taskData.machine) and not seedIndex(taskData.machine) then
+			-- The held Tool can trail ItemStatus by a moment; stowing needs the Tool itself.
+			waitUntil(function()
+				local character = localPlayer.Character
+				return character ~= nil and character:FindFirstChildWhichIsA("Tool") ~= nil
+			end, 1, 0.05)
+			refillDupes(taskData.machine)
+			if not isHolding() and not grabDupe(taskData.machine) then
+				logWarn("Dupe: lost the seeded " .. taskData.machine .. ", re-queueing it.")
+				taskData.item.state = "pending"
+				activeTasks[taskData.key or taskData.machine] = nil
+				return false
+			end
+			taskData.held = true
+		end
+
+		if not isHolding() and not firePromptUntil(finishPrompt, isHolding, 4) then
+			-- Course transitions wipe the station, so output we were tracking can vanish. Re-cook it.
+			taskData.collectFailures = (taskData.collectFailures or 0) + 1
+			if taskData.collectFailures >= 3 then
+				logWarn(taskData.machine .. " output for " .. taskData.itemName .. " is gone, re-queueing.")
+				if taskData.item then
+					taskData.item.state = "pending"
+				end
+				activeTasks[taskData.key or taskData.machine] = nil
+			end
+			return false
+		end
+		taskData.held = true
+	end
+
+	local plate = getPlate(side)
+	local addPrompt = plate and plate:FindFirstChild("AddIngredientPrompt")
+	if not firePromptUntil(enablePrompt(addPrompt), function()
+		return not isHolding()
+	end, 8) then
+		-- The plate keeps refusing, usually stale food from a failed order: wipe it and rebuild this order.
+		taskData.failures = (taskData.failures or 0) + 1
+		if taskData.failures >= 2 then
+			local states = {}
+			for _, orderItem in ipairs(taskData.order and taskData.order.items or {}) do
+				table.insert(states, orderItem.name .. "=" .. orderItem.state)
+			end
+			logWarn("Plate " .. side .. " refused " .. taskData.itemName .. " (held " .. heldStatus() .. ") for order "
+				.. tostring(taskData.order and taskData.order.id) .. " [" .. table.concat(states, ",") .. "], clearing and rebuilding.")
+			trashHeld()
+			clearPlate(side)
+			for _, item in ipairs(taskData.order and taskData.order.items or {}) do
+				if item.state == "plated" then
+					item.state = "pending"
+				end
+			end
+			taskData.item.state = "pending"
+			activeTasks[taskData.key or taskData.machine] = nil
+		end
+		return false
+	end
+
+	taskData.item.state = "plated"
+	activeTasks[taskData.key or taskData.machine] = nil
+	return true
+end
+
+---Ingredient signature of an order, so identical orders can be told apart from different ones.
+---@param order table
+---@return string
+local function orderSignature(order)
+	local names = {}
+	for _, item in ipairs(order.items) do
+		table.insert(names, item.name)
+	end
+	table.sort(names)
+	return table.concat(names, ",")
+end
+
+---The server credits a plate to the oldest open order with the same ingredients. If an older identical order
+---is still open, hand this plate (and its build progress) to that one so our tracking matches the server.
+---@param order table
+---@return table
+local function claimOldestTwin(order)
+	local signature = orderSignature(order)
+	local oldest = order
+	for _, other in pairs(orders) do
+		if other ~= order and not other.delivered and not other.failed and other.number < oldest.number and orderSignature(other) == signature then
+			oldest = other
+		end
+	end
+
+	if oldest == order then
+		return order
+	end
+
+	oldest.plate, order.plate = order.plate, oldest.plate
+	oldest.items, order.items = order.items, oldest.items
+	for _, taskData in pairs(activeTasks) do
+		if taskData.order == order then
+			taskData.order = oldest
+		elseif taskData.order == oldest then
+			taskData.order = order
+		end
+	end
+	log("Delivering this plate as order " .. oldest.id .. " (identical to order " .. order.id .. ").")
+	return oldest
+end
+
+---Pick up a finished plate and deliver it.
+---@param order table
+---@param side string
+---@return boolean
+local function deliverOrder(order, side)
+	if carriedOrder ~= order then
+		order = claimOldestTwin(order)
+		side = order.plate or side
+		local plate = getPlate(side)
+		local takePrompt = plate and plate:FindFirstChild("TakePrompt")
+		if not firePromptUntil(enablePrompt(takePrompt), isHolding, 8) then
+			return false
+		end
+		carriedOrder = order
+	end
+
+	if not firePromptUntil(chapter.deliveryPrompt(), function()
+		return not isHolding()
+	end, 8) then
+		return false
+	end
+
+	carriedOrder = nil
+	order.delivered = true
+	order.deliveredAt = os.clock()
+	lastDeliveryAt = os.clock()
+	ScarySushi.delivered += 1
+	log("Delivered order " .. order.id .. " (" .. ScarySushi.delivered .. " total)")
+
+	-- Counted on our own delivery (the server's verdict lands a second later, after the next pre-load started).
+	courseDeliveries += 1
+	if courseDeliveries >= Tune.ORDERS_PER_COURSE then
+		courseDoneAt = os.clock()
+	end
+	return true
+end
+
+---Run one scheduling decision. Returns true if an action was taken.
+---@return boolean
+local function step()
+	syncOrders()
+	local list = sortedOrders()
+
+	-- The server answers a good delivery with CompleteOrder within ~1s. If the order is still up after
+	-- DELIVERY_VERIFY seconds the plate was rejected, so rebuild the whole order.
+	for _, order in pairs(orders) do
+		if order.delivered and order.deliveredAt and os.clock() - order.deliveredAt > DELIVERY_VERIFY then
+			logWarn("Order " .. order.id .. " was not accepted by the server, rebuilding it.")
+			courseDeliveries = math.max(0, courseDeliveries - 1)
+			if courseDeliveries < Tune.ORDERS_PER_COURSE then
+				courseDoneAt = nil
+			end
+			order.delivered = false
+			order.deliveredAt = nil
+			order.plate = nil
+			for _, item in ipairs(order.items) do
+				item.state = "pending"
+			end
+			ScarySushi.delivered -= 1
+		end
+	end
+
+	-- Plates left dirty by a failed order get wiped while the hands are free.
+	if not carriedOrder and not isHolding() then
+		for side in pairs(dirtyPlates) do
+			return clearPlate(side)
+		end
+	end
+
+	-- A plate already in hand must be delivered first.
+	if carriedOrder then
+		return deliverOrder(carriedOrder, plateSideFor(carriedOrder) or "PlateLeft")
+	end
+
+	-- Re-home output whose order expired or failed, and claim pre-cooked output.
+	for _, taskData in pairs(activeTasks) do
+		if not isTaskLive(taskData) then
+			adoptTask(taskData)
+		end
+	end
+
+	-- Free the hand: an item already pulled from a machine gets plated next.
+	for _, taskData in pairs(activeTasks) do
+		local side = taskData.held and isTaskLive(taskData) and plateSideFor(taskData.order)
+		if side then
+			return plateTask(taskData, side)
+		end
+	end
+
+	-- A held item whose order died and couldn't be re-homed is dead weight: drop the task.
+	for key, taskData in pairs(activeTasks) do
+		if taskData.held and not isTaskLive(taskData) then
+			activeTasks[key] = nil
+		end
+	end
+
+	-- Nothing we track is in hand, so anything held is a stray; bin it.
+	if isHolding() then
+		logWarn("Holding untracked " .. heldStatus() .. ", trashing it.")
+		return trashHeld()
+	end
+
+	-- A full Backpack blocks every pickup, so bin strays (accidental double fires) and copies past the cap.
+	if not isHolding() then
+		local backpack = localPlayer:FindFirstChildOfClass("Backpack")
+		local kept = {}
+		for _, tool in ipairs(backpack and backpack:GetChildren() or {}) do
+			if tool:IsA("Tool") then
+				local isDupe = false
+				for _, toolName in pairs(DUPE and chapter.dupe or {}) do
+					isDupe = isDupe or tool.Name == toolName
+				end
+				for _, entry in ipairs(bag) do
+					isDupe = isDupe or entry.tool == tool
+				end
+				kept[tool.Name] = (kept[tool.Name] or 0) + 1
+				if not isDupe or kept[tool.Name] > BACKPACK_LIMIT then
+					local character = localPlayer.Character
+					local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+					if humanoid then
+						humanoid:EquipTool(tool)
+						waitUntil(isHolding, 1, 0.05)
+						logWarn("Binning stray " .. tool.Name .. " from the Backpack.")
+						return trashHeld()
+					end
+				end
+			end
+		end
+	end
+
+
+	-- Ship any fully plated order.
+	for _, order in ipairs(list) do
+		local side = plateSideFor(order)
+		if side and isOrderPlated(order) then
+			return deliverOrder(order, side)
+		end
+	end
+
+	-- Plate finished machine output.
+	for _, taskData in pairs(activeTasks) do
+		local side = isTaskLive(taskData) and plateSideFor(taskData.order)
+		if side and isTaskFinished(taskData) and plateTask(taskData, side) then
+			return true
+		end
+	end
+
+	-- Pass 1: anything obtainable instantly (free-finish machines, machine memory, stash), before a load overwrites it.
+	local pendingCook = {}
+	for _, order in ipairs(list) do
+		for _, item in ipairs(order.items) do
+			if item.state ~= "pending" then
+				continue
+			end
+
+			local machine = machineFor(item.name)
+			local instant = (chapter.freeFinish[machine] and not activeTasks[machine])
+				or (not activeTasks[machine .. "Free"] and freeSource(item.name) ~= nil)
+			if chapter.memory[machine] then
+				pendingCook[machine] = true
+			end
+
+			if instant and startItem(order, item) then
+				return true
+			end
+		end
+	end
+
+	-- Pass 2: start real cooking on idle machines, oldest order first.
+	for _, order in ipairs(list) do
+		for _, item in ipairs(order.items) do
+			local machine = machineFor(item.name)
+			if item.state == "pending" and not chapter.freeFinish[machine] and not activeTasks[machine] and not freeSource(item.name) then
+				if startItem(order, item) then
+					return true
+				end
+			end
+		end
+	end
+
+	-- Finished memory-machine output nobody needs (a pre-load, or a dead order's item) stays in the
+	-- machine's memory anyway; free the slot so it doesn't block the machine.
+	for key, taskData in pairs(activeTasks) do
+		if not taskData.held and not isTaskLive(taskData) and taskData.memory and isTaskFinished(taskData) then
+			if taskData.preload then
+				log("Pre-loaded " .. taskData.itemName .. " is ready in the " .. taskData.machine .. " machine.")
+			end
+			activeTasks[key] = nil
+		end
+	end
+
+	-- Idle: pre-load a likely item into a memory machine so the next order gets it free.
+	local pool = chapter.pools[currentCourse] or chapter.pools[4]
+	if PRELOAD and pool and not isHolding() and not carriedOrder then
+		local stashCount = 0
+		for _ in pairs(stash) do
+			stashCount += 1
+		end
+
+		-- Only pre-load when the machine has time to finish before the next order: right after a delivery
+		-- (orders come 8s later), in the window after a cutscene's station wipe, or before the first order.
+		local sinceDelivery = os.clock() - lastDeliveryAt
+		local sinceCutscene = os.clock() - cutsceneAt
+		local inWindow = (sinceDelivery < Tune.PRELOAD_DELIVERY_WINDOW and #list == 0)
+			or (sinceCutscene > Tune.PRELOAD_CUTSCENE_FROM and sinceCutscene < Tune.PRELOAD_CUTSCENE_UNTIL)
+			or (ScarySushi.delivered == 0 and #list == 0)
+
+		-- A course just finished: its change-over wipes any cut in progress, so hold off until the next one starts.
+		if courseDoneAt and chapter.key ~= "Survival" then
+			if cutsceneAt < courseDoneAt or os.clock() < cutsceneAt + Tune.COURSE_START_GRACE then
+				inWindow = false
+			else
+				courseDoneAt = nil
+			end
+		end
+
+		if inWindow then
+			for _, candidate in ipairs(pool) do
+				local machine = machineFor(candidate)
+				local memory = getMemory(machine)
+				if not memory or isCached(candidate) or pendingCook[machine] or activeTasks[machine] or isMachineBusy(machine) then
+					continue
+				end
+
+				-- Only fill empty cache slots; evicting to pre-load just churns items that orders then miss.
+				local hasRoom = stashCount < #getPlaceboards() or memory.Value == "" or bagRoom() > 0
+				local candidateItem = { name = candidate, state = "pending" }
+				if hasRoom and startItem(nil, candidateItem) then
+					log("Pre-loading " .. candidate .. ".")
+					return true
+				end
+
+				-- Not spawned yet (e.g. beetles before course 2): try the next candidate instead.
+				if not candidateItem.noSource then
+					break
+				end
+			end
+		end
+	end
+
+	-- Chapter 1 sludge: keep a cup cooking whenever the lever is free; the ready cup waits for an order.
+	-- Survival unlocks sludge at some difficulty, so it waits for the first sludge order before using the lever.
+	local sludgeLive = not chapter.sludgeNeedsSeen or sludgeSeen
+
+	-- Keep the Backpack stocked with duped copies while nothing else needs doing.
+	if not isHolding() and os.clock() >= dupeRetryAt then
+		for machine, toolName in pairs(DUPE and chapter.dupe or {}) do
+			local count = #backpackTools(toolName)
+			local seeded = seedIndex(machine) ~= nil
+			if (count > 0 or seeded) and ((count < Tune.DUPE_LOW and backpackCount() < BACKPACK_LIMIT) or not seeded) then
+				return refillDupes(machine)
+			end
+		end
+	end
+
+	local sludgeStocked = dupeToolFor("Sludge") ~= nil and (#backpackTools(dupeToolFor("Sludge")) > 0 or seedIndex("Sludge") ~= nil)
+	if chapter.precookSludge and sludgeLive and not sludgeStocked and not isHolding() and currentCourse >= SLUDGE_COURSE and os.clock() >= sludgeRetryAt then
+		if not activeTasks.Sludge then
+			if startItem(nil, { name = "Sludge", state = "pending" }) then
+				return true
+			end
+		end
+	end
+
+	return false
+end
+
+---Vote to skip any active cutscene.
+local function trySkipCutscene()
+	local skipGui = localPlayer.PlayerGui:FindFirstChild("SkipCutscene")
+	local button = skipGui and skipGui:FindFirstChild("TextButton")
+	if not (button and button.Visible and button.Active) then
+		return
+	end
+
+	local vote = events and events:FindFirstChild("VoteSkipCutscene")
+	if vote then
+		pcall(vote.InvokeServer, vote)
+	end
+end
+
+---Ask the server whether it has credited our escape. GetResults is what the results screen calls:
+---returns (totalEscapes, escapedThisRound, orders, coins).
+---@return boolean, number?
+local function hasEscaped()
+	local getResults = events and events:FindFirstChild("GetResults")
+	if not getResults then
+		return false, nil
+	end
+
+	local success, escapes, escaped = pcall(getResults.InvokeServer, getResults)
+	return success and escaped == true, success and tonumber(escapes) or nil
+end
+
+---Leave for a fresh server of this chapter. Going via the lobby lets the old server shut down first.
+local function requeue()
+	if REQUEUE_VIA_LOBBY then
+		teleportService:Teleport(PRO_LOBBY_PLACE_ID, localPlayer)
+	else
+		teleportService:Teleport(game.PlaceId, localPlayer)
+	end
+end
+
+---Free the root if a cinematic anchored it, so our teleports still replicate.
+local function freeRoot()
+	local root = getRoot()
+	if root and root.Anchored then
+		root.Anchored = false
+	end
+end
+
+---Poll the server's escape flag in the background; returns a getter for the credit time.
+---@param chaseStart number
+---@return function
+local function watchEscape(chaseStart)
+	local escapedAt = nil
+	task.spawn(function()
+		while not escapedAt and os.clock() - chaseStart < Tune.ENDING_CAP and not ScarySushi.detached do
+			local escaped, escapes = hasEscaped()
+			if escaped then
+				escapedAt = os.clock()
+				log(string.format("Server credited escape %.1fs after chase start (total escapes %s).", escapedAt - chaseStart, tostring(escapes)))
+			end
+			task.wait(0.5)
+		end
+	end)
+
+	return function()
+		return escapedAt
+	end
+end
+
+---Wait for the escape credit, then requeue.
+---@param chaseStart number
+---@param escapedAt function
+local function finishEnding(chaseStart, escapedAt)
+	waitUntil(function()
+		return escapedAt() ~= nil or ScarySushi.detached
+	end, math.max(0, Tune.ENDING_CAP - (os.clock() - chaseStart)))
+
+	if ScarySushi.detached then
+		return
+	end
+
+	if not escapedAt() then
+		logWarn("Escape never credited, requeueing anyway.")
+	end
+
+	task.wait(Tune.ESCAPE_GRACE)
+	log(string.format("Win done in %.1fs from chase start, requeueing.", os.clock() - chaseStart))
+	requeue()
+end
+
+---Chapter 1 escape: rush the portal (credited ~49s in), fall back to the elevator ride.
+local function runEndingChapter1()
+	local chaseStart = os.clock()
+	log("Chase started.")
+
+	local chase = workspace:WaitForChild("Chase")
+	local elevatorTouch = chase:WaitForChild("ElevatorTouch")
+	local elevator = workspace:WaitForChild("ElevatorRoom"):WaitForChild("Elevator")
+	local insideTouch = elevator:WaitForChild("InElevatorTouch")
+	local screen = elevator:WaitForChild("ElevatorScreenInside"):WaitForChild("SurfaceGui"):WaitForChild("Frame"):WaitForChild("TextLabel")
+	local portalTouch = workspace:WaitForChild("SecondFloor"):WaitForChild("PortalRoom"):WaitForChild("PortalTouch")
+	local escapedAt = watchEscape(chaseStart)
+
+	-- The client elevator script kills us at countdown end unless ElevatorTouch was touched after activation.
+	onEvent("ActivateElevator", function(countdown)
+		log(string.format("Elevator activated %.1fs after chase start, %ss countdown.", os.clock() - chaseStart, tostring(countdown)))
+		task.delay(0.5, function()
+			local root = getRoot()
+			if root then
+				pcall(firetouchinterest, root, elevatorTouch, 0)
+				task.wait()
+				pcall(firetouchinterest, root, elevatorTouch, 1)
+			end
+		end)
+	end)
+
+	if PORTAL_RUSH then
+		log("Rushing the portal.")
+		waitUntil(function()
+			if escapedAt() or ScarySushi.detached then
+				return true
+			end
+			freeRoot()
+			touchPart(portalTouch)
+			return false
+		end, Tune.RUSH_CAP, 0.5)
+	end
+
+	if ScarySushi.detached then
+		return
+	end
+
+	if not escapedAt() then
+		log(string.format("Not credited after %.1fs, riding the elevator.", os.clock() - chaseStart))
+		freeRoot()
+		waitUntil(function()
+			if escapedAt() then
+				return true
+			end
+			touchPart(elevatorTouch)
+			touchPart(insideTouch)
+			return screen.Text == "GOING UP" or screen.Text == "WELCOME"
+		end, Tune.ELEVATOR_CAP, 0.5)
+
+		waitUntil(function()
+			return escapedAt() ~= nil or screen.Text == "WELCOME"
+		end, Tune.PORTAL_CAP)
+
+		setHover(false)
+		waitUntil(function()
+			if escapedAt() then
+				return true
+			end
+			freeRoot()
+			touchPart(portalTouch)
+			return false
+		end, Tune.PORTAL_CAP, 0.5)
+	end
+
+	finishEnding(chaseStart, escapedAt)
+end
+
+---Resolve a nested path under workspace.
+---@param ... string
+---@return Instance?
+local function resolvePath(...)
+	local node = workspace
+	for _, name in ipairs({ ... }) do
+		node = node and node:FindFirstChild(name)
+	end
+	return node
+end
+
+---Return a BasePart for a path target (a part, or the first part inside a model/folder).
+---@param instance Instance?
+---@return BasePart?
+local function partOf(instance)
+	if not instance then
+		return nil
+	end
+	if instance:IsA("BasePart") then
+		return instance
+	end
+	return instance:FindFirstChildWhichIsA("BasePart", true)
+end
+
+-- Chapter 2 escape route, in order, per the chase layout.
+local CHAPTER2_ESCAPE_ROUTE = {
+	{ "Kitchen", "AlterGeom", "TouchPart" },
+	{ "Chase", "Ruins", "PortalExit", "TouchPart" },
+	{ "Chase", "Forest", "Portals", "Portal_Exit", "TouchPart" },
+	{ "Chase", "Ocean", "Portals", "Portal_Exit", "TouchPart" },
+	{ "Chase", "Mines", "Portals", "Portal_Exit", "TouchPart" },
+	{ "Chase", "Lighthouse", "Exit" },
+}
+
+---Chapter 2 escape: walk the chase portals in order and leave once the server credits the escape.
+local function runEndingChapter2()
+	local chaseStart = os.clock()
+	log("Chase started.")
+	local escapedAt = watchEscape(chaseStart)
+
+	waitUntil(function()
+		if escapedAt() or ScarySushi.detached then
+			return true
+		end
+
+		freeRoot()
+		for index, path in ipairs(CHAPTER2_ESCAPE_ROUTE) do
+			local part = partOf(resolvePath(table.unpack(path)))
+			if part then
+				touchPart(part)
+				task.wait(0.15)
+			elseif not ScarySushi["routeWarned" .. index] then
+				ScarySushi["routeWarned" .. index] = true
+				log("Escape route step missing: " .. table.concat(path, "."))
+			end
+		end
+		return escapedAt() ~= nil
+	end, Tune.ENDING_CAP, 1)
+
+	finishEnding(chaseStart, escapedAt)
+end
+
+---Start the chapter's ending once.
+local function runEnding()
+	if endingStarted then
+		return
+	end
+
+	endingStarted = true
+	ScarySushi.running = false
+	chapter.runEnding()
+end
+
+---Chapter 2 spore: open the fungus, take the spore (goes straight onto the plate as CookedSpore).
+---@param order table?
+---@param item table
+---@return boolean
+local function startSporeChapter2(order, item)
+	if not order or isHolding() then
+		return false
+	end
+
+	local plant = resolvePath("Mines", "FungusRoom", "fungus_plant_anim")
+	local rootPart = plant and plant:FindFirstChild("RootPart")
+	local openPrompt = rootPart and rootPart:FindFirstChildWhichIsA("ProximityPrompt")
+	local spore = plant and plant:FindFirstChild("Spore")
+	local sporePrompt = spore and spore:FindFirstChildWhichIsA("ProximityPrompt")
+	if not (openPrompt and sporePrompt) then
+		if not item.sourceWarned then
+			item.sourceWarned = true
+			logWarn("Fungus plant prompts not found.")
+		end
+		return false
+	end
+
+	local startedAt = os.clock()
+	if openPrompt.Enabled then
+		firePromptUntil(openPrompt, function()
+			return sporePrompt.Enabled or not openPrompt.Enabled
+		end, 3)
+	end
+
+	if not firePromptUntil(enablePrompt(sporePrompt), isHolding, 6) then
+		if not item.sporeWarned then
+			item.sporeWarned = true
+			logWarn("Spore pickup refused (open=" .. tostring(openPrompt.Enabled) .. ").")
+		end
+		return false
+	end
+
+	log(string.format("Spore taken in %.1fs (%s).", os.clock() - startedAt, heldStatus()))
+	if heldStatus() == "None" then
+		-- Diagnostics: which Tool is in hand / Backpack when the server hasn't caught up.
+		task.delay(0.4, function()
+			local names = {}
+			local character = localPlayer.Character
+			for _, child in ipairs(character and character:GetChildren() or {}) do
+				if child:IsA("Tool") then
+					table.insert(names, "hand:" .. child.Name)
+				end
+			end
+			local backpack = localPlayer:FindFirstChildOfClass("Backpack")
+			for _, child in ipairs(backpack and backpack:GetChildren() or {}) do
+				table.insert(names, "bp:" .. child.Name)
+			end
+			log("Spore diag for order " .. tostring(order.id) .. " on " .. tostring(order.plate) .. ": status=" .. heldStatus() .. " [" .. table.concat(names, ",") .. "]")
+		end)
+	end
+	item.state = "cooking"
+	activeTasks.SporeFree = {
+		key = "SporeFree",
+		machine = "Spore",
+		itemName = item.name,
+		order = order,
+		item = item,
+		startedAt = os.clock(),
+		readySeen = true,
+		held = true,
+	}
+	return true
+end
+
+---Chapter 2 RedEye: a story step, not an ingredient. Verified live: touching the kitchen's Tunnels portal sends
+---you into the Void (the order clears), and touching the Void's exit portal makes the server issue the real order.
+---@param order table?
+---@param item table
+---@return boolean
+local function startRedEyeChapter2(order, item)
+	if not order or isHolding() or os.clock() < (item.redEyeRetryAt or 0) then
+		return false
+	end
+
+	item.redEyeRetryAt = os.clock() + 8
+	local room = localPlayer:FindFirstChild("currentRoom")
+	local tunnels = resolvePath("Kitchen", "Portals", "Portal_TheTunnels", "TouchPart")
+	local exitPortal = resolvePath("NightKeepers", "Void", "Part8", "ExitPortal", "TouchPart")
+	if not (tunnels and exitPortal) then
+		logWarn("RedEye portals not found.")
+		return false
+	end
+
+	local startedAt = os.clock()
+	freeRoot()
+	waitUntil(function()
+		touchPart(tunnels)
+		return room ~= nil and room.Value == "Nightkeepers"
+	end, 4, 0.3)
+
+	waitUntil(function()
+		touchPart(exitPortal)
+		return room ~= nil and room.Value ~= "Nightkeepers"
+	end, 4, 0.3)
+
+	log(string.format("RedEye: went through the Void in %.1fs (room=%s).", os.clock() - startedAt, tostring(room and room.Value)))
+	return false
+end
+
+---Chapter 1 ingredient sources.
+---@param itemName string
+---@return ProximityPrompt?
+local function findSourceChapter1(itemName)
+	local riceRoom = workspace:FindFirstChild("RiceRoom")
+	local spawners = riceRoom and riceRoom:FindFirstChild("Spawners")
+	if itemName == "RiceIngredient" then
+		return findSpawnerPrompt(spawners, "RiceSpawner")
+	end
+
+	if itemName == "NoriIngredient" then
+		return findSpawnerPrompt(spawners, "NoriSpawner")
+	end
+
+	local holders = { Eel = "EelPrompt", Flounder = "Prompt", Salmon = "Part", Tuna = "TunaPrompt" }
+	if holders[itemName] then
+		local pod = resolvePath("FishFarm", "FishPods", itemName .. "FishPod")
+		local holder = pod and pod:FindFirstChild(holders[itemName])
+		return holder and holder:FindFirstChildWhichIsA("ProximityPrompt")
+	end
+
+	-- Vegetables: scan once, then reuse the cached prompt.
+	local cached = promptCache[itemName]
+	if cached and cached.Parent then
+		return cached
+	end
+
+	for _, folderName in ipairs({ "Garden", "ZenGarden" }) do
+		local prompt = findPromptByKeywords(workspace:FindFirstChild(folderName), { itemName:lower() })
+		if prompt then
+			promptCache[itemName] = prompt
+			return prompt
+		end
+	end
+	return nil
+end
+
+-- Chapter 2 keywords for live-spawned ingredients (beetles in the Forest, seafood in the Ocean).
+local CHAPTER2_SOURCE_KEYWORDS = {
+	BlueBeetle = { "Forest", { "blue" } },
+	GreenBeetle = { "Forest", { "green" } },
+	PurpleBeetle = { "Forest", { "purple" } },
+	YellowBeetle = { "Forest", { "yellow" } },
+	Jellyfish = { "Ocean", { "jelly" } },
+	Clam = { "Ocean", { "clam" } },
+	Rockfish = { "Ocean", { "fish" } },
+}
+
+---Chapter 2 ingredient sources.
+---@param itemName string
+---@return ProximityPrompt?
+local function findSourceChapter2(itemName)
+	local spawners = resolvePath("Farm", "Spawners")
+	if itemName == "RiceIngredient" then
+		return findSpawnerPrompt(spawners, "RiceSpawner")
+	end
+
+	if itemName == "NoriIngredient" then
+		return findSpawnerPrompt(spawners, "NoriSpawner")
+	end
+
+	local spec = CHAPTER2_SOURCE_KEYWORDS[itemName]
+	if not spec then
+		return nil
+	end
+
+	local prompt = findPromptByKeywords(workspace:FindFirstChild(spec[1]), spec[2])
+	if prompt and promptCache[itemName] ~= prompt then
+		promptCache[itemName] = prompt
+		log("Source for " .. itemName .. ": " .. prompt:GetFullName() .. " ('" .. prompt.ActionText .. "').")
+	end
+	return prompt
+end
+
+---Chapter 1 configuration (also the base for Survival).
+---@return table
+local function buildChapter1()
+	return {
+			key = "Chapter1",
+			tag = "Ch1",
+			machines = { RiceIngredient = "Rice", NoriIngredient = "Nori", Sludge = "Sludge" },
+			defaultMachine = "Cut",
+			freeFinish = { Rice = true, Nori = true },
+			memory = { Cut = true },
+			cookedNames = {},
+			courseFloor = { Sludge = 4, Avocado = 3, Carrot = 3, Cucumber = 3, Eel = 2, Flounder = 2, Salmon = 2, Tuna = 2 },
+			pools = {
+				[2] = { "Eel", "Salmon", "Flounder", "Tuna" },
+				[3] = { "Cucumber", "Eel", "Carrot", "Flounder", "Salmon", "Tuna", "Avocado" },
+				[4] = { "Eel", "Cucumber", "Flounder", "Carrot", "Salmon", "Tuna", "Avocado" },
+			},
+			precookSludge = true,
+			dupe = { Sludge = "SludgeCup" },
+			machineParts = {
+				Sludge = function()
+					local machineRoom = resolvePath("SludgeRoom", "MachineRoom")
+					local triggerHolder = machineRoom and machineRoom:FindFirstChild("Trigger")
+					local lever = triggerHolder and triggerHolder:FindFirstChild("Trigger")
+					local cup = machineRoom and resolvePath("SludgeRoom", "MachineRoom", "Machine", "Stage5", "Swivel", "SludgeCup")
+					return lever and lever:FindFirstChildWhichIsA("ProximityPrompt"), cup and cup:FindFirstChildWhichIsA("ProximityPrompt"), nil
+				end,
+			},
+			findSource = findSourceChapter1,
+			deliveryPrompt = function()
+				local plateInput = resolvePath("Kitchen", "DeliveryConveyor", "PlateInput")
+				return plateInput and plateInput:FindFirstChildWhichIsA("ProximityPrompt")
+			end,
+			runEnding = runEndingChapter1,
+			chaseEvent = "ReleaseTheBlobs",
+		}
+end
+
+---Build the per-chapter configuration for the current place.
+---@return table?
+local function buildChapter()
+	if game.PlaceId == CHAPTER1_PLACE_ID then
+		return buildChapter1()
+	end
+
+	-- Survival is Chapter 1's kitchen without courses or a chase: every ingredient is live from the start
+	-- and orders never stop, so it runs the Chapter 1 config at the top course tier, forever.
+	if game.PlaceId == SURVIVAL_PLACE_ID then
+		local survival = buildChapter1()
+		survival.key = "Survival"
+		survival.tag = "Surv"
+		survival.startCourse = SLUDGE_COURSE
+		survival.runEnding = function()
+			log("Survival has no chase ending.")
+		end
+		survival.chaseEvent = nil
+		survival.noEscapeCheck = true
+		survival.sludgeNeedsSeen = true
+		return survival
+	end
+
+	if game.PlaceId == CHAPTER2_PLACE_ID then
+		return {
+			key = "Chapter2",
+			tag = "Ch2",
+			-- Verified via the game's PromptHandler: RawBeetle -> cutting board, Rice/RawSeafood -> rice pot.
+			-- Verified live: the Rockfish's "Catch Fish" prompt hands over a RawBeetle, so it's cut too.
+			machines = {
+				RiceIngredient = "Rice",
+				NoriIngredient = "Nori",
+				Jellyfish = "Rice",
+				Clam = "Rice",
+				Rockfish = "Cut",
+				BlueBeetle = "Cut",
+				GreenBeetle = "Cut",
+				PurpleBeetle = "Cut",
+				YellowBeetle = "Cut",
+				Sludge = "Spore",
+				RedEye = "RedEye",
+			},
+			defaultMachine = "Cut",
+			-- Verified live: nori is free from an empty machine; the rice pot and board remember their last item.
+			freeFinish = { Nori = true },
+			memory = { Cut = true, Rice = true },
+			cookedNames = { RiceIngredient = "Rice" },
+			courseFloor = {
+				BlueBeetle = 2, GreenBeetle = 2, PurpleBeetle = 2, YellowBeetle = 2,
+				Rockfish = 3, Clam = 3, Jellyfish = 3,
+				Sludge = 4, RedEye = 4,
+			},
+			-- Ordered by how often each showed up in logged runs. Rice comes first everywhere (nearly every order
+			-- needs it); seafood is left out because cooking it pushes rice out of the pot's memory.
+			pools = {
+				[0] = { "RiceIngredient" },
+				[1] = { "RiceIngredient", "GreenBeetle" },
+				[2] = { "RiceIngredient", "GreenBeetle", "PurpleBeetle", "YellowBeetle", "BlueBeetle" },
+				[3] = { "RiceIngredient", "Rockfish", "PurpleBeetle", "GreenBeetle" },
+				[4] = { "RiceIngredient", "PurpleBeetle", "GreenBeetle", "Rockfish" },
+			},
+			precookSludge = false,
+			special = { Spore = startSporeChapter2, RedEye = startRedEyeChapter2 },
+			findSource = findSourceChapter2,
+			deliveryPrompt = function()
+				local plateInput = resolvePath("Kitchen", "Blob", "PlateInput")
+				return plateInput and plateInput:FindFirstChildWhichIsA("ProximityPrompt")
+			end,
+			runEnding = runEndingChapter2,
+			chaseEvent = nil,
+			-- Courses whose cutscene must play out (none: beetles spawn on the same timer either way).
+			keepCutscene = {},
+			-- The intro has no leaderboard part, so its skip signal works within a second or two.
+			cleanSkip = { [1] = true },
+		}
+	end
+	return nil
+end
+
+---Chef loop: one scheduling decision per tick, idles only when nothing can be done.
+local function runChef()
+	local flushed, flushError = pcall(flushMachines)
+	if not flushed then
+		logWarn("Flush error: " .. tostring(flushError))
+	end
+
+	while ScarySushi.running do
+		local success, result = pcall(step)
+		if not success then
+			logWarn("Step error: " .. tostring(result))
+			task.wait(0.25)
+		elseif not result then
+			task.wait(IDLE_TICK)
+		end
+	end
+end
+
+---Debug snapshot of the scheduler state (orders, items, machine tasks, stash).
+---@return table
+function ScarySushi.dump()
+	local snapshot = { tasks = {}, orders = {}, stash = {}, carried = carriedOrder and carriedOrder.id or nil, course = currentCourse }
+	for key, taskData in pairs(activeTasks) do
+		table.insert(snapshot.tasks, string.format("%s: %s order=%s held=%s ready=%s age=%.1f", key, taskData.itemName,
+			taskData.order and taskData.order.id or "nil", tostring(taskData.held), tostring(taskData.readySeen), os.clock() - taskData.startedAt))
+	end
+	for _, order in pairs(orders) do
+		local items = {}
+		for _, item in ipairs(order.items) do
+			table.insert(items, item.name .. "=" .. item.state)
+		end
+		table.insert(snapshot.orders, string.format("%s plate=%s delivered=%s [%s]", order.id, tostring(order.plate), tostring(order.delivered), table.concat(items, ",")))
+	end
+	for index, entry in pairs(stash) do
+		table.insert(snapshot.stash, index .. "=" .. tostring(entry.item))
+	end
+	return snapshot
+end
+
+---Stop the farm (keeps the UI, fly and camera).
+function ScarySushi.stopFarm()
+	ScarySushi.running = false
+	for _, connection in ipairs(farmConnections) do
+		pcall(function()
+			connection:Disconnect()
+		end)
+	end
+	table.clear(farmConnections)
+	setHover(false)
+end
+
+---Run the game's SkipCutscene handlers in their own threads. They start with task.wait, which a firesignal
+---thread can't do, so firesignal alone errors inside them before the cutscene is ended.
+---@param course number
+local function runSkipHandlers(course)
+	local skip = events and events:FindFirstChild("SkipCutscene")
+	if not skip then
+		return
+	end
+	if getconnections then
+		local ok, connectionList = pcall(getconnections, skip.OnClientEvent)
+		for _, connection in ipairs(ok and connectionList or {}) do
+			local handler = connection.Function
+			if type(handler) == "function" then
+				task.spawn(pcall, handler, course)
+			end
+		end
+	elseif firesignal then
+		pcall(firesignal, skip.OnClientEvent, course)
+	end
+end
+
+---Drop the game's own FinishedCutscene for a course we already reported. The hook is installed once per
+---client and reads its block list from getgenv, so re-executing the script doesn't stack hooks.
+---@param course number
+---@return boolean
+local function guardCutsceneReport(course)
+	local env = getgenv and getgenv()
+	if not (env and hookmetamethod and getnamecallmethod and checkcaller) then
+		return false
+	end
+
+	env.PotentCutsceneBlocked = env.PotentCutsceneBlocked or {}
+	env.PotentCutsceneBlocked[course] = true
+
+	if not env.PotentCutsceneHooked then
+		env.PotentCutsceneHooked = true
+		local original
+		original = hookmetamethod(game, "__namecall", (newcclosure or function(f) return f end)(function(self, ...)
+			if not checkcaller() and getnamecallmethod() == "FireServer" and typeof(self) == "Instance"
+				and self.Name == "FinishedCutscene" then
+				local blocked = getgenv().PotentCutsceneBlocked
+				local reported = tonumber((...))
+				if blocked and reported and blocked[reported] then
+					blocked[reported] = nil
+					return nil
+				end
+			end
+			return original(self, ...)
+		end))
+	end
+	return true
+end
+
+---Start the farm for the current chapter.
+function ScarySushi.startFarm()
+	if ScarySushi.running or not chapter then
+		return
+	end
+
+	if chapter.startCourse then
+		currentCourse = math.max(currentCourse, chapter.startCourse)
+	end
+
+	-- Servers keep running after an escape; if we already escaped (or died) here, this server can't give a win.
+	if not chapter.noEscapeCheck and hasEscaped() then
+		logWarn("Already escaped in this server, hopping to a fresh one.")
+		return requeue()
+	end
+
+	local killed = localPlayer:FindFirstChild("killed")
+	if killed and killed.Value == true then
+		logWarn("Already dead in this server, hopping to a fresh one.")
+		return requeue()
+	end
+
+	ScarySushi.running = true
+	endingStarted = false
+	lastProgressAt = os.clock()
+
+	-- Watchdog: a server where nothing happens for Tune.STALL_REQUEUE seconds (lost run, unassigned station, a stuck
+	-- loop) can't give a win, so move on instead of sitting there.
+	task.spawn(function()
+		while ScarySushi.running and not ScarySushi.detached do
+			task.wait(5)
+			if ScarySushi.running and not endingStarted and os.clock() - lastProgressAt > Tune.STALL_REQUEUE then
+				logWarn(string.format("No orders or deliveries for %ds, requeueing.", Tune.STALL_REQUEUE))
+				ScarySushi.stopFarm()
+				requeue()
+				break
+			end
+		end
+	end)
+
+	-- Tell the server a course's cutscene is done as soon as it starts (chase cutscenes past the last course excluded).
+	table.clear(reportedCutscenes)
+	table.clear(courseStartedAt)
+	if getgenv and getgenv().PotentCutsceneBlocked then
+		table.clear(getgenv().PotentCutsceneBlocked)
+	end
+	local function reportCutsceneDone(course)
+		course = tonumber(course)
+		if not CUTSCENE_SKIP or not course or course < 1 or course > Tune.LAST_COURSE or reportedCutscenes[course] then
+			return
+		end
+		-- Some courses need their cutscene: e.g. Chapter 2's beetles spawn on a timer during it.
+		if chapter.keepCutscene and chapter.keepCutscene[course] then
+			return
+		end
+		reportedCutscenes[course] = true
+		local startedAt = os.clock()
+		task.spawn(function()
+			-- Courses whose cutscene the game lets you skip right away: replay its skip signal locally, so the
+			-- cutscene script ends the cutscene and reports FinishedCutscene itself, once, with camera/UI tidy.
+			if chapter.cleanSkip and chapter.cleanSkip[course] then
+				for _, at in ipairs(Tune.CUTSCENE_SKIP_TRIES) do
+					task.wait(math.max(0, startedAt + at - os.clock()))
+					if not ScarySushi.running or courseStartedAt[course] then
+						break
+					end
+					runSkipHandlers(course)
+				end
+				task.wait(1)
+				if courseStartedAt[course] then
+					log(string.format("Skipped cutscene %d (course began %.1fs in).", course, courseStartedAt[course] - startedAt))
+					return
+				end
+			else
+				task.wait(math.max(0, startedAt + Tune.CUTSCENE_REPORT_DELAY - os.clock()))
+			end
+
+			-- Otherwise (the leaderboard part of cutscenes 2-4 can't be skipped) tell the server directly, and drop
+			-- the game's own report when its cutscene finishes: a second FinishedCutscene re-runs the course setup
+			-- mid-course (plates refuse food, stashes get wiped).
+			local remote = events and events:FindFirstChild("FinishedCutscene")
+			if remote and ScarySushi.running then
+				local guarded = guardCutsceneReport(course)
+				remote:FireServer(course)
+				log(string.format("Reported cutscene %d as finished%s.", course, guarded and "" or " (no duplicate guard)"))
+			end
+		end)
+	end
+
+	-- The server clears both placeboards when a course ends, so board stash entries from before then are gone.
+	local function forgetBoardStash(course)
+		courseDeliveries = 0
+		if not course or course < 2 then
+			return
+		end
+		local endedAt = os.clock()
+		local function forget(late)
+			local dropped = 0
+			local boards = getPlaceboards()
+			for index, entry in pairs(stash) do
+				local active = boards[index] and boards[index]:FindFirstChild("isActive")
+				local empty = not (active and active.Value)
+				if (not late and entry.at <= endedAt) or empty then
+					stash[index] = nil
+					dropped += 1
+				end
+			end
+			if dropped > 0 then
+				log("Course " .. (course - 1) .. " ended: forgot " .. dropped .. " placeboard stash entr" .. (dropped == 1 and "y" or "ies") .. " (wiped).")
+			end
+		end
+		forget(false)
+		task.delay(2, forget, true)
+	end
+
+	-- Each course's cutscene marks the next course early, so pre-loading and the first sludge use the transition.
+	for course = 1, 4 do
+		onEvent("PlayCutscene" .. course, function()
+			forgetBoardStash(course)
+			reportCutsceneDone(course)
+			currentCourse = math.max(currentCourse, course)
+			cutsceneAt = os.clock()
+			if course == SLUDGE_COURSE then
+				sludgeRetryAt = 0
+			end
+			log("Course " .. course .. " cutscene, preparing early.")
+		end)
+	end
+
+	-- Chapter 2 uses a single PlayCutscene remote; log its argument while mapping.
+	onEvent("PlayCutscene", function(...)
+		cutsceneAt = os.clock()
+		local args = { ... }
+		log("PlayCutscene(" .. tostring(args[1]) .. ", " .. tostring(args[2]) .. ")")
+		local nextCourse = tonumber(args[1])
+		forgetBoardStash(nextCourse)
+		reportCutsceneDone(nextCourse)
+		if nextCourse and nextCourse > currentCourse then
+			currentCourse = nextCourse
+		end
+	end)
+
+	-- The sludge machine's own start/take echoes: the ground truth for whether a cup is in flight.
+	onEvent("RunEggProcessor", function()
+		sludgeLeverAt = os.clock()
+	end)
+	onEvent("SludgeTaken", function()
+		sludgeTakenAt = os.clock()
+	end)
+
+	onEvent("CourseStart", function(course)
+		local courseNumber = tonumber(course)
+		if courseNumber and not courseStartedAt[courseNumber] then
+			courseStartedAt[courseNumber] = os.clock()
+		end
+		-- With cutscenes reported early, the client's own (late) course signals can arrive out of order.
+		currentCourse = math.max(currentCourse, courseNumber or 0)
+		local parts = {}
+		for machine in pairs(chapter.memory) do
+			local memory = getMemory(machine)
+			table.insert(parts, machine .. "=" .. tostring(memory and memory.Value))
+		end
+		for index, entry in pairs(stash) do
+			table.insert(parts, "stash" .. index .. "=" .. tostring(entry.item))
+		end
+		log("Course " .. tostring(course) .. " started. " .. table.concat(parts, " "))
+	end)
+
+	-- Log the server's verdict on every order; a failed order leaves its food on the plate.
+	for _, eventName in ipairs({ "CompleteOrder", "FailOrder" }) do
+		onEvent(eventName, function(orderId)
+			log("Server " .. eventName .. "(" .. tostring(orderId) .. ")")
+			lastProgressAt = os.clock()
+
+			if eventName == "FailOrder" then
+				for _, order in pairs(orders) do
+					if order.id == tostring(orderId) and not order.failed then
+						if order.plate then
+							dirtyPlates[order.plate] = true
+						end
+						order.failed = true
+						order.plate = nil
+					end
+				end
+			end
+		end)
+	end
+
+	-- Deaths matter in Chapter 2: a failed order or a monster costs a life; with none left the run is over.
+	onEvent("Died", function(...)
+		local args = { ... }
+		local livesLeft = tonumber(args[2])
+		logWarn("Died to " .. tostring(args[1]) .. ", lives left " .. tostring(livesLeft))
+		if livesLeft == 0 and ScarySushi.running then
+			logWarn("Out of lives, requeueing.")
+			ScarySushi.stopFarm()
+			task.delay(2, requeue)
+		end
+	end)
+
+	-- Chapter 1's chase begins with ReleaseTheBlobs.
+	if chapter.chaseEvent then
+		onEvent(chapter.chaseEvent, function()
+			task.spawn(runEnding)
+		end)
+
+		local blobs = resolvePath("Chase", "Blobs")
+		if blobs then
+			table.insert(farmConnections, blobs.ChildAdded:Connect(function()
+				task.spawn(runEnding)
+			end))
+		end
+	end
+
+	-- Chapter 2's chase is armed when the kitchen's AlterGeom touch part becomes touchable.
+	if chapter.key == "Chapter2" then
+		task.spawn(function()
+			while ScarySushi.running do
+				local touchPartInstance = resolvePath("Kitchen", "AlterGeom", "TouchPart")
+				if touchPartInstance and touchPartInstance:FindFirstChildOfClass("TouchTransmitter") and currentCourse >= 4 then
+					task.spawn(runEnding)
+					break
+				end
+				task.wait(0.25)
+			end
+		end)
+	end
+
+	-- Reroll the server if someone else is here before our first delivery.
+	if SOLO_ONLY then
+		local function checkSolo()
+			if ScarySushi.running and ScarySushi.delivered == 0 and #playersService:GetPlayers() > 1 then
+				logWarn("Not solo, rerolling server.")
+				ScarySushi.stopFarm()
+				requeue()
+			end
+		end
+
+		table.insert(farmConnections, playersService.PlayerAdded:Connect(checkSolo))
+		checkSolo()
+	end
+
+	-- Skip cutscenes as soon as the vote opens.
+	task.spawn(function()
+		while ScarySushi.running do
+			trySkipCutscene()
+			task.wait(0.25)
+		end
+	end)
+
+	setHover(true)
+	task.spawn(runChef)
+	log("Auto chef running.")
+end
+
+---Disconnect everything and stop all loops (used on re-execution).
+function ScarySushi.detach()
+	ScarySushi.detached = true
+	-- Each step on its own, so one failure still lets the rest (connections, UI) clean up.
+	pcall(ScarySushi.stopFarm)
+	pcall(Fly.stop)
+
+	for _, connection in ipairs(connections) do
+		pcall(function()
+			connection:Disconnect()
+		end)
+	end
+	table.clear(connections)
+
+	if uiInstance then
+		uiInstance:Destroy()
+		uiInstance = nil
+	end
+end
+
+---Teleport from the lobby into whichever chapter is toggled on.
+local function routeFromLobby()
+	if not LOBBY_PLACE_IDS[game.PlaceId] then
+		return
+	end
+
+	task.delay(Tune.LOBBY_TELEPORT_DELAY, function()
+		if ScarySushi.detached or not LOBBY_PLACE_IDS[game.PlaceId] then
+			return
+		end
+
+		if settings.Chapter1 then
+			log("Lobby, teleporting into Chapter 1.")
+			teleportService:Teleport(CHAPTER1_PLACE_ID, localPlayer)
+		elseif settings.Chapter2 then
+			log("Lobby, teleporting into Chapter 2.")
+			teleportService:Teleport(CHAPTER2_PLACE_ID, localPlayer)
+		elseif settings.Survival then
+			log("Lobby, teleporting into Survival.")
+			teleportService:Teleport(SURVIVAL_PLACE_ID, localPlayer)
+		end
+	end)
+end
+
+---React to a toggle change: save it, then start/stop the farm, fly, or route from the lobby.
+---@param key string
+local function onToggleChanged(key)
+	saveSettings()
+
+	if key == "Fly" then
+		applyFly()
+		return
+	end
+
+	if inGame() and chapter then
+		if settings[chapter.key] then
+			ScarySushi.startFarm()
+		else
+			ScarySushi.stopFarm()
+		end
+	end
+
+	if settings[key] then
+		routeFromLobby()
+	end
+end
+
+-- UI palette.
+Tune.ACCENT = Color3.fromRGB(255, 90, 95)
+Tune.ACCENT_DARK = Color3.fromRGB(190, 55, 60)
+Tune.ON_COLOR = Color3.fromRGB(70, 200, 120)
+Tune.OFF_COLOR = Color3.fromRGB(70, 72, 82)
+Tune.PANEL_BG = Color3.fromRGB(24, 25, 31)
+Tune.ROW_BG = Color3.fromRGB(33, 34, 42)
+Tune.TEXT_COLOR = Color3.fromRGB(235, 236, 240)
+local MODE_KEYS = { Chapter1 = true, Chapter2 = true, Survival = true }
+
+---Build the small toggle panel (Chapter 1, Chapter 2, Fly), draggable by its header.
+local function buildUi()
+	-- Leftover UI from a copy that couldn't clean up after itself.
+	local host = (gethui and gethui()) or coreGui
+	for _, child in ipairs(host:GetChildren()) do
+		if child.Name == "PotentScarySushi" and child:IsA("ScreenGui") then
+			child:Destroy()
+		end
+	end
+
+	local screenGui = Instance.new("ScreenGui")
+	screenGui.Name = "PotentScarySushi"
+	screenGui.ResetOnSpawn = false
+	screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	screenGui.Parent = (gethui and gethui()) or coreGui
+	uiInstance = screenGui
+
+	local mainFrame = Instance.new("Frame")
+	mainFrame.BackgroundColor3 = Tune.PANEL_BG
+	mainFrame.BorderSizePixel = 0
+	mainFrame.Position = UDim2.new(0, 24, 0, 96)
+	mainFrame.Size = UDim2.new(0, 220, 0, 218)
+	mainFrame.Active = true
+	mainFrame.Parent = screenGui
+	Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 10)
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = Color3.fromRGB(0, 0, 0)
+	stroke.Transparency = 0.5
+	stroke.Parent = mainFrame
+
+	local header = Instance.new("Frame")
+	header.BackgroundColor3 = Tune.ACCENT
+	header.BorderSizePixel = 0
+	header.Size = UDim2.new(1, 0, 0, 38)
+	header.Parent = mainFrame
+	Instance.new("UICorner", header).CornerRadius = UDim.new(0, 10)
+
+	local gradient = Instance.new("UIGradient")
+	gradient.Color = ColorSequence.new(Tune.ACCENT, Tune.ACCENT_DARK)
+	gradient.Rotation = 90
+	gradient.Parent = header
+
+	-- Square off the header's bottom corners.
+	local mask = Instance.new("Frame")
+	mask.BackgroundColor3 = Tune.ACCENT_DARK
+	mask.BorderSizePixel = 0
+	mask.Position = UDim2.new(0, 0, 1, -10)
+	mask.Size = UDim2.new(1, 0, 0, 10)
+	mask.ZIndex = 0
+	mask.Parent = header
+
+	local title = Instance.new("TextLabel")
+	title.BackgroundTransparency = 1
+	title.Position = UDim2.new(0, 12, 0, 0)
+	title.Size = UDim2.new(1, -24, 1, 0)
+	title.Font = Enum.Font.GothamBold
+	title.Text = "Scary Sushi"
+	title.TextColor3 = Color3.fromRGB(255, 255, 255)
+	title.TextSize = 15
+	title.TextXAlignment = Enum.TextXAlignment.Left
+	title.ZIndex = 2
+	title.Parent = header
+
+	local body = Instance.new("Frame")
+	body.BackgroundTransparency = 1
+	body.Position = UDim2.new(0, 0, 0, 38)
+	body.Size = UDim2.new(1, 0, 1, -38)
+	body.Parent = mainFrame
+
+	local padding = Instance.new("UIPadding")
+	padding.PaddingTop = UDim.new(0, 10)
+	padding.PaddingLeft = UDim.new(0, 10)
+	padding.PaddingRight = UDim.new(0, 10)
+	padding.Parent = body
+
+	local layout = Instance.new("UIListLayout")
+	layout.Padding = UDim.new(0, 8)
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Parent = body
+
+	local toggles = {}
+
+	---One clickable row with a pill switch.
+	local function makeToggle(labelText, key, order)
+		local row = Instance.new("TextButton")
+		row.BackgroundColor3 = Tune.ROW_BG
+		row.BorderSizePixel = 0
+		row.AutoButtonColor = false
+		row.Text = ""
+		row.LayoutOrder = order
+		row.Size = UDim2.new(1, 0, 0, 34)
+		row.Parent = body
+		Instance.new("UICorner", row).CornerRadius = UDim.new(0, 8)
+
+		local label = Instance.new("TextLabel")
+		label.BackgroundTransparency = 1
+		label.Position = UDim2.new(0, 12, 0, 0)
+		label.Size = UDim2.new(1, -70, 1, 0)
+		label.Font = Enum.Font.GothamMedium
+		label.Text = labelText
+		label.TextColor3 = Tune.TEXT_COLOR
+		label.TextSize = 14
+		label.TextXAlignment = Enum.TextXAlignment.Left
+		label.Parent = row
+
+		local track = Instance.new("Frame")
+		track.AnchorPoint = Vector2.new(1, 0.5)
+		track.Position = UDim2.new(1, -10, 0.5, 0)
+		track.Size = UDim2.new(0, 40, 0, 20)
+		track.BackgroundColor3 = Tune.OFF_COLOR
+		track.BorderSizePixel = 0
+		track.Parent = row
+		Instance.new("UICorner", track).CornerRadius = UDim.new(1, 0)
+
+		local knob = Instance.new("Frame")
+		knob.AnchorPoint = Vector2.new(0, 0.5)
+		knob.Position = UDim2.new(0, 3, 0.5, 0)
+		knob.Size = UDim2.new(0, 14, 0, 14)
+		knob.BackgroundColor3 = Color3.fromRGB(245, 245, 248)
+		knob.BorderSizePixel = 0
+		knob.Parent = track
+		Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
+
+		local function render()
+			local on = settings[key]
+			local info = TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+			tweenService:Create(track, info, { BackgroundColor3 = on and Tune.ON_COLOR or Tune.OFF_COLOR }):Play()
+			tweenService:Create(knob, info, { Position = on and UDim2.new(1, -17, 0.5, 0) or UDim2.new(0, 3, 0.5, 0) }):Play()
+		end
+
+		toggles[key] = render
+		row.MouseButton1Click:Connect(function()
+			settings[key] = not settings[key]
+
+			-- Only one mode can run at a time.
+			if settings[key] and MODE_KEYS[key] then
+				for otherKey in pairs(MODE_KEYS) do
+					if otherKey ~= key and settings[otherKey] then
+						settings[otherKey] = false
+						onToggleChanged(otherKey)
+					end
+				end
+			end
+
+			for _, renderToggle in pairs(toggles) do
+				renderToggle()
+			end
+			onToggleChanged(key)
+		end)
+		render()
+	end
+
+	makeToggle("Chapter 1", "Chapter1", 1)
+	makeToggle("Chapter 2", "Chapter2", 2)
+	makeToggle("Survival", "Survival", 3)
+	makeToggle("Fly", "Fly", 4)
+
+	-- Drag by the header.
+	local dragging, dragStart, startPosition = false, nil, nil
+	header.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			dragStart = input.Position
+			startPosition = mainFrame.Position
+			input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then
+					dragging = false
+				end
+			end)
+		end
+	end)
+
+	table.insert(connections, userInputService.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			local delta = input.Position - dragStart
+			mainFrame.Position = UDim2.new(startPosition.X.Scale, startPosition.X.Offset + delta.X, startPosition.Y.Scale, startPosition.Y.Offset + delta.Y)
+		end
+	end))
+end
+
+---Set up UI, camera, fly and the farm for wherever we are.
+function ScarySushi.init()
+	loadSettings()
+	chapter = buildChapter()
+	buildUi()
+
+	-- Anti-AFK.
+	table.insert(connections, localPlayer.Idled:Connect(function()
+		virtualUser:CaptureController()
+		virtualUser:ClickButton2(Vector2.zero)
+	end))
+
+	applyThirdPerson()
+	applyFly()
+
+	-- Re-apply fly and the farm hover after a respawn.
+	table.insert(connections, localPlayer.CharacterAdded:Connect(function(character)
+		character:WaitForChild("HumanoidRootPart")
+		task.wait(0.5)
+		applyFly()
+		if ScarySushi.running then
+			setHover(true)
+		end
+	end))
+
+	if LOBBY_PLACE_IDS[game.PlaceId] then
+		routeFromLobby()
+		return
+	end
+
+	if chapter and settings[chapter.key] then
+		ScarySushi.startFarm()
+	end
+end
+
+Tune.INIT_RETRIES = 3
+Tune.INIT_RETRY_DELAY = 5
+local initAttempts = 0
+
+---This is called when initialization errors. A failed start shouldn't cost the whole server, so tear down
+---whatever half-started and try again a few times.
+---@param error string
+local function onInitializeError(error)
+	warn("Failed to initialize.")
+	warn(error)
+	warn(debug.traceback())
+	pcall(logWarn, "Init failed: " .. tostring(error))
+	pcall(ScarySushi.detach)
+
+	initAttempts += 1
+	if initAttempts > Tune.INIT_RETRIES then
+		pcall(logWarn, "Init failed " .. initAttempts .. " times, giving up in this server.")
+		return
+	end
+
+	task.delay(Tune.INIT_RETRY_DELAY, function()
+		-- A newer copy took over in the meantime.
+		if shared.PotentScarySushi ~= ScarySushi then
+			return
+		end
+		pcall(log, "Retrying init (attempt " .. (initAttempts + 1) .. ").")
+		ScarySushi.detached = false
+		xpcall(ScarySushi.init, onInitializeError)
+	end)
+end
+
+-- A previous copy may be broken (e.g. one that failed to start), so its teardown must not stop this one.
+if shared.PotentScarySushi then
+	local ok, err = pcall(shared.PotentScarySushi.detach)
+	if not ok then
+		warn("Previous copy failed to detach: " .. tostring(err))
+	end
+end
+
+if shared.PotentChapterOne then
+	pcall(shared.PotentChapterOne.detach)
+	shared.PotentChapterOne = nil
+end
+
+shared.PotentScarySushi = ScarySushi
+
+-- Safely initialize the script as well as handle errors.
+xpcall(ScarySushi.init, onInitializeError)
+
+return ScarySushi
