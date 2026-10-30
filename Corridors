@@ -1,0 +1,4684 @@
+-- Check for table that is shared between executions.
+if not shared then
+	return warn("No shared, no script.")
+end
+
+-- Initialize Luraph globals if they do not exist.
+loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
+
+local AnomalyFinder = { running = false, connections = {}, controlConnections = {} }
+
+-- Constants.
+local SCAN_INTERVAL = 0.25
+local RESCAN_INTERVAL = 2.5
+local MIN_SCAN_GAP = 0.5
+-- Wait for parts to stop being added/removed so half-loaded models aren't reported.
+local SETTLE_TIME = 0.4
+local JOHN_COMPLETE_RATIO = 0.9
+local MAX_SETTLE_WAIT = 3
+-- John entries first seen this close to his death came from the ragdoll.
+local DEATH_GRACE = 3
+local YIELD_EVERY = 150
+local IGNORED_FOLDERS = { Debris = true, Ambience = true, Zones = true }
+local IGNORED_GROUPS = { ["Objects/AnomalyCounter"] = true }
+-- Doors that animate during play; only their appearance is compared.
+local POSITION_IGNORED_GROUPS = { ["Objects/Backdoor"] = true }
+
+-- The security cameras have three separate anomalies: warning signs switched on over them,
+-- the cameras gone, and one falling off the wall. Each change label maps to one of them.
+local SECURITY_CAMERAS_GROUP = "Objects/SecurityCameras"
+local SECURITY_CAMERA_ANOMALIES = {
+	toggled = { name = "Camera warning signs", kind = "New", detail = "" },
+	moved = { name = "Security camera", kind = "Altered", detail = "fell off" },
+	rotated = { name = "Security camera", kind = "Altered", detail = "fell off" },
+	["removed part"] = { name = "Security cameras", kind = "Missing", detail = "" },
+}
+
+-- Pieces of a shared folder that form their own object (the three security cameras in Props).
+local SUB_GROUPS = {
+	["Objects/Props"] = { Camera1 = "SecurityCameras", Camera2 = "SecurityCameras", Camera3 = "SecurityCameras" },
+}
+
+local ROOM_PROPERTIES = {
+	"Size", "Color", "Transparency", "Material", "Brightness", "Range", "Enabled",
+	"Texture", "TextureID", "TextureId", "MeshId", "Text", "SoundId", "Image", "Visible",
+	"ImageTransparency", "ImageColor3", "Rotation", "Face",
+}
+
+-- John animates, so he is compared on appearance only.
+local JOHN_PROPERTIES = {
+	"Size", "Color", "Transparency", "Material", "MeshId", "TextureID", "TextureId", "Texture",
+	"ShirtTemplate", "PantsTemplate", "HeadColor3", "TorsoColor3", "LeftArmColor3",
+	"RightArmColor3", "LeftLegColor3", "RightLegColor3", "C0", "C1", "Scale", "Offset",
+	"VertexColor", "Enabled", "Brightness", "Face", "HipHeight", "WalkSpeed",
+	"Part0", "Part1",
+}
+
+-- Changes that a whole-body resize causes on every part.
+local SIZE_LABELS = { resized = true, scale = true, pose = true, offset = true, height = true }
+-- Changes that a whole-body recolor causes on every part.
+local COLOR_LABELS = { recolored = true, ["skin color"] = true, tint = true, ["image tint"] = true }
+
+-- Objects that share one anomaly when they all change the same way.
+local OBJECT_FAMILIES = {
+	Frame1 = "Paintings", Frame2 = "Paintings", Frame3 = "Paintings", Frame4 = "Paintings", CameraFrame = "Paintings",
+	Camera1 = "Security cameras", Camera2 = "Security cameras",
+	ExtraCamera1 = "Security cameras", ExtraCamera2 = "Security cameras",
+	Door1 = "Side doors", Door2 = "Side doors", Door3 = "Side doors",
+	Vent1 = "Vents", Vent2 = "Vents", ArrowSign = "Arrow signs", ArrowSign2 = "Arrow signs",
+}
+local FAMILY_MERGE_MIN = 3
+-- Prompts are checked on their own so a kiss prompt reads as one clear anomaly.
+local JOHN_IGNORED_CLASSES = { AnimationTrack = true, Animator = true, Animation = true, ProximityPrompt = true }
+-- John changes that are still their own anomaly when something is attached to him.
+-- What something attached to John (the parasite, a costume piece) does to his body anyway.
+-- Everything else on him, like his shirt, colors or speed from before, is still its own anomaly.
+local ATTACHMENT_SIDE_EFFECTS = {
+	pose = true, moved = true, rotated = true, tilted = true, resized = true, scale = true,
+	offset = true, height = true, transparency = true, ["added part"] = true, ["removed part"] = true,
+}
+
+-- Don't move switches the lights off and spawns its creature as part of the same anomaly.
+local DONT_MOVE_LIGHTS = {}
+for _, lightName in ipairs({ "Ceiling lights", "Wall lamps", "Broken ceiling light" }) do
+	for _, suffix in ipairs({ "", " color", " brightness", " toggled", " transparency", " material" }) do
+		DONT_MOVE_LIGHTS[lightName .. suffix] = true
+	end
+end
+local LIGHTS_OFF_LABELS = { toggled = true, light = true, material = true, recolored = true, shade = true, transparency = true, dimmed = true }
+local DONT_MOVE_PARTS = { Creature = true }
+
+-- Anomalies built from several pieces, shown as one fixed entry however each piece reads.
+local FIXED_ANOMALIES = {
+	Piano = { kind = "New", detail = "playing" },
+	["Escape bathroom"] = { kind = "New", detail = "" },
+	Train = { kind = "New", detail = "" },
+}
+
+-- Side effects that only count when the anomaly causing them isn't already listed.
+-- The train drops an invisible "Part" into Debris; the piano and the bathroom escape turn
+-- the lights off, and the escape swings the bathroom door open.
+local DEBRIS_COMPANIONS = {
+	Part = { "Train" },
+	["Ceiling lights"] = { "Piano", "Escape bathroom" },
+	["Ceiling lights brightness"] = { "Piano", "Escape bathroom", "Spokesman" },
+	-- The spokesman makes the lights flicker as he arrives.
+	["Ceiling lights color"] = { "Spokesman" },
+	["Ceiling lights material"] = { "Spokesman" },
+	["Ceiling lights toggled"] = { "Piano", "Escape bathroom" },
+	["Door Bathroom"] = { "Escape bathroom" },
+}
+
+-- Sounds that only play during a specific anomaly (the bathroom flooding).
+-- Keyed by the sound's name, or "Parent/Sound" for generic names (Carnis whispers through "Voice").
+local SOUND_ANOMALIES = {
+	RisingWater = "Escape bathroom",
+	SpillWater = "Escape bathroom",
+	["Carnis_Voice/Voice"] = "Carnis",
+}
+
+-- Anomalies the panel has missed without a known tell. The listed parts of each corridor
+-- are snapshotted in detail, and their differences are logged when the report lists one.
+local DEEP_CHECKS = {
+	EscapeBathroom = {
+		"Objects/DoorBathroom", "Objects/ToiletCabine", "Objects/ToiletSign", "Objects/Sink",
+		"Objects/Mirror", "References/BathroomKey", "Zones/TriggerBathroom",
+	},
+	FlipArrowSign = {
+		"Objects/ArrowSignStart", "Objects/WallExitSign", "Objects/CeilingExitSign", "Objects/Props",
+	},
+	JohnFaint = { "Debris/John" },
+}
+local DEEP_CAPTURE_INTERVAL = 3
+local deepBaseline = nil
+local deepSnapshotsByLevel = {}
+local pendingDeepLevels = {}
+local lastDeepCapture = 0
+
+-- Objects where a move and an appearance change are two separate anomalies.
+-- Movement keeps the object's name; everything else goes under the second name.
+local SPLIT_OBJECTS = {
+	-- Its recolor is its own anomaly too, apart from the fire.
+	["Trash bin"] = { otherName = "Trash bin fire", labelNames = { recolored = "Trash bin color" } },
+}
+local MOVEMENT_LABELS = { moved = true, rotated = true, tilted = true }
+
+-- Every kind of change to the lights is its own anomaly: moved or turned, recolored,
+-- dimmed or brighter, and anything else. Movement keeps the plain name.
+local CATEGORY_SPLIT_OBJECTS = { ["Ceiling lights"] = true, ["Wall lamps"] = true, ["Broken ceiling light"] = true }
+-- A painting's new picture and its turning or moving are separate anomalies too.
+for index = 1, 4 do
+	CATEGORY_SPLIT_OBJECTS["Painting " .. index] = true
+end
+-- Exit signs: a wrong number and the sign being flipped or turned around are separate.
+CATEGORY_SPLIT_OBJECTS["Ceiling exit sign"] = true
+CATEGORY_SPLIT_OBJECTS["Wall level sign"] = true
+local LIGHT_CATEGORIES = {
+	recolored = "color", ["image tint"] = "color", tint = "color",
+	dimmed = "brightness", brighter = "brightness", light = "brightness", shade = "brightness",
+	image = "image", texture = "image",
+}
+local SWITCH_LABELS = { material = true, recolored = true, shade = true, transparency = true }
+
+-- The guide NPC that stands in each corridor; the name changes per map.
+local NPC_NAMES = { "John", "Jimmy" }
+-- John hides his briefcase and pistol while he asks his question.
+for _, npcName in ipairs(NPC_NAMES) do
+	DEBRIS_COMPANIONS[npcName .. "'s briefcase"] = { "John's question" }
+	DEBRIS_COMPANIONS[npcName .. "'s pistol"] = { "John's question" }
+end
+
+-- The NPC dies after the parasite anomaly, so his death is skipped when this is listed.
+local PARASITE_SUFFIX = "'s parasite"
+-- Speed first seen this close before the parasite still counts as the parasite's (half-loaded scans).
+local PARASITE_SPEED_SLACK = 1
+-- How far John's head has to turn on its neck to count as staring: his neck joint never moves otherwise.
+local STARE_MIN_DOT = 0.999
+
+-- Clean corridors are cached here so streamed-out maps still have a baseline.
+local BASELINE_CACHE_FOLDER = "AnomalyFinder"
+
+-- Different pieces of one anomaly, listed under a single name.
+local ANOMALY_ALIASES = {
+	["John's key"] = "Locked counter",
+	["Locked Counter (entity)"] = "Locked counter",
+	["Locked Counter"] = "Locked counter",
+	["Light Piano"] = "Piano",
+	["Piano (entity)"] = "Piano",
+	["Bathroom Key (entity)"] = "Escape bathroom",
+	-- The key that shows up in the corridor is the tell; the flood water comes after.
+	["Key Bathroom (entity)"] = "Escape bathroom",
+	["Key Bathroom"] = "Escape bathroom",
+	["Water (entity)"] = "Escape bathroom",
+	["Water"] = "Escape bathroom",
+	-- The spokesman brings the blocked wall and his shadows with him.
+	["Blocked Wall"] = "Spokesman",
+	["Shadow Snap"] = "Spokesman",
+	["Shadow Wave"] = "Spokesman",
+	["Shadow parade"] = "Spokesman",
+	-- The creature only shows up for Don't move.
+	["Creature"] = "Don't move",
+}
+
+-- Where the game's own post-level anomaly report gets logged next to what the panel saw.
+local REPORT_LOG_FOLDER = "AnomalyFinder"
+local REPORT_LOG_FILE = "AnomalyFinder/report_log.txt"
+
+local OBJECT_NAMES = {
+	TrainFolder = "Train", lights = "Ceiling lights", SecurityCameras = "Security cameras",
+	-- The two spirit models appear together as one anomaly.
+	SpiritsLeft = "Spirits", SpiritsRight = "Spirits",
+	Frame1 = "Painting 1", Frame2 = "Painting 2", Frame3 = "Painting 3", Frame4 = "Painting 4",
+	CameraFrame = "Camera sign", HiddenPainting = "Hidden painting",
+	Camera1 = "Security camera 1", Camera2 = "Security camera 2",
+	ExtraCamera1 = "Extra security camera 1", ExtraCamera2 = "Extra security camera 2",
+	Vent1 = "Vent 1", Vent2 = "Vent 2", Vent1Hidden = "Hidden vent",
+	Door1 = "Side door 1", Door2 = "Side door 2", Door3 = "Side door 3", Backdoor = "Exit door",
+	EyeClock = "Clock", BrokenLight = "Broken ceiling light", BloodPart = "Blood stain",
+	CeilingExitSign = "Ceiling exit sign", WallExitSign = "Wall level sign", Help = "Help sign",
+	ArrowSign = "Arrow sign 1", ArrowSign2 = "Arrow sign 2", FlowersSign = "Flowers sign",
+	TrashSign = "Trash sign", TrashBin = "Trash bin", GroundTrash = "Floor trash",
+	UniversalKey = "Key", WallDestroyEffect = "Broken wall", Bubblegum = "Bubblegum machine",
+	Walls = "Walls", Lamps = "Wall lamps", LeftHandrail = "Left handrail", RightHandrail = "Right handrail",
+	Lights = "Ceiling lights", Ceiling = "Ceiling", Floors = "Floor", Staircase = "Stairs",
+	BlindWalkway = "Floor guide strip",
+}
+
+local JOHN_NAMES = {
+	Case = "briefcase", ["Professional Glasses"] = "glasses", HumanoidRootPart = "aura / effect",
+	["Body Colors"] = "skin color", GirlHair = "hair", Hair = "hair", Pistol = "pistol", Key = "key",
+	Shirt = "shirt", Pants = "pants", Head = "head", Torso = "body", Humanoid = "body",
+	["Left Arm"] = "left arm", ["Right Arm"] = "right arm", ["Left Leg"] = "left leg", ["Right Leg"] = "right leg",
+}
+
+-- Debris holds the NPC and spawned anomalies; everything but the NPC counts.
+local DEBRIS_IGNORED = {}
+for _, npcName in ipairs(NPC_NAMES) do
+	DEBRIS_IGNORED[npcName] = true
+end
+local DEBRIS_IGNORED_PATTERNS = {}
+local DEBRIS_ENTITY_NAMES = {
+	-- The train's moving copies while it passes through.
+	SpeedClone = "Train", TrainLeft = "Train", TrainRight = "Train",
+	SCP096 = "SCP-096", AnomalyDoor = "Fake door", VoidPuddle = "Void puddle",
+	EletricPuddle = "Electric puddle", Camouflage = "Camouflage", Stalker = "Stalker",
+	DebrisShovel = "Artifact shovel", LockedCounter = "Locked counter",
+	-- A swarm of phone copies; separate from the room's own phone going missing.
+	Phone = "Crazy phone",
+}
+-- Entities that take the place of a room object; the missing object is the same anomaly.
+local DEBRIS_REPLACES = { AnomalyDoor = "Objects/Door2" }
+
+-- Client-side anomaly effects the server triggers through the AnomalyFunctions module.
+-- Names line up with the room scan's names so the same anomaly is never counted twice.
+local CLIENT_ANOMALIES = {
+	ShadowJumpscare = { name = "Shadow figure (entity)", detail = "jumpscare" },
+	-- Its own anomaly: the game lists it apart from the shadow jumpscare.
+	ShadowHeads = { name = "Shadow heads", detail = "" },
+	ShadowParade = { name = "Shadow parade", detail = "entity" },
+	DontMove = { name = "Don't move", detail = "entity" },
+	Entity0Screen = { name = "Entity 0", detail = "on screen" },
+	EyeClock = { name = "Clock", detail = "eye" },
+	JohnQuestion = { name = "John's question", detail = "" },
+	JohnKissKill = { name = "John", detail = "attacked" },
+}
+-- Effects of things already counted (the bubblegum blob, the Angel's Core item).
+local CLIENT_IGNORED = { Bubblegum = true, AngelCore = true }
+
+local ENTITY_NAMES = {
+	SCP096 = "SCP-096", EletricPuddle = "Electric puddle", Carnis_Voice = "Carnis voice",
+	-- The shadow left in Debris belongs to the shadow heads, not the shadow jumpscare.
+	Carnis = "Carnis", Puddle = "Puddle", Shadow = "Shadow heads",
+}
+
+local CHANGE_LABELS = {
+	pos = "moved", look = "rotated", up = "rotated", lookLoose = "rotated", upLoose = "rotated", Size = "resized", Color = "recolored",
+	Transparency = "transparency", Material = "material", Brightness = "light", Range = "light",
+	Enabled = "toggled", Texture = "image", TextureID = "texture", TextureId = "texture", MeshId = "shape", Image = "image",
+	SoundId = "sound", Visible = "visibility", ImageTransparency = "image", ImageColor3 = "image tint",
+	Face = "image", ShirtTemplate = "clothing", PantsTemplate = "clothing", HeadColor3 = "skin color",
+	TorsoColor3 = "skin color", LeftArmColor3 = "skin color", RightArmColor3 = "skin color",
+	LeftLegColor3 = "skin color", RightLegColor3 = "skin color", C0 = "pose", C1 = "pose",
+	Scale = "scale", Offset = "offset", VertexColor = "tint", HipHeight = "height", WalkSpeed = "speed",
+	Part0 = "in the other hand", Part1 = "in the other hand", Rotation = "rotated",
+}
+
+-- ESP and full auto. Kept in one table: the script is near Luau's 200-local limit.
+local AUTO = {
+	ESP_KEY = Enum.KeyCode.RightControl,
+	KEY = Enum.KeyCode.Delete,
+	ESP_COLORS = {
+		New = Color3.fromRGB(255, 110, 110),
+		Missing = Color3.fromRGB(255, 197, 107),
+		Altered = Color3.fromRGB(142, 197, 255),
+	},
+	ESP_MAX_BOXES = 40,
+	COUNT_SETTLE = 0.6,
+	MIN_LOOK_TIME = 0.5,
+	MAX_LOOK_TIME = 12,
+	CLICK_DELAY = 0.06,
+	STEP_TIMEOUT = 3,
+	WALK_TIMEOUT = 45,
+	DOOR_TIMEOUT = 25,
+	-- How long to stand still after the "Don't move" warning, on top of the creature being there.
+	DONT_MOVE_FREEZE = 8,
+	-- Hop along the walking path instead of walking it; much faster, same trigger zones.
+	TELEPORT = true,
+	HOP_DELAY = 0.03,
+	REPLAY_INTERVAL = 10,
+	NPC_LOOK_TIME = 1.2,
+	CONFIRM_TIME = 1,
+	DOOR_LEASH = 25,
+	OFF_TRACK_TIME = 3,
+	HAZARD_PATTERNS = { "Puddle" },
+	HAZARD_MARGIN = 3,
+	CHASERS = { "Camouflage", "Carnis" },
+	-- Entities to hide from the moment they show up (the spokesman's attacks can kill).
+	HIDE_FROM = { "Spokesman", "BlockedWall", "Blocked Wall", "ShadowSnap", "Shadow Snap", "ShadowWave", "Shadow Wave", "ShadowParade" },
+	-- How far behind the counter's wall to hide from a chaser (the button clicks from 9).
+	REFUGE_DEPTH = 3,
+	TRIGGER_DWELL = 0.35,
+	-- The bathroom escape floods the room once triggered; never walk into it on purpose.
+	SKIPPED_TRIGGERS = { "Bathroom" },
+	EVADE_TIMEOUT = 60,
+	-- Longest to wait at the start for a chaser to go back to its spot before the door.
+	DOOR_CLEAR_TIMEOUT = 25,
+	-- Longest to wait at the start for a chaser to give up (or a parasite John to die).
+	CHASE_TIMEOUT = 25,
+	-- Once the camouflage entity has been still this long, it has given up the chase.
+	CHASER_CALM = 1.5,
+	-- Don't go closer than this to a chaser that hasn't noticed us yet.
+	CHASER_KEEP_AWAY = 45,
+	-- Longest to wait for John to walk past the middle of the hallway.
+	JOHN_WALK_TIMEOUT = 20,
+	-- He faints about 18 studs before the hallway's middle; once he's past this point
+	-- (relative to the middle) he won't.
+	JOHN_SAFE_PAST = -10,
+	-- Cross the corridor in short hops, like walking it fast, so spots the server checks
+	-- along the way (the shadow jumpscare) still see us.
+	STEP_SIZE = 3,
+	STEP_DELAY = 0.06,
+	STATE_FILE = "AnomalyFinder/auto_state.txt",
+	RELOAD_SOURCE = [[repeat task.wait() until game:IsLoaded()
+pcall(function() loadstring(readfile("AnomalyFinder/AnomalyFinder.lua"), "AnomalyFinder")() end)]],
+}
+
+-- Services.
+local playersService = game:GetService("Players")
+local workspaceService = game:GetService("Workspace")
+local httpService = game:GetService("HttpService")
+local pathfindingService = game:GetService("PathfindingService")
+local userInputService = game:GetService("UserInputService")
+local lightingService = game:GetService("Lighting")
+
+local localPlayer = playersService.LocalPlayer
+
+-- State.
+local classProperties = { room = {}, john = {} }
+local roomVersions = setmetatable({}, { __mode = "k" })
+local roomCache = setmetatable({}, { __mode = "k" })
+local roomSeen = setmetatable({}, { __mode = "k" })
+local watchedRoom = nil
+local roomConnections = {}
+local roomBaseline = nil
+local johnBaseline = nil
+local johnBaselineHeight = nil
+local johnBaselineCount = nil
+local johnBaselinePrompts = {}
+local johnBaselineNeck = nil
+local wrappedReport = nil
+local pendingReportLines = {}
+local roomStructureTimes = setmetatable({}, { __mode = "k" })
+local roomWaitStarts = setmetatable({}, { __mode = "k" })
+local roomKnocks = setmetatable({}, { __mode = "k" })
+-- Entities recorded the moment they spawn, so ones that vanish quickly still count.
+local roomEntitiesSeen = setmetatable({}, { __mode = "k" })
+local baselineReferenceChildren = nil
+local roomClientAnomalies = setmetatable({}, { __mode = "k" })
+local wrappedAnomalyFunctions = {}
+-- Our own wrapper functions, so detaching only removes them when nothing wrapped on top.
+local ourWrappers = {}
+local workCounter = 0
+
+---Yield periodically so large scans spread across frames.
+local function throttle()
+	workCounter += 1
+
+	if workCounter >= YIELD_EVERY then
+		workCounter = 0
+		task.wait()
+	end
+end
+
+---Round a number to the nearest half stud.
+---@param value number
+---@return number
+local function roundHalf(value)
+	return math.floor(value * 2 + 0.5) / 2
+end
+
+---Format a direction vector in 0.05 steps (about 3 degrees).
+---@param vector Vector3
+---@return string
+local function formatDirection(vector)
+	local function round(component)
+		return math.floor(component * 20 + 0.5) / 20
+	end
+
+	return round(vector.X) .. "," .. round(vector.Y) .. "," .. round(vector.Z)
+end
+
+---Format a value into a tolerant comparison string.
+---@param value any
+---@return string
+local function formatValue(value)
+	local valueType = typeof(value)
+
+	if valueType == "number" then
+		return tostring(math.floor(value * 100 + 0.5) / 100)
+	end
+
+	if valueType == "Vector3" then
+		return roundHalf(value.X) .. "," .. roundHalf(value.Y) .. "," .. roundHalf(value.Z)
+	end
+
+	if valueType == "Color3" then
+		return math.floor(value.R * 50) .. "," .. math.floor(value.G * 50) .. "," .. math.floor(value.B * 50)
+	end
+
+	if valueType == "CFrame" then
+		return formatValue(value.Position) .. "/" .. formatValue(value.LookVector) .. "/" .. formatValue(value.UpVector)
+	end
+
+	if valueType == "Instance" then
+		return value.Name
+	end
+
+	return tostring(value)
+end
+
+---Resolve which properties exist on a class once, so scans skip pcall per property.
+---@param cacheName string
+---@param instance Instance
+---@param candidates table
+---@return table
+local function getClassProperties(cacheName, instance, candidates)
+	local cache = classProperties[cacheName]
+	local existing = cache[instance.ClassName]
+	if existing then
+		return existing
+	end
+
+	local valid = {}
+
+	for _, property in ipairs(candidates) do
+		local success = pcall(function()
+			return instance[property]
+		end)
+
+		if success then
+			table.insert(valid, property)
+		end
+	end
+
+	cache[instance.ClassName] = valid
+	return valid
+end
+
+---Get the path of an instance below a root, or nil if it left the root.
+---@param root Instance
+---@param instance Instance
+---@return table?
+local function getPath(root, instance)
+	local path = {}
+	local current = instance
+
+	while current and current ~= root do
+		table.insert(path, 1, current.Name)
+		current = current.Parent
+	end
+
+	return current and path or nil
+end
+
+---Add a signature entry to a bag.
+---@param bag table
+---@param id string
+---@param group string
+---@param fields table
+local function addEntry(bag, id, group, fields)
+	local parts = { id }
+
+	for _, field in ipairs(fields) do
+		table.insert(parts, field[1] .. "=" .. field[2])
+	end
+
+	local signature = table.concat(parts, "|")
+	local entry = bag[signature]
+
+	if entry then
+		entry.count += 1
+		return
+	end
+
+	bag[signature] = { count = 1, id = id, group = group, fields = fields }
+end
+
+---Build signatures for a room's static contents relative to its start.
+---@param room Model
+---@return table
+local function buildRoomBag(room)
+	local bag = {}
+	local roomStart = room:FindFirstChild("RoomStart")
+	if not roomStart then
+		return bag
+	end
+
+	local origin = roomStart.CFrame
+	local level = tostring(room:GetAttribute("Level") or 0)
+
+	for _, descendant in ipairs(room:GetDescendants()) do
+		throttle()
+
+		local path = getPath(room, descendant)
+		if not path or #path < 2 or IGNORED_FOLDERS[path[1]] then
+			continue
+		end
+
+		local group = path[1] .. "/" .. path[2]
+		local subGroup = SUB_GROUPS[group] and path[3] and SUB_GROUPS[group][path[3]]
+		if subGroup then
+			group = path[1] .. "/" .. subGroup
+		end
+
+		if IGNORED_GROUPS[group] then
+			continue
+		end
+
+		local fields = {}
+
+		-- Non-part instances inherit the position of their nearest part ancestor.
+		if not POSITION_IGNORED_GROUPS[group] then
+			local anchor = descendant
+			while anchor and anchor ~= room and not anchor:IsA("BasePart") do
+				anchor = anchor.Parent
+			end
+
+			if anchor and anchor:IsA("BasePart") then
+				local relative = origin:ToObjectSpace(anchor.CFrame)
+				table.insert(fields, { "pos", formatValue(relative.Position) })
+				-- Anchored parts are compared finely so a slight tilt shows; loose parts sway.
+				if anchor.Anchored then
+					table.insert(fields, { "look", formatDirection(relative.LookVector) })
+					table.insert(fields, { "up", formatDirection(relative.UpVector) })
+				else
+					table.insert(fields, { "lookLoose", formatValue(relative.LookVector) })
+					table.insert(fields, { "upLoose", formatValue(relative.UpVector) })
+				end
+			end
+		end
+
+		local isPart = descendant:IsA("BasePart")
+
+		for _, property in ipairs(getClassProperties("room", descendant, ROOM_PROPERTIES)) do
+			-- Part rotation is world-space and differs per corridor; it is covered relative to the room above.
+			if property == "Rotation" and isPart then
+				continue
+			end
+
+			local value = descendant[property]
+
+			-- The wall sign legitimately shows the room's own level number.
+			if property == "Text" and path[2] == "WallExitSign" and value == level then
+				value = "{LEVEL}"
+			end
+
+			table.insert(fields, { property, formatValue(value) })
+		end
+
+		addEntry(bag, table.concat(path, "/") .. "|" .. descendant.ClassName, group, fields)
+	end
+
+	return bag
+end
+
+---Build appearance-only signatures for a John model.
+---@param john Model
+---@return table
+local function buildJohnBag(john)
+	local bag = {}
+	local complete = true
+
+	for _, descendant in ipairs(john:GetDescendants()) do
+		throttle()
+
+		if JOHN_IGNORED_CLASSES[descendant.ClassName] then
+			continue
+		end
+
+		-- Parts can vanish while we yield (he's re-cloned or the corridor is torn down);
+		-- a bag missing them would make every lost part look like an anomaly.
+		local path = getPath(john, descendant)
+		if not path then
+			complete = false
+			continue
+		end
+
+		local fields = {}
+
+		for _, property in ipairs(getClassProperties("john", descendant, JOHN_PROPERTIES)) do
+			table.insert(fields, { property, formatValue(descendant[property]) })
+		end
+
+		addEntry(bag, table.concat(path, "/") .. "|" .. descendant.ClassName, path[1], fields)
+	end
+
+	return bag, complete and john.Parent ~= nil
+end
+
+-- Directions of anchored parts, rounded to 0.05 (about 3 degrees).
+local FINE_STEP_FIELDS = { look = 0.05, up = 0.05 }
+local HUE_CHANGE_MIN = 0.2
+
+-- Values are rounded before comparing; these are compared in half-stud steps.
+local HALF_STEP_FIELDS = {
+	pos = true, lookLoose = true, upLoose = true, Size = true, C0 = true, C1 = true,
+	Scale = true, Offset = true, VertexColor = true,
+}
+
+---Split a formatted value back into its numbers.
+---@param value string?
+---@return table
+local function parseNumbers(value)
+	local numbers = {}
+	if not value then
+		return numbers
+	end
+
+	for piece in value:gmatch("[^,/]+") do
+		local number = tonumber(piece)
+		if not number then
+			return {}
+		end
+
+		table.insert(numbers, number)
+	end
+
+	return numbers
+end
+
+---Whether two rounded values only differ by one rounding step.
+---A part sitting right on a rounding boundary can round either way from float noise.
+---@param property string
+---@param before string?
+---@param after string?
+---@return boolean
+local function isRoundingNoise(property, before, after)
+	local a, b = parseNumbers(before), parseNumbers(after)
+	if #a == 0 or #a ~= #b then
+		return false
+	end
+
+	-- Color3 values are stored in 1/50 steps; plain numbers to 0.01.
+	local step = HALF_STEP_FIELDS[property] and 0.5 or FINE_STEP_FIELDS[property] or (#a == 3 and 1 or 0.01)
+
+	for index = 1, #a do
+		if math.abs(a[index] - b[index]) > step + 1e-6 then
+			return false
+		end
+	end
+
+	return true
+end
+
+---Whether two formatted colors differ in hue, not just in how bright they are.
+---@param before string?
+---@param after string?
+---@return boolean
+local function isHueChange(before, after)
+	local a, b = parseNumbers(before), parseNumbers(after)
+	if #a ~= 3 or #b ~= 3 then
+		return false
+	end
+
+	local maxA = math.max(a[1], a[2], a[3], 1)
+	local maxB = math.max(b[1], b[2], b[3], 1)
+	local difference = 0
+	for index = 1, 3 do
+		difference = math.max(difference, math.abs(a[index] / maxA - b[index] / maxB))
+	end
+
+	return difference > HUE_CHANGE_MIN
+end
+
+---How many fields differ between two entries beyond rounding noise.
+---@param before table
+---@param after table
+---@return number
+local function countRealDifferences(before, after)
+	local beforeFields = {}
+	for _, field in ipairs(before.fields) do
+		beforeFields[field[1]] = field[2]
+	end
+
+	local count = 0
+	for _, field in ipairs(after.fields) do
+		local old = beforeFields[field[1]]
+		if old ~= field[2] and not isRoundingNoise(field[1], old, field[2]) then
+			count += 1
+		end
+	end
+
+	return count
+end
+
+---Compare two bags and describe what changed per group.
+---@param baseBag table
+---@param currentBag table
+---@return table, table, table
+local function diffBags(baseBag, currentBag)
+	local baseGroups, currentGroups, changes = {}, {}, {}
+	local leftoverBase = {}
+
+	for signature, entry in pairs(baseBag) do
+		baseGroups[entry.group] = true
+
+		local surplus = entry.count - (currentBag[signature] and currentBag[signature].count or 0)
+		if surplus > 0 then
+			leftoverBase[entry.id] = leftoverBase[entry.id] or {}
+			table.insert(leftoverBase[entry.id], entry)
+		end
+	end
+
+	for signature, entry in pairs(currentBag) do
+		currentGroups[entry.group] = true
+
+		local surplus = entry.count - (baseBag[signature] and baseBag[signature].count or 0)
+		if surplus <= 0 then
+			continue
+		end
+
+		-- Pair with the closest matching part from the baseline to name the exact change.
+		local candidates = leftoverBase[entry.id]
+		local original, originalIndex, fewest = nil, nil, math.huge
+
+		for index, candidate in ipairs(candidates or {}) do
+			local differences = countRealDifferences(candidate, entry)
+			if differences < fewest then
+				original, originalIndex, fewest = candidate, index, differences
+			end
+		end
+
+		if not original then
+			changes[entry.group] = changes[entry.group] or {}
+			changes[entry.group]["added part"] = true
+			continue
+		end
+
+		table.remove(candidates, originalIndex)
+
+		local originalFields = {}
+		for _, field in ipairs(original.fields) do
+			originalFields[field[1]] = field[2]
+		end
+
+		-- A dimmed or brightened light also shifts its tint; that is one change, not two.
+		local isLight = entry.id:find("Light$") ~= nil
+		local brightnessBefore, brightnessAfter, brightnessText
+		for _, field in ipairs(entry.fields) do
+			if field[1] == "Brightness" then
+				brightnessBefore, brightnessAfter, brightnessText = tonumber(originalFields.Brightness), tonumber(field[2]), field[2]
+			end
+		end
+
+		local brightnessChanged = isLight and brightnessBefore and brightnessAfter
+			and brightnessBefore ~= brightnessAfter
+			and not isRoundingNoise("Brightness", originalFields.Brightness, brightnessText)
+
+		-- A new hue is a recolor even when the brightness moved with it; only a same-hue
+		-- shift counts as dimmed or brighter.
+		local hueChanged = false
+		if brightnessChanged then
+			for _, field in ipairs(entry.fields) do
+				if field[1] == "Color" and isHueChange(originalFields.Color, field[2]) then
+					brightnessChanged = false
+					hueChanged = true
+				end
+			end
+		end
+
+		local labels = {}
+
+		for _, field in ipairs(entry.fields) do
+			if brightnessChanged and (field[1] == "Color" or field[1] == "Brightness") then
+				if field[1] == "Brightness" then
+					labels[brightnessAfter < brightnessBefore and "dimmed" or "brighter"] = true
+				end
+
+				continue
+			end
+
+			if hueChanged and (field[1] == "Brightness" or field[1] == "Range") then
+				continue
+			end
+
+			local old = originalFields[field[1]]
+			if old ~= field[2] and not isRoundingNoise(field[1], old, field[2]) then
+				local label = CHANGE_LABELS[field[1]] or field[1]
+
+				if field[1] == "Text" then
+					label = 'text "' .. field[2] .. '"'
+				elseif field[1] == "Color" and entry.id:find("Light") and not isHueChange(old, field[2]) then
+					-- Flickering lights go white-hot and back, the same hue; only a new hue is a recolor.
+					label = "shade"
+				elseif field[1] == "look" or field[1] == "up" then
+					-- Under about 40 degrees off reads as a tilt rather than a turn.
+					local a, b = parseNumbers(old), parseNumbers(field[2])
+					if #a == 3 and #b == 3 and a[1] * b[1] + a[2] * b[2] + a[3] * b[3] > 0.76 then
+						label = "tilted"
+					end
+				elseif field[1] == "Rotation" then
+					-- Some signs are built at 180 already, so what matters is a half-turn from normal.
+					local before = tonumber(old)
+					local after = tonumber(field[2])
+					if before and after and math.abs((after - before) % 360 - 180) < 5 then
+						label = "upside down"
+					end
+				end
+
+				labels[label] = true
+			end
+		end
+
+		if labels.rotated then
+			labels.tilted = nil
+		end
+
+		-- Only rounding noise: the part is unchanged.
+		if next(labels) then
+			changes[entry.group] = changes[entry.group] or {}
+
+			for label in pairs(labels) do
+				changes[entry.group][label] = true
+			end
+		end
+	end
+
+	for _, entries in pairs(leftoverBase) do
+		for _, entry in ipairs(entries) do
+			changes[entry.group] = changes[entry.group] or {}
+			changes[entry.group]["removed part"] = true
+		end
+	end
+
+	return changes, baseGroups, currentGroups
+end
+
+---Turn a CamelCase identifier into readable words.
+---@param name string
+---@return string
+local function splitWords(name)
+	local spaced = name:gsub("_", " "):gsub("(%l)(%u)", "%1 %2"):gsub("(%a)(%d)", "%1 %2")
+	return spaced
+end
+
+---Readable name for a room group.
+---@param group string
+---@return string
+local function roomGroupName(group)
+	local folder, name = group:match("^(.-)/(.+)$")
+
+	-- Spawn markers only change when an entity appears at them.
+	if folder == "References" then
+		local entity = name:gsub("Spawn%d*$", "")
+		return (ENTITY_NAMES[entity] or splitWords(entity)) .. " (entity)"
+	end
+
+	return OBJECT_NAMES[name] or splitWords(name)
+end
+
+---Summarise a set of change labels.
+---@param labels table
+---@return string
+local function describeChanges(labels)
+	local list = {}
+
+	for label in pairs(labels) do
+		if label ~= "added part" and label ~= "removed part" then
+			table.insert(list, label)
+		end
+	end
+
+	if #list == 0 then
+		if labels["added part"] then
+			table.insert(list, "something added")
+		end
+
+		if labels["removed part"] then
+			table.insert(list, "part missing")
+		end
+	end
+
+	table.sort(list)
+	return table.concat(list, ", ")
+end
+
+---Whether a room's parts are streamed in enough to read.
+---@param room Instance?
+---@return boolean
+local function isRoomLoaded(room)
+	return room ~= nil and room:FindFirstChild("RoomStart") ~= nil and room:FindFirstChild("RoomEnd") ~= nil
+end
+
+---Where the clean corridor is cached for this map version.
+---@return string
+local function getBaselineCachePath()
+	return BASELINE_CACHE_FOLDER .. "/baseline_v3_" .. tostring(game.PlaceId) .. "_" .. tostring(game.PlaceVersion) .. ".json"
+end
+
+---Load a clean corridor saved earlier on this map version.
+---@return table?
+local function loadCachedBaseline()
+	local success, bag = pcall(function()
+		local path = getBaselineCachePath()
+		if not isfile(path) then
+			return nil
+		end
+
+		return httpService:JSONDecode(readfile(path))
+	end)
+
+	return success and type(bag) == "table" and next(bag) ~= nil and bag or nil
+end
+
+---Save the clean corridor so later runs don't depend on it being streamed in.
+---@param bag table
+local function saveCachedBaseline(bag)
+	pcall(function()
+		if not isfolder(BASELINE_CACHE_FOLDER) then
+			makefolder(BASELINE_CACHE_FOLDER)
+		end
+
+		writefile(getBaselineCachePath(), httpService:JSONEncode(bag))
+	end)
+end
+
+---Get or build the clean room baseline.
+---The first corridor is the clean reference; the Default template can be outdated or streamed out.
+---@return table?
+local function getRoomBaseline()
+	if roomBaseline then
+		return roomBaseline
+	end
+
+	roomBaseline = loadCachedBaseline()
+	if roomBaseline then
+		return roomBaseline
+	end
+
+	local segments = workspaceService:FindFirstChild("MapSegments")
+	local firstRoom = segments and segments:FindFirstChild("Segment000")
+
+	-- Streamed maps only load parts near you; ask for the clean corridor before copying it.
+	if firstRoom and workspaceService.StreamingEnabled then
+		pcall(function()
+			localPlayer:RequestStreamAroundAsync(firstRoom:GetPivot().Position, 5)
+		end)
+	end
+
+	if isRoomLoaded(firstRoom) then
+		roomBaseline = buildRoomBag(firstRoom)
+		saveCachedBaseline(roomBaseline)
+		return roomBaseline
+	end
+
+	local template = workspaceService:FindFirstChild("Default")
+	if template and template:FindFirstChild("RoomStart") then
+		roomBaseline = buildRoomBag(template)
+		return roomBaseline
+	end
+
+	return nil
+end
+
+---Whether John has been ragdolled (killed); his health stays full when this happens.
+---@param john Model
+---@return boolean
+local function isJohnDead(john)
+	local humanoid = john:FindFirstChildOfClass("Humanoid")
+	if humanoid and humanoid.Health <= 0 then
+		return true
+	end
+
+	local disabledMotors = 0
+	for _, descendant in ipairs(john:GetDescendants()) do
+		if descendant:IsA("Motor6D") and not descendant.Enabled then
+			disabledMotors += 1
+		end
+	end
+
+	return disabledMotors >= 3
+end
+
+---Find the corridor's guide NPC (John, Jimmy...) in its Debris folder.
+---@param room Instance
+---@return Model?
+local function findNpc(room)
+	local debris = room:FindFirstChild("Debris")
+	if not debris then
+		return nil
+	end
+
+	for _, npcName in ipairs(NPC_NAMES) do
+		local npc = debris:FindFirstChild(npcName)
+		if npc then
+			return npc
+		end
+	end
+
+	return nil
+end
+
+---Height reference for an R6 or R15 body.
+---@param npc Model
+---@return BasePart?
+local function getTorso(npc)
+	return npc:FindFirstChild("Torso") or npc:FindFirstChild("UpperTorso")
+end
+
+---Get the clean John from the first room, falling back to a majority vote across rooms.
+---@return table?
+local function getJohnBaseline()
+	if johnBaseline then
+		return johnBaseline
+	end
+
+	local segments = workspaceService:FindFirstChild("MapSegments")
+	if not segments then
+		return nil
+	end
+
+	local firstRoom = segments:FindFirstChild("Segment000")
+	local firstJohn = firstRoom and findNpc(firstRoom)
+
+	-- Right after joining he can still be streaming in; a half-built John makes every part look new.
+	local function isWhole(john)
+		return getTorso(john) and john:FindFirstChild("Head") and john:FindFirstChildOfClass("Humanoid")
+			and #john:GetDescendants() >= 300 -- a whole one has about 900
+	end
+
+	if firstJohn and not isJohnDead(firstJohn) and isWhole(firstJohn) then
+		local torso = getTorso(firstJohn)
+		johnBaselineHeight = torso and torso.Size.Y
+		local neck = torso and torso:FindFirstChild("Neck")
+		johnBaselineNeck = neck and neck:IsA("Motor6D") and neck.C0 or nil
+		local baseHumanoid = firstJohn:FindFirstChildOfClass("Humanoid")
+		AnomalyFinder.johnBaselineWalkSpeed = baseHumanoid and baseHumanoid.WalkSpeed
+		johnBaselineCount = #firstJohn:GetDescendants()
+
+		for _, descendant in ipairs(firstJohn:GetDescendants()) do
+			if descendant:IsA("ProximityPrompt") then
+				johnBaselinePrompts[table.concat(getPath(firstJohn, descendant), "/")] = true
+			end
+		end
+
+		local bag, complete = buildJohnBag(firstJohn)
+		if not complete then
+			return nil
+		end
+
+		johnBaseline = bag
+		return johnBaseline
+	end
+
+	-- Anomalies are rare per room, so whatever most Johns share is the clean look.
+	local votes, total = {}, 0
+
+	for _, room in ipairs(segments:GetChildren()) do
+		local john = findNpc(room)
+		if not john or isJohnDead(john) or not isWhole(john) then
+			continue
+		end
+
+		total += 1
+
+		for signature, entry in pairs(buildJohnBag(john)) do
+			votes[signature] = votes[signature] or { entry = entry, seen = 0 }
+			votes[signature].seen += 1
+		end
+
+		for _, descendant in ipairs(john:GetDescendants()) do
+			if descendant:IsA("ProximityPrompt") then
+				local key = "prompt:" .. table.concat(getPath(john, descendant), "/")
+				votes[key] = votes[key] or { seen = 0, prompt = true }
+				votes[key].seen += 1
+			end
+		end
+	end
+
+	if total < 3 then
+		return nil
+	end
+
+	-- Prompts most Johns have are part of his normal setup.
+	for key, vote in pairs(votes) do
+		if vote.prompt then
+			if vote.seen * 2 > total then
+				johnBaselinePrompts[key:sub(8)] = true
+			end
+
+			votes[key] = nil
+		end
+	end
+
+	local bag = {}
+	for signature, vote in pairs(votes) do
+		if vote.seen * 2 > total then
+			bag[signature] = vote.entry
+		end
+	end
+
+	johnBaseline = bag
+	return bag
+end
+
+---Scan a room's John against the clean John.
+---@param room Model
+---@return table
+local function scanJohn(room)
+	local john = findNpc(room)
+	if not john then
+		return {}
+	end
+
+	local owner = john.Name
+
+	-- A dead John ragdolls every joint; that is one anomaly, not each change.
+	if isJohnDead(john) then
+		return { { name = owner, kind = "Altered", detail = "died", death = true, npc = true } }
+	end
+
+	local baseline = getJohnBaseline()
+	if not baseline then
+		return {}
+	end
+
+	-- John is cloned in when the corridor opens; skip him until he's fully there.
+	if johnBaselineCount and #john:GetDescendants() < johnBaselineCount * JOHN_COMPLETE_RATIO then
+		return {}
+	end
+
+	local currentBag, complete = buildJohnBag(john)
+	if not complete then
+		return {}
+	end
+
+	local changes, baseGroups, currentGroups = diffBags(baseline, currentBag)
+	local anomalies, altered = {}, {}
+	local hasAttachment = false
+	local hasParasite = false
+
+	-- A prompt the clean John doesn't have (the kiss prompt).
+	for _, descendant in ipairs(john:GetDescendants()) do
+		if not descendant:IsA("ProximityPrompt") then
+			continue
+		end
+
+		local path = getPath(john, descendant)
+		if path and not johnBaselinePrompts[table.concat(path, "/")] then
+			local action = descendant.ActionText ~= "" and descendant.ActionText or descendant.ObjectText
+			local isKiss = action:lower():find("kiss") ~= nil
+			table.insert(anomalies, {
+				name = isKiss and owner .. "'s kiss prompt" or owner .. "'s prompt",
+				kind = "New",
+				detail = isKiss and "" or action,
+			})
+		end
+	end
+
+	for group, labels in pairs(changes) do
+		local name = owner .. "'s " .. (JOHN_NAMES[group] or splitWords(group):lower())
+
+		if currentGroups[group] and not baseGroups[group] then
+			hasAttachment = true
+			hasParasite = hasParasite or name == owner .. PARASITE_SUFFIX
+			table.insert(anomalies, { name = name, kind = "New", detail = "attached to " .. owner })
+		elseif baseGroups[group] and not currentGroups[group] then
+			table.insert(anomalies, { name = name, kind = "Missing", detail = "" })
+		else
+			altered[group] = labels
+		end
+	end
+
+	-- Without his body parts he's still streaming in; look again once he's all there.
+	if not (getTorso(john) and john:FindFirstChild("Head") and john:FindFirstChild("HumanoidRootPart")) then
+		return {}
+	end
+
+	-- No anomaly takes more than one or two things off him; a pile of "missing" parts
+	-- means this read went wrong (he was being rebuilt), so don't believe it.
+	local missingParts, missingNames = 0, {}
+	for _, anomaly in ipairs(anomalies) do
+		if anomaly.kind == "Missing" or anomaly.kind == "New" then
+			missingParts += 1
+			table.insert(missingNames, anomaly.kind .. " " .. anomaly.name)
+		end
+	end
+	if missingParts >= 4 then
+		if AnomalyFinder.loggedBadJohn ~= john then
+			AnomalyFinder.loggedBadJohn = john
+			local children = {}
+			for _, child in ipairs(john:GetChildren()) do
+				table.insert(children, child.Name)
+			end
+			table.insert(pendingReportLines, string.format(
+				"[%s] Ignored a bad read of %s | missing: %s | he has: %s\n",
+				os.date("%Y-%m-%d %H:%M:%S"), john:GetFullName(), table.concat(missingNames, ", "), table.concat(children, ", ")
+			))
+		end
+		return {}
+	end
+
+	-- Staring: his head turned on the neck joint. An attachment never turns it, so this
+	-- survives the attachment clean-up below.
+	local torso = getTorso(john)
+	local neck = torso and torso:FindFirstChild("Neck")
+	if neck and neck:IsA("Motor6D") and johnBaselineNeck then
+		local turn = neck.C0.LookVector:Dot(johnBaselineNeck.LookVector)
+		if turn < STARE_MIN_DOT then
+			table.insert(anomalies, { name = owner .. "'s stare", kind = "Altered", detail = "head turned" })
+
+			if altered[torso.Name] then
+				altered[torso.Name].pose = nil
+			end
+		end
+	end
+
+	-- The menacing aura is a particle effect added to him; it's its own anomaly.
+	local menacing = john:FindFirstChild("MenacingAttachment", true)
+	if menacing then
+		table.insert(anomalies, { name = owner .. "'s menacing aura", kind = "New", detail = "" })
+
+		local auraGroup = getPath(john, menacing)[1]
+		if altered[auraGroup] then
+			altered[auraGroup]["added part"] = nil
+		end
+	end
+
+	-- Something attached to John reshapes his limbs too; count it once,
+	-- but keep changes an attachment can't cause (his clothes, colors, which hand holds the case).
+	-- Speed that shows up along with the parasite is the parasite's; speed he already had
+	-- before it attached stays listed from the earlier scan.
+	-- A scaled John has a different torso; check it before the attachment clean-up hides it.
+	local scaledTorso = torso and johnBaselineHeight and math.abs(torso.Size.Y - johnBaselineHeight) > 0.15
+	-- The game scales the whole model; its scale factor says so even when parts are hidden.
+	local okScale, modelScale = pcall(john.GetScale, john)
+	modelScale = okScale and modelScale or 1
+	if math.abs(modelScale - 1) > 0.01 then
+		scaledTorso = true
+	end
+
+	if hasAttachment then
+		for _, labels in pairs(altered) do
+			-- Colors and speed stay: what the parasite does to him once it turns him is
+			-- sorted out by when it happened (see getParasiteSeenTime).
+			for label in pairs(labels) do
+				if ATTACHMENT_SIDE_EFFECTS[label] then
+					labels[label] = nil
+				end
+			end
+		end
+	end
+
+	-- Only his body counts toward a whole-body color change; a recolored briefcase or hair
+	-- is its own anomaly even when it happens alongside another.
+	local bodyNames = {
+		head = true, body = true, ["skin color"] = true,
+		["left arm"] = true, ["right arm"] = true, ["left leg"] = true, ["right leg"] = true,
+	}
+
+	local sizedParts, coloredParts = 0, 0
+	for group, labels in pairs(altered) do
+		if labels.resized or labels.scale then
+			sizedParts += 1
+		end
+
+		for label in pairs(bodyNames[JOHN_NAMES[group]] and COLOR_LABELS or {}) do
+			if labels[label] then
+				coloredParts += 1
+				break
+			end
+		end
+	end
+
+	-- A whole-body resize touches every part; report it once as his size.
+	if sizedParts >= 3 or scaledTorso then
+		local torso = getTorso(john)
+		local detail = "resized"
+
+		if math.abs(modelScale - 1) > 0.01 then
+			detail = modelScale < 1 and "smaller" or "bigger"
+		elseif torso and johnBaselineHeight then
+			detail = torso.Size.Y < johnBaselineHeight and "smaller" or "bigger"
+		end
+
+		table.insert(anomalies, { name = owner .. "'s size", kind = "Altered", detail = detail })
+
+		for _, labels in pairs(altered) do
+			for label in pairs(SIZE_LABELS) do
+				labels[label] = nil
+			end
+		end
+	end
+
+	-- A color change spread across several of John's parts is one anomaly.
+	if coloredParts >= 2 then
+		table.insert(anomalies, { name = owner .. "'s color", kind = "Altered", detail = "changed" })
+
+		for group, labels in pairs(altered) do
+			for label in pairs(bodyNames[JOHN_NAMES[group]] and COLOR_LABELS or {}) do
+				labels[label] = nil
+			end
+		end
+	end
+
+	-- The briefcase joint lives under an arm; a swapped hand is its own anomaly, apart from a recolored case.
+	local swappedHand = false
+	for _, labels in pairs(altered) do
+		if labels["in the other hand"] then
+			swappedHand = true
+			labels["in the other hand"] = nil
+		end
+	end
+
+	if swappedHand then
+		table.insert(anomalies, { name = owner .. "'s briefcase hand", kind = "Altered", detail = "in the other hand" })
+	end
+
+	-- A walk speed change lives on his Humanoid; report it as his speed.
+	local speedChanged = false
+	for _, labels in pairs(altered) do
+		if labels.speed then
+			speedChanged = true
+			labels.speed = nil
+		end
+	end
+
+	if speedChanged then
+		local humanoid = john:FindFirstChildOfClass("Humanoid")
+		local baseSpeed = AnomalyFinder.johnBaselineWalkSpeed
+		local detail = "changed"
+		if humanoid and baseSpeed then
+			detail = humanoid.WalkSpeed > baseSpeed and "faster" or "slower"
+		end
+
+		table.insert(anomalies, { name = owner .. "'s speed", kind = "Altered", detail = detail })
+	end
+
+	for group, labels in pairs(altered) do
+		if next(labels) then
+			local name = owner .. "'s " .. (JOHN_NAMES[group] or splitWords(group):lower())
+			table.insert(anomalies, { name = name, kind = "Altered", detail = describeChanges(labels) })
+		end
+	end
+
+	-- Hair has two parts; keep one entry per name.
+	local seen, unique = {}, {}
+	for _, anomaly in ipairs(anomalies) do
+		local key = anomaly.kind .. anomaly.name
+		if not seen[key] then
+			seen[key] = true
+			table.insert(unique, anomaly)
+		end
+	end
+
+	return unique
+end
+
+---Find entities spawned into a room's Debris folder.
+---@param room Model
+---@return table, table
+local function scanDebrisEntities(room)
+	local debris = room:FindFirstChild("Debris")
+	local entities, replaced = {}, {}
+	if not debris then
+		return entities, replaced
+	end
+
+	-- Include entities that already left the room.
+	local names, instances = {}, {}
+	for _, child in ipairs(debris:GetChildren()) do
+		names[child.Name] = true
+		instances[child.Name] = instances[child.Name] or {}
+		table.insert(instances[child.Name], child)
+	end
+
+	local seen = roomEntitiesSeen[room]
+	for name in pairs(seen and seen.debris or {}) do
+		names[name] = true
+	end
+
+	for name in pairs(names) do
+		local ignored = DEBRIS_IGNORED[name]
+
+		for _, pattern in ipairs(DEBRIS_IGNORED_PATTERNS) do
+			if name:match(pattern) then
+				ignored = true
+			end
+		end
+
+		if ignored then
+			continue
+		end
+
+		-- Exact names first (SCP096), then without a copy number (DebrisShovel2).
+		local baseName = DEBRIS_ENTITY_NAMES[name] and name or name:gsub("%d+$", "")
+		local replacedGroup = DEBRIS_REPLACES[baseName]
+		local detail = "entity"
+
+		if replacedGroup then
+			replaced[replacedGroup] = true
+			detail = "replaces " .. (OBJECT_NAMES[replacedGroup:match("/(.+)$")] or replacedGroup):lower()
+		end
+
+		table.insert(entities, {
+			name = DEBRIS_ENTITY_NAMES[baseName] or splitWords(baseName),
+			kind = "New",
+			detail = detail,
+			targets = instances[name],
+		})
+	end
+
+	return entities, replaced
+end
+
+---The anomaly a sound belongs to, if it only plays during one.
+---@param instance Instance
+---@return string?
+local function getSoundAnomaly(instance)
+	if not instance:IsA("Sound") then
+		return nil
+	end
+
+	local parent = instance.Parent
+	return SOUND_ANOMALIES[instance.Name] or (parent and SOUND_ANOMALIES[parent.Name .. "/" .. instance.Name])
+end
+
+---Name the door a knock sound belongs to.
+---@param room Model
+---@param sound Sound
+---@return string
+local function getKnockSource(room, sound)
+	local path = getPath(room, sound)
+	if not path or #path < 2 then
+		return "a door"
+	end
+
+	local objectName = path[2]
+	if path[1] == "Debris" then
+		local entityName = DEBRIS_ENTITY_NAMES[objectName] or DEBRIS_ENTITY_NAMES[(objectName:gsub("%d+$", ""))]
+		return (entityName or splitWords(objectName)):lower()
+	end
+
+	return (OBJECT_NAMES[objectName] or splitWords(objectName)):lower()
+end
+
+---Knocks heard in this room, plus any knock playing right now.
+---@param room Model
+---@return table
+local function scanKnocks(room)
+	local knocks = roomKnocks[room] or {}
+
+	for _, descendant in ipairs(room:GetDescendants()) do
+		if descendant:IsA("Sound") and descendant.Name == "Knock" and descendant.IsPlaying then
+			knocks[getKnockSource(room, descendant)] = true
+		end
+
+		-- Sounds that only play during one anomaly, already playing when you walk in.
+		local soundAnomaly = getSoundAnomaly(descendant)
+		if soundAnomaly and descendant.IsPlaying then
+			roomClientAnomalies[room] = roomClientAnomalies[room] or {}
+			roomClientAnomalies[room][soundAnomaly] = ""
+		end
+	end
+
+	roomKnocks[room] = knocks
+
+	local anomalies = {}
+	for source in pairs(knocks) do
+		table.insert(anomalies, { name = "Knocking", kind = "New", detail = "on " .. source })
+	end
+
+	return anomalies
+end
+
+---Turn a detail string back into a set of labels.
+---@param detail string
+---@return table
+local function parseLabels(detail)
+	local labels = {}
+	for label in detail:gmatch("[^,]+") do
+		labels[label:match("^%s*(.-)%s*$")] = true
+	end
+	return labels
+end
+
+---Every instance the given anomalies point at, for the ESP boxes.
+---@param anomalies table
+---@return table
+local function collectTargets(anomalies)
+	local targets = {}
+
+	for _, anomaly in ipairs(anomalies) do
+		for _, target in ipairs(anomaly.targets or {}) do
+			table.insert(targets, target)
+		end
+	end
+
+	return targets
+end
+
+---Combine changes shared across one kind of object (paintings, cameras...).
+---A change most of them share is one "All ..." anomaly; once that is taken out,
+---two that are left only moved have swapped places, which is one more anomaly.
+---@param anomalies table
+---@return table
+local function mergeFamilies(anomalies)
+	local result, byFamily = {}, {}
+
+	for _, anomaly in ipairs(anomalies) do
+		if anomaly.family then
+			byFamily[anomaly.family] = byFamily[anomaly.family] or {}
+			table.insert(byFamily[anomaly.family], anomaly)
+		else
+			table.insert(result, anomaly)
+		end
+	end
+
+	for family, members in pairs(byFamily) do
+		local familyName = family:lower()
+		local altered, others = {}, {}
+
+		for _, member in ipairs(members) do
+			if member.kind == "Altered" then
+				table.insert(altered, { anomaly = member, labels = parseLabels(member.detail) })
+			else
+				table.insert(others, member)
+			end
+		end
+
+		-- Missing or added in bulk ("all paintings missing").
+		local byKind = {}
+		for _, member in ipairs(others) do
+			byKind[member.kind] = byKind[member.kind] or {}
+			table.insert(byKind[member.kind], member)
+		end
+
+		for kind, list in pairs(byKind) do
+			if #list >= FAMILY_MERGE_MIN then
+				table.insert(result, { name = "All " .. familyName, kind = kind, detail = "", targets = collectTargets(list) })
+			else
+				for _, member in ipairs(list) do
+					table.insert(result, member)
+				end
+			end
+		end
+
+		-- Labels enough of them share become one family-wide anomaly.
+		local labelCounts = {}
+		for _, entry in ipairs(altered) do
+			for label in pairs(entry.labels) do
+				labelCounts[label] = (labelCounts[label] or 0) + 1
+			end
+		end
+
+		local shared = {}
+		for label, count in pairs(labelCounts) do
+			if count >= FAMILY_MERGE_MIN then
+				table.insert(shared, label)
+			end
+		end
+
+		if #shared > 0 then
+			table.sort(shared)
+			table.insert(result, {
+				name = "All " .. familyName,
+				kind = "Altered",
+				detail = table.concat(shared, ", "),
+				targets = collectTargets(members),
+			})
+
+			for _, entry in ipairs(altered) do
+				for _, label in ipairs(shared) do
+					entry.labels[label] = nil
+				end
+			end
+		end
+
+		-- Two left with nothing but movement have traded places. A new picture on one of them
+		-- is its own anomaly and doesn't get in the way.
+		local onlyMoved = {}
+		for _, entry in ipairs(altered) do
+			-- Trading places means its position changed; one that only turned isn't a candidate.
+			local moved, movementOnly = entry.labels.moved == true, true
+			for label in pairs(entry.labels) do
+				if not MOVEMENT_LABELS[label] and LIGHT_CATEGORIES[label] ~= "image" then
+					movementOnly = false
+				end
+			end
+
+			if moved and movementOnly then
+				table.insert(onlyMoved, entry)
+			end
+		end
+
+		if #onlyMoved == 2 then
+			table.insert(result, {
+				name = family .. " swapped",
+				kind = "Altered",
+				detail = onlyMoved[1].anomaly.name:lower() .. " ↔ " .. onlyMoved[2].anomaly.name:lower(),
+				targets = collectTargets({ onlyMoved[1].anomaly, onlyMoved[2].anomaly }),
+			})
+
+			-- A swap moves both; a turn only one of them has is a rotated painting on top.
+			for index, entry in ipairs(onlyMoved) do
+				local other = onlyMoved[3 - index]
+				local kept = {}
+				for label in pairs(entry.labels) do
+					local turnOnlyHere = (label == "rotated" or label == "tilted") and not other.labels[label]
+					if turnOnlyHere or not MOVEMENT_LABELS[label] then
+						kept[label] = true
+					end
+				end
+				entry.kept = kept
+			end
+			onlyMoved[1].labels = onlyMoved[1].kept
+			onlyMoved[2].labels = onlyMoved[2].kept
+		end
+
+		-- Whatever each one has left is its own anomaly.
+		for _, entry in ipairs(altered) do
+			if next(entry.labels) then
+				local remaining = {}
+				for label in pairs(entry.labels) do
+					table.insert(remaining, label)
+				end
+
+				table.sort(remaining)
+				table.insert(result, {
+					name = entry.anomaly.name,
+					kind = "Altered",
+					detail = table.concat(remaining, ", "),
+					targets = entry.anomaly.targets,
+				})
+			end
+		end
+	end
+
+	return result
+end
+
+---Split objects whose movement and appearance change are separate anomalies.
+---@param anomalies table
+---@return table
+local function splitAnomalies(anomalies)
+	local result = {}
+
+	for _, anomaly in ipairs(anomalies) do
+		if CATEGORY_SPLIT_OBJECTS[anomaly.name] and anomaly.kind == "Altered" then
+			local byCategory, order = {}, {}
+
+			-- Switching lights off also changes their glow material and color; that's one change.
+			local switched = anomaly.detail:find("toggled", 1, true) ~= nil
+
+			for label in anomaly.detail:gmatch("[^,]+") do
+				label = label:match("^%s*(.-)%s*$")
+				local category = MOVEMENT_LABELS[label] and "" or LIGHT_CATEGORIES[label]
+					or (label:sub(1, 5) == "text " and "text") or label
+				if switched and SWITCH_LABELS[label] then
+					category = "toggled"
+				end
+
+				if not byCategory[category] then
+					byCategory[category] = {}
+					table.insert(order, category)
+				end
+				table.insert(byCategory[category], label)
+			end
+
+			for _, category in ipairs(order) do
+				local name = category == "" and anomaly.name or (anomaly.name .. " " .. category)
+				local detail = (category == "" or category == "brightness" or category == "text")
+					and table.concat(byCategory[category], ", ") or ""
+				table.insert(result, { name = name, kind = "Altered", detail = detail, targets = anomaly.targets })
+			end
+
+			continue
+		end
+
+		local split = SPLIT_OBJECTS[anomaly.name]
+		if not split or anomaly.kind ~= "Altered" then
+			table.insert(result, anomaly)
+			continue
+		end
+
+		local movement, other, named = {}, {}, {}
+		for label in anomaly.detail:gmatch("[^,]+") do
+			label = label:match("^%s*(.-)%s*$")
+			local ownName = split.labelNames and split.labelNames[label]
+
+			if ownName then
+				named[ownName] = true
+			else
+				table.insert(MOVEMENT_LABELS[label] and movement or other, label)
+			end
+		end
+
+		for name in pairs(named) do
+			table.insert(result, { name = name, kind = "Altered", detail = "", targets = anomaly.targets })
+		end
+
+		if #movement > 0 then
+			table.insert(result, {
+				name = anomaly.name,
+				kind = "Altered",
+				detail = table.concat(movement, ", "),
+				targets = anomaly.targets,
+			})
+		end
+
+		if #other > 0 then
+			table.insert(result, { name = split.otherName, kind = "New", detail = "", targets = anomaly.targets })
+		end
+	end
+
+	return result
+end
+
+---The instances in a room that make up one scanned group.
+---@param room Model
+---@param group string
+---@return table
+local function getGroupTargets(room, group)
+	local folderName, objectName = group:match("^(.-)/(.+)$")
+	local folder = folderName and room:FindFirstChild(folderName)
+	if not folder then
+		return {}
+	end
+
+	-- Groups built from pieces of a shared folder (the cameras in Props).
+	for parentGroup, pieces in pairs(SUB_GROUPS) do
+		local parentFolder, parentName = parentGroup:match("^(.-)/(.+)$")
+		if parentFolder == folderName then
+			local parent = folder:FindFirstChild(parentName)
+			local targets = {}
+
+			for pieceName, subGroup in pairs(pieces) do
+				local piece = parent and subGroup == objectName and parent:FindFirstChild(pieceName)
+				if piece then
+					table.insert(targets, piece)
+				end
+			end
+
+			if #targets > 0 then
+				return targets
+			end
+		end
+	end
+
+	local targets = {}
+	for _, child in ipairs(folder:GetChildren()) do
+		if child.Name == objectName then
+			table.insert(targets, child)
+		end
+	end
+
+	return targets
+end
+
+---The clean corridor instance, when it is loaded, for drawing where missing things belong.
+---@return Model?
+local function getBaselineRoomInstance()
+	local segments = workspaceService:FindFirstChild("MapSegments")
+	local firstRoom = segments and segments:FindFirstChild("Segment000")
+	if isRoomLoaded(firstRoom) then
+		return firstRoom
+	end
+
+	local template = workspaceService:FindFirstChild("Default")
+	return isRoomLoaded(template) and template or nil
+end
+
+---Boxes showing where a missing group sits in the clean corridor, moved into this room.
+---@param room Model
+---@param group string
+---@return table?
+local function getGhostBoxes(room, group)
+	local baseRoom = getBaselineRoomInstance()
+	local roomStart = room:FindFirstChild("RoomStart")
+	if not baseRoom or not roomStart then
+		return nil
+	end
+
+	local ghosts = {}
+	for _, target in ipairs(getGroupTargets(baseRoom, group)) do
+		local cframe, size
+
+		if target:IsA("BasePart") then
+			cframe, size = target.CFrame, target.Size
+		elseif target:IsA("Model") then
+			cframe, size = target:GetBoundingBox()
+		else
+			local part = target:FindFirstChildWhichIsA("BasePart", true)
+			if part then
+				cframe, size = part.CFrame, part.Size
+			end
+		end
+
+		if cframe then
+			local relative = baseRoom.RoomStart.CFrame:ToObjectSpace(cframe)
+			table.insert(ghosts, { cframe = roomStart.CFrame * relative, size = size })
+		end
+	end
+
+	return #ghosts > 0 and ghosts or nil
+end
+
+---Scan a room against the clean room and John baselines.
+---@param room Model
+---@return table
+local function scanRoom(room)
+	local baseline = getRoomBaseline()
+	if not baseline then
+		return {}
+	end
+
+	local changes, baseGroups, currentGroups = diffBags(baseline, buildRoomBag(room))
+	local entities, replaced = scanDebrisEntities(room)
+	local anomalies = {}
+
+	for _, entity in ipairs(entities) do
+		table.insert(anomalies, entity)
+	end
+
+	-- An object an entity stands in for is part of that entity's anomaly.
+	for group in pairs(replaced) do
+		changes[group] = nil
+	end
+
+	-- Entities that appeared at a spawn marker and already despawned.
+	local seen = roomEntitiesSeen[room]
+	for folder in pairs(seen and seen.references or {}) do
+		local group = "References/" .. folder
+		changes[group] = changes[group] or { ["added part"] = true }
+	end
+
+	for group, labels in pairs(changes) do
+		-- Spawn markers only matter when something new appears at them;
+		-- a marker that's empty, used up or missing isn't an anomaly.
+		if group:match("^References/") and baseGroups[group] and not labels["added part"] then
+			continue
+		end
+
+		if group == SECURITY_CAMERAS_GROUP then
+			if baseGroups[group] and not currentGroups[group] then
+				labels = { ["removed part"] = true }
+			end
+
+			local added = {}
+			for label in pairs(labels) do
+				local anomaly = SECURITY_CAMERA_ANOMALIES[label]
+				if anomaly and not added[anomaly.name] then
+					added[anomaly.name] = true
+					table.insert(anomalies, {
+						name = anomaly.name,
+						kind = anomaly.kind,
+						detail = anomaly.detail,
+						targets = getGroupTargets(room, group),
+						ghosts = anomaly.kind == "Missing" and getGhostBoxes(room, group) or nil,
+					})
+				end
+			end
+
+			if next(added) == nil then
+				table.insert(anomalies, {
+					name = "Security cameras",
+					kind = "Altered",
+					detail = describeChanges(labels),
+					targets = getGroupTargets(room, group),
+				})
+			end
+
+			continue
+		end
+
+		local kind, detail = "Altered", describeChanges(labels)
+
+		if baseGroups[group] and not currentGroups[group] then
+			kind, detail = "Missing", ""
+		elseif currentGroups[group] and not baseGroups[group] then
+			kind, detail = "New", ""
+		elseif group:match("^References/") then
+			kind, detail = "New", "appeared"
+		end
+
+		local objectName = group:match("^Objects/(.+)$")
+		table.insert(anomalies, {
+			name = roomGroupName(group),
+			kind = kind,
+			detail = detail,
+			family = objectName and OBJECT_FAMILIES[objectName],
+			targets = getGroupTargets(room, group),
+			ghosts = kind == "Missing" and getGhostBoxes(room, group) or nil,
+		})
+	end
+
+	anomalies = mergeFamilies(anomalies)
+	anomalies = splitAnomalies(anomalies)
+
+	local npc = findNpc(room)
+	for _, anomaly in ipairs(scanJohn(room)) do
+		anomaly.targets = anomaly.targets or (npc and { npc })
+		table.insert(anomalies, anomaly)
+	end
+
+	for _, anomaly in ipairs(scanKnocks(room)) do
+		table.insert(anomalies, anomaly)
+	end
+
+	for name, detail in pairs(roomClientAnomalies[room] or {}) do
+		table.insert(anomalies, { name = name, kind = "New", detail = detail })
+	end
+
+	table.sort(anomalies, function(a, b)
+		return a.name < b.name
+	end)
+
+	return anomalies
+end
+
+---Names the clean room keeps inside each spawn marker folder.
+---@return table
+local function getBaselineReferenceChildren()
+	if baselineReferenceChildren then
+		return baselineReferenceChildren
+	end
+
+	-- The clean first corridor is the reference; Default can be outdated or streamed out.
+	local segments = workspaceService:FindFirstChild("MapSegments")
+	local firstRoom = segments and segments:FindFirstChild("Segment000")
+	local firstLoaded = isRoomLoaded(firstRoom)
+	local sources = { workspaceService:FindFirstChild("Default"), firstLoaded and firstRoom or nil }
+
+	local result = {}
+	for _, source in pairs(sources) do
+		local references = source and source:FindFirstChild("References")
+
+		for _, folder in ipairs(references and references:GetChildren() or {}) do
+			result[folder.Name] = result[folder.Name] or {}
+
+			for _, child in ipairs(folder:GetChildren()) do
+				result[folder.Name][child.Name] = true
+			end
+		end
+	end
+
+	-- Only keep the list once the clean corridor could actually be read.
+	if firstLoaded then
+		baselineReferenceChildren = result
+	end
+
+	return result
+end
+
+---Record an entity spawning into a room as soon as it is parented.
+---@param room Instance
+---@param instance Instance
+local function recordEntitySpawn(room, instance)
+	local path = getPath(room, instance)
+	if not path or #path < 2 then
+		return
+	end
+
+	local seen = roomEntitiesSeen[room]
+	if not seen then
+		seen = { debris = {}, references = {} }
+		roomEntitiesSeen[room] = seen
+	end
+
+	if path[1] == "Debris" and #path == 2 and not DEBRIS_IGNORED[path[2]] then
+		seen.debris[path[2]] = true
+		return
+	end
+
+	-- Something placed inside a spawn marker that the clean room doesn't have.
+	if path[1] == "References" and #path >= 3 then
+		local known = getBaselineReferenceChildren()[path[2]]
+		if known and not known[path[3]] then
+			seen.references[path[2]] = true
+		end
+	end
+end
+
+---Follow a "Folder/Child" path below a root.
+---@param root Instance
+---@param path string
+---@return Instance?
+local function resolvePath(root, path)
+	local current = root
+	for piece in path:gmatch("[^/]+") do
+		current = current and current:FindFirstChild(piece)
+	end
+
+	return current
+end
+
+---Every path any deep check looks at.
+---@return table
+local function getDeepPaths()
+	local paths, seen = {}, {}
+	for _, list in pairs(DEEP_CHECKS) do
+		for _, path in ipairs(list) do
+			if not seen[path] then
+				seen[path] = true
+				table.insert(paths, path)
+			end
+		end
+	end
+
+	return paths
+end
+
+---Detailed state of the deep-checked parts of a corridor, including what the normal scan skips.
+---@param room Instance
+---@return table
+local function deepSnapshot(room)
+	local origin = room.RoomStart.CFrame
+	local lists = {}
+
+	for _, path in ipairs(getDeepPaths()) do
+		local target = resolvePath(room, path)
+		if not target then
+			lists[path] = { "absent" }
+			continue
+		end
+
+		local items = target:GetDescendants()
+		table.insert(items, 1, target)
+
+		for _, item in ipairs(items) do
+			throttle()
+
+			local itemPath = getPath(target, item) or {}
+			local key = path .. (#itemPath > 0 and ("/" .. table.concat(itemPath, "/")) or "") .. "|" .. item.ClassName
+			local bits = {}
+
+			for name, value in pairs(item:GetAttributes()) do
+				table.insert(bits, "@" .. name .. "=" .. tostring(value))
+			end
+
+			if item:IsA("BasePart") then
+				local relative = origin:ToObjectSpace(item.CFrame)
+				table.insert(bits, "pos=" .. formatValue(relative.Position))
+				table.insert(bits, "look=" .. formatValue(relative.LookVector))
+				table.insert(bits, "up=" .. formatValue(relative.UpVector))
+				table.insert(bits, "collide=" .. tostring(item.CanCollide))
+				table.insert(bits, "touch=" .. tostring(item.CanTouch))
+				table.insert(bits, "transparency=" .. formatValue(item.Transparency))
+			elseif item:IsA("Humanoid") then
+				table.insert(bits, "state=" .. item:GetState().Name)
+				table.insert(bits, "platform=" .. tostring(item.PlatformStand))
+				table.insert(bits, "sit=" .. tostring(item.Sit))
+				table.insert(bits, "hip=" .. formatValue(item.HipHeight))
+			elseif item:IsA("Animator") then
+				local playing = {}
+				for _, track in ipairs(item:GetPlayingAnimationTracks()) do
+					table.insert(playing, track.Animation and track.Animation.AnimationId:match("%d+$") or "?")
+				end
+				table.sort(playing)
+				table.insert(bits, "anims=" .. table.concat(playing, ","))
+			elseif item:IsA("ProximityPrompt") then
+				table.insert(bits, "enabled=" .. tostring(item.Enabled))
+				table.insert(bits, "action=" .. item.ActionText)
+			elseif item:IsA("Sound") then
+				table.insert(bits, "playing=" .. tostring(item.IsPlaying))
+			elseif item:IsA("ValueBase") then
+				table.insert(bits, "value=" .. tostring(item.Value))
+			elseif item:IsA("Light") or item:IsA("ParticleEmitter") or item:IsA("Beam") then
+				table.insert(bits, "enabled=" .. tostring(item.Enabled))
+			elseif item:IsA("Decal") then
+				table.insert(bits, "face=" .. item.Face.Name)
+				table.insert(bits, "texture=" .. item.Texture)
+			elseif item:IsA("SurfaceGui") then
+				table.insert(bits, "face=" .. item.Face.Name)
+			elseif item:IsA("GuiObject") then
+				table.insert(bits, "rotation=" .. formatValue(item.Rotation))
+				table.insert(bits, "visible=" .. tostring(item.Visible))
+
+				if item:IsA("ImageLabel") or item:IsA("ImageButton") then
+					table.insert(bits, "image=" .. item.Image)
+					table.insert(bits, "rect=" .. tostring(item.ImageRectOffset) .. "/" .. tostring(item.ImageRectSize))
+				end
+			end
+
+			table.sort(bits)
+			lists[key] = lists[key] or {}
+			table.insert(lists[key], table.concat(bits, " "))
+		end
+	end
+
+	-- Same-named siblings are sorted so their order can't create differences.
+	local snapshot = {}
+	for key, list in pairs(lists) do
+		table.sort(list)
+		snapshot[key] = table.concat(list, " | ")
+	end
+
+	return snapshot
+end
+
+---Snapshot the current corridor every few seconds, keyed by level.
+---@param room Instance
+local function captureDeepSnapshot(room)
+	local level = room:GetAttribute("Level")
+	if not level or not isRoomLoaded(room) or os.clock() - lastDeepCapture < DEEP_CAPTURE_INTERVAL then
+		return
+	end
+
+	lastDeepCapture = os.clock()
+
+	if not deepBaseline then
+		local segments = workspaceService:FindFirstChild("MapSegments")
+		local firstRoom = segments and segments:FindFirstChild("Segment000")
+		if isRoomLoaded(firstRoom) then
+			deepBaseline = deepSnapshot(firstRoom)
+		end
+	end
+
+	deepSnapshotsByLevel[level] = deepSnapshot(room)
+end
+
+---Log lines describing how a level's checked parts differed from the clean corridor.
+---@param level number
+---@param anomalyName string
+---@return string
+local function describeDeepDiff(level, anomalyName)
+	local snapshot = deepSnapshotsByLevel[level]
+	if not deepBaseline or not snapshot then
+		return string.format("    %s check, level %s: no snapshot taken\n", anomalyName, tostring(level))
+	end
+
+	local function isChecked(key)
+		for _, path in ipairs(DEEP_CHECKS[anomalyName]) do
+			if key:sub(1, #path) == path then
+				return true
+			end
+		end
+
+		return false
+	end
+
+	local lines = {}
+	for key, value in pairs(snapshot) do
+		if isChecked(key) and deepBaseline[key] ~= value then
+			table.insert(lines, "      " .. key .. ": " .. tostring(deepBaseline[key]) .. " -> " .. value)
+		end
+	end
+
+	for key, value in pairs(deepBaseline) do
+		if isChecked(key) and snapshot[key] == nil then
+			table.insert(lines, "      " .. key .. ": " .. value .. " -> (gone)")
+		end
+	end
+
+	table.sort(lines)
+
+	local text = string.format("    %s check, level %s: %d differences\n", anomalyName, tostring(level), #lines)
+	if #lines > 0 then
+		text ..= table.concat(lines, "\n", 1, math.min(#lines, 40)) .. "\n"
+	end
+
+	return text
+end
+
+---Find which room a descendant of MapSegments belongs to.
+---@param segments Folder
+---@param instance Instance
+---@return Instance?
+local function getOwningRoom(segments, instance)
+	local current = instance
+
+	while current and current.Parent ~= segments do
+		current = current.Parent
+	end
+
+	return current
+end
+
+---Mark rooms as changed whenever their contents change.
+---@param segments Folder
+local function watchSegments(segments)
+	for _, connection in ipairs(AnomalyFinder.connections) do
+		connection:Disconnect()
+	end
+
+	table.clear(AnomalyFinder.connections)
+
+	local function bump(instance)
+		local room = getOwningRoom(segments, instance)
+		if room then
+			roomVersions[room] = (roomVersions[room] or 0) + 1
+			roomStructureTimes[room] = os.clock()
+		end
+
+		return room
+	end
+
+	local function onAdded(instance)
+		local room = bump(instance)
+		if room and room ~= instance then
+			recordEntitySpawn(room, instance)
+		end
+	end
+
+	table.insert(AnomalyFinder.connections, segments.DescendantAdded:Connect(onAdded))
+	table.insert(AnomalyFinder.connections, segments.DescendantRemoving:Connect(bump))
+	AnomalyFinder.watchedSegments = segments
+end
+
+---Find the segment the local player is standing in.
+---@param segments Folder
+---@return Model?
+local function getCurrentRoom(segments)
+	local character = localPlayer.Character
+	local rootPart = character and character:FindFirstChild("HumanoidRootPart")
+	if not rootPart then
+		return nil
+	end
+
+	local position = rootPart.Position
+	local bestRoom, bestDistance = nil, math.huge
+
+	for _, room in ipairs(segments:GetChildren()) do
+		local roomStart = room:FindFirstChild("RoomStart")
+		local roomEnd = room:FindFirstChild("RoomEnd")
+		if not (roomStart and roomEnd) then
+			continue
+		end
+
+		-- Distance from the player to the start-end line segment of the room.
+		local axis = roomEnd.Position - roomStart.Position
+		local alpha = math.clamp((position - roomStart.Position):Dot(axis) / axis:Dot(axis), 0, 1)
+		local distance = (roomStart.Position + axis * alpha - position).Magnitude
+
+		if distance < bestDistance then
+			bestRoom, bestDistance = room, distance
+		end
+	end
+
+	return bestRoom
+end
+
+---Create the overlay UI.
+---@return table
+local function createInterface()
+	local screenGui = Instance.new("ScreenGui")
+	screenGui.Name = "AnomalyFinder"
+	screenGui.ResetOnSpawn = false
+	screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+	local frame = Instance.new("Frame")
+	frame.Size = UDim2.fromOffset(270, 60)
+	frame.Position = UDim2.new(0, 16, 0.35, 0)
+	frame.AutomaticSize = Enum.AutomaticSize.Y
+	frame.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
+	frame.BackgroundTransparency = 0.15
+	frame.Active = true
+	frame.Draggable = true
+	frame.Parent = screenGui
+
+	Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = Color3.fromRGB(70, 70, 80)
+	stroke.Parent = frame
+
+	local padding = Instance.new("UIPadding")
+	padding.PaddingTop = UDim.new(0, 10)
+	padding.PaddingBottom = UDim.new(0, 10)
+	padding.PaddingLeft = UDim.new(0, 12)
+	padding.PaddingRight = UDim.new(0, 12)
+	padding.Parent = frame
+
+	local layout = Instance.new("UIListLayout")
+	layout.Padding = UDim.new(0, 4)
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Parent = frame
+
+	local header = Instance.new("TextLabel")
+	header.Size = UDim2.new(1, 0, 0, 18)
+	header.BackgroundTransparency = 1
+	header.Font = Enum.Font.GothamMedium
+	header.TextSize = 13
+	header.TextColor3 = Color3.fromRGB(150, 150, 160)
+	header.TextXAlignment = Enum.TextXAlignment.Left
+	header.Text = "Corridor -"
+	header.LayoutOrder = 1
+	header.Parent = frame
+
+	local count = Instance.new("TextLabel")
+	count.Size = UDim2.new(1, 0, 0, 30)
+	count.BackgroundTransparency = 1
+	count.Font = Enum.Font.GothamBold
+	count.TextSize = 26
+	count.TextColor3 = Color3.fromRGB(240, 240, 245)
+	count.TextXAlignment = Enum.TextXAlignment.Left
+	count.Text = "Scanning..."
+	count.LayoutOrder = 2
+	count.Parent = frame
+
+	local toggleRow = Instance.new("Frame")
+	toggleRow.Size = UDim2.new(1, 0, 0, 26)
+	toggleRow.BackgroundTransparency = 1
+	toggleRow.LayoutOrder = 3
+	toggleRow.Parent = frame
+
+	local rowLayout = Instance.new("UIListLayout")
+	rowLayout.FillDirection = Enum.FillDirection.Horizontal
+	rowLayout.Padding = UDim.new(0, 6)
+	rowLayout.Parent = toggleRow
+
+	local function createToggle(text, order)
+		local button = Instance.new("TextButton")
+		button.Size = UDim2.new(0.5, -3, 1, 0)
+		button.BackgroundColor3 = Color3.fromRGB(40, 40, 48)
+		button.AutoButtonColor = true
+		button.Font = Enum.Font.GothamMedium
+		button.TextSize = 12
+		button.TextColor3 = Color3.fromRGB(200, 200, 210)
+		button.Text = text
+		button.LayoutOrder = order
+		button.Parent = toggleRow
+
+		Instance.new("UICorner", button).CornerRadius = UDim.new(0, 6)
+		return button
+	end
+
+	local autoButton = createToggle("Full auto [Del]: off", 1)
+	local espButton = createToggle("ESP [RCtrl]: off", 2)
+
+	local status = Instance.new("TextLabel")
+	status.Size = UDim2.new(1, 0, 0, 0)
+	status.AutomaticSize = Enum.AutomaticSize.Y
+	status.BackgroundTransparency = 1
+	status.Font = Enum.Font.Gotham
+	status.TextSize = 12
+	status.TextWrapped = true
+	status.TextColor3 = Color3.fromRGB(150, 150, 160)
+	status.TextXAlignment = Enum.TextXAlignment.Left
+	status.Text = ""
+	status.Visible = false
+	status.LayoutOrder = 4
+	status.Parent = frame
+
+	local list = Instance.new("TextLabel")
+	list.Size = UDim2.new(1, 0, 0, 0)
+	list.AutomaticSize = Enum.AutomaticSize.Y
+	list.BackgroundTransparency = 1
+	list.Font = Enum.Font.Gotham
+	list.TextSize = 14
+	list.RichText = true
+	list.TextWrapped = true
+	list.TextColor3 = Color3.fromRGB(210, 210, 215)
+	list.TextXAlignment = Enum.TextXAlignment.Left
+	list.TextYAlignment = Enum.TextYAlignment.Top
+	list.Text = ""
+	list.LayoutOrder = 5
+	list.Parent = frame
+
+	local parentSuccess = pcall(function()
+		screenGui.Parent = gethui()
+	end)
+
+	if not parentSuccess then
+		screenGui.Parent = localPlayer:WaitForChild("PlayerGui")
+	end
+
+	local espGui = Instance.new("ScreenGui")
+	espGui.Name = "AnomalyFinderESP"
+	espGui.ResetOnSpawn = false
+	espGui.Parent = screenGui.Parent
+
+	return {
+		gui = screenGui,
+		header = header,
+		count = count,
+		list = list,
+		status = status,
+		autoButton = autoButton,
+		espButton = espButton,
+		espGui = espGui,
+	}
+end
+
+local KIND_COLORS = {
+	New = "#ff7a7a",
+	Missing = "#ffc56b",
+	Altered = "#8ec5ff",
+}
+
+---Render a room's scan results.
+---@param interface table
+---@param room Model?
+---@param anomalies table?
+local function render(interface, room, anomalies)
+	if not room then
+		interface.header.Text = "Corridor -"
+		interface.count.Text = "Not in a corridor"
+		interface.count.TextColor3 = Color3.fromRGB(240, 240, 245)
+		interface.list.Text = ""
+		return
+	end
+
+	interface.header.Text = "Corridor " .. tostring(room:GetAttribute("Level") or room.Name)
+
+	if not anomalies then
+		interface.count.Text = "Scanning..."
+		interface.count.TextColor3 = Color3.fromRGB(240, 240, 245)
+		interface.list.Text = ""
+		return
+	end
+
+	interface.count.Text = #anomalies .. (#anomalies == 1 and " anomaly" or " anomalies")
+	interface.count.TextColor3 = #anomalies == 0 and Color3.fromRGB(120, 220, 140) or Color3.fromRGB(255, 120, 120)
+
+	local lines = {}
+	for _, anomaly in ipairs(anomalies) do
+		local detail = anomaly.detail ~= "" and ('  <font color="#8a8a95">' .. anomaly.detail .. "</font>") or ""
+		table.insert(lines, string.format('<font color="%s">%s</font>  %s%s', KIND_COLORS[anomaly.kind], anomaly.kind, anomaly.name, detail))
+	end
+
+	interface.list.Text = table.concat(lines, "\n")
+end
+
+---Get the game's AnomalyFunctions module table without requiring it ourselves.
+---@return table?
+local function getAnomalyFunctions()
+	local gameGlobals = getrenv()._G
+	local module = gameGlobals and gameGlobals.AnomalyFunctions
+	return type(module) == "table" and module or nil
+end
+
+---Log client-side anomalies into the current room when the server triggers them.
+local function wrapAnomalyFunctions()
+	local module = getAnomalyFunctions()
+	if not module then
+		return
+	end
+
+	for key, original in pairs(module) do
+		if type(original) ~= "function" or CLIENT_IGNORED[key] or wrappedAnomalyFunctions[key] then
+			continue
+		end
+
+		local info = CLIENT_ANOMALIES[key] or { name = splitWords(key), detail = "" }
+
+		local function record()
+			if key == "DontMove" then
+				AnomalyFinder.freezeUntil = os.clock() + AUTO.DONT_MOVE_FREEZE
+			end
+
+			local segments = workspaceService:FindFirstChild("MapSegments")
+			local room = segments and AnomalyFinder.getCurrentRoom(segments)
+			if not room then
+				return
+			end
+
+			-- The spokesman's shadow parade: time to hide behind the counter.
+			if key == "ShadowParade" then
+				AnomalyFinder.spokesmanRoom = room
+			end
+
+			roomClientAnomalies[room] = roomClientAnomalies[room] or {}
+			roomClientAnomalies[room][info.name] = info.detail
+			roomVersions[room] = (roomVersions[room] or 0) + 1
+		end
+
+		wrappedAnomalyFunctions[key] = original
+		ourWrappers[key] = function(...)
+			if AnomalyFinder.running then
+				pcall(record)
+			end
+
+			return original(...)
+		end
+		module[key] = ourWrappers[key]
+	end
+
+	-- Log what got us when a jumpscare plays, since those end the run without a report.
+	local jumpscares = getrenv()._G.Jumpscares
+	if type(jumpscares) == "table" and not AnomalyFinder.jumpscaresWrapped then
+		AnomalyFinder.jumpscaresWrapped = true
+
+		for key, original in pairs(jumpscares) do
+			if type(original) == "function" then
+				jumpscares[key] = function(...)
+					if AnomalyFinder.running then
+						-- Written straight away: the run ends and the server hops right after.
+						local interface = AnomalyFinder.interface
+						pcall(appendfile, REPORT_LOG_FILE, string.format(
+							"[%s] Jumpscare %s | %s | doing: %s | evading: %s\n",
+							os.date("%Y-%m-%d %H:%M:%S"),
+							key,
+							interface and interface.header.Text or "?",
+							interface and interface.status.Text or "?",
+							AnomalyFinder.evading and (AnomalyFinder.evading.parasite and "parasite" or "camouflage") or "no"
+						))
+					end
+
+					return original(...)
+				end
+			end
+		end
+	end
+end
+
+---Save the game's post-level anomaly report next to what the panel saw in that corridor.
+---@param report table
+local function logReport(report)
+	if type(report) ~= "table" or type(report.Anomalies) ~= "table" then
+		return
+	end
+
+	local segments = workspaceService:FindFirstChild("MapSegments")
+	local panelNames = {}
+
+	for _, room in ipairs(segments and segments:GetChildren() or {}) do
+		if room:GetAttribute("Level") ~= report.Level then
+			continue
+		end
+
+		local seen = roomSeen[room]
+		for _, name in ipairs(seen and seen.order or {}) do
+			local anomaly = seen.byName[name]
+			table.insert(panelNames, name .. ((anomaly.detail or "") ~= "" and " (" .. anomaly.detail .. ")" or ""))
+		end
+	end
+
+	-- The game calls this from its own thread, which can't write files; the scan loop writes it.
+	local line = string.format(
+		"[%s] Level %s | real (%d): %s | panel (%d): %s | auto entered %s\n",
+		os.date("%Y-%m-%d %H:%M:%S"),
+		tostring(report.Level),
+		#report.Anomalies,
+		table.concat(report.Anomalies, ", "),
+		#panelNames,
+		table.concat(panelNames, ", "),
+		tostring(AnomalyFinder.lastEntered)
+	)
+
+	table.insert(pendingReportLines, line)
+
+	-- A known blind spot was missed: log what that corridor's bathroom looked like.
+	for _, anomalyName in ipairs(report.Anomalies) do
+		if DEEP_CHECKS[anomalyName] then
+			table.insert(pendingDeepLevels, { level = report.Level, anomaly = anomalyName })
+		end
+	end
+end
+
+---Write queued report lines from the executor's own thread.
+local function flushReportLog()
+	for _, pending in ipairs(pendingDeepLevels) do
+		table.insert(pendingReportLines, describeDeepDiff(pending.level, pending.anomaly))
+	end
+
+	table.clear(pendingDeepLevels)
+
+	if #pendingReportLines == 0 then
+		return
+	end
+
+	local lines = table.concat(pendingReportLines)
+	table.clear(pendingReportLines)
+
+	pcall(function()
+		if not isfolder(REPORT_LOG_FOLDER) then
+			makefolder(REPORT_LOG_FOLDER)
+		end
+
+		-- appendfile doesn't create a missing file on every executor.
+		if isfile(REPORT_LOG_FILE) then
+			appendfile(REPORT_LOG_FILE, lines)
+		else
+			writefile(REPORT_LOG_FILE, lines)
+		end
+	end)
+end
+
+---Watch the game's report so real anomaly IDs can be compared with the panel later.
+local function wrapReport()
+	local utility = getrenv()._G.LocalFunctions
+	local original = type(utility) == "table" and utility.WrongCountEffect
+	if type(original) ~= "function" or wrappedReport then
+		return
+	end
+
+	wrappedReport = original
+	ourWrappers.WrongCountEffect = function(report, ...)
+		if AnomalyFinder.running then
+			AnomalyFinder.lastWrongAt = os.clock()
+			pcall(logReport, report)
+		end
+
+		return original(report, ...)
+	end
+	utility.WrongCountEffect = ourWrappers.WrongCountEffect
+end
+
+---Put the game's own anomaly functions back.
+local function unwrapAnomalyFunctions()
+	local module = getAnomalyFunctions()
+
+	for key, original in pairs(wrappedAnomalyFunctions) do
+		if module and module[key] == ourWrappers[key] then
+			module[key] = original
+		end
+	end
+
+	table.clear(wrappedAnomalyFunctions)
+
+	local utility = getrenv()._G.LocalFunctions
+	if wrappedReport and type(utility) == "table" and utility.WrongCountEffect == ourWrappers.WrongCountEffect then
+		utility.WrongCountEffect = wrappedReport
+	end
+
+	wrappedReport = nil
+	table.clear(ourWrappers)
+end
+
+---Stop the finder and clean up.
+function AnomalyFinder.detach()
+	AnomalyFinder.running = false
+	unwrapAnomalyFunctions()
+
+	for _, connection in ipairs(AnomalyFinder.connections) do
+		connection:Disconnect()
+	end
+
+	table.clear(AnomalyFinder.connections)
+
+	for _, connection in ipairs(AnomalyFinder.controlConnections) do
+		connection:Disconnect()
+	end
+
+	table.clear(AnomalyFinder.controlConnections)
+
+	for _, connection in ipairs(roomConnections) do
+		connection:Disconnect()
+	end
+
+	table.clear(roomConnections)
+	watchedRoom = nil
+	AnomalyFinder.autoEnabled = false
+	AnomalyFinder.espEnabled = false
+	if AnomalyFinder.clearEsp then
+		pcall(AnomalyFinder.clearEsp)
+	end
+
+	if AnomalyFinder.interface then
+		AnomalyFinder.interface.gui:Destroy()
+		AnomalyFinder.interface.espGui:Destroy()
+		AnomalyFinder.interface = nil
+	end
+end
+
+---Mark the current room changed whenever any of its parts change a property.
+---@param room Model
+local function watchRoom(room)
+	if watchedRoom == room then
+		return
+	end
+
+	for _, connection in ipairs(roomConnections) do
+		connection:Disconnect()
+	end
+
+	table.clear(roomConnections)
+	watchedRoom = room
+
+	local function bump()
+		roomVersions[room] = (roomVersions[room] or 0) + 1
+	end
+
+	-- A knock is only a sound; record it the moment it plays.
+	local function onKnock(sound)
+		roomKnocks[room] = roomKnocks[room] or {}
+		roomKnocks[room][getKnockSource(room, sound)] = true
+		bump()
+	end
+
+	local function hook(instance)
+		table.insert(roomConnections, instance.Changed:Connect(bump))
+
+		-- Record anomaly-only sounds the moment they start.
+		local soundAnomaly = getSoundAnomaly(instance)
+		if soundAnomaly then
+			local function onSound()
+				if not instance.Playing then
+					return
+				end
+
+				roomClientAnomalies[room] = roomClientAnomalies[room] or {}
+				roomClientAnomalies[room][soundAnomaly] = ""
+				bump()
+			end
+
+			table.insert(roomConnections, instance.Played:Connect(onSound))
+			table.insert(roomConnections, instance:GetPropertyChangedSignal("Playing"):Connect(onSound))
+		end
+
+		if instance:IsA("Sound") and instance.Name == "Knock" then
+			table.insert(roomConnections, instance.Played:Connect(function()
+				onKnock(instance)
+			end))
+
+			table.insert(roomConnections, instance:GetPropertyChangedSignal("Playing"):Connect(function()
+				if instance.Playing then
+					onKnock(instance)
+				end
+			end))
+		end
+	end
+
+	table.insert(roomConnections, room.DescendantAdded:Connect(hook))
+
+	for _, descendant in ipairs(room:GetDescendants()) do
+		throttle()
+
+		if watchedRoom ~= room then
+			return
+		end
+
+		hook(descendant)
+	end
+end
+
+---Whether a listed anomaly belongs to the corridor's NPC ("John's hair", "Jimmy's size").
+---@param name string
+---@param suffix string?
+---@return boolean
+local function isNpcAnomaly(name, suffix)
+	for _, npcName in ipairs(NPC_NAMES) do
+		local prefix = npcName .. "'s"
+		if name:sub(1, #prefix) == prefix and (not suffix or name == npcName .. suffix) then
+			return true
+		end
+	end
+
+	return false
+end
+
+---Whether any NPC in this room is listed as having the parasite.
+---@param seen table
+---@return boolean
+local function hasParasiteListed(seen)
+	for _, npcName in ipairs(NPC_NAMES) do
+		if seen.byName[npcName .. PARASITE_SUFFIX] then
+			return true
+		end
+	end
+
+	return false
+end
+
+---When the parasite turned its host (set by the chaser watcher). Speed and color changes
+---before that are anomalies of their own.
+---@param seen table
+---@return number?
+local function getParasiteSeenTime(seen)
+	return seen.parasiteTurnedAt
+end
+
+---Flickering lights change two or more of their glow material, color and brightness at
+---once; that's one anomaly (the lights flickering), not one per property.
+---@param anomalies table
+---@return table
+local function mergeFlicker(anomalies)
+	local byName = {}
+	for _, anomaly in ipairs(anomalies) do
+		byName[anomaly.name] = anomaly
+	end
+
+	local folded = {}
+	for lightName in pairs(CATEGORY_SPLIT_OBJECTS) do
+		local present = 0
+		for _, suffix in ipairs({ " material", " brightness" }) do
+			if byName[lightName .. suffix] then
+				present += 1
+			end
+		end
+
+		-- A new hue (the colored lights anomaly) stays its own entry.
+		if present >= 2 then
+			-- Flickering also swaps glow parts in and out.
+			for _, suffix in ipairs({ " material", " brightness", " something added", " part missing" }) do
+				folded[lightName .. suffix] = lightName
+			end
+		end
+	end
+
+	if next(folded) == nil then
+		return anomalies
+	end
+
+	local result, added = {}, {}
+	for _, anomaly in ipairs(anomalies) do
+		local lightName = folded[anomaly.name]
+		if not lightName then
+			table.insert(result, anomaly)
+		elseif not added[lightName] then
+			added[lightName] = true
+			table.insert(result, {
+				name = lightName .. " flicker",
+				kind = "Altered",
+				detail = "",
+				targets = anomaly.targets,
+				firstSeen = anomaly.firstSeen,
+			})
+		end
+	end
+
+	return result
+end
+
+---Whether a change on the NPC is what falling over does to him (limbs posed, parts shifted),
+---rather than something like a new color or outfit, which a fall can't cause.
+---@param entry table
+---@return boolean
+local function isRagdollNoise(entry)
+	if entry.kind ~= "Altered" then
+		return false
+	end
+
+	for label in entry.detail:gmatch("[^,]+") do
+		if not ATTACHMENT_SIDE_EFFECTS[label:match("^%s*(.-)%s*$")] then
+			return false
+		end
+	end
+
+	return true
+end
+
+---Merge a fresh scan into everything seen in this room so brief anomalies stay listed.
+---@param room Model
+---@param anomalies table
+---@return table
+local function rememberAnomalies(room, anomalies)
+	local seen = roomSeen[room]
+	if not seen then
+		seen = { byName = {}, order = {} }
+		roomSeen[room] = seen
+	end
+
+	local now = os.clock()
+	local passTargets = {}
+
+	for _, anomaly in ipairs(anomalies) do
+		anomaly.name = ANOMALY_ALIASES[anomaly.name] or anomaly.name
+
+		-- An entity can be found at its spawn marker and in Debris; both are one anomaly.
+		local entityName = anomaly.name:match("^(.-) %(entity%)$")
+		if entityName then
+			anomaly.name = ANOMALY_ALIASES[entityName] or entityName
+
+			if anomaly.detail == "" or anomaly.detail == "appeared" then
+				anomaly.detail = "entity"
+			end
+		end
+
+		-- Multi-piece anomalies read the same no matter which piece was seen.
+		local fixed = FIXED_ANOMALIES[anomaly.name]
+		if fixed then
+			anomaly.kind, anomaly.detail = fixed.kind, fixed.detail
+		end
+
+		-- Changes picked up while the NPC was being ragdolled belong to his death.
+		if anomaly.death then
+			for index = #seen.order, 1, -1 do
+				local name = seen.order[index]
+				local entry = seen.byName[name]
+
+				-- Falling over also switches off his joints and whatever his root part carries.
+				local switchedOff = entry.kind == "Altered"
+				for label in entry.detail:gmatch("[^,]+") do
+					label = label:match("^%s*(.-)%s*$")
+					if label ~= "toggled" and not ATTACHMENT_SIDE_EFFECTS[label] then
+						switchedOff = false
+					end
+				end
+
+				if isNpcAnomaly(name) and now - entry.firstSeen < DEATH_GRACE and (isRagdollNoise(entry) or switchedOff) then
+					seen.byName[name] = nil
+					table.remove(seen.order, index)
+				end
+			end
+		end
+
+		-- A parasite NPC dies as part of that anomaly; his death isn't a separate one.
+		if anomaly.death and hasParasiteListed(seen) then
+			continue
+		end
+
+		local existing = seen.byName[anomaly.name]
+
+		-- Several pieces can land on one name (the spokesman's entities); box all of them.
+		if anomaly.targets and #anomaly.targets > 0 then
+			passTargets[anomaly.name] = passTargets[anomaly.name] or {}
+			for _, target in ipairs(anomaly.targets) do
+				table.insert(passTargets[anomaly.name], target)
+			end
+		end
+
+		if existing then
+			existing.kind = anomaly.kind
+			existing.detail = anomaly.detail
+			existing.ghosts = anomaly.ghosts or existing.ghosts
+		else
+			anomaly.firstSeen = now
+			seen.byName[anomaly.name] = anomaly
+			table.insert(seen.order, anomaly.name)
+		end
+	end
+
+	for name, targets in pairs(passTargets) do
+		if seen.byName[name] then
+			seen.byName[name].targets = targets
+		end
+	end
+
+	-- Lights going dark during Don't move belong to that anomaly.
+	local dontMove = seen.byName["Don't move"] ~= nil
+	local parasiteSeenAt = getParasiteSeenTime(seen)
+
+	local merged = {}
+	for _, name in ipairs(seen.order) do
+		local anomaly = seen.byName[name]
+		local partOfDontMove = dontMove and DONT_MOVE_PARTS[name] == true
+
+		local isCompanion = false
+		for _, companionOf in ipairs(DEBRIS_COMPANIONS[name] or {}) do
+			local owner = seen.byName[companionOf]
+			-- Lights already flickering before the spokesman showed up are their own anomaly.
+			local predates = companionOf == "Spokesman" and owner and anomaly.firstSeen
+				and owner.firstSeen and anomaly.firstSeen < owner.firstSeen - 1
+			if owner and not predates then
+				isCompanion = true
+			end
+		end
+
+		-- Drawing the gun shows/hides his things; a recolored briefcase is still its own anomaly.
+		if isCompanion and isNpcAnomaly(name) then
+			local kept = {}
+			for label in anomaly.detail:gmatch("[^,]+") do
+				label = label:match("^%s*(.-)%s*$")
+				if label ~= "transparency" and label ~= "toggled" and label ~= "" then
+					table.insert(kept, label)
+				end
+			end
+			if #kept > 0 then
+				isCompanion = false
+				anomaly = table.clone(anomaly)
+				anomaly.detail = table.concat(kept, ", ")
+			end
+		end
+		if isCompanion then
+			continue
+		end
+
+		-- Once the parasite turns him it speeds him up and tints him and what he holds; speed or
+		-- colors he had before that are anomalies of their own.
+		local parasiteEffect = isNpcAnomaly(name, "'s speed") or isNpcAnomaly(name, "'s color")
+		if anomaly.kind == "Altered" and anomaly.detail ~= "" and not parasiteEffect then
+			parasiteEffect = true
+			for label in anomaly.detail:gmatch("[^,]+") do
+				label = label:match("^%s*(.-)%s*$")
+				-- On John himself the turn also switches his effects and shifts his limbs.
+				local npcSideEffect = isNpcAnomaly(name) and (label == "toggled" or ATTACHMENT_SIDE_EFFECTS[label])
+				if not (COLOR_LABELS[label] or npcSideEffect) then
+					parasiteEffect = false
+				end
+			end
+		end
+		if parasiteSeenAt and parasiteEffect and anomaly.firstSeen >= parasiteSeenAt - PARASITE_SPEED_SLACK then
+			continue
+		end
+
+		-- Shrinking him slows his walk along with it; that's the size anomaly. Faster is its own.
+		if isNpcAnomaly(name, "'s speed") and anomaly.detail == "slower" then
+			local npcName = name:sub(1, #name - #"'s speed")
+			local size = seen.byName[npcName .. "'s size"]
+			if size and size.detail == "smaller" then
+				continue
+			end
+		end
+
+		if dontMove and DONT_MOVE_LIGHTS[name] then
+			partOfDontMove = true
+
+			for label in anomaly.detail:gmatch("[^,]+") do
+				if not LIGHTS_OFF_LABELS[label:match("^%s*(.-)%s*$")] then
+					partOfDontMove = false
+				end
+			end
+		end
+
+		if not partOfDontMove then
+			table.insert(merged, anomaly)
+		end
+	end
+
+	merged = mergeFlicker(merged)
+
+	table.sort(merged, function(a, b)
+		return a.name < b.name
+	end)
+
+	return merged
+end
+
+---Scan a room only when it changed or its periodic re-check is due.
+---@param room Model
+---@return table?
+local function getRoomAnomalies(room)
+	local cached = roomCache[room]
+	local version = roomVersions[room] or 0
+
+	-- Parts are still streaming in or out; wait for the room to settle, but not forever.
+	local now = os.clock()
+	if now - (roomStructureTimes[room] or 0) < SETTLE_TIME then
+		roomWaitStarts[room] = roomWaitStarts[room] or now
+
+		if now - roomWaitStarts[room] < MAX_SETTLE_WAIT then
+			return cached and cached.anomalies
+		end
+	end
+
+	roomWaitStarts[room] = nil
+
+	if cached then
+		local age = os.clock() - cached.time
+
+		-- Flickering or animating parts change constantly; cap the scan rate.
+		if age < MIN_SCAN_GAP or (cached.version == version and age < RESCAN_INTERVAL) then
+			return cached.anomalies
+		end
+	end
+
+	local anomalies = rememberAnomalies(room, scanRoom(room))
+	roomCache[room] = { version = version, time = os.clock(), anomalies = anomalies }
+
+	return anomalies
+end
+
+---A part to hang an ESP label on.
+---@param instance Instance
+---@return BasePart?
+local function getLabelPart(instance)
+	if instance:IsA("BasePart") then
+		return instance
+	end
+
+	if instance:IsA("Model") and instance.PrimaryPart then
+		return instance.PrimaryPart
+	end
+
+	return instance:FindFirstChildWhichIsA("BasePart", true)
+end
+
+---What a box can be drawn around for one target: itself, or the pieces inside a folder.
+---@param instance Instance
+---@return table
+local function getBoxAdornees(instance)
+	if instance:IsA("BasePart") or instance:IsA("Model") then
+		return { instance }
+	end
+
+	local adornees = {}
+	for _, child in ipairs(instance:GetChildren()) do
+		if child:IsA("BasePart") or child:IsA("Model") then
+			table.insert(adornees, child)
+		end
+	end
+
+	if #adornees == 0 then
+		local part = getLabelPart(instance)
+		if part then
+			table.insert(adornees, part)
+		end
+	end
+
+	return adornees
+end
+
+local espState = { signature = nil, anchors = {} }
+
+---Remove every ESP box and label.
+local function clearEsp()
+	local interface = AnomalyFinder.interface
+	if interface then
+		interface.espGui:ClearAllChildren()
+	end
+
+	for _, anchor in ipairs(espState.anchors) do
+		anchor:Destroy()
+	end
+
+	table.clear(espState.anchors)
+	espState.signature = nil
+end
+
+---Draw a box around everything listed in the current corridor.
+---@param anomalies table?
+local function updateEsp(anomalies)
+	local interface = AnomalyFinder.interface
+	if not interface or not anomalies then
+		return
+	end
+
+	-- Rebuild only when the list or what it points at changes.
+	local parts = {}
+	for _, anomaly in ipairs(anomalies) do
+		local alive = 0
+		for _, target in ipairs(anomaly.targets or {}) do
+			if target.Parent then
+				alive += 1
+			end
+		end
+
+		table.insert(parts, anomaly.name .. ":" .. anomaly.kind .. ":" .. alive .. ":" .. (anomaly.ghosts and #anomaly.ghosts or 0))
+	end
+
+	local signature = table.concat(parts, "|")
+	if signature == espState.signature then
+		return
+	end
+
+	clearEsp()
+	espState.signature = signature
+
+	for _, anomaly in ipairs(anomalies) do
+		local color = AUTO.ESP_COLORS[anomaly.kind] or AUTO.ESP_COLORS.Altered
+		local labelPart = nil
+		local boxes = 0
+
+		for _, target in ipairs(anomaly.targets or {}) do
+			if not target.Parent then
+				continue
+			end
+
+			for _, adornee in ipairs(getBoxAdornees(target)) do
+				if boxes >= AUTO.ESP_MAX_BOXES then
+					break
+				end
+
+				local box = Instance.new("SelectionBox")
+				box.Adornee = adornee
+				box.Color3 = color
+				box.SurfaceColor3 = color
+				box.SurfaceTransparency = 0.85
+				box.LineThickness = 0.04
+				box.Parent = interface.espGui
+				boxes += 1
+			end
+
+			labelPart = labelPart or getLabelPart(target)
+		end
+
+		-- Missing things get a see-through box where they should be.
+		for _, ghost in ipairs(anomaly.ghosts or {}) do
+			local box = Instance.new("BoxHandleAdornment")
+			box.Adornee = workspaceService.Terrain
+			box.CFrame = ghost.cframe
+			box.Size = ghost.size
+			box.Color3 = color
+			box.Transparency = 0.7
+			box.AlwaysOnTop = true
+			box.ZIndex = 1
+			box.Parent = interface.espGui
+
+			if not labelPart then
+				local anchor = Instance.new("Part")
+				anchor.Anchored = true
+				anchor.CanCollide = false
+				anchor.CanQuery = false
+				anchor.CanTouch = false
+				anchor.Transparency = 1
+				anchor.Size = Vector3.one * 0.2
+				anchor.CFrame = ghost.cframe
+				anchor.Parent = workspaceService.CurrentCamera
+				table.insert(espState.anchors, anchor)
+				labelPart = anchor
+			end
+		end
+
+		if labelPart then
+			local billboard = Instance.new("BillboardGui")
+			billboard.Adornee = labelPart
+			billboard.AlwaysOnTop = true
+			billboard.Size = UDim2.fromOffset(220, 22)
+			billboard.StudsOffset = Vector3.new(0, 2.5, 0)
+			billboard.Parent = interface.espGui
+
+			local label = Instance.new("TextLabel")
+			label.Size = UDim2.fromScale(1, 1)
+			label.BackgroundTransparency = 1
+			label.Font = Enum.Font.GothamBold
+			label.TextSize = 13
+			label.TextColor3 = color
+			label.TextStrokeTransparency = 0.4
+			label.Text = anomaly.name .. (anomaly.detail ~= "" and (" (" .. anomaly.detail .. ")") or "")
+			label.Parent = billboard
+		end
+	end
+end
+
+---The local character's humanoid and root part.
+---@return Humanoid?, BasePart?
+local function getCharacterParts()
+	local character = localPlayer.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	local rootPart = character and character:FindFirstChild("HumanoidRootPart")
+
+	if not humanoid or not rootPart or humanoid.Health <= 0 then
+		return nil, nil
+	end
+
+	return humanoid, rootPart
+end
+
+---Show what full auto is doing.
+---@param text string
+local function setAutoStatus(text)
+	local interface = AnomalyFinder.interface
+	if interface then
+		-- Keep the last few steps, so a run that ends without a report shows what led to it.
+		if interface.status.Text ~= text and text ~= "" then
+			local history = AnomalyFinder.statusHistory or {}
+			AnomalyFinder.statusHistory = history
+			table.insert(history, string.format("%s %s", os.date("%M:%S"), text))
+			if #history > 25 then
+				table.remove(history, 1)
+			end
+		end
+
+		interface.status.Text = text
+		interface.status.Visible = AnomalyFinder.autoEnabled == true and text ~= ""
+	end
+end
+
+---Answer John's "are you an anomaly?" question.
+local function answerJohnQuestion()
+	local events = localPlayer.PlayerGui:FindFirstChild("Events")
+	local question = events and events:FindFirstChild("JohnQuestion")
+	local frame = question and question:FindFirstChild("Frame")
+	local answer = frame and frame:FindFirstChild("No")
+
+	if not (question and question.Visible and frame.Visible and answer) then
+		return
+	end
+
+	if AnomalyFinder.lastAnswer and os.clock() - AnomalyFinder.lastAnswer < 3 then
+		return
+	end
+
+	AnomalyFinder.lastAnswer = os.clock()
+	pcall(firesignal, answer.Activated)
+end
+
+---Whether standing still is required right now (Don't move, or the game holding the player).
+---@param room Model?
+---@return boolean
+local function mustStandStill(room)
+	if os.clock() < (AnomalyFinder.freezeUntil or 0) then
+		return true
+	end
+
+	local debris = room and room:FindFirstChild("Debris")
+	if debris and debris:FindFirstChild("Creature") then
+		return true
+	end
+
+	local _, rootPart = getCharacterParts()
+	return rootPart ~= nil and rootPart.Anchored
+end
+
+---Stop walking on the spot.
+local function stopWalking()
+	local humanoid, rootPart = getCharacterParts()
+	if humanoid then
+		humanoid:Move(Vector3.zero)
+		humanoid:MoveTo(rootPart.Position)
+	end
+end
+
+---The camouflage entity and a parasite John chase you and kill on contact; the chaser
+---watcher pulls you back to the corridor's start the moment one starts. Here the auto
+---loop just waits until that's over.
+---@param room Model?
+local function evadeChaser(room)
+	local evading = AnomalyFinder.evading
+	if not evading then
+		return
+	end
+
+	local chaserName = evading.parasite and "the parasite" or evading.target.Name
+	if not evading.atStart then
+		setAutoStatus("Hiding behind the counter from " .. chaserName)
+		return true
+	end
+
+	-- Wait at the start until it's gone, then jump straight to the counter.
+	setAutoStatus("Waiting at the start for " .. chaserName .. " to give up")
+	while AnomalyFinder.autoEnabled and AnomalyFinder.evading == evading do
+		task.wait(0.1)
+	end
+
+	-- The watcher has put us behind the counter by now; the sweep is over for this corridor.
+	AnomalyFinder.skipSweep = evading.room
+	return true
+end
+
+---Wait out anything that needs the player to stay put.
+---@param room Model?
+local function waitWhileFrozen(room)
+	local _, moved = pcall(evadeChaser, room)
+	local froze = false
+
+	while AnomalyFinder.autoEnabled and mustStandStill(room) do
+		froze = true
+		stopWalking()
+		answerJohnQuestion()
+		setAutoStatus("Standing still...")
+		task.wait(0.1)
+	end
+
+	return moved == true or froze
+end
+
+---Keep pathfinding away from hazards like the electric puddle.
+---@param room Model
+local function markHazards(room)
+	local debris = room:FindFirstChild("Debris")
+	if not debris then
+		return
+	end
+
+	for _, child in ipairs(debris:GetChildren()) do
+		for _, pattern in ipairs(AUTO.HAZARD_PATTERNS) do
+			if child.Name:find(pattern) and not child:FindFirstChild("AutoHazard", true) then
+				local modifier = Instance.new("PathfindingModifier")
+				modifier.Name = "AutoHazard"
+				modifier.Label = "Hazard"
+				modifier.Parent = child:IsA("BasePart") and child or child:FindFirstChildWhichIsA("BasePart", true)
+			end
+		end
+	end
+end
+
+---Whether a point is on or right next to a hazard (an electric or void puddle).
+---@param room Model
+---@param position Vector3
+---@return boolean
+local function isHazardPoint(room, position)
+	local debris = room:FindFirstChild("Debris")
+	if not debris then
+		return false
+	end
+
+	for _, child in ipairs(debris:GetChildren()) do
+		for _, pattern in ipairs(AUTO.HAZARD_PATTERNS) do
+			if child.Name:find(pattern) then
+				local parts = child:IsA("BasePart") and { child } or child:GetDescendants()
+				for _, part in ipairs(parts) do
+					if part:IsA("BasePart") then
+						local offset = part.CFrame:PointToObjectSpace(position)
+						local half = part.Size / 2
+						if math.abs(offset.X) <= half.X + AUTO.HAZARD_MARGIN
+							and math.abs(offset.Z) <= half.Z + AUTO.HAZARD_MARGIN
+							and math.abs(offset.Y) <= half.Y + 6
+						then
+							return true
+						end
+					end
+				end
+			end
+		end
+	end
+
+	return false
+end
+
+---Horizontal distance between two points, with the height difference.
+---@param a Vector3
+---@param b Vector3
+---@return number, number
+local function flatDistance(a, b)
+	return Vector3.new(a.X - b.X, 0, a.Z - b.Z).Magnitude, math.abs(a.Y - b.Y)
+end
+
+---Whether the end-of-run screen is up.
+---@return boolean
+local function isRunOver()
+	local hud = localPlayer.PlayerGui:FindFirstChild("HUD")
+	local ending = hud and hud:FindFirstChild("Ending")
+	return ending ~= nil and ending.Visible
+end
+
+---Move the character straight to a point, keeping which way it faces.
+---@param position Vector3
+local function hopTo(position)
+	local _, rootPart = getCharacterParts()
+	if not rootPart or AnomalyFinder.evading then
+		return
+	end
+
+	rootPart.AssemblyLinearVelocity = Vector3.zero
+	rootPart.CFrame = CFrame.new(position) * rootPart.CFrame.Rotation
+end
+
+---Walk to a point with pathfinding, standing still whenever the corridor demands it.
+---@param room Model
+---@param target Vector3
+---@param arriveDistance number
+---@return boolean
+local function walkTo(room, target, arriveDistance)
+	local deadline = os.clock() + AUTO.WALK_TIMEOUT
+
+	while AnomalyFinder.autoEnabled and os.clock() < deadline do
+		-- Hiding behind the counter: the corridor's walk is over. Running back to the start:
+		-- wait it out, then carry on from wherever that leaves us.
+		if AnomalyFinder.evading then
+			if not AnomalyFinder.evading.atStart then
+				return false
+			end
+			waitWhileFrozen(room)
+			continue
+		end
+
+		if isRunOver() then
+			return false
+		end
+
+		waitWhileFrozen(room)
+		answerJohnQuestion()
+
+		local humanoid, rootPart = getCharacterParts()
+		if not humanoid then
+			task.wait(0.5)
+			continue
+		end
+
+		local distance, height = flatDistance(rootPart.Position, target)
+		if distance <= arriveDistance and height < 8 then
+			return true
+		end
+
+		markHazards(room)
+
+		local path = pathfindingService:CreatePath({
+			AgentRadius = 2,
+			AgentHeight = 5,
+			AgentCanJump = true,
+			WaypointSpacing = 4,
+			Costs = { Hazard = math.huge },
+		})
+
+		local computed = pcall(function()
+			path:ComputeAsync(rootPart.Position, target)
+		end)
+
+		if not computed or path.Status ~= Enum.PathStatus.Success then
+			-- No path (a closed door, a target inside a wall); head straight there and retry.
+			if AUTO.TELEPORT then
+				hopTo(target)
+				task.wait(0.2)
+				return true
+			end
+
+			humanoid:MoveTo(target)
+			task.wait(0.5)
+			continue
+		end
+
+		-- Something blocking the corridor (the locked counter) can send the path back
+		-- through earlier corridors; teleporting straight there is far quicker.
+		local waypoints = path:GetWaypoints()
+		if AUTO.TELEPORT then
+			local pathLength = 0
+			for index = 2, #waypoints do
+				pathLength += (waypoints[index].Position - waypoints[index - 1].Position).Magnitude
+			end
+
+			if pathLength > (target - rootPart.Position).Magnitude * 2 + 30 then
+				hopTo(target + Vector3.new(0, 3, 0))
+				task.wait(0.2)
+				return true
+			end
+		end
+
+		local lastHop = nil
+		local hopped = false
+		for index, waypoint in ipairs(waypoints) do
+			if index == 1 then
+				continue
+			end
+
+			if not AnomalyFinder.autoEnabled or mustStandStill(room) then
+				break
+			end
+
+			-- Never land on a puddle; hopping over it means we never touch it.
+			if AUTO.TELEPORT and isHazardPoint(room, waypoint.Position) then
+				continue
+			end
+
+			if AUTO.TELEPORT then
+				local hopTarget = waypoint.Position + Vector3.new(0, 3, 0)
+				local from = lastHop or rootPart.Position
+				local offset = hopTarget - from
+				local steps = math.max(1, math.ceil(offset.Magnitude / AUTO.STEP_SIZE))
+				local interrupted = false
+
+				for step = 1, steps do
+					local point = from + offset * (step / steps)
+					local flat = Vector3.new(offset.X, 0, offset.Z)
+
+					-- Never land on a puddle; stepping over it means we never touch it.
+					if AnomalyFinder.evading then
+						interrupted = true
+						break
+					end
+
+					if step == steps or not isHazardPoint(room, point - Vector3.new(0, 3, 0)) then
+						local _, stepRoot = getCharacterParts()
+						if stepRoot then
+							stepRoot.AssemblyLinearVelocity = Vector3.zero
+							stepRoot.CFrame = flat.Magnitude > 0.1 and CFrame.lookAt(point, point + flat) or CFrame.new(point) * stepRoot.CFrame.Rotation
+						end
+					end
+
+					task.wait(AUTO.STEP_DELAY)
+
+					-- The game moved us (a wrong answer, a death); stop following the old path.
+					local _, movedRoot = getCharacterParts()
+					if movedRoot and (movedRoot.Position - point).Magnitude > AUTO.DOOR_LEASH then
+						return false
+					end
+
+					-- Ran back from a chaser or froze in place; plan a fresh path from here.
+					if waitWhileFrozen(room) or not AnomalyFinder.autoEnabled then
+						interrupted = true
+						break
+					end
+				end
+
+				if interrupted then
+					hopped = true
+					break
+				end
+
+				lastHop = hopTarget
+				hopped = true
+				continue
+			end
+
+			if waypoint.Action == Enum.PathWaypointAction.Jump then
+				humanoid.Jump = true
+			end
+
+			humanoid:MoveTo(waypoint.Position)
+
+			local started = os.clock()
+			local stuck = false
+
+			while AnomalyFinder.autoEnabled do
+				humanoid, rootPart = getCharacterParts()
+				if not humanoid or mustStandStill(room) then
+					break
+				end
+
+				if flatDistance(rootPart.Position, waypoint.Position) < 2.5 then
+					break
+				end
+
+				if os.clock() - started > AUTO.STEP_TIMEOUT then
+					stuck = true
+					break
+				end
+
+				task.wait(0.05)
+			end
+
+			if stuck or not humanoid then
+				break
+			end
+		end
+
+		-- Every step left lands in a puddle; give up on this spot rather than spin here.
+		if AUTO.TELEPORT and not hopped then
+			return false
+		end
+	end
+
+	return false
+end
+
+---Points on the floor around the counter's button, within clicking range.
+---@param counter Model
+---@return table
+local function getCounterSpots(counter)
+	local button = counter:FindFirstChild("Button")
+	if not button then
+		return {}
+	end
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { localPlayer.Character, counter }
+
+	local spots = {}
+	for step = 0, 7 do
+		local angle = step * math.pi / 4
+		local start = button.Position + Vector3.new(math.cos(angle) * 4, 2, math.sin(angle) * 4)
+		local hit = workspaceService:Raycast(start, Vector3.new(0, -15, 0), params)
+
+		if hit and hit.Normal.Y > 0.7 then
+			table.insert(spots, hit.Position + Vector3.new(0, 3, 0))
+		end
+	end
+
+	-- Nearest to the corridor's start first, so the walk ends on the open side.
+	table.sort(spots, function(a, b)
+		return (a - button.Position).Magnitude < (b - button.Position).Magnitude
+	end)
+
+	return spots
+end
+
+---Put a number on the corridor's anomaly counter.
+---@param counter Model
+---@param amount number
+---@return boolean
+local function setCounter(counter, amount)
+	local screen = counter:FindFirstChild("Screen")
+	local display = screen and screen:FindFirstChildWhichIsA("TextLabel", true)
+	local reset = counter:FindFirstChild("Reset")
+	local button = counter:FindFirstChild("Button")
+
+	local resetDetector = reset and reset:FindFirstChildOfClass("ClickDetector")
+	local buttonDetector = button and button:FindFirstChildOfClass("ClickDetector")
+	if not (display and resetDetector and buttonDetector) then
+		return false
+	end
+
+
+	for _ = 1, 3 do
+		if tonumber(display.Text) == amount then
+			return true
+		end
+
+		-- Only top up from what's already on it; reset only when it's over.
+		local current = tonumber(display.Text)
+		local clicks = amount
+		if current and current <= amount then
+			clicks = amount - current
+		else
+			fireclickdetector(resetDetector)
+			task.wait(AUTO.CLICK_DELAY + 0.1)
+		end
+
+		for _ = 1, clicks do
+			fireclickdetector(buttonDetector)
+			task.wait(AUTO.CLICK_DELAY)
+		end
+
+		task.wait(0.3)
+	end
+
+	return tonumber(display.Text) == amount
+end
+
+---The corridor with the given level, if it exists.
+---@param segments Instance
+---@param level number
+---@return Model?
+local function findRoomByLevel(segments, level)
+	for _, room in ipairs(segments:GetChildren()) do
+		if room:GetAttribute("Level") == level then
+			return room
+		end
+	end
+
+	return nil
+end
+
+---Hover in place while auto runs (like Infinite Yield's fly): no falling or sliding between
+---hops, and we can wait outside the corridor's walls.
+---@param enabled boolean
+local function updateFly(enabled)
+	local humanoid, rootPart = getCharacterParts()
+	if not (humanoid and rootPart) then
+		return
+	end
+
+	local gyro = rootPart:FindFirstChild("AnomalyFinderGyro")
+	local velocity = rootPart:FindFirstChild("AnomalyFinderVelocity")
+
+	if not enabled then
+		if gyro or velocity then
+			if gyro then
+				gyro:Destroy()
+			end
+			if velocity then
+				velocity:Destroy()
+			end
+			humanoid.PlatformStand = false
+		end
+		return
+	end
+
+	if not gyro then
+		gyro = Instance.new("BodyGyro")
+		gyro.Name = "AnomalyFinderGyro"
+		gyro.P = 9e4
+		gyro.MaxTorque = Vector3.new(9e9, 9e9, 9e9)
+		gyro.Parent = rootPart
+	end
+
+	if not velocity then
+		velocity = Instance.new("BodyVelocity")
+		velocity.Name = "AnomalyFinderVelocity"
+		velocity.MaxForce = Vector3.new(9e9, 9e9, 9e9)
+		velocity.Parent = rootPart
+	end
+
+	-- Stay upright, facing wherever the last hop pointed us. While told not to move, hold
+	-- exactly as we are: even turning on the spot could count as moving.
+	local look = rootPart.CFrame.LookVector
+	local flat = Vector3.new(look.X, 0, look.Z)
+	if os.clock() < (AnomalyFinder.freezeUntil or 0) then
+		gyro.CFrame = rootPart.CFrame.Rotation
+	elseif flat.Magnitude > 0.1 then
+		gyro.CFrame = CFrame.lookAt(Vector3.zero, flat)
+	end
+
+	velocity.Velocity = Vector3.zero
+	humanoid.PlatformStand = true
+end
+
+---The spot just behind the anomaly counter, on the far side of its wall: out of reach of
+---anything chasing us, but still close enough to click the counter.
+---@param room Model
+---@return Vector3?
+local function getRefuge(room)
+	local objects = room:FindFirstChild("Objects")
+	local counter = objects and objects:FindFirstChild("AnomalyCounter")
+	local button = counter and counter:FindFirstChild("Button")
+	local front = counter and getCounterSpots(counter)[1]
+	if not (button and front) then
+		return nil
+	end
+
+	-- The counter is a thin panel on the wall; its thin side points through the wall.
+	local through = button.CFrame.RightVector
+	if through:Dot(button.Position - front) < 0 then
+		through = -through
+	end
+
+	return button.Position + through * AUTO.REFUGE_DEPTH
+end
+
+---Every frame: keep fly on, answer John's question, and spot the camouflage entity,
+---Carnis or a parasite John starting to chase. Then hide behind the counter until auto
+---has put the count in and heads for the door.
+local function watchChasers()
+	if not AnomalyFinder.autoEnabled then
+		AnomalyFinder.evading = nil
+		updateFly(false)
+	else
+		updateFly(true)
+		-- John's question (the gun one too) holds us in place until it's answered; always "No".
+		answerJohnQuestion()
+	end
+
+	local segments = workspaceService:FindFirstChild("MapSegments")
+	local gameInfo = workspaceService:FindFirstChild("GameInfo")
+	local level = gameInfo and gameInfo:GetAttribute("LatestRoomId")
+	local room = segments and level and findRoomByLevel(segments, level)
+
+	local evading = AnomalyFinder.evading
+	if evading then
+		local over = evading.room ~= room or os.clock() > evading.deadline
+
+		-- Waiting at the start: the camouflage gives up and goes still, a parasite John dies.
+		if evading.atStart and not over then
+			local target = evading.target
+			if not target.Parent or (evading.parasite and isJohnDead(target)) then
+				over = true
+			elseif not evading.parasite then
+				local position = target:GetPivot().Position
+				if (position - evading.lastPosition).Magnitude > 0.05 or target:GetAttribute("Walking") then
+					evading.lastMoved = os.clock()
+				end
+				evading.lastPosition = position
+				over = os.clock() - evading.lastMoved > AUTO.CHASER_CALM
+			end
+		end
+
+		if over then
+			AnomalyFinder.evading = nil
+
+			-- It gave up. Stay at the start: the counter takes clicks from here, and the trip
+			-- to the door keeps an eye on it.
+			if evading.atStart and evading.room == room and AnomalyFinder.autoEnabled then
+				AnomalyFinder.skipSweep = room
+				if not evading.parasite then
+					AnomalyFinder.lastChaser = { room = room, target = evading.target }
+				end
+			end
+			return
+		end
+
+		local _, rootPart = getCharacterParts()
+		if rootPart then
+			rootPart.AssemblyLinearVelocity = Vector3.zero
+			rootPart.CFrame = CFrame.new(evading.refuge) * rootPart.CFrame.Rotation
+		end
+		return
+	end
+
+	-- Already hid in this corridor and the count is in; we're on our way out.
+	local debris = room and room ~= AnomalyFinder.hidRoom and room:FindFirstChild("Debris")
+	if not debris then
+		return
+	end
+
+	-- Chasers (the camouflage, Carnis, a parasite John) give up once we're back at the
+	-- corridor's start; the spokesman is waited out behind the counter instead.
+	local function startEvading(target, parasite, atStart)
+		local spawn = room:FindFirstChild("Spawn")
+		local refuge = atStart and spawn and spawn.Position + Vector3.new(0, 3, 0) or getRefuge(room)
+		if not refuge then
+			return
+		end
+
+		AnomalyFinder.evading = {
+			room = room, refuge = refuge, target = target, parasite = parasite, atStart = atStart,
+			deadline = os.clock() + (atStart and AUTO.CHASE_TIMEOUT or AUTO.EVADE_TIMEOUT),
+			lastPosition = target:GetPivot().Position, lastMoved = os.clock(),
+		}
+		table.insert(pendingReportLines, string.format(
+			"[%s] %s | corridor %s | from %s\n",
+			os.date("%Y-%m-%d %H:%M:%S"), atStart and "Ran back to the start" or "Hid behind the counter",
+			tostring(level), target.Name
+		))
+		watchChasers()
+	end
+
+	-- The spokesman: hide as soon as he or one of his attacks is there.
+	if AnomalyFinder.autoEnabled and AnomalyFinder.spokesmanRoom == room then
+		startEvading(room, false)
+		return
+	end
+
+	-- The camouflage entity or Carnis: chasing the moment they move at all.
+	for _, chaser in ipairs(debris:GetChildren()) do
+		for _, name in ipairs(AUTO.HIDE_FROM) do
+			if AnomalyFinder.autoEnabled and chaser.Name:find(name, 1, true) then
+				startEvading(chaser, false)
+				return
+			end
+		end
+
+		local isChaser = false
+		for _, name in ipairs(AUTO.CHASERS) do
+			if chaser.Name:find(name) then
+				isChaser = true
+			end
+		end
+
+		if isChaser and AnomalyFinder.autoEnabled and chaser:IsA("Model") then
+			local position = chaser:GetPivot().Position
+			local lastPositions = AnomalyFinder.chaserPositions or setmetatable({}, { __mode = "k" })
+			AnomalyFinder.chaserPositions = lastPositions
+			local lastPosition = lastPositions[chaser] or position
+			lastPositions[chaser] = position
+
+			-- Where it waits before it ever moves.
+			AnomalyFinder.chaserOrigins = AnomalyFinder.chaserOrigins or setmetatable({}, { __mode = "k" })
+			AnomalyFinder.chaserOrigins[chaser] = AnomalyFinder.chaserOrigins[chaser] or position
+
+			if (position - lastPosition).Magnitude > 0.05 or chaser:GetAttribute("Walking") then
+				startEvading(chaser, false, true)
+				return
+			end
+		end
+	end
+
+	-- A parasite John: his walk speed changes the moment he turns (it drops to 0 for the
+	-- transformation, then jumps up for the chase).
+	local seen = roomSeen[room]
+	local npc = findNpc(room)
+	local humanoid = npc and npc:FindFirstChildOfClass("Humanoid")
+	if not (seen and humanoid and hasParasiteListed(seen)) or AnomalyFinder.parasiteWaitedRoom == room then
+		return
+	end
+
+	if AnomalyFinder.parasiteSpeedRoom ~= room then
+		AnomalyFinder.parasiteSpeedRoom = room
+		AnomalyFinder.parasitePreSpeed = humanoid.WalkSpeed
+	end
+
+	if humanoid.WalkSpeed ~= AnomalyFinder.parasitePreSpeed and not isJohnDead(npc) then
+		AnomalyFinder.parasiteWaitedRoom = room
+		-- What changes on him from here on is the parasite's doing.
+		seen.parasiteTurnedAt = os.clock()
+		if AnomalyFinder.autoEnabled then
+			startEvading(npc, true, true)
+		end
+	end
+end
+
+---Sweep the corridor in short hops, passing through every trigger zone on the way, so
+---everything in it gets set off.
+---@param room Model
+local function visitTriggers(room)
+	local zones = room:FindFirstChild("Zones")
+	if not zones then
+		return
+	end
+
+	local triggers = {}
+	for _, zone in ipairs(zones:GetChildren()) do
+		local skipped = false
+		for _, pattern in ipairs(AUTO.SKIPPED_TRIGGERS) do
+			if zone.Name:find(pattern) then
+				skipped = true
+			end
+		end
+
+		if zone:IsA("BasePart") and not skipped then
+			table.insert(triggers, zone)
+		end
+	end
+
+	-- Visit them in the order a walk down the corridor would.
+	local start = room.RoomStart.Position
+	table.sort(triggers, function(a, b)
+		return (a.Position - start).Magnitude < (b.Position - start).Magnitude
+	end)
+
+	for _, trigger in ipairs(triggers) do
+		if not AnomalyFinder.autoEnabled or AnomalyFinder.evading or AnomalyFinder.skipSweep == room then
+			return
+		end
+
+		-- Any spot inside the zone sets it off; pick the closest one clear of puddles.
+		local _, rootPart = getCharacterParts()
+		local from = rootPart and rootPart.Position or trigger.Position
+		local half = trigger.Size / 2
+		local inside = trigger.CFrame:PointToObjectSpace(from)
+		if math.abs(inside.X) <= half.X and math.abs(inside.Y) <= half.Y and math.abs(inside.Z) <= half.Z then
+			continue
+		end
+
+		local best, bestDistance = nil, math.huge
+		for x = -half.X + 1.5, half.X - 1.5, 3 do
+			for z = -half.Z + 1.5, half.Z - 1.5, 3 do
+				local point = (trigger.CFrame * CFrame.new(x, 0, z)).Position
+				local floor = Vector3.new(point.X, trigger.Position.Y - half.Y + 3, point.Z)
+				local distance = (floor - from).Magnitude
+				if distance < bestDistance and not isHazardPoint(room, floor) then
+					best, bestDistance = floor, distance
+				end
+			end
+		end
+
+		if best then
+			walkTo(room, best, 2)
+		end
+		answerJohnQuestion()
+	end
+
+end
+
+---John walks from the far end back toward the corridor's start, and when he faints it's
+---somewhere along the way. Hold off on the count until he's past the middle of the
+---hallway (or down), so a faint can't happen after the count is in.
+---@param room Model
+local function waitForJohn(room)
+	local npc = findNpc(room)
+	local path = room:FindFirstChild("References") and room.References:FindFirstChild("John")
+	path = path and path:FindFirstChild("Path")
+	local first, last = path and path:FindFirstChild("1"), path and path:FindFirstChild("4")
+	if not (npc and first and last) then
+		return
+	end
+
+	local middle = (first.Position + last.Position) / 2
+	local direction = (last.Position - first.Position).Unit
+	local deadline = os.clock() + AUTO.JOHN_WALK_TIMEOUT
+
+	-- Some of his anomalies (the stare) only show once someone is near him; pop over for a
+	-- moment while there's time to kill anyway, then come back. Stand off to his side: a
+	-- head that turns to follow us doesn't turn at all if we're straight ahead.
+	local torso = getTorso(npc)
+	local _, rootPart = getCharacterParts()
+
+	-- Not right next to something that chases on sight (the camouflage waits by the end).
+	local nearChaser = false
+	local debris = room:FindFirstChild("Debris")
+	for _, child in ipairs(debris and debris:GetChildren() or {}) do
+		for _, name in ipairs(AUTO.CHASERS) do
+			if torso and child:IsA("Model") and child.Name:find(name)
+				and (child:GetPivot().Position - torso.Position).Magnitude < AUTO.CHASER_KEEP_AWAY
+			then
+				nearChaser = true
+			end
+		end
+	end
+
+	if torso and rootPart and not AnomalyFinder.evading and not nearChaser and not isJohnDead(npc) then
+		local back = rootPart.Position
+		setAutoStatus("Checking " .. npc.Name)
+		hopTo(torso.Position + torso.CFrame.RightVector * 6 + torso.CFrame.LookVector * 2)
+
+		local started = os.clock()
+		while AnomalyFinder.autoEnabled and os.clock() - started < AUTO.NPC_LOOK_TIME and not AnomalyFinder.evading do
+			-- He keeps walking; stay in front of him.
+			hopTo(torso.Position + torso.CFrame.RightVector * 6 + torso.CFrame.LookVector * 2)
+			answerJohnQuestion()
+			task.wait(0.1)
+		end
+
+		if not AnomalyFinder.evading then
+			hopTo(back)
+		end
+	end
+
+	-- Hiding behind the counter still waits for him (he can still faint); running back to
+	-- the start is the chaser handling's business.
+	while AnomalyFinder.autoEnabled and npc.Parent and os.clock() < deadline
+		and not (AnomalyFinder.evading and AnomalyFinder.evading.atStart)
+	do
+		if isJohnDead(npc) then
+			-- Where along the hallway he went down, to learn where fainting happens.
+			table.insert(pendingReportLines, string.format(
+				"[%s] John fainted | corridor %s | %.0f studs past the middle, %.1fs after we got to the counter\n",
+				os.date("%Y-%m-%d %H:%M:%S"), tostring(room:GetAttribute("Level")),
+				(npc:GetPivot().Position - middle):Dot(direction), AUTO.JOHN_WALK_TIMEOUT - (deadline - os.clock())
+			))
+			return
+		end
+
+		if (npc:GetPivot().Position - middle):Dot(direction) >= AUTO.JOHN_SAFE_PAST then
+			return
+		end
+
+		setAutoStatus("Waiting for " .. npc.Name .. " to pass the middle")
+		waitWhileFrozen(room)
+		task.wait(0.1)
+	end
+end
+
+---Look around the corridor until the list stops changing, then return it.
+---@param room Model
+---@return table
+local function settleCount(room)
+	local started = os.clock()
+	local stableSince = os.clock()
+	local lastSignature = nil
+	local anomalies = {}
+
+	while AnomalyFinder.autoEnabled and os.clock() - started < AUTO.MAX_LOOK_TIME do
+		waitWhileFrozen(room)
+
+		local cached = roomCache[room]
+		anomalies = cached and cached.anomalies or {}
+
+		local names = {}
+		for _, anomaly in ipairs(anomalies) do
+			table.insert(names, anomaly.name)
+		end
+
+		local signature = table.concat(names, "|")
+		if signature ~= lastSignature then
+			lastSignature = signature
+			stableSince = os.clock()
+		end
+
+		setAutoStatus(string.format("Checking corridor %s: %d found", tostring(room:GetAttribute("Level")), #anomalies))
+
+		if os.clock() - started >= AUTO.MIN_LOOK_TIME and os.clock() - stableSince >= AUTO.COUNT_SETTLE then
+			break
+		end
+
+		task.wait(0.25)
+	end
+
+	return anomalies
+end
+
+---Which way a closed door faces, taken from the clean template's door, for this door's zone.
+---@param zone BasePart
+---@return Vector3?
+local function getClosedDoorLook(zone)
+	local template = workspaceService:FindFirstChild("Default")
+	local backdoor = template and template:FindFirstChild("Objects") and template.Objects:FindFirstChild("Backdoor")
+	local templateZone = backdoor and backdoor:FindFirstChild("Zone")
+	local templateDoor = backdoor and backdoor:FindFirstChild("MovingDoor")
+	if not (templateZone and templateDoor) then
+		return nil
+	end
+
+	local relative = templateZone.CFrame:VectorToObjectSpace(templateDoor:GetPivot().LookVector)
+	return zone.CFrame:VectorToWorldSpace(relative)
+end
+
+---Go through the door into the next corridor.
+---@param segments Instance
+---@param room Model
+---@return boolean
+local function enterNextRoom(segments, room, nextRoom)
+	local level = room:GetAttribute("Level") or -1
+
+	-- The count is in; come out from behind the counter and head for the door. Whatever
+	-- we hid from is still out there, so wait in the door's far half, behind the door.
+	local hiding = AnomalyFinder.evading ~= nil and not AnomalyFinder.evading.atStart
+	local chaser = hiding and not AnomalyFinder.evading.parasite and AnomalyFinder.evading.target
+	local lastChaser = AnomalyFinder.lastChaser
+	if lastChaser and lastChaser.room == room then
+		chaser = lastChaser.target
+	end
+	if hiding then
+		AnomalyFinder.hidRoom = AnomalyFinder.evading.room
+	end
+	nextRoom = nextRoom or findRoomByLevel(segments, level + 1)
+
+	if not nextRoom then
+		pcall(function()
+			localPlayer:RequestStreamAroundAsync(room.RoomEnd.Position)
+		end)
+
+		nextRoom = findRoomByLevel(segments, level + 1)
+	end
+
+	if not nextRoom then
+		return false
+	end
+
+	local backdoor = nextRoom:FindFirstChild("Objects") and nextRoom.Objects:FindFirstChild("Backdoor")
+	local zone = backdoor and backdoor:FindFirstChild("Zone")
+	local movingDoor = backdoor and backdoor:FindFirstChild("MovingDoor")
+	local spawn = nextRoom:FindFirstChild("Spawn")
+	local inside = spawn and spawn.Position or nextRoom.RoomStart.Position
+
+	if not (zone and movingDoor) then
+		return false
+	end
+
+	-- A chaser we hid from hangs around the counter and the door, and comes for us again
+	-- if we go near. Wait at the corridor's start (it won't chase us there) until it's back
+	-- where it started and still, then make for the door.
+	if hiding then
+		AnomalyFinder.evading = nil
+	end
+	local origin = chaser and AnomalyFinder.chaserOrigins and AnomalyFinder.chaserOrigins[chaser]
+	local spawnPoint = room:FindFirstChild("Spawn")
+	if chaser and chaser ~= room and chaser:IsA("Model") and chaser.Parent and origin and spawnPoint then
+		setAutoStatus("Waiting at the start for " .. chaser.Name .. " to settle")
+		local deadline = os.clock() + AUTO.DOOR_CLEAR_TIMEOUT
+		local lastPosition, stillSince = chaser:GetPivot().Position, os.clock()
+		while AnomalyFinder.autoEnabled and chaser.Parent and os.clock() < deadline do
+			local _, rootPart = getCharacterParts()
+			if rootPart then
+				rootPart.AssemblyLinearVelocity = Vector3.zero
+				rootPart.CFrame = CFrame.new(spawnPoint.Position + Vector3.new(0, 3, 0)) * rootPart.CFrame.Rotation
+			end
+
+			local position = chaser:GetPivot().Position
+			if (position - lastPosition).Magnitude > 0.05 then
+				stillSince = os.clock()
+			end
+			lastPosition = position
+
+			-- Only back at its own spot is it far enough from the door not to come for us.
+			local settled = (position - origin).Magnitude < 5
+			if os.clock() - stillSince > AUTO.CHASER_CALM and settled then
+				break
+			end
+			task.wait(0.1)
+		end
+	end
+
+	-- The door's zone straddles the doorway; stand in its half on this side.
+	local side = zone.CFrame:PointToObjectSpace(inside).X >= 0 and -1 or 1
+	if hiding then
+		side = -side
+	end
+	local standPoint = (zone.CFrame * CFrame.new(side * 1.5, -1, 0)).Position
+
+	setAutoStatus("Heading to corridor " .. tostring(level + 1))
+	hopTo(standPoint)
+	task.wait(0.2)
+
+	-- The door only opens (and the corridor only counts) once the game checks the answer.
+	-- Never go through it closed: that skips the check and the game doesn't move on.
+	local closedLook = getClosedDoorLook(zone) or movingDoor:GetPivot().LookVector
+	local waitStarted = os.clock()
+	local deadline = waitStarted + AUTO.DOOR_TIMEOUT
+	local opened = false
+
+	local chaserLast = chaser and chaser.Parent and chaser ~= room and chaser:IsA("Model") and chaser:GetPivot().Position
+	while AnomalyFinder.autoEnabled and os.clock() < deadline do
+		waitWhileFrozen(room)
+
+		-- The chaser came for us at the door: back to the start until it stops, then return.
+		if chaserLast and chaser.Parent then
+			local position = chaser:GetPivot().Position
+			if (position - chaserLast).Magnitude > 0.3 then
+				setAutoStatus("Running back from " .. chaser.Name)
+				local spawnPart = room:FindFirstChild("Spawn")
+				local stillSince, last = os.clock(), position
+				local giveUp = os.clock() + AUTO.CHASE_TIMEOUT
+				while spawnPart and AnomalyFinder.autoEnabled and chaser.Parent and os.clock() < giveUp do
+					local _, rootPart = getCharacterParts()
+					if rootPart then
+						rootPart.AssemblyLinearVelocity = Vector3.zero
+						rootPart.CFrame = CFrame.new(spawnPart.Position + Vector3.new(0, 3, 0)) * rootPart.CFrame.Rotation
+					end
+					local now = chaser:GetPivot().Position
+					if (now - last).Magnitude > 0.05 then
+						stillSince = os.clock()
+					end
+					last = now
+					if os.clock() - stillSince > AUTO.CHASER_CALM then
+						break
+					end
+					task.wait(0.05)
+				end
+				hopTo(standPoint)
+				deadline = os.clock() + AUTO.DOOR_TIMEOUT
+				position = chaser:GetPivot().Position
+			end
+			chaserLast = position
+		end
+
+		-- A wrong answer sends us back to the checkpoint; don't drag the character back here.
+		if isRunOver() or (AnomalyFinder.lastWrongAt or 0) > waitStarted - 1 then
+			return false
+		end
+
+		-- Something new showed up after the count went in: go back and fix the counter.
+		local cached = roomCache[room]
+		if AnomalyFinder.lastEntered and cached and #cached.anomalies ~= AnomalyFinder.lastEntered then
+			return false
+		end
+
+		-- Nudged a little (the door swinging): step back in. Moved far (the game sent us
+		-- somewhere): give up and let the main loop look again.
+		local _, rootPart = getCharacterParts()
+		local away = rootPart and (rootPart.Position - standPoint).Magnitude or 0
+		if away > AUTO.DOOR_LEASH then
+			return false
+		elseif away > 4 then
+			hopTo(standPoint)
+		end
+
+		if movingDoor:GetPivot().LookVector:Dot(closedLook) < 0.8 then
+			opened = true
+			break
+		end
+
+		setAutoStatus("Waiting for door " .. tostring(level + 1))
+		task.wait(chaserLast and 0.05 or 0.25)
+	end
+
+	if not opened then
+		return false
+	end
+
+	-- Step through to the next corridor's spawn point.
+	return walkTo(room, inside, 4)
+end
+
+---On the end-of-run screen, press Play Again.
+---@return boolean
+local function replayIfEnded()
+	local hud = localPlayer.PlayerGui:FindFirstChild("HUD")
+	local ending = hud and hud:FindFirstChild("Ending")
+	if not (ending and ending.Visible) then
+		return false
+	end
+
+	if os.clock() - (AnomalyFinder.lastReplay or 0) > AUTO.REPLAY_INTERVAL then
+		-- Note where the run ended; a last-life mistake shows no report to log.
+		if not AnomalyFinder.lastReplay then
+			local character = localPlayer.Character
+			local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+			table.insert(pendingReportLines, string.format(
+				"[%s] Run ended | last corridor %s | entered %s | health %s | panel: %s\n    steps: %s\n",
+				os.date("%Y-%m-%d %H:%M:%S"),
+				tostring(AnomalyFinder.lastLevel),
+				tostring(AnomalyFinder.lastEntered),
+				humanoid and tostring(humanoid.Health) or "no character",
+				tostring(AnomalyFinder.lastEnteredNames),
+				table.concat(AnomalyFinder.statusHistory or {}, " > ", math.max(1, #(AnomalyFinder.statusHistory or {}) - 12))
+			))
+		end
+
+		AnomalyFinder.lastReplay = os.clock()
+		setAutoStatus("Run over; playing again")
+
+		local remotes = game:GetService("ReplicatedStorage"):FindFirstChild("Remotes")
+		local replay = remotes and remotes:FindFirstChild("Replay")
+		if replay then
+			replay:FireServer()
+		end
+	end
+
+	return true
+end
+
+---Play corridors on its own until switched off.
+local function runAuto()
+	while AnomalyFinder.autoEnabled and AnomalyFinder.running do
+		local success, err = pcall(function()
+			if replayIfEnded() then
+				task.wait(1)
+				return
+			end
+
+			local segments = workspaceService:FindFirstChild("MapSegments")
+			local room = segments and AnomalyFinder.getCurrentRoom(segments)
+			local level = room and room:GetAttribute("Level")
+
+			-- A new run starts in the lobby room; the first door leads into corridor 0.
+			local gameInfo = workspaceService:FindFirstChild("GameInfo")
+			local lobby = segments and segments:FindFirstChild("Start")
+			if lobby and gameInfo and gameInfo:GetAttribute("start") == nil then
+				local firstRoom = findRoomByLevel(segments, 0)
+				if firstRoom then
+					setAutoStatus("Starting the run")
+					enterNextRoom(segments, lobby, firstRoom)
+					task.wait(0.5)
+					return
+				end
+			end
+
+			if not level then
+				setAutoStatus("Waiting for a corridor...")
+				task.wait(1)
+				return
+			end
+
+			-- The game tracks which corridor you're on (a wrong answer resets it to the start).
+			-- If that disagrees with where the character is for a few seconds, go there.
+			local function getProgress()
+				return gameInfo and gameInfo:GetAttribute("LatestRoomId")
+			end
+
+			if getProgress() and getProgress() ~= level then
+				local waitUntil = os.clock() + AUTO.OFF_TRACK_TIME
+				while os.clock() < waitUntil and getProgress() ~= level do
+					task.wait(0.25)
+				end
+
+				local progress = getProgress()
+				local progressRoom = progress ~= level and findRoomByLevel(segments, progress)
+				local spawn = progressRoom and progressRoom:FindFirstChild("Spawn")
+				if spawn then
+					setAutoStatus("Back to corridor " .. progress)
+					hopTo(spawn.Position + Vector3.new(0, 3, 0))
+					task.wait(0.5)
+					return
+				end
+			end
+
+			local objects = room:FindFirstChild("Objects")
+			local counter = objects and objects:FindFirstChild("AnomalyCounter")
+
+			AnomalyFinder.lastEntered = nil
+			AnomalyFinder.lastLevel = level
+
+			if counter then
+				setAutoStatus("Walking corridor " .. level)
+				visitTriggers(room)
+
+				-- The counter takes clicks from anywhere in the corridor, so there's no need to
+				-- walk over to it (and right past whatever sits next to it).
+
+				-- Put in what's been found so far while John walks by; only changes are left after.
+				local found = roomCache[room]
+				if found then
+					setAutoStatus(string.format("Entering %d on the counter", #found.anomalies))
+					setCounter(counter, #found.anomalies)
+				end
+
+				waitForJohn(room)
+
+				local anomalies = settleCount(room)
+				if not AnomalyFinder.autoEnabled then
+					return
+				end
+
+				-- Something can still turn up while the count goes in; keep the counter in step.
+				local entered = -1
+				local confirmUntil = os.clock() + AUTO.CONFIRM_TIME
+				while AnomalyFinder.autoEnabled do
+					local cached = roomCache[room]
+					local amount = cached and #cached.anomalies or #anomalies
+
+					if amount ~= entered then
+						setAutoStatus(string.format("Entering %d on the counter", amount))
+						if not setCounter(counter, amount) then
+							warn("[AnomalyFinder] auto: the counter didn't take " .. amount)
+						end
+
+						entered = amount
+						AnomalyFinder.lastEntered = amount
+						local names = {}
+						for _, anomaly in ipairs(cached and cached.anomalies or anomalies) do
+							table.insert(names, anomaly.name .. ((anomaly.detail or "") ~= "" and " (" .. anomaly.detail .. ")" or ""))
+						end
+						AnomalyFinder.lastEnteredNames = table.concat(names, ", ")
+						confirmUntil = os.clock() + AUTO.CONFIRM_TIME
+					elseif os.clock() > confirmUntil then
+						break
+					end
+
+					task.wait(0.1)
+				end
+			end
+
+			if not enterNextRoom(segments, room) then
+				setAutoStatus("No way forward from corridor " .. level .. "; waiting")
+				task.wait(2)
+			end
+		end)
+
+		if not success then
+			warn("[AnomalyFinder] auto: " .. tostring(err))
+			task.wait(1)
+		end
+	end
+
+	stopWalking()
+	setAutoStatus("")
+end
+
+---Turn full auto on or off.
+---@param enabled boolean
+local function setAutoEnabled(enabled)
+	AnomalyFinder.autoEnabled = enabled
+
+	-- Remembered across server hops (Play Again moves you to a new server).
+	pcall(writefile, AUTO.STATE_FILE, enabled and "1" or "0")
+
+	local interface = AnomalyFinder.interface
+	if interface then
+		interface.autoButton.Text = "Full auto [Del]: " .. (enabled and "on" or "off")
+		interface.autoButton.BackgroundColor3 = enabled and Color3.fromRGB(60, 120, 80) or Color3.fromRGB(40, 40, 48)
+	end
+
+	if enabled and not AnomalyFinder.autoThread then
+		AnomalyFinder.autoThread = task.spawn(function()
+			runAuto()
+			AnomalyFinder.autoThread = nil
+		end)
+	elseif not enabled then
+		stopWalking()
+		setAutoStatus("")
+	end
+end
+
+---Turn the anomaly boxes on or off.
+---@param enabled boolean
+local function setEspEnabled(enabled)
+	AnomalyFinder.espEnabled = enabled
+
+	local interface = AnomalyFinder.interface
+	if interface then
+		interface.espButton.Text = "ESP [RCtrl]: " .. (enabled and "on" or "off")
+		interface.espButton.BackgroundColor3 = enabled and Color3.fromRGB(60, 90, 140) or Color3.fromRGB(40, 40, 48)
+	end
+
+	if not enabled then
+		clearEsp()
+	end
+end
+
+---Wire up the toggle buttons and their keys.
+local function bindControls()
+	local interface = AnomalyFinder.interface
+
+	table.insert(AnomalyFinder.controlConnections, interface.autoButton.Activated:Connect(function()
+		setAutoEnabled(not AnomalyFinder.autoEnabled)
+	end))
+
+	table.insert(AnomalyFinder.controlConnections, interface.espButton.Activated:Connect(function()
+		setEspEnabled(not AnomalyFinder.espEnabled)
+	end))
+
+	table.insert(AnomalyFinder.controlConnections, userInputService.InputBegan:Connect(function(input)
+		if userInputService:GetFocusedTextBox() then
+			return
+		end
+
+		if input.KeyCode == AUTO.KEY then
+			setAutoEnabled(not AnomalyFinder.autoEnabled)
+		elseif input.KeyCode == AUTO.ESP_KEY then
+			setEspEnabled(not AnomalyFinder.espEnabled)
+		end
+	end))
+end
+
+---Start scanning and rendering.
+function AnomalyFinder.init()
+	AnomalyFinder.running = true
+	AnomalyFinder.interface = createInterface()
+	AnomalyFinder.scanRoom = scanRoom
+	AnomalyFinder.getCurrentRoom = getCurrentRoom
+	wrapAnomalyFunctions()
+	wrapReport()
+	bindControls()
+	AnomalyFinder.clearEsp = clearEsp
+
+	-- Log every death cutscene (what got us, and what auto was doing), once per server.
+	local remotes = game:GetService("ReplicatedStorage"):FindFirstChild("Remotes")
+	local cutscenes = remotes and remotes:FindFirstChild("Cutscenes")
+	if cutscenes and getcallbackvalue and not cutscenes:GetAttribute("AnomalyFinderHook") then
+		local ok, original = pcall(getcallbackvalue, cutscenes, "OnClientInvoke")
+		if ok and type(original) == "function" then
+			cutscenes:SetAttribute("AnomalyFinderHook", true)
+			cutscenes.OnClientInvoke = function(name, ...)
+				pcall(function()
+					local finder = shared.AnomalyFinder
+					appendfile(REPORT_LOG_FILE, string.format(
+						"[%s] Cutscene %s | %s | doing: %s\n",
+						os.date("%Y-%m-%d %H:%M:%S"), tostring(name),
+						finder.interface.header.Text, finder.interface.status.Text
+					))
+				end)
+				return original(name, ...)
+			end
+		end
+	end
+
+	-- Chasers are checked every frame so we're gone the instant one starts coming.
+	table.insert(AnomalyFinder.controlConnections, game:GetService("RunService").Heartbeat:Connect(function()
+		pcall(watchChasers)
+	end))
+
+	-- Come back on the next server, and pick full auto back up if it was on.
+	local queueTeleport = queue_on_teleport or queueonteleport
+	if queueTeleport then
+		pcall(queueTeleport, AUTO.RELOAD_SOURCE)
+	end
+
+	-- Log deaths too: they cost lives without the game's report showing up.
+	local function watchDeath(character)
+		local humanoid = character:WaitForChild("Humanoid", 10)
+		if not humanoid then
+			return
+		end
+
+		table.insert(AnomalyFinder.controlConnections, humanoid.Died:Connect(function()
+			local interface = AnomalyFinder.interface
+			table.insert(pendingReportLines, string.format(
+				"[%s] Died | %s | doing: %s | panel: %s\n",
+				os.date("%Y-%m-%d %H:%M:%S"),
+				interface and interface.header.Text or "?",
+				interface and interface.status.Text or "?",
+				interface and (interface.list.Text:gsub("<[^>]+>", ""):gsub("\n", "; ")) or "?"
+			))
+		end))
+	end
+
+	if localPlayer.Character then
+		task.spawn(watchDeath, localPlayer.Character)
+	end
+	table.insert(AnomalyFinder.controlConnections, localPlayer.CharacterAdded:Connect(watchDeath))
+
+	local stateOk, state = pcall(readfile, AUTO.STATE_FILE)
+	if stateOk and state == "1" then
+		setAutoEnabled(true)
+	end
+
+	task.spawn(function()
+		while AnomalyFinder.running do
+			-- Our panel was removed by a newer copy; step aside.
+			local interface = AnomalyFinder.interface
+			if not interface or not interface.gui.Parent then
+				AnomalyFinder.detach()
+				break
+			end
+
+			pcall(flushReportLog)
+
+			-- After a server hop we can load before the game's own modules; keep trying to hook them.
+			if not wrappedReport or next(wrappedAnomalyFunctions) == nil or not AnomalyFinder.jumpscaresWrapped then
+				pcall(wrapAnomalyFunctions)
+				pcall(wrapReport)
+			end
+
+			local success, err = pcall(function()
+				local segments = workspaceService:FindFirstChild("MapSegments")
+				if not segments then
+					render(AnomalyFinder.interface, nil)
+					return
+				end
+
+				if AnomalyFinder.watchedSegments ~= segments then
+					watchSegments(segments)
+				end
+
+				local room = getCurrentRoom(segments)
+				if not room then
+					render(AnomalyFinder.interface, nil)
+					return
+				end
+
+				task.spawn(watchRoom, room)
+
+				-- Show cached results right away while a fresh scan runs.
+				local cached = roomCache[room]
+				render(AnomalyFinder.interface, room, cached and cached.anomalies)
+
+				local anomalies = getRoomAnomalies(room)
+				pcall(captureDeepSnapshot, room)
+				if AnomalyFinder.running and AnomalyFinder.interface then
+					render(AnomalyFinder.interface, room, anomalies)
+
+					if AnomalyFinder.espEnabled then
+						updateEsp(anomalies)
+					end
+				end
+			end)
+
+			if not success then
+				warn("[AnomalyFinder] " .. tostring(err))
+			end
+
+			task.wait(SCAN_INTERVAL)
+		end
+	end)
+end
+
+---This is called when initialization errors.
+---@param error string
+local function onInitializeError(error)
+	warn("Failed to initialize.")
+	warn(error)
+	warn(debug.traceback())
+	AnomalyFinder.detach()
+end
+
+-- Replace any previous instance on re-execution.
+if shared.AnomalyFinder then
+	shared.AnomalyFinder.detach()
+end
+
+-- Another script environment may be running its own copy; removing its panel stops it.
+pcall(function()
+	for _, child in ipairs(gethui():GetChildren()) do
+		if child.Name == "AnomalyFinder" or child.Name == "AnomalyFinderESP" then
+			child:Destroy()
+		end
+	end
+end)
+
+shared.AnomalyFinder = AnomalyFinder
+
+xpcall(AnomalyFinder.init, onInitializeError)
