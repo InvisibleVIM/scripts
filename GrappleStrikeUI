@@ -1,0 +1,775 @@
+-- Check for table that is shared between executions.
+if not shared then
+	return warn("No shared, no script.")
+end
+
+-- Initialize Luraph globals if they do not exist.
+loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
+
+local GrappleStrike = { connections = {} }
+
+-- Unload a previous execution before touching any game tables.
+if shared.GrappleStrike then
+	pcall(shared.GrappleStrike.detach)
+end
+
+-- Services.
+local runService = game:GetService("RunService")
+local userInputService = game:GetService("UserInputService")
+local tweenService = game:GetService("TweenService")
+local httpService = game:GetService("HttpService")
+
+-- Constants.
+-- Constants.
+local SETTINGS_FOLDER = "GrappleStrike"
+local SETTINGS_FILE = SETTINGS_FOLDER .. "/settings.json"
+local SAVE_INTERVAL = 0.5
+
+-- Palette.
+local STEEL = Color3.fromHex("16212A")
+local PANEL = Color3.fromHex("1A2731")
+local RAISED = Color3.fromHex("223442")
+local LINE = Color3.fromHex("2F4757")
+local TEXT = Color3.fromHex("E9EEF0")
+local MUTED = Color3.fromHex("8DA2AE")
+local GOLD = Color3.fromHex("F2B33D")
+
+local DISPLAY_FONT = Font.new("rbxasset://fonts/families/Oswald.json", Enum.FontWeight.Bold)
+local TAB_FONT = Font.new("rbxasset://fonts/families/Oswald.json", Enum.FontWeight.Medium)
+local BODY_FONT = Font.new("rbxasset://fonts/families/TitilliumWeb.json", Enum.FontWeight.SemiBold)
+local BODY_BOLD = Font.new("rbxasset://fonts/families/TitilliumWeb.json", Enum.FontWeight.Bold)
+
+-- Config (mutated live by the UI).
+local Config = {
+	SilentAim = false,
+	HitChance = 100,
+	CameraAim = false,
+	AimMode = "Hold",
+	AimKey = Enum.KeyCode.F,
+	Smoothing = 0.8,
+	FOV = 140,
+	AimPoint = "Center",
+	Priority = "Crosshair",
+	LeadRockets = true,
+	WallCheck = true,
+	SkipProtected = true,
+	ShowFOV = true,
+	ESP = false,
+	Boxes = true,
+	Names = true,
+	Health = true,
+	Info = true,
+	Tracers = false,
+	PlayerColors = true,
+	ShowTeammates = false,
+}
+
+---Serialize Config to JSON; EnumItems are stored as { enum, name }.
+---@return string
+local function encodeSettings()
+	local data = {}
+	for key, value in pairs(Config) do
+		if typeof(value) == "EnumItem" then
+			data[key] = { enum = tostring(value.EnumType), name = value.Name }
+		else
+			data[key] = value
+		end
+	end
+	return httpService:JSONEncode(data)
+end
+
+---Write settings to the workspace folder.
+local function saveSettings()
+	pcall(function()
+		if not isfolder(SETTINGS_FOLDER) then
+			makefolder(SETTINGS_FOLDER)
+		end
+		writefile(SETTINGS_FILE, encodeSettings())
+	end)
+end
+
+---Apply saved settings over the defaults, ignoring unknown or mistyped keys.
+local function loadSettings()
+	local ok, data = pcall(function()
+		return isfile(SETTINGS_FILE) and httpService:JSONDecode(readfile(SETTINGS_FILE))
+	end)
+	if not (ok and type(data) == "table") then
+		return
+	end
+
+	for key, value in pairs(data) do
+		local default = Config[key]
+		if default == nil then
+			continue
+		end
+		if typeof(default) == "EnumItem" then
+			if type(value) == "table" then
+				local found, item = pcall(function()
+					return Enum[value.enum][value.name]
+				end)
+				if found and item then
+					Config[key] = item
+				end
+			end
+		elseif type(value) == type(default) then
+			Config[key] = value
+		end
+	end
+end
+
+loadSettings()
+
+-- State.
+local rebinding = false
+
+-- ============================================================
+--  Input
+-- ============================================================
+
+local refreshKeybind = nil
+
+table.insert(GrappleStrike.connections, userInputService.InputBegan:Connect(function(input)
+	if rebinding then
+		if input.KeyCode == Enum.KeyCode.Escape then
+			rebinding = false
+		elseif input.KeyCode ~= Enum.KeyCode.Unknown then
+			rebinding = false
+			Config.AimKey = input.KeyCode
+		elseif input.UserInputType.Name:find("MouseButton") then
+			rebinding = false
+			Config.AimKey = input.UserInputType
+		end
+		if refreshKeybind and not rebinding then
+			refreshKeybind()
+		end
+		return
+	end
+
+	if input.KeyCode == Enum.KeyCode.RightShift and GrappleStrike.panel then
+		GrappleStrike.panel.Visible = not GrappleStrike.panel.Visible
+		return
+	end
+
+end))
+
+
+
+-- ============================================================
+--  Interface
+-- ============================================================
+
+local function create(class, props, children)
+	local instance = Instance.new(class)
+	for key, value in pairs(props or {}) do
+		instance[key] = value
+	end
+	for _, child in ipairs(children or {}) do
+		child.Parent = instance
+	end
+	return instance
+end
+
+local function corner(radius)
+	return create("UICorner", { CornerRadius = UDim.new(0, radius) })
+end
+
+local function tween(instance, props, duration)
+	tweenService:Create(instance, TweenInfo.new(duration or 0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props):Play()
+end
+
+local function inputName(input)
+	if input == Enum.UserInputType.MouseButton1 then
+		return "Mouse 1"
+	elseif input == Enum.UserInputType.MouseButton2 then
+		return "Mouse 2"
+	elseif input == Enum.UserInputType.MouseButton3 then
+		return "Mouse 3"
+	end
+	return input.Name
+end
+
+local guiParent = (gethui and gethui()) or game:GetService("CoreGui")
+local oldGui = guiParent:FindFirstChild("GrappleStrikeUI")
+if oldGui then
+	oldGui:Destroy()
+end
+
+local screenGui = create("ScreenGui", {
+	Name = "GrappleStrikeUI",
+	ResetOnSpawn = false,
+	IgnoreGuiInset = true,
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	DisplayOrder = 50,
+})
+GrappleStrike.gui = screenGui
+
+local panel = create("Frame", {
+	Name = "Panel",
+	AnchorPoint = Vector2.new(0, 0.5),
+	Position = UDim2.new(0, 28, 0.5, 0),
+	Size = UDim2.fromOffset(304, 488),
+	BackgroundColor3 = PANEL,
+	BorderSizePixel = 0,
+	ClipsDescendants = false,
+	Parent = screenGui,
+}, {
+	corner(10),
+	create("UIStroke", { Color = LINE, Thickness = 1 }),
+})
+GrappleStrike.panel = panel
+
+-- The cable the panel hangs from, with its carabiner.
+create("Frame", {
+	Name = "Cable",
+	Position = UDim2.new(0, 34, 0, -1),
+	Size = UDim2.new(1, -44, 0, 2),
+	BackgroundColor3 = GOLD,
+	BorderSizePixel = 0,
+	ZIndex = 3,
+	Parent = panel,
+})
+create("Frame", {
+	Name = "Carabiner",
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Position = UDim2.new(0, 26, 0, 0),
+	Size = UDim2.fromOffset(16, 24),
+	BackgroundColor3 = PANEL,
+	BorderSizePixel = 0,
+	ZIndex = 4,
+	Parent = panel,
+}, {
+	corner(8),
+	create("UIStroke", { Color = GOLD, Thickness = 2.5 }),
+	create("Frame", {
+		Name = "Gate",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.78, 0.5),
+		Size = UDim2.fromOffset(2, 10),
+		BackgroundColor3 = GOLD,
+		BorderSizePixel = 0,
+		ZIndex = 5,
+	}),
+})
+
+local header = create("Frame", {
+	Name = "Header",
+	Size = UDim2.new(1, 0, 0, 62),
+	BackgroundTransparency = 1,
+	Parent = panel,
+})
+create("TextLabel", {
+	Name = "Title",
+	Position = UDim2.fromOffset(18, 18),
+	Size = UDim2.new(1, -36, 0, 26),
+	BackgroundTransparency = 1,
+	FontFace = DISPLAY_FONT,
+	Text = "Grapple Strike",
+	TextColor3 = TEXT,
+	TextSize = 25,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	Parent = header,
+})
+local statusLabel = create("TextLabel", {
+	Name = "Status",
+	AnchorPoint = Vector2.new(1, 0),
+	Position = UDim2.new(1, -18, 0, 24),
+	Size = UDim2.fromOffset(130, 18),
+	BackgroundTransparency = 1,
+	FontFace = BODY_FONT,
+	Text = "",
+	TextColor3 = MUTED,
+	TextSize = 14,
+	TextXAlignment = Enum.TextXAlignment.Right,
+	TextTruncate = Enum.TextTruncate.AtEnd,
+	Parent = header,
+})
+
+-- Drag by the header.
+do
+	local dragging, dragStart, startPosition = false, nil, nil
+	header.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging, dragStart, startPosition = true, input.Position, panel.Position
+		end
+	end)
+	table.insert(GrappleStrike.connections, userInputService.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			local delta = input.Position - dragStart
+			panel.Position = UDim2.new(startPosition.X.Scale, startPosition.X.Offset + delta.X, startPosition.Y.Scale, startPosition.Y.Offset + delta.Y)
+		end
+	end))
+	table.insert(GrappleStrike.connections, userInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end))
+end
+
+-- Tabs.
+local tabBar = create("Frame", {
+	Name = "Tabs",
+	Position = UDim2.fromOffset(18, 62),
+	Size = UDim2.new(1, -36, 0, 30),
+	BackgroundTransparency = 1,
+	Parent = panel,
+})
+create("Frame", {
+	Name = "Rule",
+	Position = UDim2.new(0, 0, 1, -1),
+	Size = UDim2.new(1, 0, 0, 1),
+	BackgroundColor3 = LINE,
+	BorderSizePixel = 0,
+	Parent = tabBar,
+})
+local tabUnderline = create("Frame", {
+	Name = "Underline",
+	Position = UDim2.new(0, 0, 1, -2),
+	Size = UDim2.fromOffset(34, 2),
+	BackgroundColor3 = GOLD,
+	BorderSizePixel = 0,
+	ZIndex = 2,
+	Parent = tabBar,
+})
+
+local pages, tabButtons = {}, {}
+
+local function makePage(name)
+	local page = create("ScrollingFrame", {
+		Name = name,
+		Position = UDim2.fromOffset(0, 98),
+		Size = UDim2.new(1, 0, 1, -98 - 40),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ScrollBarThickness = 3,
+		ScrollBarImageColor3 = LINE,
+		CanvasSize = UDim2.new(),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		Visible = false,
+		Parent = panel,
+	}, {
+		create("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 12), PaddingBottom = UDim.new(0, 8) }),
+		create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 2) }),
+	})
+	pages[name] = page
+	return page
+end
+
+local function selectTab(name)
+	for pageName, page in pairs(pages) do
+		page.Visible = pageName == name
+	end
+	for buttonName, button in pairs(tabButtons) do
+		local active = buttonName == name
+		button.TextColor3 = active and TEXT or MUTED
+		if active then
+			tween(tabUnderline, {
+				Position = UDim2.new(0, button.Position.X.Offset, 1, -2),
+				Size = UDim2.fromOffset(button.TextBounds.X, 2),
+			}, 0.18)
+		end
+	end
+end
+
+local function makeTab(name, x)
+	local button = create("TextButton", {
+		Name = name,
+		Position = UDim2.fromOffset(x, 0),
+		Size = UDim2.new(0, 70, 1, -4),
+		AutomaticSize = Enum.AutomaticSize.X,
+		BackgroundTransparency = 1,
+		FontFace = TAB_FONT,
+		Text = name,
+		TextColor3 = MUTED,
+		TextSize = 17,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		AutoButtonColor = false,
+		Parent = tabBar,
+	})
+	button.Size = UDim2.new(0, 0, 1, -4)
+	tabButtons[name] = button
+	button.MouseButton1Click:Connect(function()
+		selectTab(name)
+	end)
+	return button
+end
+
+-- Control builders.
+local layoutOrder = 0
+local function nextOrder()
+	layoutOrder = layoutOrder + 1
+	return layoutOrder
+end
+
+local function rowBase(page, height, clickable)
+	local row = create(clickable and "TextButton" or "Frame", {
+		Size = UDim2.new(1, 0, 0, height),
+		BackgroundColor3 = RAISED,
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		LayoutOrder = nextOrder(),
+		Parent = page,
+	}, { corner(6) })
+	if clickable then
+		row.Text = ""
+		row.AutoButtonColor = false
+	end
+	row.MouseEnter:Connect(function()
+		tween(row, { BackgroundTransparency = 0.35 }, 0.1)
+	end)
+	row.MouseLeave:Connect(function()
+		tween(row, { BackgroundTransparency = 1 }, 0.1)
+	end)
+	return row
+end
+
+local function rowLabel(row, text, y)
+	return create("TextLabel", {
+		Position = UDim2.fromOffset(8, y or 0),
+		Size = UDim2.new(1, -120, 0, y and 20 or row.Size.Y.Offset),
+		BackgroundTransparency = 1,
+		FontFace = BODY_FONT,
+		Text = text,
+		TextColor3 = TEXT,
+		TextSize = 15,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Parent = row,
+	})
+end
+
+local function heading(page, text)
+	create("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 30),
+		BackgroundTransparency = 1,
+		FontFace = BODY_BOLD,
+		Text = text,
+		TextColor3 = MUTED,
+		TextSize = 13,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Bottom,
+		LayoutOrder = nextOrder(),
+		Parent = page,
+	}, { create("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingBottom = UDim.new(0, 4) }) })
+end
+
+---Square latch: gold with a check when on.
+local function toggle(page, text, key)
+	local row = rowBase(page, 34, true)
+	rowLabel(row, text)
+	local latch = create("Frame", {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -8, 0.5, 0),
+		Size = UDim2.fromOffset(20, 20),
+		BackgroundColor3 = GOLD,
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		Parent = row,
+	}, { corner(5) })
+	local latchStroke = create("UIStroke", { Color = LINE, Thickness = 1.5, Parent = latch })
+	local check = create("TextLabel", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		FontFace = BODY_BOLD,
+		Text = "✓",
+		TextColor3 = PANEL,
+		TextSize = 15,
+		TextTransparency = 1,
+		Parent = latch,
+	})
+
+	local function refresh()
+		local on = Config[key]
+		tween(latch, { BackgroundTransparency = on and 0 or 1 })
+		tween(check, { TextTransparency = on and 0 or 1 })
+		tween(latchStroke, { Color = on and GOLD or LINE })
+	end
+	row.MouseButton1Click:Connect(function()
+		Config[key] = not Config[key]
+		refresh()
+	end)
+	refresh()
+end
+
+---Thin cable-style slider.
+local function slider(page, text, key, minValue, maxValue, step, format)
+	local row = rowBase(page, 48, false)
+	rowLabel(row, text, 4)
+	local valueLabel = create("TextLabel", {
+		AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, -8, 0, 4),
+		Size = UDim2.fromOffset(90, 20),
+		BackgroundTransparency = 1,
+		FontFace = BODY_BOLD,
+		TextColor3 = GOLD,
+		TextSize = 15,
+		TextXAlignment = Enum.TextXAlignment.Right,
+		Parent = row,
+	})
+	local track = create("TextButton", {
+		Position = UDim2.new(0, 8, 0, 30),
+		Size = UDim2.new(1, -16, 0, 12),
+		BackgroundTransparency = 1,
+		Text = "",
+		AutoButtonColor = false,
+		Parent = row,
+	})
+	create("Frame", {
+		AnchorPoint = Vector2.new(0, 0.5),
+		Position = UDim2.fromScale(0, 0.5),
+		Size = UDim2.new(1, 0, 0, 2),
+		BackgroundColor3 = LINE,
+		BorderSizePixel = 0,
+		Parent = track,
+	})
+	local fill = create("Frame", {
+		AnchorPoint = Vector2.new(0, 0.5),
+		Position = UDim2.fromScale(0, 0.5),
+		Size = UDim2.new(0, 0, 0, 2),
+		BackgroundColor3 = GOLD,
+		BorderSizePixel = 0,
+		Parent = track,
+	})
+	local knob = create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0, 0.5),
+		Size = UDim2.fromOffset(12, 12),
+		BackgroundColor3 = GOLD,
+		BorderSizePixel = 0,
+		ZIndex = 2,
+		Parent = track,
+	}, { corner(6), create("UIStroke", { Color = PANEL, Thickness = 2 }) })
+
+	local function refresh()
+		local fraction = (Config[key] - minValue) / (maxValue - minValue)
+		fill.Size = UDim2.new(fraction, 0, 0, 2)
+		knob.Position = UDim2.fromScale(fraction, 0.5)
+		valueLabel.Text = format(Config[key])
+	end
+	local dragging = false
+	local function setFromX(x)
+		local fraction = math.clamp((x - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
+		local value = minValue + fraction * (maxValue - minValue)
+		Config[key] = math.clamp(math.floor(value / step + 0.5) * step, minValue, maxValue)
+		refresh()
+	end
+	track.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			setFromX(input.Position.X)
+		end
+	end)
+	table.insert(GrappleStrike.connections, userInputService.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			setFromX(input.Position.X)
+		end
+	end))
+	table.insert(GrappleStrike.connections, userInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end))
+	refresh()
+end
+
+---Segmented choice for short option sets.
+local function segmented(page, text, key, options)
+	local row = rowBase(page, 34, false)
+	rowLabel(row, text)
+	local group = create("Frame", {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -6, 0.5, 0),
+		Size = UDim2.fromOffset(0, 24),
+		AutomaticSize = Enum.AutomaticSize.X,
+		BackgroundColor3 = STEEL,
+		BorderSizePixel = 0,
+		Parent = row,
+	}, {
+		corner(6),
+		create("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 2) }),
+		create("UIPadding", { PaddingLeft = UDim.new(0, 2), PaddingRight = UDim.new(0, 2), PaddingTop = UDim.new(0, 2), PaddingBottom = UDim.new(0, 2) }),
+	})
+	local buttons = {}
+	local function refresh()
+		for option, button in pairs(buttons) do
+			local active = Config[key] == option
+			tween(button, { BackgroundTransparency = active and 0 or 1, TextColor3 = active and GOLD or MUTED }, 0.12)
+		end
+	end
+	for index, option in ipairs(options) do
+		local button = create("TextButton", {
+			Size = UDim2.fromOffset(0, 20),
+			AutomaticSize = Enum.AutomaticSize.X,
+			BackgroundColor3 = RAISED,
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			FontFace = BODY_FONT,
+			Text = option,
+			TextColor3 = MUTED,
+			TextSize = 13,
+			AutoButtonColor = false,
+			LayoutOrder = index,
+			Parent = group,
+		}, { corner(4), create("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8) }) })
+		buttons[option] = button
+		button.MouseButton1Click:Connect(function()
+			Config[key] = option
+			refresh()
+		end)
+	end
+	refresh()
+end
+
+local function keybind(page, text)
+	local row = rowBase(page, 34, true)
+	rowLabel(row, text)
+	local chip = create("TextLabel", {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -6, 0.5, 0),
+		Size = UDim2.fromOffset(0, 22),
+		AutomaticSize = Enum.AutomaticSize.X,
+		BackgroundColor3 = STEEL,
+		BorderSizePixel = 0,
+		FontFace = BODY_BOLD,
+		TextColor3 = TEXT,
+		TextSize = 13,
+		Parent = row,
+	}, { corner(5), create("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) }) })
+	refreshKeybind = function()
+		chip.Text = rebinding and "Press a key" or inputName(Config.AimKey)
+		chip.TextColor3 = rebinding and GOLD or TEXT
+	end
+	row.MouseButton1Click:Connect(function()
+		rebinding = true
+		refreshKeybind()
+	end)
+	refreshKeybind()
+end
+
+-- Aim page.
+local aimPage = makePage("Aim")
+heading(aimPage, "Silent aim")
+toggle(aimPage, "Silent aim", "SilentAim")
+slider(aimPage, "Hit chance", "HitChance", 0, 100, 1, function(v) return v .. "%" end)
+
+heading(aimPage, "Camera aim")
+toggle(aimPage, "Camera aim", "CameraAim")
+keybind(aimPage, "Aim key")
+segmented(aimPage, "Mode", "AimMode", { "Hold", "Toggle" })
+slider(aimPage, "Smoothing", "Smoothing", 0, 0.95, 0.05, function(v) return math.floor(v * 100 + 0.5) .. "%" end)
+
+heading(aimPage, "Targeting")
+slider(aimPage, "Field of view", "FOV", 20, 500, 5, function(v) return v .. " px" end)
+segmented(aimPage, "Aim point", "AimPoint", { "Upper", "Center", "Lower" })
+segmented(aimPage, "Priority", "Priority", { "Crosshair", "Nearest" })
+toggle(aimPage, "Lead rockets", "LeadRockets")
+toggle(aimPage, "Wall check", "WallCheck")
+toggle(aimPage, "Skip spawn-protected", "SkipProtected")
+toggle(aimPage, "Show FOV circle", "ShowFOV")
+
+-- Visuals page.
+local visualsPage = makePage("Visuals")
+heading(visualsPage, "Players")
+toggle(visualsPage, "Show players", "ESP")
+toggle(visualsPage, "Boxes", "Boxes")
+toggle(visualsPage, "Names", "Names")
+toggle(visualsPage, "Health bar", "Health")
+toggle(visualsPage, "Health, weapon and distance", "Info")
+toggle(visualsPage, "Tracers", "Tracers")
+heading(visualsPage, "Style")
+toggle(visualsPage, "Use player colors", "PlayerColors")
+toggle(visualsPage, "Show teammates in TDM", "ShowTeammates")
+
+-- Footer.
+local footer = create("Frame", {
+	Name = "Footer",
+	Position = UDim2.new(0, 0, 1, -40),
+	Size = UDim2.new(1, 0, 0, 40),
+	BackgroundColor3 = STEEL,
+	BorderSizePixel = 0,
+	Parent = panel,
+}, { corner(10) })
+create("Frame", { -- squares off the footer's top corners
+	Size = UDim2.new(1, 0, 0, 10),
+	BackgroundColor3 = STEEL,
+	BorderSizePixel = 0,
+	Parent = footer,
+})
+create("TextLabel", {
+	Position = UDim2.fromOffset(18, 0),
+	Size = UDim2.new(1, -120, 1, 0),
+	BackgroundTransparency = 1,
+	FontFace = BODY_FONT,
+	Text = "Right Shift hides this panel",
+	TextColor3 = MUTED,
+	TextSize = 13,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	ZIndex = 2,
+	Parent = footer,
+})
+local unloadButton = create("TextButton", {
+	AnchorPoint = Vector2.new(1, 0.5),
+	Position = UDim2.new(1, -12, 0.5, 0),
+	Size = UDim2.fromOffset(72, 26),
+	BackgroundColor3 = RAISED,
+	BorderSizePixel = 0,
+	FontFace = BODY_BOLD,
+	Text = "Unload",
+	TextColor3 = TEXT,
+	TextSize = 13,
+	AutoButtonColor = true,
+	ZIndex = 2,
+	Parent = footer,
+}, { corner(6) })
+
+makeTab("Aim", 0)
+makeTab("Visuals", 56)
+screenGui.Parent = guiParent
+task.defer(selectTab, "Aim")
+
+-- Autosave whenever a setting changes.
+do
+	local lastSaved = encodeSettings()
+	local elapsed = 0
+	table.insert(GrappleStrike.connections, runService.Heartbeat:Connect(function(dt)
+		elapsed = elapsed + dt
+		if elapsed < SAVE_INTERVAL then
+			return
+		end
+		elapsed = 0
+		local encoded = encodeSettings()
+		if encoded ~= lastSaved then
+			lastSaved = encoded
+			saveSettings()
+		end
+	end))
+end
+
+-- Live lock status in the header.
+table.insert(GrappleStrike.connections, runService.Heartbeat:Connect(function()
+	local on = Config.SilentAim or Config.CameraAim
+	statusLabel.Text = on and "Aim on" or "Aim off"
+	statusLabel.TextColor3 = on and GOLD or MUTED
+end))
+
+-- ============================================================
+--  Lifecycle
+-- ============================================================
+
+---Undo every hook, connection and drawing.
+function GrappleStrike.detach()
+	saveSettings()
+	for _, connection in ipairs(GrappleStrike.connections) do
+		connection:Disconnect()
+	end
+	if GrappleStrike.gui then
+		GrappleStrike.gui:Destroy()
+	end
+	if shared.GrappleStrike == GrappleStrike then
+		shared.GrappleStrike = nil
+	end
+end
+
+unloadButton.MouseButton1Click:Connect(GrappleStrike.detach)
+
+shared.GrappleStrike = GrappleStrike
+getgenv().GrappleStrikeConfig = Config
+print("[Grapple Strike] UI loaded (front end only). Right Shift toggles the panel.")
