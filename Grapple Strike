@@ -19,12 +19,16 @@ local runService = game:GetService("RunService")
 local userInputService = game:GetService("UserInputService")
 local replicatedStorage = game:GetService("ReplicatedStorage")
 local tweenService = game:GetService("TweenService")
+local httpService = game:GetService("HttpService")
 
 local localPlayer = playersService.LocalPlayer
 
 -- Constants.
 local BOT_UID = -1000
 local VISUAL_AIM_RANGE = 600
+local SETTINGS_FOLDER = "GrappleStrike"
+local SETTINGS_FILE = SETTINGS_FOLDER .. "/settings.json"
+local SAVE_INTERVAL = 0.5
 local AIM_POINT_OFFSETS = { Upper = 0.3, Center = 0, Lower = -0.3 }
 local BOX_CORNERS = {}
 for _, x in ipairs({ -1, 1 }) do
@@ -73,6 +77,61 @@ local Config = {
 	PlayerColors = true,
 	ShowTeammates = false,
 }
+
+---Serialize Config to JSON; EnumItems are stored as { enum, name }.
+---@return string
+local function encodeSettings()
+	local data = {}
+	for key, value in pairs(Config) do
+		if typeof(value) == "EnumItem" then
+			data[key] = { enum = tostring(value.EnumType), name = value.Name }
+		else
+			data[key] = value
+		end
+	end
+	return httpService:JSONEncode(data)
+end
+
+---Write settings to the workspace folder.
+local function saveSettings()
+	pcall(function()
+		if not isfolder(SETTINGS_FOLDER) then
+			makefolder(SETTINGS_FOLDER)
+		end
+		writefile(SETTINGS_FILE, encodeSettings())
+	end)
+end
+
+---Apply saved settings over the defaults, ignoring unknown or mistyped keys.
+local function loadSettings()
+	local ok, data = pcall(function()
+		return isfile(SETTINGS_FILE) and httpService:JSONDecode(readfile(SETTINGS_FILE))
+	end)
+	if not (ok and type(data) == "table") then
+		return
+	end
+
+	for key, value in pairs(data) do
+		local default = Config[key]
+		if default == nil then
+			continue
+		end
+		if typeof(default) == "EnumItem" then
+			if type(value) == "table" then
+				local found, item = pcall(function()
+					return Enum[value.enum][value.name]
+				end)
+				if found and item then
+					Config[key] = item
+				end
+			end
+		elseif type(value) == type(default) then
+			Config[key] = value
+		end
+	end
+end
+
+loadSettings()
 
 -- State.
 local aimHeld = false
@@ -1189,6 +1248,24 @@ makeTab("Visuals", 56)
 screenGui.Parent = guiParent
 task.defer(selectTab, "Aim")
 
+-- Autosave whenever a setting changes.
+do
+	local lastSaved = encodeSettings()
+	local elapsed = 0
+	table.insert(GrappleStrike.connections, runService.Heartbeat:Connect(function(dt)
+		elapsed = elapsed + dt
+		if elapsed < SAVE_INTERVAL then
+			return
+		end
+		elapsed = 0
+		local encoded = encodeSettings()
+		if encoded ~= lastSaved then
+			lastSaved = encoded
+			saveSettings()
+		end
+	end))
+end
+
 -- Live lock status in the header.
 table.insert(GrappleStrike.connections, runService.Heartbeat:Connect(function()
 	if not (Config.SilentAim or Config.CameraAim) then
@@ -1209,6 +1286,7 @@ end))
 
 ---Undo every hook, connection and drawing.
 function GrappleStrike.detach()
+	saveSettings()
 	if weaponClient and originalAimPoint and weaponClient.AimPoint == silentAimPoint then
 		weaponClient.AimPoint = originalAimPoint
 	end
