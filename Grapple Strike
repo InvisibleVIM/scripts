@@ -1,0 +1,1235 @@
+-- Check for table that is shared between executions.
+if not shared then
+	return warn("No shared, no script.")
+end
+
+-- Initialize Luraph globals if they do not exist.
+loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
+
+local GrappleStrike = { connections = {}, esp = {} }
+
+-- Unload a previous execution before touching any game tables.
+if shared.GrappleStrike then
+	pcall(shared.GrappleStrike.detach)
+end
+
+-- Services.
+local playersService = game:GetService("Players")
+local runService = game:GetService("RunService")
+local userInputService = game:GetService("UserInputService")
+local replicatedStorage = game:GetService("ReplicatedStorage")
+local tweenService = game:GetService("TweenService")
+
+local localPlayer = playersService.LocalPlayer
+
+-- Constants.
+local BOT_UID = -1000
+local VISUAL_AIM_RANGE = 600
+local AIM_POINT_OFFSETS = { Upper = 0.3, Center = 0, Lower = -0.3 }
+local BOX_CORNERS = {}
+for _, x in ipairs({ -1, 1 }) do
+	for _, y in ipairs({ -1, 1 }) do
+		for _, z in ipairs({ -1, 1 }) do
+			table.insert(BOX_CORNERS, Vector3.new(x, y, z))
+		end
+	end
+end
+
+-- Palette.
+local STEEL = Color3.fromHex("16212A")
+local PANEL = Color3.fromHex("1A2731")
+local RAISED = Color3.fromHex("223442")
+local LINE = Color3.fromHex("2F4757")
+local TEXT = Color3.fromHex("E9EEF0")
+local MUTED = Color3.fromHex("8DA2AE")
+local GOLD = Color3.fromHex("F2B33D")
+
+local DISPLAY_FONT = Font.new("rbxasset://fonts/families/Oswald.json", Enum.FontWeight.Bold)
+local TAB_FONT = Font.new("rbxasset://fonts/families/Oswald.json", Enum.FontWeight.Medium)
+local BODY_FONT = Font.new("rbxasset://fonts/families/TitilliumWeb.json", Enum.FontWeight.SemiBold)
+local BODY_BOLD = Font.new("rbxasset://fonts/families/TitilliumWeb.json", Enum.FontWeight.Bold)
+
+-- Config (mutated live by the UI).
+local Config = {
+	SilentAim = false,
+	HitChance = 100,
+	CameraAim = false,
+	AimMode = "Hold",
+	AimKey = Enum.KeyCode.F,
+	Smoothing = 0.8,
+	FOV = 140,
+	AimPoint = "Center",
+	Priority = "Crosshair",
+	LeadRockets = true,
+	WallCheck = true,
+	SkipProtected = true,
+	ShowFOV = true,
+	ESP = false,
+	Boxes = true,
+	Names = true,
+	Health = true,
+	Info = true,
+	Tracers = false,
+	PlayerColors = true,
+	ShowTeammates = false,
+}
+
+-- State.
+local aimHeld = false
+local rebinding = false
+local currentTarget = nil
+local peakHealth = setmetatable({}, { __mode = "k" })
+local colorCache = {}
+
+---Require a game module at identity 2 so it cannot see our environment.
+---@param module ModuleScript
+---@return any
+local function safeRequire(module)
+	if not module then
+		return nil
+	end
+	setthreadidentity(2)
+	local ok, result = pcall(require, module)
+	setthreadidentity(8)
+	return ok and result or nil
+end
+
+local sharedFolder = replicatedStorage:WaitForChild("Shared")
+local gameConfig = safeRequire(sharedFolder:FindFirstChild("Config")) or {}
+local weaponDefs = safeRequire(sharedFolder:FindFirstChild("Weapons")) or {}
+local characterBuilder = safeRequire(sharedFolder:FindFirstChild("CharacterBuilder"))
+local aimRemote = replicatedStorage:WaitForChild("Remotes"):FindFirstChild("Aim")
+
+local cameraConfig = gameConfig.Camera or {}
+local CAMERA_TILT = math.rad(cameraConfig.Tilt or 15)
+local MIN_PITCH = math.rad(cameraConfig.MinPitch or -77)
+local MAX_PITCH = math.rad(cameraConfig.MaxPitch or 105)
+local BASE_MAX_HEALTH = gameConfig.MaxHealth or 200
+
+-- The game's own weapon + camera module tables.
+local weaponClient = filtergc("table", { Keys = { "AimPoint", "AssistOn", "Recoil" } }, true)
+local cameraRig = filtergc("table", { Keys = { "LookAlong", "Kick", "yaw", "pitch" } }, true)
+
+if not weaponClient then
+	warn("[Grapple Strike] WeaponClient not found; silent aim disabled.")
+end
+if not cameraRig then
+	warn("[Grapple Strike] CameraRig not found; camera aim disabled.")
+end
+
+-- ============================================================
+--  Targeting (mirrors the game's own Roster / counts() rules)
+-- ============================================================
+
+---Resolve the Player or bot Folder that owns a character model.
+---@param character Model
+---@return Instance?
+local function ownerOf(character)
+	local userId = character:GetAttribute("UserId")
+	if type(userId) == "number" then
+		if userId > BOT_UID then
+			return playersService:GetPlayerByUserId(userId)
+		end
+		local bots = replicatedStorage:FindFirstChild("Bots")
+		for _, bot in ipairs(bots and bots:GetChildren() or {}) do
+			if bot:GetAttribute("UserId") == userId then
+				return bot
+			end
+		end
+	end
+	return playersService:GetPlayerFromCharacter(character)
+end
+
+---@param owner Instance?
+---@return string
+local function displayNameOf(owner, character)
+	if owner and owner:IsA("Player") then
+		return owner.DisplayName
+	end
+	return (owner and owner:GetAttribute("DisplayName")) or character.Name
+end
+
+local function layerOf(instance)
+	return instance:GetAttribute("Layer") or 0
+end
+
+---@param owner Instance?
+---@return boolean
+local function isTeammate(owner)
+	if replicatedStorage:GetAttribute("Mode") ~= "TDM" then
+		return false
+	end
+	local myTeam = localPlayer:GetAttribute("Team")
+	return owner ~= nil and myTeam ~= nil and myTeam ~= "" and owner:GetAttribute("Team") == myTeam
+end
+
+---A character is relevant when it is someone else's, alive and in our layer.
+---@param character Model
+---@return boolean, Instance?
+local function isLiveEnemyLayer(character)
+	if character == localPlayer.Character or character:GetAttribute("UserId") == localPlayer.UserId then
+		return false
+	end
+	if character:GetAttribute("Dead") or (character:GetAttribute("Health") or 1) <= 0 then
+		return false
+	end
+	if layerOf(character) ~= layerOf(localPlayer) then
+		return false
+	end
+	return true, ownerOf(character)
+end
+
+local fallbackParams = RaycastParams.new()
+fallbackParams.FilterType = Enum.RaycastFilterType.Exclude
+
+---Where bullets leave from: the gun tip, else the camera.
+---@return Vector3
+local function shotOrigin()
+	local character = localPlayer.Character
+	local visuals = weaponClient and weaponClient.visuals
+	if character and visuals and visuals.TipOf then
+		local ok, tip = pcall(visuals.TipOf, character)
+		if ok and typeof(tip) == "Vector3" then
+			return tip
+		end
+	end
+	return workspace.CurrentCamera.CFrame.Position
+end
+
+---Line of sight using the game's own world raycast params.
+---@param character Model
+---@param hitbox BasePart
+---@return boolean
+local function isVisible(character, hitbox)
+	local controller = weaponClient and weaponClient.controller
+	local origin = shotOrigin()
+	local params = fallbackParams
+	if controller and controller.WorldParams then
+		local ok, worldParams = pcall(controller.WorldParams)
+		if ok and worldParams then
+			params = worldParams
+		end
+	else
+		fallbackParams.FilterDescendantsInstances = { localPlayer.Character }
+	end
+
+	local result = workspace:Raycast(origin, hitbox.Position - origin, params)
+	if not result or result.Instance:IsDescendantOf(character) then
+		return true
+	end
+	if controller and controller.CharacterOf then
+		local ok, owner = pcall(controller.CharacterOf, result.Instance)
+		return ok and owner == character
+	end
+	return false
+end
+
+---Projectile speed of the equipped weapon, if it is a rocket.
+---@return number?
+local function equippedProjectileSpeed()
+	local character = localPlayer.Character
+	local weaponName = character and character:GetAttribute("Weapon")
+	local def = weaponName and weaponDefs[weaponName]
+	return def and def.Kind == "rocket" and def.Speed or nil
+end
+
+---World point to aim at on a target, with optional rocket lead.
+---@param character Model
+---@param origin Vector3
+---@return Vector3
+local function aimPointOf(character, origin)
+	local hitbox = character.Hitbox
+	local offset = AIM_POINT_OFFSETS[Config.AimPoint] or 0
+	local point = hitbox.CFrame:PointToWorldSpace(Vector3.new(0, hitbox.Size.Y * offset, 0))
+
+	local speed = Config.LeadRockets and equippedProjectileSpeed()
+	if speed then
+		local root = character:FindFirstChild("Root") or hitbox
+		point = point + root.AssemblyLinearVelocity * ((point - origin).Magnitude / speed)
+	end
+	return point
+end
+
+---Best target inside the FOV circle.
+---@return Model?
+local function getTarget()
+	local characters = workspace:FindFirstChild("Characters")
+	if not characters then
+		return nil
+	end
+
+	local camera = workspace.CurrentCamera
+	local mouse = userInputService:GetMouseLocation()
+	local best, bestScore = nil, math.huge
+
+	for _, character in ipairs(characters:GetChildren()) do
+		local hitbox = character:FindFirstChild("Hitbox")
+		if not hitbox then
+			continue
+		end
+		local relevant, owner = isLiveEnemyLayer(character)
+		if not relevant or isTeammate(owner) then
+			continue
+		end
+		if Config.SkipProtected and character:GetAttribute("Protected") then
+			continue
+		end
+
+		local screen, onScreen = camera:WorldToViewportPoint(hitbox.Position)
+		if not onScreen then
+			continue
+		end
+		local screenDistance = (Vector2.new(screen.X, screen.Y) - mouse).Magnitude
+		if screenDistance > Config.FOV then
+			continue
+		end
+		if Config.WallCheck and not isVisible(character, hitbox) then
+			continue
+		end
+
+		local score = Config.Priority == "Crosshair" and screenDistance or (hitbox.Position - camera.CFrame.Position).Magnitude
+		if score < bestScore then
+			best, bestScore = character, score
+		end
+	end
+
+	return best
+end
+
+-- ============================================================
+--  Silent aim: replace WeaponClient.AimPoint (feeds every weapon)
+-- ============================================================
+
+local originalAimPoint = weaponClient and weaponClient.AimPoint
+
+---Keep the server's replicated Aim direction consistent with the shot.
+---@param point Vector3
+local function replicateAim(point)
+	if not aimRemote then
+		return
+	end
+	local direction = point - workspace.CurrentCamera.CFrame.Position
+	if direction.Magnitude > 0.1 then
+		aimRemote:FireServer(direction.Unit)
+	end
+end
+
+---Swap the aim point to the target when silent aim applies.
+local function silentAimPoint(range, ...)
+	if not Config.SilentAim then
+		return originalAimPoint(range, ...)
+	end
+
+	local ok, point = pcall(function()
+		local target = currentTarget or getTarget()
+		if not target or not target.Parent or not target:FindFirstChild("Hitbox") then
+			return nil
+		end
+
+		-- The 600-range call is the per-frame gun visual; everything else is a shot.
+		local isShot = range ~= VISUAL_AIM_RANGE
+		if isShot and math.random(1, 100) > Config.HitChance then
+			return nil
+		end
+
+		local aimPoint = aimPointOf(target, shotOrigin())
+		if isShot then
+			replicateAim(aimPoint)
+		end
+		return aimPoint
+	end)
+
+	if ok and point then
+		return point, nil
+	end
+	return originalAimPoint(range, ...)
+end
+
+if weaponClient and originalAimPoint then
+	weaponClient.AimPoint = silentAimPoint
+end
+
+-- ============================================================
+--  Camera aim: steer CameraRig yaw/pitch (camera is Scriptable)
+-- ============================================================
+
+---@param dt number
+local function stepCameraAim(dt)
+	if not (Config.CameraAim and aimHeld and cameraRig and currentTarget) then
+		return
+	end
+	if not currentTarget:FindFirstChild("Hitbox") then
+		return
+	end
+
+	local origin = workspace.CurrentCamera.CFrame.Position
+	local direction = (aimPointOf(currentTarget, origin) - origin).Unit
+	local goalYaw = math.atan2(-direction.X, -direction.Z)
+	local goalPitch = math.clamp(math.asin(math.clamp(direction.Y, -1, 1)) + CAMERA_TILT, MIN_PITCH, MAX_PITCH)
+
+	-- Frame-rate independent easing; smoothing 0 snaps.
+	local alpha = 1 - math.clamp(Config.Smoothing, 0, 0.97) ^ (dt * 60)
+	local yawDelta = (goalYaw - cameraRig.yaw + math.pi) % (2 * math.pi) - math.pi
+	cameraRig.yaw = cameraRig.yaw + yawDelta * alpha
+	cameraRig.pitch = cameraRig.pitch + (goalPitch - cameraRig.pitch) * alpha
+end
+
+runService:BindToRenderStep("GrappleStrikeAim", Enum.RenderPriority.Camera.Value - 1, function(dt)
+	if Config.SilentAim or Config.CameraAim then
+		currentTarget = getTarget()
+	else
+		currentTarget = nil
+	end
+	stepCameraAim(dt)
+end)
+
+-- ============================================================
+--  ESP (characters live in workspace.Characters, no Humanoid)
+-- ============================================================
+
+local fovCircle = Drawing.new("Circle")
+fovCircle.Thickness = 1.5
+fovCircle.NumSides = 72
+fovCircle.Filled = false
+fovCircle.Transparency = 1
+fovCircle.Color = GOLD
+
+local function newDrawing(class, props)
+	local drawing = Drawing.new(class)
+	for key, value in pairs(props) do
+		drawing[key] = value
+	end
+	return drawing
+end
+
+local function makeEsp()
+	return {
+		tracer = newDrawing("Line", { Thickness = 1, Transparency = 0.8, ZIndex = 1 }),
+		outline = newDrawing("Square", { Thickness = 3, Filled = false, Color = STEEL, Transparency = 0.7, ZIndex = 2 }),
+		box = newDrawing("Square", { Thickness = 1.25, Filled = false, Transparency = 1, ZIndex = 3 }),
+		healthBack = newDrawing("Square", { Filled = true, Color = STEEL, Transparency = 0.8, ZIndex = 2 }),
+		healthFill = newDrawing("Square", { Filled = true, Transparency = 1, ZIndex = 3 }),
+		name = newDrawing("Text", { Size = 14, Center = true, Outline = true, Font = Drawing.Fonts.Plex, Transparency = 1, ZIndex = 4 }),
+		info = newDrawing("Text", { Size = 12, Center = true, Outline = true, Font = Drawing.Fonts.Plex, Color = MUTED, Transparency = 1, ZIndex = 4 }),
+	}
+end
+
+local function hideEsp(entry)
+	for _, drawing in pairs(entry) do
+		drawing.Visible = false
+	end
+end
+
+local function removeEsp(character)
+	local entry = GrappleStrike.esp[character]
+	if not entry then
+		return
+	end
+	for _, drawing in pairs(entry) do
+		pcall(drawing.Remove, drawing)
+	end
+	GrappleStrike.esp[character] = nil
+end
+
+---Each character's in-game color, falling back to gold.
+---@param character Model
+---@return Color3
+local function colorOf(character)
+	if not (Config.PlayerColors and characterBuilder and characterBuilder.ColorOf) then
+		return GOLD
+	end
+	local key = character:GetAttribute("Color") or "PlayerCyan"
+	if colorCache[key] == nil then
+		local ok, color = pcall(characterBuilder.ColorOf, key)
+		colorCache[key] = (ok and typeof(color) == "Color3") and color or false
+	end
+	return colorCache[key] or GOLD
+end
+
+---Screen-space bounds of a part's 8 corners, or nil if any is behind us.
+---@param camera Camera
+---@param part BasePart
+---@return Vector2?, Vector2?
+local function projectBounds(camera, part)
+	local half = part.Size / 2
+	local minX, minY, maxX, maxY = math.huge, math.huge, -math.huge, -math.huge
+	for _, corner in ipairs(BOX_CORNERS) do
+		local screen = camera:WorldToViewportPoint(part.CFrame:PointToWorldSpace(half * corner))
+		if screen.Z <= 0 then
+			return nil
+		end
+		minX, minY = math.min(minX, screen.X), math.min(minY, screen.Y)
+		maxX, maxY = math.max(maxX, screen.X), math.max(maxY, screen.Y)
+	end
+	return Vector2.new(minX, minY), Vector2.new(maxX - minX, maxY - minY)
+end
+
+local function healthColor(fraction)
+	return Color3.fromHex("E5484D"):Lerp(Color3.fromHex("46C47E"), fraction)
+end
+
+local function stepEsp()
+	local camera = workspace.CurrentCamera
+	local mouse = userInputService:GetMouseLocation()
+
+	fovCircle.Visible = Config.ShowFOV and (Config.SilentAim or Config.CameraAim)
+	fovCircle.Position = mouse
+	fovCircle.Radius = Config.FOV
+	fovCircle.Color = currentTarget and TEXT or GOLD
+
+	local characters = workspace:FindFirstChild("Characters")
+	local seen = {}
+
+	for _, character in ipairs(characters and characters:GetChildren() or {}) do
+		local hitbox = character:FindFirstChild("Hitbox")
+		local relevant, owner = isLiveEnemyLayer(character)
+		if not (hitbox and relevant) then
+			continue
+		end
+		seen[character] = true
+
+		local entry = GrappleStrike.esp[character]
+		if not entry then
+			entry = makeEsp()
+			GrappleStrike.esp[character] = entry
+		end
+
+		local position, size = projectBounds(camera, hitbox)
+		if not Config.ESP or not position or (isTeammate(owner) and not Config.ShowTeammates) then
+			hideEsp(entry)
+			continue
+		end
+
+		local color = colorOf(character)
+		local isLocked = character == currentTarget
+
+		entry.box.Visible = Config.Boxes
+		entry.box.Position = position
+		entry.box.Size = size
+		entry.box.Color = isLocked and TEXT or color
+		entry.outline.Visible = Config.Boxes
+		entry.outline.Position = position
+		entry.outline.Size = size
+
+		entry.name.Visible = Config.Names
+		entry.name.Text = displayNameOf(owner, character)
+		entry.name.Color = isLocked and GOLD or TEXT
+		entry.name.Position = Vector2.new(position.X + size.X / 2, position.Y - 18)
+
+		if Config.Health then
+			local health = character:GetAttribute("Health") or 0
+			local peak = math.max(peakHealth[character] or BASE_MAX_HEALTH, health)
+			peakHealth[character] = peak
+			local fraction = math.clamp(health / peak, 0, 1)
+			entry.healthBack.Visible = true
+			entry.healthBack.Position = Vector2.new(position.X - 6, position.Y - 1)
+			entry.healthBack.Size = Vector2.new(4, size.Y + 2)
+			entry.healthFill.Visible = true
+			entry.healthFill.Color = healthColor(fraction)
+			entry.healthFill.Position = Vector2.new(position.X - 5, position.Y + size.Y * (1 - fraction))
+			entry.healthFill.Size = Vector2.new(2, size.Y * fraction)
+		else
+			entry.healthBack.Visible = false
+			entry.healthFill.Visible = false
+		end
+
+		if Config.Info then
+			local distance = math.floor((hitbox.Position - camera.CFrame.Position).Magnitude)
+			local weapon = character:GetAttribute("Weapon")
+			local health = math.floor(character:GetAttribute("Health") or 0)
+			local parts = { tostring(health) .. " hp" }
+			if type(weapon) == "string" and weapon ~= "" then
+				table.insert(parts, weapon)
+			end
+			table.insert(parts, distance .. "m")
+			entry.info.Visible = true
+			entry.info.Text = table.concat(parts, "   ")
+			entry.info.Position = Vector2.new(position.X + size.X / 2, position.Y + size.Y + 3)
+		else
+			entry.info.Visible = false
+		end
+
+		if Config.Tracers then
+			local viewport = camera.ViewportSize
+			entry.tracer.Visible = true
+			entry.tracer.Color = color
+			entry.tracer.From = Vector2.new(viewport.X / 2, viewport.Y - 2)
+			entry.tracer.To = Vector2.new(position.X + size.X / 2, position.Y + size.Y)
+		else
+			entry.tracer.Visible = false
+		end
+	end
+
+	-- Clean up characters that left, died or changed layer.
+	for character, entry in pairs(GrappleStrike.esp) do
+		if not seen[character] then
+			if character.Parent then
+				hideEsp(entry)
+			else
+				removeEsp(character)
+			end
+		end
+	end
+end
+
+table.insert(GrappleStrike.connections, runService.RenderStepped:Connect(stepEsp))
+
+-- ============================================================
+--  Input
+-- ============================================================
+
+local refreshKeybind = nil
+
+local function inputMatches(input)
+	return input.KeyCode == Config.AimKey or input.UserInputType == Config.AimKey
+end
+
+table.insert(GrappleStrike.connections, userInputService.InputBegan:Connect(function(input, gameProcessed)
+	if rebinding then
+		if input.KeyCode == Enum.KeyCode.Escape then
+			rebinding = false
+		elseif input.KeyCode ~= Enum.KeyCode.Unknown then
+			rebinding = false
+			Config.AimKey = input.KeyCode
+		elseif input.UserInputType.Name:find("MouseButton") then
+			rebinding = false
+			Config.AimKey = input.UserInputType
+		end
+		if refreshKeybind and not rebinding then
+			refreshKeybind()
+		end
+		return
+	end
+
+	if input.KeyCode == Enum.KeyCode.RightShift and GrappleStrike.panel then
+		GrappleStrike.panel.Visible = not GrappleStrike.panel.Visible
+		return
+	end
+
+	if userInputService:GetFocusedTextBox() or not inputMatches(input) then
+		return
+	end
+	aimHeld = Config.AimMode == "Hold" or not aimHeld
+end))
+
+table.insert(GrappleStrike.connections, userInputService.InputEnded:Connect(function(input)
+	if Config.AimMode == "Hold" and inputMatches(input) then
+		aimHeld = false
+	end
+end))
+
+-- ============================================================
+--  Interface
+-- ============================================================
+
+local function create(class, props, children)
+	local instance = Instance.new(class)
+	for key, value in pairs(props or {}) do
+		instance[key] = value
+	end
+	for _, child in ipairs(children or {}) do
+		child.Parent = instance
+	end
+	return instance
+end
+
+local function corner(radius)
+	return create("UICorner", { CornerRadius = UDim.new(0, radius) })
+end
+
+local function tween(instance, props, duration)
+	tweenService:Create(instance, TweenInfo.new(duration or 0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props):Play()
+end
+
+local function inputName(input)
+	if input == Enum.UserInputType.MouseButton1 then
+		return "Mouse 1"
+	elseif input == Enum.UserInputType.MouseButton2 then
+		return "Mouse 2"
+	elseif input == Enum.UserInputType.MouseButton3 then
+		return "Mouse 3"
+	end
+	return input.Name
+end
+
+local guiParent = (gethui and gethui()) or game:GetService("CoreGui")
+local oldGui = guiParent:FindFirstChild("GrappleStrikeUI")
+if oldGui then
+	oldGui:Destroy()
+end
+
+local screenGui = create("ScreenGui", {
+	Name = "GrappleStrikeUI",
+	ResetOnSpawn = false,
+	IgnoreGuiInset = true,
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	DisplayOrder = 50,
+})
+GrappleStrike.gui = screenGui
+
+local panel = create("Frame", {
+	Name = "Panel",
+	AnchorPoint = Vector2.new(0, 0.5),
+	Position = UDim2.new(0, 28, 0.5, 0),
+	Size = UDim2.fromOffset(304, 488),
+	BackgroundColor3 = PANEL,
+	BorderSizePixel = 0,
+	ClipsDescendants = false,
+	Parent = screenGui,
+}, {
+	corner(10),
+	create("UIStroke", { Color = LINE, Thickness = 1 }),
+})
+GrappleStrike.panel = panel
+
+-- The cable the panel hangs from, with its carabiner.
+create("Frame", {
+	Name = "Cable",
+	Position = UDim2.new(0, 34, 0, -1),
+	Size = UDim2.new(1, -44, 0, 2),
+	BackgroundColor3 = GOLD,
+	BorderSizePixel = 0,
+	ZIndex = 3,
+	Parent = panel,
+})
+create("Frame", {
+	Name = "Carabiner",
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Position = UDim2.new(0, 26, 0, 0),
+	Size = UDim2.fromOffset(16, 24),
+	BackgroundColor3 = PANEL,
+	BorderSizePixel = 0,
+	ZIndex = 4,
+	Parent = panel,
+}, {
+	corner(8),
+	create("UIStroke", { Color = GOLD, Thickness = 2.5 }),
+	create("Frame", {
+		Name = "Gate",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.78, 0.5),
+		Size = UDim2.fromOffset(2, 10),
+		BackgroundColor3 = GOLD,
+		BorderSizePixel = 0,
+		ZIndex = 5,
+	}),
+})
+
+local header = create("Frame", {
+	Name = "Header",
+	Size = UDim2.new(1, 0, 0, 62),
+	BackgroundTransparency = 1,
+	Parent = panel,
+})
+create("TextLabel", {
+	Name = "Title",
+	Position = UDim2.fromOffset(18, 18),
+	Size = UDim2.new(1, -36, 0, 26),
+	BackgroundTransparency = 1,
+	FontFace = DISPLAY_FONT,
+	Text = "Grapple Strike",
+	TextColor3 = TEXT,
+	TextSize = 25,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	Parent = header,
+})
+local statusLabel = create("TextLabel", {
+	Name = "Status",
+	AnchorPoint = Vector2.new(1, 0),
+	Position = UDim2.new(1, -18, 0, 24),
+	Size = UDim2.fromOffset(130, 18),
+	BackgroundTransparency = 1,
+	FontFace = BODY_FONT,
+	Text = "",
+	TextColor3 = MUTED,
+	TextSize = 14,
+	TextXAlignment = Enum.TextXAlignment.Right,
+	TextTruncate = Enum.TextTruncate.AtEnd,
+	Parent = header,
+})
+
+-- Drag by the header.
+do
+	local dragging, dragStart, startPosition = false, nil, nil
+	header.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging, dragStart, startPosition = true, input.Position, panel.Position
+		end
+	end)
+	table.insert(GrappleStrike.connections, userInputService.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			local delta = input.Position - dragStart
+			panel.Position = UDim2.new(startPosition.X.Scale, startPosition.X.Offset + delta.X, startPosition.Y.Scale, startPosition.Y.Offset + delta.Y)
+		end
+	end))
+	table.insert(GrappleStrike.connections, userInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end))
+end
+
+-- Tabs.
+local tabBar = create("Frame", {
+	Name = "Tabs",
+	Position = UDim2.fromOffset(18, 62),
+	Size = UDim2.new(1, -36, 0, 30),
+	BackgroundTransparency = 1,
+	Parent = panel,
+})
+create("Frame", {
+	Name = "Rule",
+	Position = UDim2.new(0, 0, 1, -1),
+	Size = UDim2.new(1, 0, 0, 1),
+	BackgroundColor3 = LINE,
+	BorderSizePixel = 0,
+	Parent = tabBar,
+})
+local tabUnderline = create("Frame", {
+	Name = "Underline",
+	Position = UDim2.new(0, 0, 1, -2),
+	Size = UDim2.fromOffset(34, 2),
+	BackgroundColor3 = GOLD,
+	BorderSizePixel = 0,
+	ZIndex = 2,
+	Parent = tabBar,
+})
+
+local pages, tabButtons = {}, {}
+
+local function makePage(name)
+	local page = create("ScrollingFrame", {
+		Name = name,
+		Position = UDim2.fromOffset(0, 98),
+		Size = UDim2.new(1, 0, 1, -98 - 40),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ScrollBarThickness = 3,
+		ScrollBarImageColor3 = LINE,
+		CanvasSize = UDim2.new(),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		Visible = false,
+		Parent = panel,
+	}, {
+		create("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 12), PaddingBottom = UDim.new(0, 8) }),
+		create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 2) }),
+	})
+	pages[name] = page
+	return page
+end
+
+local function selectTab(name)
+	for pageName, page in pairs(pages) do
+		page.Visible = pageName == name
+	end
+	for buttonName, button in pairs(tabButtons) do
+		local active = buttonName == name
+		button.TextColor3 = active and TEXT or MUTED
+		if active then
+			tween(tabUnderline, {
+				Position = UDim2.new(0, button.Position.X.Offset, 1, -2),
+				Size = UDim2.fromOffset(button.TextBounds.X, 2),
+			}, 0.18)
+		end
+	end
+end
+
+local function makeTab(name, x)
+	local button = create("TextButton", {
+		Name = name,
+		Position = UDim2.fromOffset(x, 0),
+		Size = UDim2.new(0, 70, 1, -4),
+		AutomaticSize = Enum.AutomaticSize.X,
+		BackgroundTransparency = 1,
+		FontFace = TAB_FONT,
+		Text = name,
+		TextColor3 = MUTED,
+		TextSize = 17,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		AutoButtonColor = false,
+		Parent = tabBar,
+	})
+	button.Size = UDim2.new(0, 0, 1, -4)
+	tabButtons[name] = button
+	button.MouseButton1Click:Connect(function()
+		selectTab(name)
+	end)
+	return button
+end
+
+-- Control builders.
+local layoutOrder = 0
+local function nextOrder()
+	layoutOrder = layoutOrder + 1
+	return layoutOrder
+end
+
+local function rowBase(page, height, clickable)
+	local row = create(clickable and "TextButton" or "Frame", {
+		Size = UDim2.new(1, 0, 0, height),
+		BackgroundColor3 = RAISED,
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		LayoutOrder = nextOrder(),
+		Parent = page,
+	}, { corner(6) })
+	if clickable then
+		row.Text = ""
+		row.AutoButtonColor = false
+	end
+	row.MouseEnter:Connect(function()
+		tween(row, { BackgroundTransparency = 0.35 }, 0.1)
+	end)
+	row.MouseLeave:Connect(function()
+		tween(row, { BackgroundTransparency = 1 }, 0.1)
+	end)
+	return row
+end
+
+local function rowLabel(row, text, y)
+	return create("TextLabel", {
+		Position = UDim2.fromOffset(8, y or 0),
+		Size = UDim2.new(1, -120, 0, y and 20 or row.Size.Y.Offset),
+		BackgroundTransparency = 1,
+		FontFace = BODY_FONT,
+		Text = text,
+		TextColor3 = TEXT,
+		TextSize = 15,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Parent = row,
+	})
+end
+
+local function heading(page, text)
+	create("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 30),
+		BackgroundTransparency = 1,
+		FontFace = BODY_BOLD,
+		Text = text,
+		TextColor3 = MUTED,
+		TextSize = 13,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Bottom,
+		LayoutOrder = nextOrder(),
+		Parent = page,
+	}, { create("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingBottom = UDim.new(0, 4) }) })
+end
+
+---Square latch: gold with a check when on.
+local function toggle(page, text, key)
+	local row = rowBase(page, 34, true)
+	rowLabel(row, text)
+	local latch = create("Frame", {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -8, 0.5, 0),
+		Size = UDim2.fromOffset(20, 20),
+		BackgroundColor3 = GOLD,
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		Parent = row,
+	}, { corner(5) })
+	local latchStroke = create("UIStroke", { Color = LINE, Thickness = 1.5, Parent = latch })
+	local check = create("TextLabel", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		FontFace = BODY_BOLD,
+		Text = "✓",
+		TextColor3 = PANEL,
+		TextSize = 15,
+		TextTransparency = 1,
+		Parent = latch,
+	})
+
+	local function refresh()
+		local on = Config[key]
+		tween(latch, { BackgroundTransparency = on and 0 or 1 })
+		tween(check, { TextTransparency = on and 0 or 1 })
+		tween(latchStroke, { Color = on and GOLD or LINE })
+	end
+	row.MouseButton1Click:Connect(function()
+		Config[key] = not Config[key]
+		refresh()
+	end)
+	refresh()
+end
+
+---Thin cable-style slider.
+local function slider(page, text, key, minValue, maxValue, step, format)
+	local row = rowBase(page, 48, false)
+	rowLabel(row, text, 4)
+	local valueLabel = create("TextLabel", {
+		AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, -8, 0, 4),
+		Size = UDim2.fromOffset(90, 20),
+		BackgroundTransparency = 1,
+		FontFace = BODY_BOLD,
+		TextColor3 = GOLD,
+		TextSize = 15,
+		TextXAlignment = Enum.TextXAlignment.Right,
+		Parent = row,
+	})
+	local track = create("TextButton", {
+		Position = UDim2.new(0, 8, 0, 30),
+		Size = UDim2.new(1, -16, 0, 12),
+		BackgroundTransparency = 1,
+		Text = "",
+		AutoButtonColor = false,
+		Parent = row,
+	})
+	create("Frame", {
+		AnchorPoint = Vector2.new(0, 0.5),
+		Position = UDim2.fromScale(0, 0.5),
+		Size = UDim2.new(1, 0, 0, 2),
+		BackgroundColor3 = LINE,
+		BorderSizePixel = 0,
+		Parent = track,
+	})
+	local fill = create("Frame", {
+		AnchorPoint = Vector2.new(0, 0.5),
+		Position = UDim2.fromScale(0, 0.5),
+		Size = UDim2.new(0, 0, 0, 2),
+		BackgroundColor3 = GOLD,
+		BorderSizePixel = 0,
+		Parent = track,
+	})
+	local knob = create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0, 0.5),
+		Size = UDim2.fromOffset(12, 12),
+		BackgroundColor3 = GOLD,
+		BorderSizePixel = 0,
+		ZIndex = 2,
+		Parent = track,
+	}, { corner(6), create("UIStroke", { Color = PANEL, Thickness = 2 }) })
+
+	local function refresh()
+		local fraction = (Config[key] - minValue) / (maxValue - minValue)
+		fill.Size = UDim2.new(fraction, 0, 0, 2)
+		knob.Position = UDim2.fromScale(fraction, 0.5)
+		valueLabel.Text = format(Config[key])
+	end
+	local dragging = false
+	local function setFromX(x)
+		local fraction = math.clamp((x - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
+		local value = minValue + fraction * (maxValue - minValue)
+		Config[key] = math.clamp(math.floor(value / step + 0.5) * step, minValue, maxValue)
+		refresh()
+	end
+	track.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			setFromX(input.Position.X)
+		end
+	end)
+	table.insert(GrappleStrike.connections, userInputService.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			setFromX(input.Position.X)
+		end
+	end))
+	table.insert(GrappleStrike.connections, userInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end))
+	refresh()
+end
+
+---Segmented choice for short option sets.
+local function segmented(page, text, key, options)
+	local row = rowBase(page, 34, false)
+	rowLabel(row, text)
+	local group = create("Frame", {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -6, 0.5, 0),
+		Size = UDim2.fromOffset(0, 24),
+		AutomaticSize = Enum.AutomaticSize.X,
+		BackgroundColor3 = STEEL,
+		BorderSizePixel = 0,
+		Parent = row,
+	}, {
+		corner(6),
+		create("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 2) }),
+		create("UIPadding", { PaddingLeft = UDim.new(0, 2), PaddingRight = UDim.new(0, 2), PaddingTop = UDim.new(0, 2), PaddingBottom = UDim.new(0, 2) }),
+	})
+	local buttons = {}
+	local function refresh()
+		for option, button in pairs(buttons) do
+			local active = Config[key] == option
+			tween(button, { BackgroundTransparency = active and 0 or 1, TextColor3 = active and GOLD or MUTED }, 0.12)
+		end
+	end
+	for index, option in ipairs(options) do
+		local button = create("TextButton", {
+			Size = UDim2.fromOffset(0, 20),
+			AutomaticSize = Enum.AutomaticSize.X,
+			BackgroundColor3 = RAISED,
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			FontFace = BODY_FONT,
+			Text = option,
+			TextColor3 = MUTED,
+			TextSize = 13,
+			AutoButtonColor = false,
+			LayoutOrder = index,
+			Parent = group,
+		}, { corner(4), create("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8) }) })
+		buttons[option] = button
+		button.MouseButton1Click:Connect(function()
+			Config[key] = option
+			refresh()
+		end)
+	end
+	refresh()
+end
+
+local function keybind(page, text)
+	local row = rowBase(page, 34, true)
+	rowLabel(row, text)
+	local chip = create("TextLabel", {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -6, 0.5, 0),
+		Size = UDim2.fromOffset(0, 22),
+		AutomaticSize = Enum.AutomaticSize.X,
+		BackgroundColor3 = STEEL,
+		BorderSizePixel = 0,
+		FontFace = BODY_BOLD,
+		TextColor3 = TEXT,
+		TextSize = 13,
+		Parent = row,
+	}, { corner(5), create("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) }) })
+	refreshKeybind = function()
+		chip.Text = rebinding and "Press a key" or inputName(Config.AimKey)
+		chip.TextColor3 = rebinding and GOLD or TEXT
+	end
+	row.MouseButton1Click:Connect(function()
+		rebinding = true
+		refreshKeybind()
+	end)
+	refreshKeybind()
+end
+
+-- Aim page.
+local aimPage = makePage("Aim")
+heading(aimPage, "Silent aim")
+toggle(aimPage, "Silent aim", "SilentAim")
+slider(aimPage, "Hit chance", "HitChance", 0, 100, 1, function(v) return v .. "%" end)
+
+heading(aimPage, "Camera aim")
+toggle(aimPage, "Camera aim", "CameraAim")
+keybind(aimPage, "Aim key")
+segmented(aimPage, "Mode", "AimMode", { "Hold", "Toggle" })
+slider(aimPage, "Smoothing", "Smoothing", 0, 0.95, 0.05, function(v) return math.floor(v * 100 + 0.5) .. "%" end)
+
+heading(aimPage, "Targeting")
+slider(aimPage, "Field of view", "FOV", 20, 500, 5, function(v) return v .. " px" end)
+segmented(aimPage, "Aim point", "AimPoint", { "Upper", "Center", "Lower" })
+segmented(aimPage, "Priority", "Priority", { "Crosshair", "Nearest" })
+toggle(aimPage, "Lead rockets", "LeadRockets")
+toggle(aimPage, "Wall check", "WallCheck")
+toggle(aimPage, "Skip spawn-protected", "SkipProtected")
+toggle(aimPage, "Show FOV circle", "ShowFOV")
+
+-- Visuals page.
+local visualsPage = makePage("Visuals")
+heading(visualsPage, "Players")
+toggle(visualsPage, "Show players", "ESP")
+toggle(visualsPage, "Boxes", "Boxes")
+toggle(visualsPage, "Names", "Names")
+toggle(visualsPage, "Health bar", "Health")
+toggle(visualsPage, "Health, weapon and distance", "Info")
+toggle(visualsPage, "Tracers", "Tracers")
+heading(visualsPage, "Style")
+toggle(visualsPage, "Use player colors", "PlayerColors")
+toggle(visualsPage, "Show teammates in TDM", "ShowTeammates")
+
+-- Footer.
+local footer = create("Frame", {
+	Name = "Footer",
+	Position = UDim2.new(0, 0, 1, -40),
+	Size = UDim2.new(1, 0, 0, 40),
+	BackgroundColor3 = STEEL,
+	BorderSizePixel = 0,
+	Parent = panel,
+}, { corner(10) })
+create("Frame", { -- squares off the footer's top corners
+	Size = UDim2.new(1, 0, 0, 10),
+	BackgroundColor3 = STEEL,
+	BorderSizePixel = 0,
+	Parent = footer,
+})
+create("TextLabel", {
+	Position = UDim2.fromOffset(18, 0),
+	Size = UDim2.new(1, -120, 1, 0),
+	BackgroundTransparency = 1,
+	FontFace = BODY_FONT,
+	Text = "Right Shift hides this panel",
+	TextColor3 = MUTED,
+	TextSize = 13,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	ZIndex = 2,
+	Parent = footer,
+})
+local unloadButton = create("TextButton", {
+	AnchorPoint = Vector2.new(1, 0.5),
+	Position = UDim2.new(1, -12, 0.5, 0),
+	Size = UDim2.fromOffset(72, 26),
+	BackgroundColor3 = RAISED,
+	BorderSizePixel = 0,
+	FontFace = BODY_BOLD,
+	Text = "Unload",
+	TextColor3 = TEXT,
+	TextSize = 13,
+	AutoButtonColor = true,
+	ZIndex = 2,
+	Parent = footer,
+}, { corner(6) })
+
+makeTab("Aim", 0)
+makeTab("Visuals", 56)
+screenGui.Parent = guiParent
+task.defer(selectTab, "Aim")
+
+-- Live lock status in the header.
+table.insert(GrappleStrike.connections, runService.Heartbeat:Connect(function()
+	if not (Config.SilentAim or Config.CameraAim) then
+		statusLabel.Text = "Aim off"
+		statusLabel.TextColor3 = MUTED
+	elseif currentTarget then
+		statusLabel.Text = displayNameOf(ownerOf(currentTarget), currentTarget)
+		statusLabel.TextColor3 = GOLD
+	else
+		statusLabel.Text = "No target"
+		statusLabel.TextColor3 = MUTED
+	end
+end))
+
+-- ============================================================
+--  Lifecycle
+-- ============================================================
+
+---Undo every hook, connection and drawing.
+function GrappleStrike.detach()
+	if weaponClient and originalAimPoint and weaponClient.AimPoint == silentAimPoint then
+		weaponClient.AimPoint = originalAimPoint
+	end
+	pcall(runService.UnbindFromRenderStep, runService, "GrappleStrikeAim")
+	for _, connection in ipairs(GrappleStrike.connections) do
+		connection:Disconnect()
+	end
+	for character in pairs(GrappleStrike.esp) do
+		removeEsp(character)
+	end
+	pcall(fovCircle.Remove, fovCircle)
+	if GrappleStrike.gui then
+		GrappleStrike.gui:Destroy()
+	end
+	if shared.GrappleStrike == GrappleStrike then
+		shared.GrappleStrike = nil
+	end
+end
+
+unloadButton.MouseButton1Click:Connect(GrappleStrike.detach)
+
+shared.GrappleStrike = GrappleStrike
+getgenv().GrappleStrikeConfig = Config
+print("[Grapple Strike] Loaded. Right Shift toggles the panel.")
