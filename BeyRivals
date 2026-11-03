@@ -1,0 +1,1735 @@
+task.wait(5)
+
+-- Check for table that is shared between executions.
+if not shared then
+	return warn("No shared, no script.")
+end
+
+-- Initialize Luraph globals if they do not exist.
+loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
+
+local BeyRivals = { connections = {} }
+
+-- Unload a previous execution before touching any game tables.
+local previousStats = shared.BeyRivals and shared.BeyRivals.stats
+if shared.BeyRivals then
+	pcall(shared.BeyRivals.detach)
+end
+
+-- Services.
+local playersService = game:GetService("Players")
+local runService = game:GetService("RunService")
+local userInputService = game:GetService("UserInputService")
+local tweenService = game:GetService("TweenService")
+local httpService = game:GetService("HttpService")
+
+local localPlayer = playersService.LocalPlayer
+
+-- Constants.
+local SETTINGS_FOLDER = "BeyRivals"
+local SETTINGS_FILE = SETTINGS_FOLDER .. "/settings.json"
+local SAVE_INTERVAL = 0.5
+local RIP_PRESS = 16
+local BRACE_BIT = 4
+local DIRECTIONS = 8
+local LAUNCH_PLAN_TIME = 4
+local QUEUE_RETRY_EVERY = 1.5
+local QUEUE_GIVE_UP = 90
+local ANTI_AFK_EVERY = 60
+local SKIP_DELAY = 0.6
+local LAUNCH_FRAME_MS = 14
+local LAUNCH_HORIZON = 600
+-- The game's AI rival launches at 0.60 of the bowl, within about +-0.36 rad of its stance.
+local FOE_LAUNCH_D = 0.6
+local FOE_ANGLE_SPREAD = { -0.3, 0, 0.3 }
+local LAUNCH_ANGLES = 16
+local LAUNCH_DISTANCES = { 0.55, 0.85, 0.35, 0.15, 0.7 }
+
+-- Palette.
+local STEEL = Color3.fromHex("16212A")
+local PANEL = Color3.fromHex("1A2731")
+local RAISED = Color3.fromHex("223442")
+local LINE = Color3.fromHex("2F4757")
+local TEXT = Color3.fromHex("E9EEF0")
+local MUTED = Color3.fromHex("8DA2AE")
+local GOLD = Color3.fromHex("F2B33D")
+local WIN = Color3.fromHex("46C47E")
+local LOSS = Color3.fromHex("E5484D")
+
+local DISPLAY_FONT = Font.new("rbxasset://fonts/families/Oswald.json", Enum.FontWeight.Bold)
+local TAB_FONT = Font.new("rbxasset://fonts/families/Oswald.json", Enum.FontWeight.Medium)
+local BODY_FONT = Font.new("rbxasset://fonts/families/TitilliumWeb.json", Enum.FontWeight.SemiBold)
+local BODY_BOLD = Font.new("rbxasset://fonts/families/TitilliumWeb.json", Enum.FontWeight.Bold)
+
+-- Config (mutated live by the UI).
+local Config = {
+	AutoBattle = false,
+	AutoLaunch = true,
+	PerfectRip = true,
+	TiltLaunch = false,
+	PilotLevel = 1,
+	Lookahead = true,
+	LookaheadMs = 8,
+	PerfectClash = true,
+	AutoCounter = true,
+	AutoGuard = true,
+	PlanLaunch = true,
+	AutoQueue = false,
+	QueueMode = "Queue",
+	AutoSkipReplay = false,
+	StayActive = true,
+}
+
+---Serialize Config to JSON.
+---@return string
+local function encodeSettings()
+	return httpService:JSONEncode(Config)
+end
+
+---Write settings to the workspace folder.
+local function saveSettings()
+	pcall(function()
+		if not isfolder(SETTINGS_FOLDER) then
+			makefolder(SETTINGS_FOLDER)
+		end
+		writefile(SETTINGS_FILE, encodeSettings())
+	end)
+end
+
+---Apply saved settings over the defaults, ignoring unknown or mistyped keys.
+local function loadSettings()
+	local ok, data = pcall(function()
+		return isfile(SETTINGS_FILE) and httpService:JSONDecode(readfile(SETTINGS_FILE))
+	end)
+	if not (ok and type(data) == "table") then
+		return
+	end
+	for key, value in pairs(data) do
+		if Config[key] ~= nil and type(value) == type(Config[key]) then
+			Config[key] = value
+		end
+	end
+end
+
+loadSettings()
+
+-- ============================================================
+--  Game modules (the live instances the game itself uses)
+-- ============================================================
+
+local Sim = filtergc("table", { Keys = { "aiInput", "pilotAI", "checksum", "clashNote" } }, true)
+local BattleInput = filtergc("table", { Keys = { "sample", "tap", "clash", "BITS" } }, true)
+local BattleController = filtergc("table", { Keys = { "Started", "Ended", "Events" } }, true)
+local Stadiums = filtergc("table", { Keys = { "standAngle", "get" } }, true)
+local Packets = filtergc("table", { Keys = { "ArenaAgain", "BattleLaunch", "BattleSwap" } }, true)
+local onLaunchAction = filtergc("function", { Name = "onLaunchAction" }, true)
+local endSimReplay = filtergc("function", { Name = "endSimReplay" }, true)
+local FinishReplay = filtergc("table", { Keys = { "play", "live", "record", "reset", "sharing" } }, true)
+
+if not (Sim and BattleInput and onLaunchAction) then
+	return warn("[Bey Rivals] Battle modules not found; open the game fully and run again.")
+end
+
+local Tuning = Sim.Tuning
+local RIP_TICK = Tuning.RIP_TICK
+local RIP_BEAT = Tuning.RIP_BEAT
+local RIP_FIRST = RIP_TICK - 3 * RIP_BEAT
+local RIM_CALL = Tuning.RIM_CALL
+local CLASH_BIT = Tuning.CLASH_Q_BIT
+local CLASH_NOTES = Tuning.CLASH_NOTES
+local COUNTER_BIT = Tuning.CA_BIT
+local GUARD_WINDOW = Tuning.GUARD_WIN * Tuning.GUARD_WIN_ATK_MOVE
+local GUARD_LOOKAHEAD = 6
+local GUARD_PRESS_LEAD = 3
+
+-- State.
+local pilot = nil
+local pilotToken = nil
+local plan = nil
+local planFirst = false
+local planUntil = 0
+local reflexAfter = 0
+local forceDanger = false
+local stepCost = 0.02
+local launchedRound = nil
+local lastBattle = nil
+local status = "Idle"
+-- Session stats survive a reload of the script.
+local Stats = { battles = 0, wins = 0, losses = 0, perfectRips = 0, rips = 0, counters = 0, guards = 0 }
+if type(previousStats) == "table" then
+	for key in pairs(Stats) do
+		if type(previousStats[key]) == "number" then
+			Stats[key] = previousStats[key]
+		end
+	end
+end
+BeyRivals.stats = Stats
+
+-- ============================================================
+--  Battle access
+-- ============================================================
+
+---The current battle table (BattleController's private u7).
+---@return table?
+local function currentBattle()
+	local ok, battle = pcall(debug.getupvalue, onLaunchAction, 1)
+	if ok and type(battle) == "table" and battle.mySlot then
+		return battle
+	end
+	return nil
+end
+
+---@param sim table
+---@param slot number
+---@return table, table
+local function sidesOf(sim, slot)
+	local me = sim.beys[slot]
+	local foes = {}
+	for index, bey in ipairs(sim.beys) do
+		if index ~= slot and (me.team == nil or bey.team ~= me.team) then
+			table.insert(foes, bey)
+		end
+	end
+	return me, foes
+end
+
+---How damaged a bey is toward bursting, 0 to 1.
+local function burstRatio(bey)
+	local burstMax = bey.burstMax
+	if type(burstMax) ~= "number" or burstMax <= 0 then
+		return 0
+	end
+	return math.clamp((bey.burst or 0) / burstMax, 0, 1)
+end
+
+local stadiumCache = {}
+
+---How exposed a bey is to a ring-out: steep past 55% of the bowl, doubled near an exit pocket.
+---@param sim table
+---@param bey table
+---@return number 0..80
+local function edgeRisk(sim, bey)
+	local stadium = stadiumCache[sim.stadium]
+	if stadium == nil then
+		stadium = Stadiums and Stadiums.get(sim.stadium) or false
+		stadiumCache[sim.stadium] = stadium
+	end
+	if not stadium then
+		return 0
+	end
+	local x, z = bey.x or 0, bey.z or 0
+	local reach = math.sqrt(x * x + z * z) / stadium.bowlRadius
+	local risk = math.clamp((reach - 0.55) / 0.45, 0, 1) ^ 2 * 40
+	if risk <= 0 then
+		return 0
+	end
+	local degrees = math.deg(math.atan2(z, x)) % 360
+	for _, pocket in ipairs(stadium.pockets or {}) do
+		if math.abs((degrees - pocket + 180) % 360 - 180) < 20 then
+			return risk * 2
+		end
+	end
+	return risk
+end
+
+---Score a simulated future from our side: big for knockouts, else spin and burst lead.
+---@param sim table
+---@param slot number
+---@return number
+local function scoreOf(sim, slot)
+	local me, foes = sidesOf(sim, slot)
+	if me.out then
+		return -1000 + sim.tick * 0.01
+	end
+
+	local foesLeft, foeSpin, foeBurst = 0, 0, 0
+	for _, foe in ipairs(foes) do
+		if not foe.out then
+			foesLeft = foesLeft + 1
+			foeSpin = foeSpin + (foe.spin or 0)
+			foeBurst = foeBurst + burstRatio(foe)
+		end
+	end
+	if foesLeft == 0 then
+		return 1000 - sim.tick * 0.01
+	end
+
+	local score = ((me.spin or 0) - foeSpin / foesLeft) * 100
+	score = score + (foeBurst / foesLeft - burstRatio(me)) * 60
+	-- Near the burst limit any hit ends the round: steep cost for us, bonus for pressing a near-burst rival.
+	local function nearBurst(ratio)
+		return math.clamp((ratio - 0.6) / 0.4, 0, 1) ^ 2 * 80
+	end
+	score = score - nearBurst(burstRatio(me))
+	for _, foe in ipairs(foes) do
+		if not foe.out then
+			score = score + nearBurst(burstRatio(foe)) * 0.5 / foesLeft
+		end
+	end
+	score = score + (#foes - foesLeft) * 200
+	if (me.teeter or 0) > 0 then
+		score = score - 25
+	end
+
+	-- Stay off the edge (ring-outs have no rescue here); push the foe toward it.
+	-- An awakened rival hits far harder, so the edge is worth more caution meanwhile.
+	local caution = 1
+	for _, foe in ipairs(foes) do
+		if not foe.out and (foe.awakeT or 0) > 0 then
+			caution = 1.5
+		end
+	end
+	score = score - edgeRisk(sim, me) * caution
+	for _, foe in ipairs(foes) do
+		if not foe.out then
+			score = score + edgeRisk(sim, foe) * 0.6 / foesLeft
+		end
+	end
+	return score
+end
+
+-- ============================================================
+--  Pilot: the game's own AI, run for our slot on a copy
+-- ============================================================
+
+local function freshPilot()
+	local state = Sim.pilotAI()
+	state.level = Config.PilotLevel
+	return state
+end
+
+---Input the game's AI would give for our bey right now (computed on a copy).
+---@param sim table
+---@param slot number
+---@return table
+local function pilotInput(sim, slot)
+	local scratch = Sim.copy(sim)
+	pilot.level = Config.PilotLevel
+	scratch.ai[slot] = pilot
+	local input = Sim.aiInput(scratch, slot)
+	return { sx = input.sx or 0, sz = input.sz or 0, b = input.b or 0, t = 0 }
+end
+
+local PLAN_TICKS = 6
+local ripBits, clashBits, inClash
+local ABILITY_BITS = { 32, 64, 8 }
+local DASH_BIT = 1
+
+---Step a copy with our bey played exactly like live: perfect rip and clash presses, and the AI's
+---input computed *outside* the sim's random stream (we are a player, so the real sim never draws
+---from it for us; letting our AI draw would shift the rival's random choices away from reality).
+---@param copy table
+---@param slot number
+---@param clone table pilot state for this rollout
+---@param override table? fixed input to use instead
+local function stepAsPlayer(copy, slot, clone, override)
+	local bey = copy.beys[slot]
+	local input = override
+	if not input then
+		if not bey.launched then
+			input = { sx = 0, sz = 0, b = bey.ripTick == 0 and ripBits(copy.tick + 1) or 0, t = 0 }
+		else
+			local rng = copy.rng
+			copy.ai[slot] = clone
+			local ok, ai = pcall(Sim.aiInput, copy, slot)
+			copy.rng = rng
+			copy.ai[slot] = nil
+			input = ok and { sx = ai.sx or 0, sz = ai.sz or 0, b = ai.b or 0, t = 0 } or { sx = 0, sz = 0, b = 0, t = 0 }
+			if Config.PerfectClash and inClash(copy, slot) then
+				input.b = bit32.bor(bit32.band(input.b, bit32.bnot(CLASH_BIT)), clashBits(copy, bey, copy.tick + 1))
+			end
+		end
+	end
+	copy.ai[slot] = nil
+	Sim.step(copy, { [slot] = input })
+end
+
+---Try a candidate for PLAN_TICKS, then play on like live, and score the future.
+---@param sim table
+---@param slot number
+---@param candidate table? nil = AI pilot from now on
+---@param horizon number
+---@return number
+local function rollout(sim, slot, candidate, horizon)
+	local copy = Sim.copy(sim)
+	local clone = table.clone(pilot)
+	clone.level = Config.PilotLevel
+	local steps = 0
+
+	if candidate then
+		local held = { sx = candidate.sx, sz = candidate.sz, b = 0, t = 0 }
+		for step = 1, math.min(PLAN_TICKS, horizon) do
+			if copy.done then
+				break
+			end
+			-- Button bits are edges: press on the first tick only.
+			stepAsPlayer(copy, slot, clone, step == 1 and candidate or held)
+			steps = steps + 1
+		end
+	end
+
+	while steps < horizon and not copy.done do
+		stepAsPlayer(copy, slot, clone)
+		steps = steps + 1
+	end
+	return scoreOf(copy, slot)
+end
+
+---Every option worth comparing this decision.
+---@param bey table
+---@return table
+local function candidateList(bey)
+	local list = { false }
+	for index = 0, DIRECTIONS - 1 do
+		local angle = index / DIRECTIONS * math.pi * 2
+		local sx, sz = math.cos(angle), math.sin(angle)
+		table.insert(list, { sx = sx, sz = sz, b = 0, t = 0 })
+		table.insert(list, { sx = sx, sz = sz, b = DASH_BIT, t = 0 })
+	end
+	-- Moves aimed the way the bey is already heading.
+	local speed = math.sqrt((bey.vx or 0) ^ 2 + (bey.vz or 0) ^ 2)
+	local hx, hz = 0, 0
+	if speed > 0.01 then
+		hx, hz = bey.vx / speed, bey.vz / speed
+	end
+	for _, bits in ipairs(ABILITY_BITS) do
+		table.insert(list, { sx = hx, sz = hz, b = bits, t = 0 })
+	end
+	return list
+end
+
+---Pick the best plan for the next few ticks within the frame budget.
+---@param sim table
+---@param slot number
+local function decide(sim, slot)
+	local candidates = candidateList(sim.beys[slot])
+	-- See further while a rival's ability is in flight: that is when we get knocked out.
+	local danger = false
+	local _, foes = sidesOf(sim, slot)
+	for _, foe in ipairs(foes) do
+		if not foe.out and ((foe.ab or 0) ~= 0 or (foe.awakeT or 0) > 0) then
+			danger = true
+		end
+	end
+	local budget = Config.LookaheadMs * ((danger or forceDanger) and 3 or 1)
+	local horizon = math.clamp(math.floor(budget / (stepCost * #candidates)), 20, 240)
+	local started = os.clock()
+
+	local pilotScore = rollout(sim, slot, nil, horizon)
+	local bestScore, best = pilotScore, nil
+	for index = 2, #candidates do
+		local score = rollout(sim, slot, candidates[index], horizon)
+		if score > bestScore then
+			bestScore, best = score, candidates[index]
+		end
+	end
+
+	local elapsed = (os.clock() - started) * 1000
+	stepCost = stepCost * 0.7 + (elapsed / (horizon * #candidates)) * 0.3
+
+	-- Only override the AI when an option is clearly better.
+	if best and bestScore - pilotScore < 3 then
+		best = nil
+	end
+	plan = best
+	planFirst = true
+	planUntil = sim.tick + PLAN_TICKS
+
+	if bestScore >= 900 then
+		status = "Winning line found"
+	elseif bestScore <= -900 then
+		status = "Defending"
+	else
+		status = bestScore >= 0 and "Ahead" or "Behind"
+	end
+end
+
+local COUNTER_CHECK_TICKS = 60
+local COUNTER_CHECK_EVERY = 4
+local counterVerdict = { tick = -math.huge, safe = false }
+
+---Compare countering now against holding off (both followed by the full-skill AI) on copies.
+---@return boolean
+local function counterIsSafe(sim, slot, input)
+	if sim.tick - counterVerdict.tick < COUNTER_CHECK_EVERY then
+		return counterVerdict.safe
+	end
+	local withCounter = { sx = input.sx, sz = input.sz, b = bit32.bor(input.b, COUNTER_BIT), t = 0 }
+	local with = rollout(sim, slot, withCounter, COUNTER_CHECK_TICKS)
+	local without = rollout(sim, slot, nil, COUNTER_CHECK_TICKS)
+	counterVerdict.tick = sim.tick
+	counterVerdict.safe = with > -900 and with >= without - 2
+	return counterVerdict.safe
+end
+
+local ATTACK_BITS = bit32.bor(1, 32, 64, 8)
+local attackVerdict = { key = nil, safe = true }
+
+---Before starting a dash or move, compare the exact input we'll send against the same input
+---without the new press; skip the press if it loses (e.g. dashing into a rival's perfect guard).
+---@return table input, possibly with the new attack press removed
+local function guardAttack(sim, slot, bey, input)
+	local fresh = bit32.band(bit32.band(input.b, ATTACK_BITS), bit32.bnot(bey.prevB or 0))
+	if fresh == 0 then
+		return input
+	end
+	local key = tostring(sim.tick) .. ":" .. tostring(input.b)
+	if attackVerdict.key ~= key then
+		local quiet = { sx = input.sx, sz = input.sz, b = bit32.band(input.b, bit32.bnot(fresh)), t = 0 }
+		local with = rollout(sim, slot, input, COUNTER_CHECK_TICKS)
+		local without = rollout(sim, slot, quiet, COUNTER_CHECK_TICKS)
+		attackVerdict.key = key
+		attackVerdict.safe = with > -900 and with >= without - 2
+	end
+	if attackVerdict.safe then
+		return input
+	end
+	status = "Held back"
+	return { sx = input.sx, sz = input.sz, b = bit32.band(input.b, bit32.bnot(fresh)), t = 0 }
+end
+
+-- ============================================================
+--  Timed presses: rip rings, clash notes, rim saves
+-- ============================================================
+
+---Rip presses land exactly on each ring (ticks 42, 84, 126) and the rip (168).
+---@param nextTick number
+---@return number
+function ripBits(nextTick)
+	if not Config.PerfectRip then
+		return 0
+	end
+	local offset = nextTick - RIP_FIRST
+	if offset >= 0 and offset % RIP_BEAT == 0 and offset / RIP_BEAT <= 3 then
+		local bits = RIP_PRESS
+		if offset / RIP_BEAT == 3 and Config.TiltLaunch then
+			bits = bit32.bor(bits, BRACE_BIT)
+		end
+		return bits
+	end
+	return 0
+end
+
+---Press on the exact tick of the next ungraded clash note.
+function clashBits(sim, bey, nextTick)
+	for index = 1, CLASH_NOTES do
+		if Sim.clashGrade(bey, index) == 0 then
+			local note = Sim.clashNote(sim, index)
+			return note == nextTick and CLASH_BIT or 0
+		end
+	end
+	return 0
+end
+
+---@param sim table
+---@param slot number
+---@return boolean
+function inClash(sim, slot)
+	return sim.clash > 0 and (sim.clashA == slot or sim.clashB == slot or sim.clashAsA == slot or sim.clashAsB == slot)
+end
+
+---Ticks until our bey next makes contact (body clash or an ability/counter hit), or nil.
+---Runs the opponent's own AI forward on a copy with our input held.
+---@param sim table
+---@param slot number
+---@param input table
+---@return number?
+local function ticksToContact(sim, slot, input)
+	local copy = Sim.copy(sim)
+	copy.ai[slot] = nil
+	local held = { [slot] = { sx = input.sx, sz = input.sz, b = bit32.band(input.b, bit32.bnot(BRACE_BIT)), t = 0 } }
+	for step = 1, GUARD_LOOKAHEAD do
+		Sim.step(copy, held)
+		for _, event in ipairs(copy.events) do
+			local kind = event.kind
+			if kind == "Clash" and (event.a == slot or event.b == slot) then
+				return step, kind
+			elseif (kind == "AbilityHit" or kind == "CounterAttack") and (event.target == slot or event.slot == slot) then
+				return step, kind
+			end
+		end
+		if copy.done then
+			return nil
+		end
+	end
+	return nil
+end
+
+---Brace control: tap right before contact for a perfect guard (or a harder hit); never waste charges.
+---@return number brace bits to OR into the input
+local function guardBits(sim, slot, bey, input)
+	if (bey.guardN or 0) <= 0 or (bey.gbT or 0) > 0 or (bey.braceT or 99) < GUARD_WINDOW then
+		return 0
+	end
+	-- A fresh edge is needed; if last tick held Brace, release this tick.
+	if bit32.band(bey.prevB or 0, BRACE_BIT) ~= 0 then
+		return 0
+	end
+	local contact, kind = ticksToContact(sim, slot, input)
+	if not (contact and contact <= GUARD_PRESS_LEAD) then
+		return 0
+	end
+	-- Attack types hold a single guard charge: keep it for the hits that actually ring us out.
+	if kind == "Clash" and bey.typ == "Attack" then
+		return 0
+	end
+	return BRACE_BIT
+end
+
+---Counter attack: the window opens after a perfect guard (caT > 0); the game's AI only takes it ~40% of the time.
+---@param bey table
+---@return boolean? true = press, false = release (so the next press is a fresh edge), nil = not our concern
+local function counterPress(bey)
+	if (bey.caT or 0) <= 0 then
+		return nil
+	end
+	local canAct = (bey.down or 0) <= 0 and (bey.heldT or 0) <= 0 and (bey.air or 0) <= 0
+	if not canAct then
+		return false
+	end
+	return bit32.band(bey.prevB or 0, COUNTER_BIT) == 0
+end
+
+---Read rip grades from the last step's events for the stats tab.
+local function recordEvents(sim, slot)
+	for _, event in ipairs(sim.events) do
+		if event.kind == "Guard" and event.slot == slot then
+			Stats.guards = Stats.guards + 1
+		elseif event.kind == "CounterAttack" and event.stage == "go" and event.slot == slot then
+			Stats.counters = Stats.counters + 1
+		end
+		if event.kind == "Rip" and event.slot == slot then
+			Stats.rips = Stats.rips + 1
+			if event.grade == "Perfect" then
+				Stats.perfectRips = Stats.perfectRips + 1
+			end
+		end
+	end
+end
+
+-- ============================================================
+--  Input hook: replaces BattleInput.sample while auto battle is on
+-- ============================================================
+
+local originalSample = BattleInput.sample
+
+---Build this tick's input for our bey.
+---@param battle table
+---@return table?
+local function autoInput(battle)
+	local round = battle.round
+	local sim = round and round.sim
+	if not sim or battle.watch or round.phase ~= "Battle" or sim.done then
+		return nil
+	end
+	local slot = battle.mySlot
+	local bey = sim.beys[slot]
+	if not bey or bey.out then
+		return nil
+	end
+
+	recordEvents(sim, slot)
+
+	-- A new battle or round gets a fresh pilot.
+	if pilotToken ~= battle.token or not pilot then
+		pilot, pilotToken, plan = freshPilot(), battle.token, nil
+	end
+
+	local nextTick = sim.tick + 1
+
+	if not bey.launched then
+		status = bey.ripTick == 0 and "Ripping" or "Launching"
+		return { sx = 0, sz = 0, b = bey.ripTick == 0 and ripBits(nextTick) or 0, t = 0 }
+	end
+
+	local input = pilotInput(sim, slot)
+
+	if Config.PerfectClash and inClash(sim, slot) then
+		status = "Clash"
+		input.b = bit32.bor(bit32.band(input.b, bit32.bnot(CLASH_BIT)), clashBits(sim, bey, nextTick))
+		return input
+	end
+
+	-- Rim hops only exist when the game enables them.
+	if Tuning.RIM_ON and (bey.rimT or 0) > 0 then
+		status = "Rim save"
+		input.b = (bey.rimT + 1 == RIM_CALL) and RIP_PRESS or 0
+		return input
+	end
+
+	-- We own the Brace bit: strip the AI's guesses and tap only before predicted contact.
+	if Config.AutoGuard then
+		input.b = bit32.band(input.b, bit32.bnot(BRACE_BIT))
+		local brace = guardBits(sim, slot, bey, input)
+		if brace ~= 0 then
+			status = "Guard"
+			input.b = bit32.bor(input.b, brace)
+		end
+	end
+
+	-- Take counter windows the moment they are legal, unless the lunge would cost us (e.g. off the edge).
+	if Config.AutoCounter then
+		local press = counterPress(bey)
+		if press == true and counterIsSafe(sim, slot, input) then
+			status = "Counter!"
+			input.b = bit32.bor(input.b, COUNTER_BIT)
+			return input
+		elseif press ~= nil then
+			input.b = bit32.band(input.b, bit32.bnot(COUNTER_BIT))
+		end
+	end
+
+	if Config.Lookahead then
+		-- Reflex: an ability/counter hit is coming and the guard can't take it: re-plan right now.
+		local guardReady = (bey.guardN or 0) > 0 and (bey.gbT or 0) <= 0
+		if not guardReady and sim.tick < planUntil and sim.tick >= reflexAfter then
+			local contact, kind = ticksToContact(sim, slot, input)
+			if contact and kind ~= "Clash" then
+				planUntil = sim.tick
+				reflexAfter = sim.tick + PLAN_TICKS
+				forceDanger = true
+			end
+		end
+		if sim.tick >= planUntil then
+			decide(sim, slot)
+			forceDanger = false
+		end
+		if plan then
+			-- Take the planned line; its button press goes out once, plus our guard/counter bits.
+			local bits = bit32.band(input.b, bit32.bor(BRACE_BIT, COUNTER_BIT))
+			if planFirst then
+				bits = bit32.bor(bits, plan.b)
+				planFirst = false
+			end
+			return guardAttack(sim, slot, bey, { sx = plan.sx, sz = plan.sz, b = bits, t = 0 })
+		end
+	else
+		status = "Fighting"
+	end
+
+	return guardAttack(sim, slot, bey, input)
+end
+
+local function sampleHook(origin, ...)
+	if Config.AutoBattle then
+		local battle = currentBattle()
+		if battle then
+			local ok, input = pcall(autoInput, battle)
+			if ok and input then
+				return input
+			elseif not ok then
+				warn("[Bey Rivals] " .. tostring(input))
+			end
+		end
+	end
+	return originalSample(origin, ...)
+end
+
+BattleInput.sample = sampleHook
+
+-- Aim assist would bend the AI's steering toward the locked rival.
+local hadAimAssist = localPlayer:GetAttribute("AimAssist")
+local function syncAimAssist()
+	if Config.AutoBattle then
+		localPlayer:SetAttribute("AimAssist", false)
+	else
+		localPlayer:SetAttribute("AimAssist", hadAimAssist)
+	end
+end
+
+-- ============================================================
+--  Launch: simulate a grid of launch spots, lock in the best one
+-- ============================================================
+
+---Candidate (angle, distance) pairs, coarse grid first so a cut-off search still spreads out.
+---@param defaultAngle number
+---@return table
+local function launchCandidates(defaultAngle)
+	local list = { { a = defaultAngle, d = 0.55, default = true } }
+	for pass = 0, 1 do
+		for _, distance in ipairs(LAUNCH_DISTANCES) do
+			for index = pass, LAUNCH_ANGLES - 1, 2 do
+				table.insert(list, { a = index / LAUNCH_ANGLES * math.pi * 2, d = distance })
+			end
+		end
+	end
+	return list
+end
+
+---Play a round from this launch spot (both sides on the game's AI) and score it.
+---@param sim table
+---@param slot number
+---@param candidate table
+---@param foeOffset number rival angle offset from its stance
+---@return number
+local function scoreLaunchOnce(sim, slot, candidate, foeOffset)
+	local copy = Sim.copy(sim)
+	local count = #copy.beys
+	for index, bey in ipairs(copy.beys) do
+		if index == slot then
+			Sim.setAim(copy, index, candidate.a, candidate.d, "Power")
+		elseif (bey.aimS or 0) == 0 then
+			-- Rival aim is unknown until both lock in: model the AI's habit.
+			local stand = Stadiums and Stadiums.standAngle(index, count) or 0
+			Sim.setAim(copy, index, stand + foeOffset, FOE_LAUNCH_D, "Power")
+		end
+		if not copy.ai[index] then
+			copy.ai[index] = freshPilot()
+		end
+	end
+	copy.ai[slot] = nil
+	local clone = freshPilot()
+	for _ = 1, LAUNCH_HORIZON do
+		if copy.done then
+			break
+		end
+		stepAsPlayer(copy, slot, clone)
+	end
+	return scoreOf(copy, slot)
+end
+
+local launchFrameStart = os.clock()
+
+---Average a launch spot over the rival's likely angles, so the pick is robust to its randomness.
+local function scoreLaunch(sim, slot, candidate)
+	local total = 0
+	for _, offset in ipairs(FOE_ANGLE_SPREAD) do
+		total = total + scoreLaunchOnce(sim, slot, candidate, offset)
+		-- Yield between test rounds so planning never stalls a frame for long.
+		if (os.clock() - launchFrameStart) * 1000 > LAUNCH_FRAME_MS then
+			task.wait()
+			launchFrameStart = os.clock()
+		end
+	end
+	return total / #FOE_ANGLE_SPREAD
+end
+
+---Search launch spots across frames, then lock in through the game's own launch handler.
+---@param battle table
+local function planAndLaunch(battle)
+	local round = battle.round
+	local slot = battle.mySlot
+	local radius = battle.stadium and battle.stadium.bowlRadius or 1
+	local defaultAim = battle.aim
+	local defaultAngle = typeof(defaultAim) == "Vector2" and math.atan2(defaultAim.Y, defaultAim.X) or 0
+
+	local best = { a = defaultAngle, d = 0.55 }
+	if Config.PlanLaunch then
+		status = "Planning launch"
+		local candidates = launchCandidates(defaultAngle)
+		local deadline = os.clock() + LAUNCH_PLAN_TIME
+		launchFrameStart = os.clock()
+		local bestScore, tried = -math.huge, 0
+
+		for _, candidate in ipairs(candidates) do
+			if os.clock() > deadline or currentBattle() ~= battle or battle.ready or round.phase ~= "Launch" then
+				break
+			end
+			local ok, score = pcall(scoreLaunch, round.sim, slot, candidate)
+			tried = tried + 1
+			-- Prefer the default spot on ties so we only move for a real gain.
+			if ok and (score > bestScore + (candidate.default and 0 or 0.5)) then
+				bestScore, best = score, candidate
+			end
+			if (os.clock() - launchFrameStart) * 1000 > LAUNCH_FRAME_MS then
+				task.wait()
+				launchFrameStart = os.clock()
+			end
+		end
+		status = string.format("Launch picked (%d spots)", tried)
+	end
+
+	if currentBattle() ~= battle or battle.ready or round.phase ~= "Launch" then
+		return
+	end
+	-- Set the aim and lock in on the same frame, before the mouse can move it.
+	battle.aim = Vector2.new(math.cos(best.a), math.sin(best.a)) * math.clamp(best.d, 0.1, 0.85) * radius
+
+	-- Run the game's handler at game-script identity: its HUD toasts lazily require
+	-- game modules, which errors at executor identity and aborts before the launch is sent.
+	setthreadidentity(2)
+	local ok, err = pcall(onLaunchAction, "BeyLaunch", Enum.UserInputState.Begin, nil)
+	setthreadidentity(8)
+	if not ok then
+		warn("[Bey Rivals] Launch handler error: " .. tostring(err))
+	end
+end
+
+-- Start planning when a launch phase opens.
+table.insert(BeyRivals.connections, runService.Heartbeat:Connect(function()
+	syncAimAssist()
+	local battle = currentBattle()
+	if battle then
+		lastBattle = battle
+	end
+	if not (Config.AutoBattle and Config.AutoLaunch and battle and battle.round) then
+		return
+	end
+	if battle.watch or battle.round.phase ~= "Launch" or battle.ready then
+		return
+	end
+
+	local key = tostring(battle.token) .. ":" .. tostring(battle.round.no)
+	if launchedRound == key then
+		return
+	end
+	launchedRound = key
+	task.spawn(planAndLaunch, battle)
+end))
+
+---Did our side win the battle that just ended?
+local function weWon(battle)
+	local winner = battle and battle.winner
+	if type(winner) ~= "number" then
+		return nil
+	end
+	if winner == battle.mySlot then
+		return true
+	end
+	local sim = battle.round and battle.round.sim
+	local mine = sim and sim.beys[battle.mySlot]
+	local theirs = sim and sim.beys[winner]
+	if mine and theirs and mine.team ~= nil then
+		return mine.team == theirs.team
+	end
+	return false
+end
+
+---True once a battle other than the one that just ended is running.
+---@param endedToken any
+local function inNewBattle(endedToken)
+	local battle = currentBattle()
+	return battle ~= nil and battle.token ~= endedToken and not battle.over
+end
+
+---Ask the server for the next battle and keep at it until a *new* one starts.
+---The finished battle stays registered while its results/replay play, so we compare battle ids.
+local queueRun = 0
+local queuedToken = nil
+local function joinNextBattle(endedToken)
+	if not Packets then
+		return
+	end
+	queueRun = queueRun + 1
+	local run = queueRun
+	local mode = Config.QueueMode == "Rematch" and "rematch" or "queue"
+	local giveUp = os.clock() + QUEUE_GIVE_UP
+
+	while os.clock() < giveUp and run == queueRun and Config.AutoQueue do
+		if inNewBattle(endedToken) then
+			return
+		end
+		setthreadidentity(2)
+		local ok, accepted, reason = pcall(function()
+			return Packets.ArenaAgain:Fire(mode)
+		end)
+		setthreadidentity(8)
+
+		if ok and accepted == true then
+			-- We're in matchmaking now. Re-asking would not help (and the play-again window
+			-- closes meanwhile), so just wait for the match however long it takes.
+			status = mode == "queue" and "In queue, waiting for a match" or "Rematch requested"
+			repeat
+				task.wait(0.5)
+			until inNewBattle(endedToken) or run ~= queueRun or not Config.AutoQueue
+			return
+		else
+			if ok and type(reason) == "string" and reason ~= "" then
+				status = reason
+			end
+			task.wait(QUEUE_RETRY_EVERY)
+		end
+	end
+	if run == queueRun and not inNewBattle(endedToken) then
+		status = "Couldn't join the next battle"
+	end
+end
+
+---Start requeuing once per finished battle, as early as the server marks it over.
+local function queueAfter(battle)
+	if not (Config.AutoQueue and battle) or battle.watch or queuedToken == battle.token then
+		return
+	end
+	queuedToken = battle.token
+	task.spawn(joinNextBattle, battle.token)
+end
+
+-- The server flags the match over well before the client's end screens finish.
+table.insert(BeyRivals.connections, runService.Heartbeat:Connect(function()
+	local battle = currentBattle()
+	if battle and battle.over then
+		queueAfter(battle)
+	end
+end))
+
+-- ============================================================
+--  Stay active while the Roblox window is unfocused
+-- ============================================================
+
+-- The game rejoins you after 19 min without input, and Roblox kicks at 20. Unfocused = no input.
+local afkTouched = nil
+for _, candidate in ipairs(filtergc("function", { Name = "touched" }, false) or {}) do
+	local ok, source = pcall(debug.info, candidate, "s")
+	if ok and type(source) == "string" and source:find("AfkController") then
+		afkTouched = candidate
+		break
+	end
+end
+
+local virtualUser = game:GetService("VirtualUser")
+table.insert(BeyRivals.connections, localPlayer.Idled:Connect(function()
+	if Config.StayActive and (Config.AutoBattle or Config.AutoQueue) then
+		pcall(function()
+			virtualUser:CaptureController()
+			virtualUser:ClickButton2(Vector2.new())
+		end)
+	end
+end))
+
+do
+	local elapsed = 0
+	table.insert(BeyRivals.connections, runService.Heartbeat:Connect(function(dt)
+		elapsed = elapsed + dt
+		if elapsed < ANTI_AFK_EVERY then
+			return
+		end
+		elapsed = 0
+		if afkTouched and Config.StayActive and (Config.AutoBattle or Config.AutoQueue) then
+			pcall(afkTouched)
+		end
+	end))
+end
+
+-- ============================================================
+--  Auto skip replay
+-- ============================================================
+
+---Is the standalone finish replay (FinishReplay.play) running?
+local function finishReplayPlaying()
+	if not FinishReplay then
+		return false
+	end
+	local ok, handle = pcall(debug.getupvalue, FinishReplay.stop, 1)
+	return ok and handle ~= nil
+end
+
+local skippedReplay = nil
+local skipAt = nil
+
+-- Skip the end-of-round replay the same way a key press does, after the game's 0.5s minimum.
+table.insert(BeyRivals.connections, runService.Heartbeat:Connect(function()
+	if not Config.AutoSkipReplay then
+		skipAt = nil
+		return
+	end
+	local battle = currentBattle()
+	local replay = battle and battle.replay
+	local active = replay or (finishReplayPlaying() and FinishReplay) or nil
+	if not active then
+		skipAt = nil
+		return
+	end
+	if skippedReplay == active then
+		return
+	end
+	skipAt = skipAt or (os.clock() + SKIP_DELAY)
+	if os.clock() < skipAt then
+		return
+	end
+
+	skippedReplay, skipAt = active, nil
+	setthreadidentity(2)
+	local ok, err = pcall(function()
+		if replay and endSimReplay then
+			endSimReplay(battle, "Skipped")
+		elseif FinishReplay then
+			FinishReplay.stop()
+		end
+	end)
+	setthreadidentity(8)
+	if not ok then
+		warn("[Bey Rivals] Replay skip error: " .. tostring(err))
+	end
+end))
+
+-- Count results, then queue for the next battle if that's switched on.
+if BattleController then
+	table.insert(BeyRivals.connections, BattleController.Ended:Connect(function()
+		local battle = lastBattle
+		pilot, pilotToken, plan = nil, nil, nil
+		launchedRound = nil
+		status = "Idle"
+
+		if battle and not battle.watch then
+			Stats.battles = Stats.battles + 1
+			local won = weWon(battle)
+			if won == true then
+				Stats.wins = Stats.wins + 1
+			elseif won == false then
+				Stats.losses = Stats.losses + 1
+			end
+		end
+
+		-- Backup trigger in case the over flag was missed.
+		queueAfter(battle)
+	end))
+end
+
+-- ============================================================
+--  Interface
+-- ============================================================
+
+local function create(class, props, children)
+	local instance = Instance.new(class)
+	for key, value in pairs(props or {}) do
+		instance[key] = value
+	end
+	for _, child in ipairs(children or {}) do
+		child.Parent = instance
+	end
+	return instance
+end
+
+local function corner(radius)
+	return create("UICorner", { CornerRadius = UDim.new(0, radius) })
+end
+
+local function tween(instance, props, duration)
+	tweenService:Create(instance, TweenInfo.new(duration or 0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props):Play()
+end
+
+local guiParent = (gethui and gethui()) or game:GetService("CoreGui")
+local oldGui = guiParent:FindFirstChild("BeyRivalsUI")
+if oldGui then
+	oldGui:Destroy()
+end
+
+local screenGui = create("ScreenGui", {
+	Name = "BeyRivalsUI",
+	ResetOnSpawn = false,
+	IgnoreGuiInset = true,
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	DisplayOrder = 50,
+})
+BeyRivals.gui = screenGui
+
+local panel = create("Frame", {
+	Name = "Panel",
+	AnchorPoint = Vector2.new(0, 0.5),
+	Position = UDim2.new(0, 28, 0.5, 0),
+	Size = UDim2.fromOffset(304, 488),
+	BackgroundColor3 = PANEL,
+	BorderSizePixel = 0,
+	ClipsDescendants = false,
+	Parent = screenGui,
+}, {
+	corner(10),
+	create("UIStroke", { Color = LINE, Thickness = 1 }),
+})
+BeyRivals.panel = panel
+
+-- The cable the panel hangs from, with its carabiner.
+create("Frame", {
+	Name = "Cable",
+	Position = UDim2.new(0, 38, 0, -1),
+	Size = UDim2.new(1, -48, 0, 2),
+	BackgroundColor3 = GOLD,
+	BorderSizePixel = 0,
+	ZIndex = 3,
+	Parent = panel,
+})
+local beyMark = create("Frame", {
+	Name = "Bey",
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Position = UDim2.new(0, 26, 0, 0),
+	Size = UDim2.fromOffset(22, 22),
+	BackgroundColor3 = PANEL,
+	BorderSizePixel = 0,
+	ZIndex = 4,
+	Parent = panel,
+}, {
+	corner(11),
+	create("UIStroke", { Color = GOLD, Thickness = 2.5 }),
+	create("Frame", {
+		Name = "Blade",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromOffset(12, 3),
+		BackgroundColor3 = GOLD,
+		BorderSizePixel = 0,
+		ZIndex = 5,
+	}, { corner(2) }),
+	create("Frame", {
+		Name = "Tip",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromOffset(4, 4),
+		BackgroundColor3 = PANEL,
+		BorderSizePixel = 0,
+		ZIndex = 6,
+	}, { corner(2) }),
+})
+
+local header = create("Frame", {
+	Name = "Header",
+	Size = UDim2.new(1, 0, 0, 62),
+	BackgroundTransparency = 1,
+	Parent = panel,
+})
+create("TextLabel", {
+	Name = "Title",
+	Position = UDim2.fromOffset(18, 18),
+	Size = UDim2.new(1, -36, 0, 26),
+	BackgroundTransparency = 1,
+	FontFace = DISPLAY_FONT,
+	Text = "Bey Rivals",
+	TextColor3 = TEXT,
+	TextSize = 25,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	Parent = header,
+})
+local statusLabel = create("TextLabel", {
+	Name = "Status",
+	AnchorPoint = Vector2.new(1, 0),
+	Position = UDim2.new(1, -18, 0, 24),
+	Size = UDim2.fromOffset(130, 18),
+	BackgroundTransparency = 1,
+	FontFace = BODY_FONT,
+	Text = "",
+	TextColor3 = MUTED,
+	TextSize = 14,
+	TextXAlignment = Enum.TextXAlignment.Right,
+	TextTruncate = Enum.TextTruncate.AtEnd,
+	Parent = header,
+})
+
+-- Drag by the header.
+do
+	local dragging, dragStart, startPosition = false, nil, nil
+	header.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging, dragStart, startPosition = true, input.Position, panel.Position
+		end
+	end)
+	table.insert(BeyRivals.connections, userInputService.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			local delta = input.Position - dragStart
+			panel.Position = UDim2.new(startPosition.X.Scale, startPosition.X.Offset + delta.X, startPosition.Y.Scale, startPosition.Y.Offset + delta.Y)
+		end
+	end))
+	table.insert(BeyRivals.connections, userInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end))
+end
+
+-- Tabs.
+local tabBar = create("Frame", {
+	Name = "Tabs",
+	Position = UDim2.fromOffset(18, 62),
+	Size = UDim2.new(1, -36, 0, 30),
+	BackgroundTransparency = 1,
+	Parent = panel,
+})
+create("Frame", {
+	Name = "Rule",
+	Position = UDim2.new(0, 0, 1, -1),
+	Size = UDim2.new(1, 0, 0, 1),
+	BackgroundColor3 = LINE,
+	BorderSizePixel = 0,
+	Parent = tabBar,
+})
+local tabUnderline = create("Frame", {
+	Name = "Underline",
+	Position = UDim2.new(0, 0, 1, -2),
+	Size = UDim2.fromOffset(34, 2),
+	BackgroundColor3 = GOLD,
+	BorderSizePixel = 0,
+	ZIndex = 2,
+	Parent = tabBar,
+})
+
+local pages, tabButtons = {}, {}
+
+local function makePage(name)
+	local page = create("ScrollingFrame", {
+		Name = name,
+		Position = UDim2.fromOffset(0, 98),
+		Size = UDim2.new(1, 0, 1, -98 - 40),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ScrollBarThickness = 3,
+		ScrollBarImageColor3 = LINE,
+		CanvasSize = UDim2.new(),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		Visible = false,
+		Parent = panel,
+	}, {
+		create("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 12), PaddingBottom = UDim.new(0, 8) }),
+		create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 2) }),
+	})
+	pages[name] = page
+	return page
+end
+
+local function selectTab(name)
+	for pageName, page in pairs(pages) do
+		page.Visible = pageName == name
+	end
+	for buttonName, button in pairs(tabButtons) do
+		local active = buttonName == name
+		button.TextColor3 = active and TEXT or MUTED
+		if active then
+			tween(tabUnderline, {
+				Position = UDim2.new(0, button.Position.X.Offset, 1, -2),
+				Size = UDim2.fromOffset(button.TextBounds.X, 2),
+			}, 0.18)
+		end
+	end
+end
+
+local function makeTab(name, x)
+	local button = create("TextButton", {
+		Name = name,
+		Position = UDim2.fromOffset(x, 0),
+		Size = UDim2.new(0, 70, 1, -4),
+		AutomaticSize = Enum.AutomaticSize.X,
+		BackgroundTransparency = 1,
+		FontFace = TAB_FONT,
+		Text = name,
+		TextColor3 = MUTED,
+		TextSize = 17,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		AutoButtonColor = false,
+		Parent = tabBar,
+	})
+	button.Size = UDim2.new(0, 0, 1, -4)
+	tabButtons[name] = button
+	button.MouseButton1Click:Connect(function()
+		selectTab(name)
+	end)
+	return button
+end
+
+-- Control builders.
+local layoutOrder = 0
+local function nextOrder()
+	layoutOrder = layoutOrder + 1
+	return layoutOrder
+end
+
+local function rowBase(page, height, clickable)
+	local row = create(clickable and "TextButton" or "Frame", {
+		Size = UDim2.new(1, 0, 0, height),
+		BackgroundColor3 = RAISED,
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		LayoutOrder = nextOrder(),
+		Parent = page,
+	}, { corner(6) })
+	if clickable then
+		row.Text = ""
+		row.AutoButtonColor = false
+	end
+	row.MouseEnter:Connect(function()
+		tween(row, { BackgroundTransparency = 0.35 }, 0.1)
+	end)
+	row.MouseLeave:Connect(function()
+		tween(row, { BackgroundTransparency = 1 }, 0.1)
+	end)
+	return row
+end
+
+local function rowLabel(row, text, y)
+	return create("TextLabel", {
+		Position = UDim2.fromOffset(8, y or 0),
+		Size = UDim2.new(1, -120, 0, y and 20 or row.Size.Y.Offset),
+		BackgroundTransparency = 1,
+		FontFace = BODY_FONT,
+		Text = text,
+		TextColor3 = TEXT,
+		TextSize = 15,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Parent = row,
+	})
+end
+
+local function heading(page, text)
+	create("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 30),
+		BackgroundTransparency = 1,
+		FontFace = BODY_BOLD,
+		Text = text,
+		TextColor3 = MUTED,
+		TextSize = 13,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Bottom,
+		LayoutOrder = nextOrder(),
+		Parent = page,
+	}, { create("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingBottom = UDim.new(0, 4) }) })
+end
+
+---Square latch: gold with a check when on.
+local function toggle(page, text, key)
+	local row = rowBase(page, 34, true)
+	rowLabel(row, text)
+	local latch = create("Frame", {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -8, 0.5, 0),
+		Size = UDim2.fromOffset(20, 20),
+		BackgroundColor3 = GOLD,
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		Parent = row,
+	}, { corner(5) })
+	local latchStroke = create("UIStroke", { Color = LINE, Thickness = 1.5, Parent = latch })
+	local check = create("TextLabel", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		FontFace = BODY_BOLD,
+		Text = "✓",
+		TextColor3 = PANEL,
+		TextSize = 15,
+		TextTransparency = 1,
+		Parent = latch,
+	})
+
+	local function refresh()
+		local on = Config[key]
+		tween(latch, { BackgroundTransparency = on and 0 or 1 })
+		tween(check, { TextTransparency = on and 0 or 1 })
+		tween(latchStroke, { Color = on and GOLD or LINE })
+	end
+	row.MouseButton1Click:Connect(function()
+		Config[key] = not Config[key]
+		refresh()
+	end)
+	refresh()
+end
+
+---Thin cable-style slider.
+local function slider(page, text, key, minValue, maxValue, step, format)
+	local row = rowBase(page, 48, false)
+	rowLabel(row, text, 4)
+	local valueLabel = create("TextLabel", {
+		AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, -8, 0, 4),
+		Size = UDim2.fromOffset(90, 20),
+		BackgroundTransparency = 1,
+		FontFace = BODY_BOLD,
+		TextColor3 = GOLD,
+		TextSize = 15,
+		TextXAlignment = Enum.TextXAlignment.Right,
+		Parent = row,
+	})
+	local track = create("TextButton", {
+		Position = UDim2.new(0, 8, 0, 30),
+		Size = UDim2.new(1, -16, 0, 12),
+		BackgroundTransparency = 1,
+		Text = "",
+		AutoButtonColor = false,
+		Parent = row,
+	})
+	create("Frame", {
+		AnchorPoint = Vector2.new(0, 0.5),
+		Position = UDim2.fromScale(0, 0.5),
+		Size = UDim2.new(1, 0, 0, 2),
+		BackgroundColor3 = LINE,
+		BorderSizePixel = 0,
+		Parent = track,
+	})
+	local fill = create("Frame", {
+		AnchorPoint = Vector2.new(0, 0.5),
+		Position = UDim2.fromScale(0, 0.5),
+		Size = UDim2.new(0, 0, 0, 2),
+		BackgroundColor3 = GOLD,
+		BorderSizePixel = 0,
+		Parent = track,
+	})
+	local knob = create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0, 0.5),
+		Size = UDim2.fromOffset(12, 12),
+		BackgroundColor3 = GOLD,
+		BorderSizePixel = 0,
+		ZIndex = 2,
+		Parent = track,
+	}, { corner(6), create("UIStroke", { Color = PANEL, Thickness = 2 }) })
+
+	local function refresh()
+		local fraction = (Config[key] - minValue) / (maxValue - minValue)
+		fill.Size = UDim2.new(fraction, 0, 0, 2)
+		knob.Position = UDim2.fromScale(fraction, 0.5)
+		valueLabel.Text = format(Config[key])
+	end
+	local dragging = false
+	local function setFromX(x)
+		local fraction = math.clamp((x - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
+		local value = minValue + fraction * (maxValue - minValue)
+		Config[key] = math.clamp(math.floor(value / step + 0.5) * step, minValue, maxValue)
+		refresh()
+	end
+	track.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			setFromX(input.Position.X)
+		end
+	end)
+	table.insert(BeyRivals.connections, userInputService.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			setFromX(input.Position.X)
+		end
+	end))
+	table.insert(BeyRivals.connections, userInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end))
+	refresh()
+end
+
+---Segmented choice for short option sets.
+local function segmented(page, text, key, options)
+	local row = rowBase(page, 34, false)
+	rowLabel(row, text)
+	local group = create("Frame", {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -6, 0.5, 0),
+		Size = UDim2.fromOffset(0, 24),
+		AutomaticSize = Enum.AutomaticSize.X,
+		BackgroundColor3 = STEEL,
+		BorderSizePixel = 0,
+		Parent = row,
+	}, {
+		corner(6),
+		create("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 2) }),
+		create("UIPadding", { PaddingLeft = UDim.new(0, 2), PaddingRight = UDim.new(0, 2), PaddingTop = UDim.new(0, 2), PaddingBottom = UDim.new(0, 2) }),
+	})
+	local buttons = {}
+	local function refresh()
+		for option, button in pairs(buttons) do
+			local active = Config[key] == option
+			tween(button, { BackgroundTransparency = active and 0 or 1, TextColor3 = active and GOLD or MUTED }, 0.12)
+		end
+	end
+	for index, option in ipairs(options) do
+		local button = create("TextButton", {
+			Size = UDim2.fromOffset(0, 20),
+			AutomaticSize = Enum.AutomaticSize.X,
+			BackgroundColor3 = RAISED,
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			FontFace = BODY_FONT,
+			Text = option,
+			TextColor3 = MUTED,
+			TextSize = 13,
+			AutoButtonColor = false,
+			LayoutOrder = index,
+			Parent = group,
+		}, { corner(4), create("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8) }) })
+		buttons[option] = button
+		button.MouseButton1Click:Connect(function()
+			Config[key] = option
+			refresh()
+		end)
+	end
+	refresh()
+end
+
+
+---Muted one-line hint under a control.
+local function hint(page, text)
+	create("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 22),
+		BackgroundTransparency = 1,
+		FontFace = BODY_FONT,
+		Text = text,
+		TextColor3 = MUTED,
+		TextSize = 13,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		LayoutOrder = nextOrder(),
+		Parent = page,
+	}, { create("UIPadding", { PaddingLeft = UDim.new(0, 8) }) })
+end
+
+-- Battle page.
+local battlePage = makePage("Battle")
+heading(battlePage, "Auto battle")
+toggle(battlePage, "Auto battle", "AutoBattle")
+hint(battlePage, "Aims, launches, rips, fights and clashes for you")
+
+heading(battlePage, "Launch")
+toggle(battlePage, "Lock in launch automatically", "AutoLaunch")
+toggle(battlePage, "Pick the best launch spot", "PlanLaunch")
+toggle(battlePage, "Perfect rip on every ring", "PerfectRip")
+toggle(battlePage, "Tilt launch to the ridge", "TiltLaunch")
+
+heading(battlePage, "Fight")
+slider(battlePage, "Pilot skill", "PilotLevel", 0.5, 1, 0.05, function(v) return math.floor(v * 100 + 0.5) .. "%" end)
+toggle(battlePage, "Look ahead and pick the best line", "Lookahead")
+slider(battlePage, "Look-ahead budget", "LookaheadMs", 2, 16, 0.5, function(v) return string.format("%.1f ms", v) end)
+toggle(battlePage, "Perfect clash timing", "PerfectClash")
+toggle(battlePage, "Perfect guard before every hit", "AutoGuard")
+toggle(battlePage, "Counter after every perfect guard", "AutoCounter")
+
+heading(battlePage, "Next battle")
+toggle(battlePage, "Auto queue after each battle", "AutoQueue")
+segmented(battlePage, "Join by", "QueueMode", { "Queue", "Rematch" })
+toggle(battlePage, "Auto skip replay", "AutoSkipReplay")
+toggle(battlePage, "Stay active when Roblox is unfocused", "StayActive")
+hint(battlePage, "Keeps going with Roblox in the background")
+
+
+-- Stats page.
+local statsPage = makePage("Stats")
+heading(statsPage, "This session")
+local statLabels = {}
+local function statRow(label, key)
+	local row = rowBase(statsPage, 34, false)
+	rowLabel(row, label)
+	statLabels[key] = create("TextLabel", {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -8, 0.5, 0),
+		Size = UDim2.fromOffset(110, 20),
+		BackgroundTransparency = 1,
+		FontFace = BODY_BOLD,
+		TextColor3 = TEXT,
+		TextSize = 15,
+		TextXAlignment = Enum.TextXAlignment.Right,
+		Parent = row,
+	})
+end
+statRow("Battles", "battles")
+statRow("Wins", "wins")
+statRow("Losses", "losses")
+statRow("Win rate", "rate")
+statRow("Perfect rips", "rips")
+statRow("Perfect guards", "guards")
+statRow("Counters thrown", "counters")
+
+-- Footer.
+local footer = create("Frame", {
+	Name = "Footer",
+	Position = UDim2.new(0, 0, 1, -40),
+	Size = UDim2.new(1, 0, 0, 40),
+	BackgroundColor3 = STEEL,
+	BorderSizePixel = 0,
+	Parent = panel,
+}, { corner(10) })
+create("Frame", {
+	Size = UDim2.new(1, 0, 0, 10),
+	BackgroundColor3 = STEEL,
+	BorderSizePixel = 0,
+	Parent = footer,
+})
+create("TextLabel", {
+	Position = UDim2.fromOffset(18, 0),
+	Size = UDim2.new(1, -120, 1, 0),
+	BackgroundTransparency = 1,
+	FontFace = BODY_FONT,
+	Text = "Right Ctrl hides this panel",
+	TextColor3 = MUTED,
+	TextSize = 13,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	ZIndex = 2,
+	Parent = footer,
+})
+local unloadButton = create("TextButton", {
+	AnchorPoint = Vector2.new(1, 0.5),
+	Position = UDim2.new(1, -12, 0.5, 0),
+	Size = UDim2.fromOffset(72, 26),
+	BackgroundColor3 = RAISED,
+	BorderSizePixel = 0,
+	FontFace = BODY_BOLD,
+	Text = "Unload",
+	TextColor3 = TEXT,
+	TextSize = 13,
+	AutoButtonColor = true,
+	ZIndex = 2,
+	Parent = footer,
+}, { corner(6) })
+
+makeTab("Battle", 0)
+makeTab("Stats", 72)
+screenGui.Parent = guiParent
+task.defer(selectTab, "Battle")
+
+-- Right Ctrl toggles the panel.
+table.insert(BeyRivals.connections, userInputService.InputBegan:Connect(function(input)
+	if input.KeyCode == Enum.KeyCode.RightControl and not userInputService:GetFocusedTextBox() then
+		panel.Visible = not panel.Visible
+	end
+end))
+
+-- Autosave whenever a setting changes.
+do
+	local lastSaved = encodeSettings()
+	local elapsed = 0
+	table.insert(BeyRivals.connections, runService.Heartbeat:Connect(function(dt)
+		elapsed = elapsed + dt
+		if elapsed < SAVE_INTERVAL then
+			return
+		end
+		elapsed = 0
+		local encoded = encodeSettings()
+		if encoded ~= lastSaved then
+			lastSaved = encoded
+			saveSettings()
+		end
+	end))
+end
+
+-- Live status, stats, and the spinning bey mark.
+table.insert(BeyRivals.connections, runService.RenderStepped:Connect(function(dt)
+	if Config.AutoBattle then
+		beyMark.Rotation = (beyMark.Rotation + dt * 720) % 360
+		statusLabel.Text = status
+		statusLabel.TextColor3 = (status == "Behind" or status == "Defending") and LOSS or GOLD
+	elseif Config.AutoQueue then
+		statusLabel.Text = status == "Idle" and "Auto queue on" or status
+		statusLabel.TextColor3 = GOLD
+	else
+		statusLabel.Text = "Off"
+		statusLabel.TextColor3 = MUTED
+	end
+
+	statLabels.battles.Text = tostring(Stats.battles)
+	statLabels.wins.Text = tostring(Stats.wins)
+	statLabels.wins.TextColor3 = Stats.wins > 0 and WIN or TEXT
+	statLabels.losses.Text = tostring(Stats.losses)
+	statLabels.losses.TextColor3 = Stats.losses > 0 and LOSS or TEXT
+	local decided = Stats.wins + Stats.losses
+	statLabels.rate.Text = decided > 0 and (math.floor(Stats.wins / decided * 100 + 0.5) .. "%") or "–"
+	statLabels.rips.Text = Stats.rips > 0 and (Stats.perfectRips .. " of " .. Stats.rips) or "–"
+	statLabels.counters.Text = tostring(Stats.counters)
+	statLabels.guards.Text = tostring(Stats.guards)
+end))
+
+-- ============================================================
+--  Lifecycle
+-- ============================================================
+
+---Undo every hook and connection.
+function BeyRivals.detach()
+	saveSettings()
+	if BattleInput.sample == sampleHook then
+		BattleInput.sample = originalSample
+	end
+	localPlayer:SetAttribute("AimAssist", hadAimAssist)
+	for _, connection in ipairs(BeyRivals.connections) do
+		connection:Disconnect()
+	end
+	if BeyRivals.gui then
+		BeyRivals.gui:Destroy()
+	end
+	if shared.BeyRivals == BeyRivals then
+		shared.BeyRivals = nil
+	end
+end
+
+unloadButton.MouseButton1Click:Connect(BeyRivals.detach)
+
+shared.BeyRivals = BeyRivals
+getgenv().BeyRivalsConfig = Config
+print("[Bey Rivals] Loaded. Right Ctrl toggles the panel.")
