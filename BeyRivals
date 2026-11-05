@@ -1,4 +1,11 @@
+local loadToken = {}
+getgenv().BeyRivalsLoadToken = loadToken
+
+-- Give the game time to load its battle modules (needed when auto-executed on join).
 task.wait(5)
+if getgenv().BeyRivalsLoadToken ~= loadToken then
+	return
+end
 
 -- Check for table that is shared between executions.
 if not shared then
@@ -73,6 +80,43 @@ local Config = {
 	PerfectClash = true,
 	AutoCounter = true,
 	AutoGuard = true,
+	Aggression = 1.5,
+	ModelHumans = true,
+	SafeRidge = true,
+	TraitItem = "",
+	DrawSize = "x10",
+	DrawKeep = 0,
+	DrawMax = 0,
+	DrawWant_bey = true,
+	DrawWant_aura = false,
+	DrawWant_break = false,
+	DrawWant_launch = false,
+	DrawWant_trail = false,
+	DrawWant_finish = false,
+	DrawWant_emote = false,
+	PullSize = "x10",
+	PullStop = "Mythic",
+	PullTickets = true,
+	PullMax = 0,
+	NameStop = "Mythic",
+	NameLucky = false,
+	NameMax = 0,
+	TraitSlot = 1,
+	TraitUseCoins = true,
+	TraitMaxRolls = 0,
+	TraitWant_Apex = true,
+	TraitWant_Balanced = false,
+	TraitWant_Sharp3 = false,
+	TraitWant_Sturdy3 = false,
+	TraitWant_Enduring3 = false,
+	TraitWant_Swift2 = false,
+	TraitWant_Sharp2 = false,
+	TraitWant_Sturdy2 = false,
+	TraitWant_Enduring2 = false,
+	TraitWant_Swift1 = false,
+	TraitWant_Sharp1 = false,
+	TraitWant_Sturdy1 = false,
+	TraitWant_Enduring1 = false,
 	PlanLaunch = true,
 	AutoQueue = false,
 	QueueMode = "Queue",
@@ -146,6 +190,7 @@ local GUARD_PRESS_LEAD = 3
 local pilot = nil
 local pilotToken = nil
 local plan = nil
+local lastBestScore = 0
 local planFirst = false
 local planUntil = 0
 local reflexAfter = 0
@@ -154,7 +199,11 @@ local stepCost = 0.02
 local launchedRound = nil
 local lastBattle = nil
 local status = "Idle"
+local logTick = nil
 -- Session stats survive a reload of the script.
+local counterWindow = nil
+local CounterLog = {}
+BeyRivals.counterLog = CounterLog
 local Stats = { battles = 0, wins = 0, losses = 0, perfectRips = 0, rips = 0, counters = 0, guards = 0 }
 if type(previousStats) == "table" then
 	for key in pairs(Stats) do
@@ -164,6 +213,18 @@ if type(previousStats) == "table" then
 	end
 end
 BeyRivals.stats = Stats
+-- Lifetime totals survive teleports (ranked servers) and rejoins.
+local STATS_FILE = "BeyRivals/stats.json"
+local Lifetime = { battles = 0, wins = 0, losses = 0 }
+pcall(function()
+	if isfile(STATS_FILE) then
+		local saved = game:GetService("HttpService"):JSONDecode(readfile(STATS_FILE))
+		for key in pairs(Lifetime) do
+			Lifetime[key] = tonumber(saved[key]) or 0
+		end
+	end
+end)
+BeyRivals.lifetime = Lifetime
 
 -- ============================================================
 --  Battle access
@@ -219,14 +280,16 @@ local function edgeRisk(sim, bey)
 	end
 	local x, z = bey.x or 0, bey.z or 0
 	local reach = math.sqrt(x * x + z * z) / stadium.bowlRadius
-	local risk = math.clamp((reach - 0.55) / 0.45, 0, 1) ^ 2 * 40
+	-- Both logged ring-out losses were a hit on the ridge followed by a slide into an exit pocket.
+	local risk = math.clamp((reach - 0.5) / 0.5, 0, 1) ^ 1.6 * 70
 	if risk <= 0 then
 		return 0
 	end
 	local degrees = math.deg(math.atan2(z, x)) % 360
 	for _, pocket in ipairs(stadium.pockets or {}) do
-		if math.abs((degrees - pocket + 180) % 360 - 180) < 20 then
-			return risk * 2
+		local off = math.abs((degrees - pocket + 180) % 360 - 180)
+		if off < 32 then
+			return risk * (1 + 1.2 * (1 - off / 32))
 		end
 	end
 	return risk
@@ -238,8 +301,9 @@ end
 ---@return number
 local function scoreOf(sim, slot)
 	local me, foes = sidesOf(sim, slot)
+	-- Ranked scoring: a burst is worth 2 points, a ring-out or spin finish 1.
 	if me.out then
-		return -1000 + sim.tick * 0.01
+		return (me.out == "Burst" and -1000 or -720) + sim.tick * 0.01
 	end
 
 	local foesLeft, foeSpin, foeBurst = 0, 0, 0
@@ -251,14 +315,20 @@ local function scoreOf(sim, slot)
 		end
 	end
 	if foesLeft == 0 then
-		return 1000 - sim.tick * 0.01
+		local bursted = false
+		for _, foe in ipairs(foes) do
+			if foe.out == "Burst" then
+				bursted = true
+			end
+		end
+		return (bursted and 1000 or 780) - sim.tick * 0.01
 	end
 
 	local score = ((me.spin or 0) - foeSpin / foesLeft) * 100
-	score = score + (foeBurst / foesLeft - burstRatio(me)) * 60
+	score = score + (foeBurst / foesLeft - burstRatio(me)) * 90
 	-- Near the burst limit any hit ends the round: steep cost for us, bonus for pressing a near-burst rival.
 	local function nearBurst(ratio)
-		return math.clamp((ratio - 0.6) / 0.4, 0, 1) ^ 2 * 80
+		return math.clamp((ratio - 0.4) / 0.55, 0, 1) ^ 1.5 * 160
 	end
 	score = score - nearBurst(burstRatio(me))
 	for _, foe in ipairs(foes) do
@@ -266,9 +336,45 @@ local function scoreOf(sim, slot)
 			score = score + nearBurst(burstRatio(foe)) * 0.5 / foesLeft
 		end
 	end
+	-- Crush zone: at 60%+ gauge, any solid hit taken while stunned bursts outright (game rule).
+	-- Being stunned anywhere near a rival up there is as bad as losing; a stunned rival up there is a kill.
+	local myRatio = burstRatio(me)
+	if myRatio >= 0.55 then
+		score = score - 35
+		if (me.stun or 0) > 0.05 then
+			for _, foe in ipairs(foes) do
+				if not foe.out then
+					local dx, dz = (foe.x or 0) - (me.x or 0), (foe.z or 0) - (me.z or 0)
+					if dx * dx + dz * dz < 16 then
+						score = score - 150
+					end
+				end
+			end
+		end
+	end
+	for _, foe in ipairs(foes) do
+		if not foe.out and burstRatio(foe) >= 0.6 and (foe.stun or 0) > 0.05 then
+			score = score + 60 / foesLeft
+		end
+	end
 	score = score + (#foes - foesLeft) * 200
+	-- Every logged ring-out went ridge -> hit -> Lip -> Pocket within ~20 ticks. A lip or teeter is
+	-- nearly a lost round already; the boss loss was three of these while far ahead on burst.
+	if (me.lip or 0) ~= 0 then
+		score = score - 260
+	end
 	if (me.teeter or 0) > 0 then
-		score = score - 25
+		score = score - 90
+	end
+	if me.onRidge then
+		for _, foe in ipairs(foes) do
+			if not foe.out then
+				local dx, dz = (foe.x or 0) - (me.x or 0), (foe.z or 0) - (me.z or 0)
+				if dx * dx + dz * dz < 25 then
+					score = score - 40
+				end
+			end
+		end
 	end
 
 	-- Stay off the edge (ring-outs have no rescue here); push the foe toward it.
@@ -279,11 +385,41 @@ local function scoreOf(sim, slot)
 			caution = 1.5
 		end
 	end
-	score = score - edgeRisk(sim, me) * caution
+	local myEdge = edgeRisk(sim, me)
+	local safety = 1 - math.clamp(myEdge / 60, 0, 1)
+	score = score - myEdge * caution
+	local aggression = Config.Aggression
 	for _, foe in ipairs(foes) do
 		if not foe.out then
-			score = score + edgeRisk(sim, foe) * 0.6 / foesLeft
+			-- Pushing a rival toward the rim is worth more the more aggressive we are.
+			score = score + edgeRisk(sim, foe) * (0.6 + 0.5 * aggression) / foesLeft
 		end
+	end
+	-- Pressure: stay on top of the closest rival instead of circling.
+	if aggression > 0 then
+		local stadium = stadiumCache[sim.stadium]
+		local radius = stadium and stadium.bowlRadius or 7.56
+		local closest = math.huge
+		for _, foe in ipairs(foes) do
+			if not foe.out then
+				local dx, dz = (foe.x or 0) - (me.x or 0), (foe.z or 0) - (me.z or 0)
+				closest = math.min(closest, math.sqrt(dx * dx + dz * dz) / radius)
+			end
+		end
+		if closest < math.huge then
+			-- Close in only while our gauge has room; near our burst limit, contact is the danger.
+			local room = math.clamp(1 - burstRatio(me) / 0.6, 0, 1)
+			score = score - math.clamp(closest, 0, 2) * 12 * aggression * room * safety
+		end
+		-- Burst race: when our gauge is clearly fuller than theirs, the next exchange bursts us first.
+		-- Keep distance and win on spin instead (both logged ranked losses were exactly this).
+		local mine, theirs = burstRatio(me), foeBurst / foesLeft
+		if closest < math.huge and mine > 0.35 and mine > theirs + 0.08 then
+			score = score + math.clamp(closest, 0, 2) * 30 * math.clamp((mine - theirs) / 0.4, 0, 1)
+		end
+		-- Damage dealt counts extra: favour lines that take the rival's spin and burst down.
+		score = score + (foeBurst / foesLeft) * 25 * aggression
+		score = score - (foeSpin / foesLeft) * 40 * aggression
 	end
 	return score
 end
@@ -296,6 +432,21 @@ local function freshPilot()
 	local state = Sim.pilotAI()
 	state.level = Config.PilotLevel
 	return state
+end
+
+---Human rivals have no AI in the sim, so copies would step them with no input at all (a rival that
+---never attacks). Both ranked losses on 11-05 were a human smashing us as we rushed off the ridge
+---at 80%+ gauge, a line the planner thought was free. Model every human rival as the game's AI.
+function BeyRivals.modelFoes(copy, slot)
+	if not Config.ModelHumans then
+		return copy
+	end
+	for index in ipairs(copy.beys) do
+		if index ~= slot and not copy.ai[index] then
+			copy.ai[index] = freshPilot()
+		end
+	end
+	return copy
 end
 
 ---Input the game's AI would give for our bey right now (computed on a copy).
@@ -311,7 +462,7 @@ local function pilotInput(sim, slot)
 end
 
 local PLAN_TICKS = 6
-local ripBits, clashBits, inClash
+local ripBits, clashBits, inClash, counterPress, burstAfterContact
 local ABILITY_BITS = { 32, 64, 8 }
 local DASH_BIT = 1
 
@@ -338,6 +489,15 @@ local function stepAsPlayer(copy, slot, clone, override)
 			if Config.PerfectClash and inClash(copy, slot) then
 				input.b = bit32.bor(bit32.band(input.b, bit32.bnot(CLASH_BIT)), clashBits(copy, bey, copy.tick + 1))
 			end
+			-- Live we take every counter window, so the futures we score should too.
+			if Config.AutoCounter then
+				local press = counterPress(bey)
+				if press == true then
+					input.b = bit32.bor(input.b, COUNTER_BIT)
+				elseif press == false then
+					input.b = bit32.band(input.b, bit32.bnot(COUNTER_BIT))
+				end
+			end
 		end
 	end
 	copy.ai[slot] = nil
@@ -351,7 +511,7 @@ end
 ---@param horizon number
 ---@return number
 local function rollout(sim, slot, candidate, horizon)
-	local copy = Sim.copy(sim)
+	local copy = BeyRivals.modelFoes(Sim.copy(sim), slot)
 	local clone = table.clone(pilot)
 	clone.level = Config.PilotLevel
 	local steps = 0
@@ -378,13 +538,38 @@ end
 ---Every option worth comparing this decision.
 ---@param bey table
 ---@return table
-local function candidateList(bey)
+local function candidateList(bey, sim, slot)
 	local list = { false }
+	-- Straight at the closest rival: plain push, dash and every ability.
+	if sim then
+		local _, foes = sidesOf(sim, slot)
+		local target, best = nil, math.huge
+		for _, foe in ipairs(foes) do
+			if not foe.out then
+				local dx, dz = (foe.x or 0) - (bey.x or 0), (foe.z or 0) - (bey.z or 0)
+				local distance = dx * dx + dz * dz
+				if distance < best then
+					target, best = { dx = dx, dz = dz }, distance
+				end
+			end
+		end
+		if target and best > 0 then
+			local length = math.sqrt(best)
+			local fx, fz = target.dx / length, target.dz / length
+			table.insert(list, { sx = fx, sz = fz, b = 0, t = 0 })
+			table.insert(list, { sx = fx, sz = fz, b = DASH_BIT, t = 0 })
+			for _, bits in ipairs(ABILITY_BITS) do
+				table.insert(list, { sx = fx, sz = fz, b = bits, t = 0 })
+			end
+		end
+	end
 	for index = 0, DIRECTIONS - 1 do
 		local angle = index / DIRECTIONS * math.pi * 2
 		local sx, sz = math.cos(angle), math.sin(angle)
 		table.insert(list, { sx = sx, sz = sz, b = 0, t = 0 })
-		table.insert(list, { sx = sx, sz = sz, b = DASH_BIT, t = 0 })
+		if index % 2 == 0 then
+			table.insert(list, { sx = sx, sz = sz, b = DASH_BIT, t = 0 })
+		end
 	end
 	-- Moves aimed the way the bey is already heading.
 	local speed = math.sqrt((bey.vx or 0) ^ 2 + (bey.vz or 0) ^ 2)
@@ -398,11 +583,129 @@ local function candidateList(bey)
 	return list
 end
 
+---Steer away from the closest rival (along the bowl, never out toward the rim) and drop attack
+---presses, while our burst gauge is high and fuller than theirs. nil = keep fighting.
+local DISENGAGE_AT = 0.55
+local function disengageInput(sim, slot, bey, input)
+	local mine = burstRatio(bey)
+	if mine < DISENGAGE_AT - 0.15 then
+		return nil
+	end
+	local _, foes = sidesOf(sim, slot)
+	local target, best = nil, math.huge
+	for _, foe in ipairs(foes) do
+		if not foe.out then
+			local dx, dz = (foe.x or 0) - (bey.x or 0), (foe.z or 0) - (bey.z or 0)
+			local distance = dx * dx + dz * dz
+			if distance < best then
+				target, best = foe, distance
+			end
+		end
+	end
+	if not target then
+		return nil
+	end
+	local theirs = burstRatio(target)
+	local spinLead = (bey.spin or 0) - (target.spin or 0)
+	-- With a spin lead, there's no reason to trade at all once the gauge is getting full.
+	local threshold = spinLead > 0.03 and (DISENGAGE_AT - 0.15) or DISENGAGE_AT
+	if mine < threshold or theirs >= mine then
+		return nil
+	end
+	local distance = math.sqrt(best)
+	if distance > 6 then
+		return nil
+	end
+	local ax, az = (bey.x or 0) - (target.x or 0), (bey.z or 0) - (target.z or 0)
+	local length = math.max(distance, 0.001)
+	ax, az = ax / length, az / length
+	-- Near the rim, slide around the bowl instead of backing out of it.
+	local stadium = stadiumCache[sim.stadium]
+	local radius = stadium and stadium.bowlRadius or 10
+	local px, pz = bey.x or 0, bey.z or 0
+	local reach = math.sqrt(px * px + pz * pz)
+	if reach > radius * 0.6 and reach > 0.01 then
+		local ox, oz = px / reach, pz / reach
+		local outward = ax * ox + az * oz
+		if outward > 0 then
+			ax, az = ax - ox * outward * 1.4, az - oz * outward * 1.4
+			local l2 = math.max(math.sqrt(ax * ax + az * az), 0.001)
+			ax, az = ax / l2, az / l2
+		end
+	end
+	local bits = bit32.band(input.b, bit32.bor(BRACE_BIT, COUNTER_BIT))
+	return { sx = ax, sz = az, b = bits, t = 0 }
+end
+
+---Our burst gauge after holding `input` (dash/attack presses only on the first tick) for `ticks`.
+local function burstAfterHold(sim, slot, input, ticks)
+	local copy = BeyRivals.modelFoes(Sim.copy(sim), slot)
+	copy.ai[slot] = nil
+	local first = { sx = input.sx, sz = input.sz, b = input.b, t = 0 }
+	local held = { sx = input.sx, sz = input.sz, b = bit32.band(input.b, bit32.bor(BRACE_BIT, COUNTER_BIT)), t = 0 }
+	for step = 1, ticks do
+		Sim.step(copy, { [slot] = step == 1 and first or held })
+		if copy.done then
+			break
+		end
+	end
+	local bey = copy.beys[slot]
+	if bey.out then
+		return (bey.burstMax or 1) * 2
+	end
+	return bey.burst or 0
+end
+
+local escapeVerdict = { tick = -math.huge, input = nil }
+
+---Get out of a rival's ability while it is running. Ability waves can't be guarded (a guard only
+---halves the knockback) and their damage falls off with distance; in the logged Stamina losses one
+---wave took 33-35% of the gauge. Compared on copies: escaping vs. the line we'd otherwise take.
+local function waveEscapeInput(sim, slot, bey, input)
+	if sim.tick - escapeVerdict.tick < 6 then
+		return escapeVerdict.input
+	end
+	escapeVerdict.tick, escapeVerdict.input = sim.tick, nil
+	local _, foes = sidesOf(sim, slot)
+	local stadium = stadiumCache[sim.stadium]
+	for _, foe in ipairs(foes) do
+		if not foe.out and (foe.ab or 0) ~= 0 then
+			local dx, dz = (bey.x or 0) - (foe.x or 0), (bey.z or 0) - (foe.z or 0)
+			local distance = math.sqrt(dx * dx + dz * dz)
+			if distance < 8 then
+				local ax, az = dx / math.max(distance, 0.001), dz / math.max(distance, 0.001)
+				local px, pz = bey.x or 0, bey.z or 0
+				local radius = stadium and stadium.bowlRadius or 10
+				local fromCentre = math.sqrt(px * px + pz * pz)
+				if fromCentre > radius * 0.6 and fromCentre > 0.01 then
+					local ox, oz = px / fromCentre, pz / fromCentre
+					local outward = ax * ox + az * oz
+					if outward > 0 then
+						ax, az = ax - ox * outward * 1.4, az - oz * outward * 1.4
+						local l2 = math.max(math.sqrt(ax * ax + az * az), 0.001)
+						ax, az = ax / l2, az / l2
+					end
+				end
+				local bits = bit32.band(input.b, bit32.bor(BRACE_BIT, COUNTER_BIT))
+				local escape = { sx = ax, sz = az, b = bit32.bor(bits, DASH_BIT), t = 0 }
+				local burstMax = (bey.burstMax and bey.burstMax > 0) and bey.burstMax or 1
+				local stay = burstAfterHold(sim, slot, input, 45)
+				local run = burstAfterHold(sim, slot, escape, 45)
+				if (stay - run) / burstMax > 0.08 then
+					escapeVerdict.input = escape
+					return escape
+				end
+			end
+		end
+	end
+	return nil
+end
+
 ---Pick the best plan for the next few ticks within the frame budget.
 ---@param sim table
 ---@param slot number
 local function decide(sim, slot)
-	local candidates = candidateList(sim.beys[slot])
+	local candidates = candidateList(sim.beys[slot], sim, slot)
 	-- See further while a rival's ability is in flight: that is when we get knocked out.
 	local danger = false
 	local _, foes = sidesOf(sim, slot)
@@ -412,7 +715,7 @@ local function decide(sim, slot)
 		end
 	end
 	local budget = Config.LookaheadMs * ((danger or forceDanger) and 3 or 1)
-	local horizon = math.clamp(math.floor(budget / (stepCost * #candidates)), 20, 240)
+	local horizon = math.clamp(math.floor(budget / (stepCost * #candidates)), 45, 240)
 	local started = os.clock()
 
 	local pilotScore = rollout(sim, slot, nil, horizon)
@@ -428,16 +731,17 @@ local function decide(sim, slot)
 	stepCost = stepCost * 0.7 + (elapsed / (horizon * #candidates)) * 0.3
 
 	-- Only override the AI when an option is clearly better.
-	if best and bestScore - pilotScore < 3 then
+	if best and bestScore - pilotScore < math.max(3 - Config.Aggression * 1.5, 0.5) then
 		best = nil
 	end
 	plan = best
+	lastBestScore = bestScore
 	planFirst = true
 	planUntil = sim.tick + PLAN_TICKS
 
-	if bestScore >= 900 then
+	if bestScore >= 650 then
 		status = "Winning line found"
-	elseif bestScore <= -900 then
+	elseif bestScore <= -650 then
 		status = "Defending"
 	else
 		status = bestScore >= 0 and "Ahead" or "Behind"
@@ -450,15 +754,16 @@ local counterVerdict = { tick = -math.huge, safe = false }
 
 ---Compare countering now against holding off (both followed by the full-skill AI) on copies.
 ---@return boolean
-local function counterIsSafe(sim, slot, input)
-	if sim.tick - counterVerdict.tick < COUNTER_CHECK_EVERY then
+local function counterIsSafe(sim, slot, input, window)
+	if counterVerdict.window == window and sim.tick - counterVerdict.tick < COUNTER_CHECK_EVERY then
 		return counterVerdict.safe
 	end
+	-- The counter lunges at the rival; the only reason to skip it is that the lunge rings us out.
 	local withCounter = { sx = input.sx, sz = input.sz, b = bit32.bor(input.b, COUNTER_BIT), t = 0 }
 	local with = rollout(sim, slot, withCounter, COUNTER_CHECK_TICKS)
-	local without = rollout(sim, slot, nil, COUNTER_CHECK_TICKS)
 	counterVerdict.tick = sim.tick
-	counterVerdict.safe = with > -900 and with >= without - 2
+	counterVerdict.window = window
+	counterVerdict.safe = with > -650
 	return counterVerdict.safe
 end
 
@@ -479,7 +784,7 @@ local function guardAttack(sim, slot, bey, input)
 		local with = rollout(sim, slot, input, COUNTER_CHECK_TICKS)
 		local without = rollout(sim, slot, quiet, COUNTER_CHECK_TICKS)
 		attackVerdict.key = key
-		attackVerdict.safe = with > -900 and with >= without - 2
+		attackVerdict.safe = with > -650 and with >= without - 2 - Config.Aggression * 8
 	end
 	if attackVerdict.safe then
 		return input
@@ -535,7 +840,7 @@ end
 ---@param input table
 ---@return number?
 local function ticksToContact(sim, slot, input)
-	local copy = Sim.copy(sim)
+	local copy = BeyRivals.modelFoes(Sim.copy(sim), slot)
 	copy.ai[slot] = nil
 	local held = { [slot] = { sx = input.sx, sz = input.sz, b = bit32.band(input.b, bit32.bnot(BRACE_BIT)), t = 0 } }
 	for step = 1, GUARD_LOOKAHEAD do
@@ -555,6 +860,26 @@ local function ticksToContact(sim, slot, input)
 	return nil
 end
 
+---Our burst gauge a few ticks after the predicted contact, with or without bracing now.
+---@return number
+function burstAfterContact(sim, slot, input, contact, brace)
+	local copy = BeyRivals.modelFoes(Sim.copy(sim), slot)
+	copy.ai[slot] = nil
+	local bits = bit32.band(input.b, bit32.bnot(BRACE_BIT))
+	for step = 1, contact + 4 do
+		local b = (brace and step == 1) and bit32.bor(bits, BRACE_BIT) or bits
+		Sim.step(copy, { [slot] = { sx = input.sx, sz = input.sz, b = b, t = 0 } })
+		if copy.done then
+			break
+		end
+	end
+	local bey = copy.beys[slot]
+	if bey.out then
+		return (bey.burstMax or 1) * 2
+	end
+	return bey.burst or 0
+end
+
 ---Brace control: tap right before contact for a perfect guard (or a harder hit); never waste charges.
 ---@return number brace bits to OR into the input
 local function guardBits(sim, slot, bey, input)
@@ -569,8 +894,18 @@ local function guardBits(sim, slot, bey, input)
 	if not (contact and contact <= GUARD_PRESS_LEAD) then
 		return 0
 	end
-	-- Attack types hold a single guard charge: keep it for the hits that actually ring us out.
+	-- Attack types hold a single guard charge. Spend it on a clash only when that clash hurts:
+	-- in the logged losses one unguarded clash took 35-50% of our burst gauge and burst us.
 	if kind == "Clash" and bey.typ == "Attack" then
+		local open = burstAfterContact(sim, slot, input, contact, false)
+		local braced = burstAfterContact(sim, slot, input, contact, true)
+		local burstMax = (bey.burstMax and bey.burstMax > 0) and bey.burstMax or 1
+		local now = bey.burst or 0
+		local gain = (open - now) / burstMax
+		local saved = (open - braced) / burstMax
+		if open >= burstMax * 0.98 or (now + (open - now)) / burstMax > 0.7 or gain > 0.12 or saved > 0.08 then
+			return BRACE_BIT
+		end
 		return 0
 	end
 	return BRACE_BIT
@@ -579,7 +914,7 @@ end
 ---Counter attack: the window opens after a perfect guard (caT > 0); the game's AI only takes it ~40% of the time.
 ---@param bey table
 ---@return boolean? true = press, false = release (so the next press is a fresh edge), nil = not our concern
-local function counterPress(bey)
+function counterPress(bey)
 	if (bey.caT or 0) <= 0 then
 		return nil
 	end
@@ -619,6 +954,10 @@ local originalSample = BattleInput.sample
 local function autoInput(battle)
 	local round = battle.round
 	local sim = round and round.sim
+	-- Log first, so the final ticks of a round (including the ones where we go out) are kept.
+	if sim and sim.beys and logTick and round.phase == "Battle" then
+		pcall(logTick, battle, sim, battle.mySlot)
+	end
 	if not sim or battle.watch or round.phase ~= "Battle" or sim.done then
 		return nil
 	end
@@ -670,11 +1009,30 @@ local function autoInput(battle)
 	-- Take counter windows the moment they are legal, unless the lunge would cost us (e.g. off the edge).
 	if Config.AutoCounter then
 		local press = counterPress(bey)
-		if press == true and counterIsSafe(sim, slot, input) then
-			status = "Counter!"
-			input.b = bit32.bor(input.b, COUNTER_BIT)
-			return input
-		elseif press ~= nil then
+		if (bey.caT or 0) > 0 then
+			if not counterWindow or counterWindow.token ~= battle.token or sim.tick - counterWindow.lastTick > 2 then
+				counterWindow = { token = battle.token, start = sim.tick, lastTick = sim.tick, outcome = "open", vetoes = 0 }
+				table.insert(CounterLog, counterWindow)
+				if #CounterLog > 20 then
+					table.remove(CounterLog, 1)
+				end
+			end
+			counterWindow.lastTick = sim.tick
+		end
+		if press == true then
+			if counterIsSafe(sim, slot, input, counterWindow.start) then
+				status = "Counter!"
+				counterWindow.outcome = "pressed"
+				input.b = bit32.bor(input.b, COUNTER_BIT)
+				return input
+			end
+			counterWindow.vetoes = counterWindow.vetoes + 1
+			counterWindow.outcome = "skipped (would ring us out)"
+			input.b = bit32.band(input.b, bit32.bnot(COUNTER_BIT))
+		elseif press == false then
+			if counterWindow.outcome == "open" then
+				counterWindow.outcome = "waiting (stunned/airborne)"
+			end
 			input.b = bit32.band(input.b, bit32.bnot(COUNTER_BIT))
 		end
 	end
@@ -684,7 +1042,9 @@ local function autoInput(battle)
 		local guardReady = (bey.guardN or 0) > 0 and (bey.gbT or 0) <= 0
 		if not guardReady and sim.tick < planUntil and sim.tick >= reflexAfter then
 			local contact, kind = ticksToContact(sim, slot, input)
-			if contact and kind ~= "Clash" then
+			-- Re-plan for incoming ability hits, and for any contact once our gauge is past 45%
+			-- (a single clash took 25-35% of the gauge in the logged losses).
+			if contact and (kind ~= "Clash" or burstRatio(bey) > 0.45) then
 				planUntil = sim.tick
 				reflexAfter = sim.tick + PLAN_TICKS
 				forceDanger = true
@@ -694,6 +1054,22 @@ local function autoInput(battle)
 			decide(sim, slot)
 			forceDanger = false
 		end
+		-- No better line than the game's own AI: that AI keeps charging even deep in the crush zone
+		-- (the logged Stamina loss: a Rush at 79% gauge). When our gauge is the fuller one, stay off them.
+		if lastBestScore < 650 then
+			local escape = waveEscapeInput(sim, slot, bey, input)
+			if escape then
+				status = "Dodging wave"
+				return escape
+			end
+		end
+		if not plan and lastBestScore < 650 then
+			local away = disengageInput(sim, slot, bey, input)
+			if away then
+				status = "Keeping away"
+				return away
+			end
+		end
 		if plan then
 			-- Take the planned line; its button press goes out once, plus our guard/counter bits.
 			local bits = bit32.band(input.b, bit32.bor(BRACE_BIT, COUNTER_BIT))
@@ -701,13 +1077,52 @@ local function autoInput(battle)
 				bits = bit32.bor(bits, plan.b)
 				planFirst = false
 			end
-			return guardAttack(sim, slot, bey, { sx = plan.sx, sz = plan.sz, b = bits, t = 0 })
+			return BeyRivals.ridgeSafe(sim, slot, bey, guardAttack(sim, slot, bey, { sx = plan.sx, sz = plan.sz, b = bits, t = 0 }))
 		end
 	else
 		status = "Fighting"
 	end
 
-	return guardAttack(sim, slot, bey, input)
+	return BeyRivals.ridgeSafe(sim, slot, bey, guardAttack(sim, slot, bey, input))
+end
+
+---Never rush off the ridge into a rival while our gauge is high and at least as full as theirs:
+---the rush exit is predictable, and a smash into it took 1.2-1.6 burst (100%) in both 11-05 losses.
+function BeyRivals.ridgeSafe(sim, slot, bey, input)
+	if not (Config.SafeRidge and bey.onRidge) then
+		return input
+	end
+	local mine = burstRatio(bey)
+	if mine < 0.55 then
+		return input
+	end
+	local _, foes = sidesOf(sim, slot)
+	local theirs = 0
+	for _, foe in ipairs(foes) do
+		if not foe.out then
+			theirs = math.max(theirs, burstRatio(foe))
+		end
+	end
+	if theirs > mine + 0.1 then
+		return input
+	end
+	local px, pz = bey.x or 0, bey.z or 0
+	local r = math.sqrt(px * px + pz * pz)
+	local length = math.sqrt(input.sx * input.sx + input.sz * input.sz)
+	if r < 0.01 or length < 0.01 then
+		return input
+	end
+	local inward = (input.sx * -px + input.sz * -pz) / (r * length)
+	if inward <= (Tuning.RUSH_DOT or 0.3) - 0.1 then
+		return input
+	end
+	-- Keep riding around the bowl instead (tangent in the direction we're already going).
+	local tx, tz = -pz / r, px / r
+	if (bey.vx or 0) * tx + (bey.vz or 0) * tz < 0 then
+		tx, tz = -tx, -tz
+	end
+	status = "Safe ridge"
+	return { sx = tx, sz = tz, b = bit32.band(input.b, bit32.bor(BRACE_BIT, COUNTER_BIT)), t = 0 }
 end
 
 local function sampleHook(origin, ...)
@@ -734,6 +1149,12 @@ local function syncAimAssist()
 		localPlayer:SetAttribute("AimAssist", false)
 	else
 		localPlayer:SetAttribute("AimAssist", hadAimAssist)
+	for _, packet in pairs(hookedPackets) do
+		rawset(packet, "Fire", nil)
+	end
+	if originalShow and RivalsResults.show ~= originalShow then
+		RivalsResults.show = originalShow
+	end
 	end
 end
 
@@ -902,7 +1323,151 @@ local function inNewBattle(endedToken)
 	return battle ~= nil and battle.token ~= endedToken and not battle.over
 end
 
----Ask the server for the next battle and keep at it until a *new* one starts.
+-- ============================================================
+--  Requeue: repeat whatever got us into the last battle
+-- ============================================================
+
+local JOIN_FILE = SETTINGS_FOLDER .. "/lastjoin.json"
+local RESULT_WAIT = 20
+
+-- The last way the player (or we) entered a battle: { packet = name, args = {...}, at = os.time() }.
+local lastJoin = nil
+pcall(function()
+	if isfile(JOIN_FILE) then
+		lastJoin = httpService:JSONDecode(readfile(JOIN_FILE))
+	end
+end)
+
+local function rememberJoin(packet, args)
+	lastJoin = { packet = packet, args = args, at = os.time() }
+	pcall(function()
+		if not isfolder(SETTINGS_FOLDER) then
+			makefolder(SETTINGS_FOLDER)
+		end
+		writefile(JOIN_FILE, httpService:JSONEncode(lastJoin))
+	end)
+end
+
+-- Watch the join packets so we know how to get back in: modes (story, raids, KOTH, trainers...),
+-- ranked queue and the Halloween boss fight.
+local hookedPackets = {}
+if Packets then
+	for _, name in ipairs({ "ModePlay", "RankedQueue", "HalloweenAct" }) do
+		local packet = Packets[name]
+		if type(packet) == "table" and rawget(packet, "Fire") == nil then
+			local original = packet.Fire
+			rawset(packet, "Fire", function(self, ...)
+				local args = { ... }
+				local results = table.pack(original(self, ...))
+				local remember = results[1] == true
+				if name == "HalloweenAct" and args[1] ~= "fight" then
+					remember = false
+				end
+				if name == "RankedQueue" and args[1] == "lobby" then
+					remember = false
+				end
+				if remember then
+					rememberJoin(name, args)
+				end
+				return table.unpack(results, 1, results.n)
+			end)
+			hookedPackets[name] = packet
+		end
+	end
+end
+
+-- The results screen says what "play again" means for this battle; keep the latest one.
+local RivalsResults = nil
+pcall(function()
+	setthreadidentity(2)
+	RivalsResults = require(localPlayer.PlayerScripts.UI.RivalsResults)
+end)
+setthreadidentity(8)
+local originalShow = RivalsResults and RivalsResults.show
+local lastResult, lastResultAt = nil, 0
+if originalShow then
+	RivalsResults.show = function(result, ...)
+		lastResult, lastResultAt = result, os.clock()
+		return originalShow(result, ...)
+	end
+end
+
+---Fire a join packet the way the game's own buttons do.
+local function firePacket(name, ...)
+	local packet = Packets and Packets[name]
+	if not packet then
+		return false, "missing packet " .. name
+	end
+	local args = table.pack(...)
+	setthreadidentity(2)
+	local ok, accepted, reason = pcall(function()
+		return packet:Fire(table.unpack(args, 1, args.n))
+	end)
+	setthreadidentity(8)
+	if not ok then
+		return false, tostring(accepted)
+	end
+	return accepted == true, reason
+end
+
+---Work out how to get back into the same kind of battle.
+---@return string label, function attempt -> (accepted, reason, teleports)
+local function nextJoin(result)
+	pcall(function()
+		if isfile(JOIN_FILE) then
+			lastJoin = httpService:JSONDecode(readfile(JOIN_FILE))
+		end
+	end)
+	if type(result) == "table" then
+		if result.mode == "Horseman" then
+			return "Boss fight", function()
+				return firePacket("HalloweenAct", "fight", "")
+			end
+		end
+		if result.again == true then
+			local mode = Config.QueueMode == "Rematch" and "rematch" or "queue"
+			return mode == "queue" and "Queue" or "Rematch", function()
+				return firePacket("ArenaAgain", mode)
+			end
+		end
+		if type(result.nextMode) == "table" and type(result.nextMode.mode) == "string" then
+			local nextMode = result.nextMode
+			return "Next: " .. nextMode.mode, function()
+				return firePacket("ModePlay", nextMode.mode, tostring(nextMode.arg or ""))
+			end
+		end
+		if type(result.eloDelta) == "number" then
+			-- Ranked: the server sends us to the park and queues us again on arrival.
+			return "Ranked", function()
+				local accepted, reason = firePacket("RankedQueue", "again")
+				return accepted, reason, true
+			end
+		end
+	end
+	if lastJoin and lastJoin.packet == "HalloweenAct" then
+		return "Boss fight", function()
+			return firePacket("HalloweenAct", "fight", "")
+		end
+	end
+	if lastJoin and lastJoin.packet == "ModePlay" and type(lastJoin.args) == "table" then
+		local args = lastJoin.args
+		return "Mode: " .. tostring(args[1]), function()
+			return firePacket("ModePlay", tostring(args[1] or ""), tostring(args[2] or ""))
+		end
+	end
+	if lastJoin and lastJoin.packet == "RankedQueue" then
+		return "Ranked", function()
+			local accepted, reason = firePacket("RankedQueue", "again")
+			return accepted, reason, true
+		end
+	end
+	local mode = Config.QueueMode == "Rematch" and "rematch" or "queue"
+	return "Queue", function()
+		return firePacket("ArenaAgain", mode)
+	end
+end
+
+---Ask for the next battle and keep at it until a *new* one starts.
 ---The finished battle stays registered while its results/replay play, so we compare battle ids.
 local queueRun = 0
 local queuedToken = nil
@@ -912,33 +1477,36 @@ local function joinNextBattle(endedToken)
 	end
 	queueRun = queueRun + 1
 	local run = queueRun
-	local mode = Config.QueueMode == "Rematch" and "rematch" or "queue"
-	local giveUp = os.clock() + QUEUE_GIVE_UP
+	local endedAt = os.clock()
 
-	while os.clock() < giveUp and run == queueRun and Config.AutoQueue do
+	-- Give the results screen a moment so we know which kind of battle this was.
+	status = "Waiting for results"
+	repeat
+		task.wait(0.25)
+	until lastResultAt >= endedAt or os.clock() - endedAt > RESULT_WAIT or run ~= queueRun or not Config.AutoQueue or inNewBattle(endedToken)
+	if run ~= queueRun or not Config.AutoQueue or inNewBattle(endedToken) or BeyRivals.detached then
+		return
+	end
+
+	local result = lastResultAt >= endedAt and lastResult or nil
+	local label, attempt = nextJoin(result)
+	local giveUp = os.clock() + QUEUE_GIVE_UP
+	while os.clock() < giveUp and run == queueRun and Config.AutoQueue and not BeyRivals.detached do
 		if inNewBattle(endedToken) then
 			return
 		end
-		setthreadidentity(2)
-		local ok, accepted, reason = pcall(function()
-			return Packets.ArenaAgain:Fire(mode)
-		end)
-		setthreadidentity(8)
-
-		if ok and accepted == true then
-			-- We're in matchmaking now. Re-asking would not help (and the play-again window
-			-- closes meanwhile), so just wait for the match however long it takes.
-			status = mode == "queue" and "In queue, waiting for a match" or "Rematch requested"
+		local accepted, reason, teleports = attempt()
+		if accepted then
+			status = teleports and (label .. ": heading back, requeues on arrival") or (label .. ": waiting for the battle")
 			repeat
 				task.wait(0.5)
-			until inNewBattle(endedToken) or run ~= queueRun or not Config.AutoQueue
+			until inNewBattle(endedToken) or run ~= queueRun or not Config.AutoQueue or BeyRivals.detached
 			return
-		else
-			if ok and type(reason) == "string" and reason ~= "" then
-				status = reason
-			end
-			task.wait(QUEUE_RETRY_EVERY)
 		end
+		if type(reason) == "string" and reason ~= "" then
+			status = label .. ": " .. reason
+		end
+		task.wait(QUEUE_RETRY_EVERY)
 	end
 	if run == queueRun and not inNewBattle(endedToken) then
 		status = "Couldn't join the next battle"
@@ -952,6 +1520,27 @@ local function queueAfter(battle)
 	end
 	queuedToken = battle.token
 	task.spawn(joinNextBattle, battle.token)
+end
+
+-- Survive teleports (ranked and event servers): reload this script in the next server.
+pcall(function()
+	if queue_on_teleport and isfile(SETTINGS_FOLDER .. "/BeyRivals.lua") then
+		queue_on_teleport('getgenv().BeyRivalsTeleported = true if isfile("BeyRivals/BeyRivals.lua") then loadstring(readfile("BeyRivals/BeyRivals.lua"))() end')
+	end
+end)
+
+-- Arriving back from a boss/mode server with auto queue on: go again if no battle is running.
+local arrivedByTeleport = getgenv().BeyRivalsTeleported == true
+getgenv().BeyRivalsTeleported = nil
+if arrivedByTeleport and Config.AutoQueue and lastJoin and lastJoin.packet ~= "RankedQueue" and os.time() - (lastJoin.at or 0) < 600 then
+	task.delay(8, function()
+		if Config.AutoQueue and not currentBattle() and queueRun == 0 then
+			queueRun = queueRun + 1
+			local label, attempt = nextJoin(nil)
+			local accepted, reason = attempt()
+			status = accepted and (label .. ": waiting for the battle") or (label .. ": " .. tostring(reason or "couldn't join"))
+		end
+	end)
 end
 
 -- The server flags the match over well before the client's end screens finish.
@@ -1052,6 +1641,216 @@ table.insert(BeyRivals.connections, runService.Heartbeat:Connect(function()
 	end
 end))
 
+
+local finishMatch
+do
+-- ============================================================
+--  Match log: every battle, round by round, saved to BeyRivals/matches.json
+-- ============================================================
+
+local MATCH_FILE = SETTINGS_FOLDER .. "/matches.json"
+local MATCH_KEEP = 150
+local TIMELINE_KEEP = 220
+
+---JSON-safe copy of a game table (no functions/instances, bounded size).
+local function safeCopy(value, depth)
+	local kind = type(value)
+	if kind == "number" then
+		return value == value and math.abs(value) < 1e12 and math.floor(value * 1000 + 0.5) / 1000 or 0
+	elseif kind == "string" or kind == "boolean" then
+		return value
+	elseif kind ~= "table" or (depth or 0) > 3 then
+		return nil
+	end
+	local out, count = {}, 0
+	for key, inner in pairs(value) do
+		count = count + 1
+		if count > 60 then
+			break
+		end
+		local copied = safeCopy(inner, (depth or 0) + 1)
+		if copied ~= nil then
+			out[tostring(key)] = copied
+		end
+	end
+	return out
+end
+
+local MatchLog = {}
+pcall(function()
+	if isfile(MATCH_FILE) then
+		MatchLog = httpService:JSONDecode(readfile(MATCH_FILE))
+	end
+end)
+if type(MatchLog) ~= "table" then
+	MatchLog = {}
+end
+BeyRivals.matchLog = MatchLog
+
+local function saveMatches()
+	while #MatchLog > MATCH_KEEP do
+		table.remove(MatchLog, 1)
+	end
+	pcall(function()
+		if not isfolder(SETTINGS_FOLDER) then
+			makefolder(SETTINGS_FOLDER)
+		end
+		writefile(MATCH_FILE, httpService:JSONEncode(MatchLog))
+	end)
+end
+
+local function beySnapshot(bey)
+	return {
+		slot = bey.slot,
+		typ = bey.typ,
+		team = bey.team,
+		combo = safeCopy(bey.combo, 1),
+		spin = safeCopy(bey.spin),
+		burst = safeCopy(bey.burst),
+		burstMax = safeCopy(bey.burstMax),
+		out = bey.out,
+		x = safeCopy(bey.x),
+		z = safeCopy(bey.z),
+		guardN = bey.guardN,
+		special = safeCopy(bey.special),
+	}
+end
+
+local LOGGED_EVENTS = {
+	Clash = true, AbilityHit = true, CounterAttack = true, Guard = true, GuardBreak = true, Dodge = true,
+	Smash = true, Finisher = true, Burst = true, RingOut = true, SpinOut = true, Out = true, Awaken = true,
+	Ability = true, Ultimate = true, Rip = true, FirstStrike = true,
+}
+
+-- Everything else is logged, so burst jumps can be tied to whatever caused them.
+local QUIET_EVENTS = {
+	Land = true, Beat = true, Yaw = true, Click = true, Grind = true, Spinner = true, CoreSpin = true,
+	ClashStart = true, ClashEnd = true, AbilityPhase = true, Tip = true, Share = true, Rip = false,
+}
+local currentMatch, currentRound, lastStatus = nil, nil, nil
+
+-- The game swaps in a fresh sim table every frame, so a round is keyed by the round object.
+local function newRound(sim)
+	currentRound = {
+		startedAt = os.time(),
+		stadium = sim.stadium,
+		seed = sim.rng,
+		beys = {},
+		timeline = {},
+		counts = {},
+		trace = {},
+		lastTick = sim.tick,
+	}
+	for slot, bey in pairs(sim.beys) do
+		currentRound.beys[tostring(slot)] = beySnapshot(bey)
+	end
+	table.insert(currentMatch.rounds, currentRound)
+	return currentRound
+end
+
+local function note(round, tick, text)
+	table.insert(round.timeline, { t = tick, e = text })
+	if #round.timeline > TIMELINE_KEEP then
+		table.remove(round.timeline, 1)
+	end
+end
+
+local function openMatch(battle)
+	if currentMatch and currentMatch.token == tostring(battle.token) then
+		return true
+	end
+	if battle.over then
+		return false
+	end
+	currentMatch = {
+		token = tostring(battle.token),
+		at = os.time(),
+		mySlot = battle.mySlot,
+		mode = lastJoin and lastJoin.packet and (lastJoin.packet .. ":" .. tostring(lastJoin.args and lastJoin.args[1] or "")) or "?",
+		auto = Config.AutoBattle,
+		aggression = Config.Aggression,
+		budget = Config.LookaheadMs,
+		rounds = {},
+	}
+	currentRound = nil
+	table.insert(MatchLog, currentMatch)
+	return true
+end
+
+local lastBurst = {}
+
+---Called once per simulated tick from the input hook (every step, so no events are missed).
+logTick = function(battle, sim, slot)
+	if not battle or battle.watch or not openMatch(battle) then
+		return
+	end
+	-- A new round starts the tick counter over; nothing is logged between a round's end and that reset.
+	if not currentRound or sim.tick < (currentRound.lastTick or 0) - 5 then
+		if currentRound and not currentRound.done then
+			currentRound.done = true
+		end
+		newRound(sim)
+		lastBurst = {}
+	elseif currentRound.done then
+		currentRound.lastTick = sim.tick
+		return
+	end
+	local round = currentRound
+	if sim.tick == round.lastTick and #round.trace > 0 then
+		return
+	end
+	round.lastTick = sim.tick
+	if status ~= lastStatus then
+		lastStatus = status
+		note(round, sim.tick, "status:" .. tostring(status))
+	end
+	for _, event in ipairs(sim.events or {}) do
+		if not QUIET_EVENTS[event.kind] then
+			round.counts[event.kind] = (round.counts[event.kind] or 0) + 1
+			local who = event.slot or event.a or event.target
+			note(round, sim.tick, string.format("%s s%s->%s%s", event.kind, tostring(who), tostring(event.target or event.b or ""), event.grade and (" " .. tostring(event.grade)) or ""))
+		end
+	end
+	-- Every jump in a burst gauge, and a compact state trace twice a second.
+	for beySlot, bey in pairs(sim.beys) do
+		local burst = bey.burst or 0
+		local before = lastBurst[beySlot] or 0
+		if burst - before > 0.25 then
+			note(round, sim.tick, string.format("burst s%s +%.2f -> %.0f%%", tostring(beySlot), burst - before, burstRatio(bey) * 100))
+		end
+		lastBurst[beySlot] = burst
+	end
+	if sim.tick % 30 == 0 then
+		local parts = { tostring(sim.tick) }
+		for beySlot, bey in pairs(sim.beys) do
+			table.insert(parts, string.format("s%s sp%.2f b%.0f%% r%.2f", tostring(beySlot), bey.spin or 0, burstRatio(bey) * 100, math.sqrt((bey.x or 0) ^ 2 + (bey.z or 0) ^ 2)))
+		end
+		table.insert(round.trace, table.concat(parts, " "))
+	end
+	if sim.done or sim.finished then
+		round.done = true
+		round.ticks = sim.tick
+		round.loser = safeCopy(sim.loser)
+		round.finish = safeCopy(sim.finish, 1)
+		round.endBeys = {}
+		for beySlot, bey in pairs(sim.beys) do
+			round.endBeys[tostring(beySlot)] = beySnapshot(bey)
+		end
+		saveMatches()
+	end
+end
+
+---Close the match record with the result.
+function finishMatch(battle, won)
+	if currentMatch and battle and currentMatch.token == tostring(battle.token) then
+		currentMatch.won = won
+		currentMatch.winner = battle.winner
+		currentMatch.endedAt = os.time()
+		saveMatches()
+	end
+end
+end
+
 -- Count results, then queue for the next battle if that's switched on.
 if BattleController then
 	table.insert(BeyRivals.connections, BattleController.Ended:Connect(function()
@@ -1065,9 +1864,16 @@ if BattleController then
 			local won = weWon(battle)
 			if won == true then
 				Stats.wins = Stats.wins + 1
+				Lifetime.wins = Lifetime.wins + 1
 			elseif won == false then
 				Stats.losses = Stats.losses + 1
+				Lifetime.losses = Lifetime.losses + 1
 			end
+			Lifetime.battles = Lifetime.battles + 1
+			pcall(function()
+				writefile(STATS_FILE, httpService:JSONEncode(Lifetime))
+			end)
+			finishMatch(battle, won)
 		end
 
 		-- Backup trigger in case the over flag was missed.
@@ -1568,10 +2374,14 @@ toggle(battlePage, "Tilt launch to the ridge", "TiltLaunch")
 heading(battlePage, "Fight")
 slider(battlePage, "Pilot skill", "PilotLevel", 0.5, 1, 0.05, function(v) return math.floor(v * 100 + 0.5) .. "%" end)
 toggle(battlePage, "Look ahead and pick the best line", "Lookahead")
+toggle(battlePage, "Expect human rivals to fight back", "ModelHumans")
+toggle(battlePage, "No ridge rush at high gauge", "SafeRidge")
 slider(battlePage, "Look-ahead budget", "LookaheadMs", 2, 16, 0.5, function(v) return string.format("%.1f ms", v) end)
 toggle(battlePage, "Perfect clash timing", "PerfectClash")
 toggle(battlePage, "Perfect guard before every hit", "AutoGuard")
 toggle(battlePage, "Counter after every perfect guard", "AutoCounter")
+slider(battlePage, "Aggression", "Aggression", 0, 3, 0.1, function(v) return string.format("%.1f", v) end)
+hint(battlePage, "Higher presses the rival and pushes them to the rim harder")
 
 heading(battlePage, "Next battle")
 toggle(battlePage, "Auto queue after each battle", "AutoQueue")
@@ -1580,6 +2390,580 @@ toggle(battlePage, "Auto skip replay", "AutoSkipReplay")
 toggle(battlePage, "Stay active when Roblox is unfocused", "StayActive")
 hint(battlePage, "Keeps going with Roblox in the background")
 
+
+
+local stopTraitRolling
+do
+-- ============================================================
+--  Trait auto roll: keeps rolling a slot (tokens, then coins) until a wanted trait lands
+-- ============================================================
+
+local Catalog = filtergc("table", { Keys = { "trait", "traitSlots", "TRAIT_ROLL_BP" } }, true)
+local TRAIT_ROLL_GAP = 0.3
+
+local cachedData, cachedAt = nil, 0
+local function playerData()
+	if cachedData and type(cachedData.Items) == "table" and os.clock() - cachedAt < 5 then
+		return cachedData
+	end
+	cachedData, cachedAt = filtergc("table", { Keys = { "Items", "Tokens" } }, true), os.clock()
+	return cachedData
+end
+
+local function traitName(id)
+	local trait = Catalog and Catalog.trait(id)
+	return trait and trait.name or tostring(id)
+end
+
+local function itemName(item)
+	local part = Catalog and Catalog.part and Catalog.part(item.kind, item.id)
+	local name = part and part.display or item.id
+	return string.format("%s %s%s", tostring(name), string.rep("*", item.star or 0), item.kind and (" (" .. item.kind .. ")") or "")
+end
+
+local function slotsOf(item)
+	local ok, slots = pcall(Catalog.traitSlots, item.kind, item.id, item.star)
+	return ok and type(slots) == "number" and slots or 0
+end
+
+---Currently equipped parts that can hold traits (layer, disc, driver): { uid, item }.
+local function traitItems()
+	local list = {}
+	local data = playerData()
+	if not (data and Catalog) then
+		return list
+	end
+	local equipped = {}
+	for _, uid in pairs(type(data.Equip) == "table" and data.Equip or {}) do
+		equipped[uid] = true
+	end
+	for uid, item in pairs(data.Items) do
+		if equipped[uid] and type(item) == "table" and slotsOf(item) > 0 then
+			table.insert(list, { uid = uid, item = item })
+		end
+	end
+	table.sort(list, function(a, b)
+		if a.item.kind ~= b.item.kind then
+			return tostring(a.item.kind) < tostring(b.item.kind)
+		end
+		if (a.item.star or 0) ~= (b.item.star or 0) then
+			return (a.item.star or 0) > (b.item.star or 0)
+		end
+		return itemName(a.item) < itemName(b.item)
+	end)
+	return list
+end
+
+local traitStatus = "Pick an item, a slot and the traits you want"
+local rolling = false
+stopTraitRolling = function()
+	rolling = false
+end
+local rollRun = 0
+
+local function wanted(id)
+	return type(id) == "string" and Config["TraitWant_" .. id] == true
+end
+
+local function stopRolling(text)
+	rolling = false
+	traitStatus = text
+end
+
+local function startRolling()
+	if rolling then
+		stopRolling("Stopped")
+		return
+	end
+	if not (Catalog and Packets and Packets.RivalsTrait) then
+		traitStatus = "Trait modules not found"
+		return
+	end
+	rolling = true
+	rollRun = rollRun + 1
+	local run = rollRun
+	task.spawn(function()
+		local rolls, coinRolls = 0, 0
+		while rolling and run == rollRun do
+			local data = playerData()
+			local item = data and data.Items[Config.TraitItem]
+			if not item then
+				return stopRolling("Pick an item first")
+			end
+			local slots = slotsOf(item)
+			if slots <= 0 then
+				return stopRolling("That item has no trait slots")
+			end
+			local slot = math.clamp(math.floor(Config.TraitSlot), 1, slots)
+			local current = item.traits and item.traits[slot]
+			if wanted(current) then
+				return stopRolling(string.format("Done: slot %d is %s (%d rolls)", slot, traitName(current), rolls))
+			end
+			if Config.TraitMaxRolls > 0 and rolls >= Config.TraitMaxRolls then
+				return stopRolling(string.format("Stopped after %d rolls (limit)", rolls))
+			end
+			local useCoins = (data.Tokens or 0) <= 0
+			if useCoins and not Config.TraitUseCoins then
+				return stopRolling(string.format("Out of tokens after %d rolls", rolls))
+			end
+
+			setthreadidentity(2)
+			local ok, accepted, message, rolled = pcall(function()
+				return Packets.RivalsTrait:Fire(Config.TraitItem, slot, useCoins)
+			end)
+			setthreadidentity(8)
+
+			if not ok then
+				task.wait(1)
+			elseif accepted ~= true then
+				local reason = (type(message) == "string" and message ~= "") and message or tostring(rolled)
+				return stopRolling(string.format("Stopped: %s (%d rolls)", reason, rolls))
+			else
+				rolls = rolls + 1
+				if useCoins then
+					coinRolls = coinRolls + 1
+				end
+				traitStatus = string.format("Roll %d%s: %s", rolls, useCoins and " (coins)" or "", traitName(rolled))
+				if wanted(rolled) then
+					return stopRolling(string.format("Got %s on slot %d after %d rolls (%d with coins)", traitName(rolled), slot, rolls, coinRolls))
+				end
+			end
+			task.wait(TRAIT_ROLL_GAP)
+		end
+	end)
+end
+
+-- Traits page.
+local traitsPage = makePage("Traits")
+
+---Row that shows a value and cycles through options on click (right click goes back).
+local function cycler(page, text, getOptions, getLabel, onPick)
+	local row = rowBase(page, 34, true)
+	rowLabel(row, text)
+	local value = create("TextLabel", {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -8, 0.5, 0),
+		Size = UDim2.fromOffset(190, 20),
+		BackgroundTransparency = 1,
+		FontFace = BODY_BOLD,
+		TextColor3 = GOLD,
+		TextSize = 14,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		TextXAlignment = Enum.TextXAlignment.Right,
+		Parent = row,
+	})
+	local function refresh()
+		value.Text = getLabel()
+	end
+	local function step(direction)
+		local options = getOptions()
+		if #options == 0 then
+			return refresh()
+		end
+		local index = 0
+		for i, option in ipairs(options) do
+			if option.current then
+				index = i
+			end
+		end
+		index = (index - 1 + direction) % #options + 1
+		onPick(options[index])
+		refresh()
+	end
+	row.MouseButton1Click:Connect(function()
+		step(1)
+	end)
+	row.MouseButton2Click:Connect(function()
+		step(-1)
+	end)
+	refresh()
+	return refresh
+end
+
+heading(traitsPage, "Item")
+local refreshSlot
+local refreshItem = cycler(traitsPage, "Equipped part (click to change)", function()
+	local options = {}
+	for _, entry in ipairs(traitItems()) do
+		table.insert(options, { uid = entry.uid, current = entry.uid == Config.TraitItem })
+	end
+	return options
+end, function()
+	local data = playerData()
+	local item = data and data.Items[Config.TraitItem]
+	return item and itemName(item) or "None"
+end, function(option)
+	Config.TraitItem = option.uid
+	Config.TraitSlot = 1
+	if refreshSlot then
+		refreshSlot()
+	end
+end)
+refreshSlot = cycler(traitsPage, "Slot", function()
+	local data = playerData()
+	local item = data and data.Items[Config.TraitItem]
+	local options = {}
+	for slot = 1, item and slotsOf(item) or 0 do
+		table.insert(options, { slot = slot, current = slot == Config.TraitSlot })
+	end
+	return options
+end, function()
+	local data = playerData()
+	local item = data and data.Items[Config.TraitItem]
+	if not item then
+		return "-"
+	end
+	local current = item.traits and item.traits[Config.TraitSlot]
+	return string.format("%d of %d: %s", Config.TraitSlot, slotsOf(item), (current and current ~= "") and traitName(current) or "Empty")
+end, function(option)
+	Config.TraitSlot = option.slot
+end)
+
+heading(traitsPage, "Stop when the slot rolls")
+for _, id in ipairs({ "Apex", "Balanced", "Sharp3", "Sturdy3", "Enduring3", "Swift2", "Sharp2", "Sturdy2", "Enduring2", "Swift1", "Sharp1", "Sturdy1", "Enduring1" }) do
+	local trait = Catalog and Catalog.trait(id)
+	local label = trait and string.format("%s  (%s)", trait.name, trait.text) or id
+	toggle(traitsPage, label, "TraitWant_" .. id)
+end
+
+heading(traitsPage, "Roll")
+toggle(traitsPage, "Use coins once tokens run out", "TraitUseCoins")
+slider(traitsPage, "Stop after (0 = no limit)", "TraitMaxRolls", 0, 500, 5, function(v) return v == 0 and "No limit" or (tostring(v) .. " rolls") end)
+local rollRow = rowBase(traitsPage, 40, true)
+local rollLabel = create("TextLabel", {
+	Size = UDim2.fromScale(1, 1),
+	BackgroundTransparency = 1,
+	FontFace = BODY_BOLD,
+	Text = "Start auto roll",
+	TextColor3 = GOLD,
+	TextSize = 16,
+	Parent = rollRow,
+})
+local rollStatusLabel = create("TextLabel", {
+	Size = UDim2.new(1, 0, 0, 34),
+	BackgroundTransparency = 1,
+	FontFace = BODY_FONT,
+	Text = traitStatus,
+	TextColor3 = MUTED,
+	TextSize = 13,
+	TextWrapped = true,
+	LayoutOrder = nextOrder(),
+	Parent = traitsPage,
+})
+rollRow.MouseButton1Click:Connect(startRolling)
+table.insert(BeyRivals.connections, runService.Heartbeat:Connect(function()
+	rollLabel.Text = rolling and "Stop auto roll" or "Start auto roll"
+	rollStatusLabel.Text = traitStatus
+end))
+do
+	local elapsed = 0
+	table.insert(BeyRivals.connections, runService.Heartbeat:Connect(function(dt)
+		elapsed = elapsed + dt
+		if elapsed > 0.5 then
+			elapsed = 0
+			refreshItem()
+			refreshSlot()
+		end
+	end))
+end
+
+end
+
+local stopAllRollers
+do
+	-- ============================================================
+	--  Rolls: soul draw, summons, surnames, daily freebies
+	-- ============================================================
+
+	local ROLL_GAP = 0.6
+	local Catalog = filtergc("table", { Keys = { "trait", "traitSlots", "TRAIT_ROLL_BP" } }, true)
+	local Halloween, Names = nil, nil
+	pcall(function()
+		setthreadidentity(2)
+		Halloween = require(game:GetService("ReplicatedStorage").Rivals.Halloween)
+		Names = require(game:GetService("ReplicatedStorage").Rivals.Names)
+	end)
+	setthreadidentity(8)
+
+	local PART_RARITY = { "Common", "Rare", "Epic", "Legendary", "Mythic", "Divine" }
+	local function rarityRank(list, name)
+		for index, value in ipairs(list) do
+			if value == name then
+				return index
+			end
+		end
+		return 0
+	end
+
+	local cachedData, cachedAt = nil, 0
+	local function data()
+		if cachedData and type(cachedData.Items) == "table" and os.clock() - cachedAt < 5 then
+			return cachedData
+		end
+		cachedData, cachedAt = filtergc("table", { Keys = { "Items", "Tokens" } }, true), os.clock()
+		return cachedData
+	end
+
+	local function fire(name, ...)
+		local packet = Packets and Packets[name]
+		if not packet then
+			return false, "missing " .. name
+		end
+		local args = table.pack(...)
+		setthreadidentity(2)
+		local results = table.pack(pcall(function()
+			return packet:Fire(table.unpack(args, 1, args.n))
+		end))
+		setthreadidentity(8)
+		if not results[1] then
+			return false, tostring(results[2])
+		end
+		return results[2] == true, results[3], results[4]
+	end
+
+	local function decode(text)
+		local ok, value = pcall(httpService.JSONDecode, httpService, tostring(text or ""))
+		return ok and value or nil
+	end
+
+	local rollers = {}
+	stopAllRollers = function()
+		for _, roller in ipairs(rollers) do
+			roller.running = false
+		end
+	end
+
+	---A start/stop button with a status line; `step(roller)` runs once per roll and returns
+	---false (with roller.status set) to stop.
+	local function roller(page, label, step)
+		local state = { running = false, status = "Idle", count = 0 }
+		table.insert(rollers, state)
+		local row = rowBase(page, 38, true)
+		local text = create("TextLabel", {
+			Size = UDim2.fromScale(1, 1),
+			BackgroundTransparency = 1,
+			FontFace = BODY_BOLD,
+			Text = "Start " .. label,
+			TextColor3 = GOLD,
+			TextSize = 15,
+			Parent = row,
+		})
+		local statusLine = create("TextLabel", {
+			Size = UDim2.new(1, 0, 0, 30),
+			BackgroundTransparency = 1,
+			FontFace = BODY_FONT,
+			Text = state.status,
+			TextColor3 = MUTED,
+			TextSize = 13,
+			TextWrapped = true,
+			LayoutOrder = nextOrder(),
+			Parent = page,
+		})
+		row.MouseButton1Click:Connect(function()
+			if state.running then
+				state.running = false
+				state.status = string.format("Stopped after %d", state.count)
+				return
+			end
+			state.running, state.count = true, 0
+			state.status = "Starting..."
+			task.spawn(function()
+				while state.running do
+					local ok, keepGoing = pcall(step, state)
+					if not ok then
+						state.status = "Error: " .. tostring(keepGoing)
+						break
+					end
+					if not keepGoing then
+						break
+					end
+					task.wait(ROLL_GAP)
+				end
+				state.running = false
+			end)
+		end)
+		table.insert(BeyRivals.connections, runService.Heartbeat:Connect(function()
+			text.Text = (state.running and "Stop " or "Start ") .. label
+			statusLine.Text = state.status
+		end))
+		return state
+	end
+
+	local rollsPage = makePage("Rolls")
+
+	-- Halloween soul draw.
+	if Halloween and Halloween.POOL then
+		heading(rollsPage, "Halloween soul draw")
+		segmented(rollsPage, "Draw size", "DrawSize", { "x1", "x10" })
+		slider(rollsPage, "Keep at least (tickets)", "DrawKeep", 0, 1500, 10, function(v) return tostring(v) end)
+		slider(rollsPage, "Stop after (0 = no limit)", "DrawMax", 0, 300, 5, function(v) return v == 0 and "No limit" or (v .. " draws") end)
+		hint(rollsPage, "Stops early when any ticked prize drops:")
+		for _, prize in ipairs(Halloween.POOL) do
+			if prize.rarity == "Epic" or prize.rarity == "Legendary" or prize.rarity == "Divine" then
+				toggle(rollsPage, string.format("%s  (%s)", prize.name, prize.rarity), "DrawWant_" .. prize.id)
+			end
+		end
+		roller(rollsPage, "soul draw", function(state)
+			local save = data() and data().Event and data().Event[Halloween.SAVE]
+			local tickets = type(save) == "table" and tonumber(save.t) or 0
+			local size = Config.DrawSize == "x10" and 10 or 1
+			if tickets - size < Config.DrawKeep then
+				state.status = string.format("Done: %d tickets left (keeping %d). %d draws.", tickets, Config.DrawKeep, state.count)
+				return false
+			end
+			if Config.DrawMax > 0 and state.count >= Config.DrawMax then
+				state.status = string.format("Stopped at the %d draw limit", state.count)
+				return false
+			end
+			local accepted, message, payload = fire("HalloweenAct", "draw", tostring(size))
+			if not accepted then
+				state.status = "Stopped: " .. tostring(message ~= "" and message or "draw refused")
+				return false
+			end
+			state.count = state.count + size
+			cachedAt = 0
+			local result = decode(payload)
+			local got = {}
+			for _, row in ipairs(type(result) == "table" and result.rows or {}) do
+				local id = type(row) == "table" and (row.id or row.prize) or row
+				local prize = Halloween.prize and Halloween.prize(id)
+				local name = type(prize) == "table" and prize.name or tostring(id)
+				if Config["DrawWant_" .. tostring(id)] then
+					state.status = string.format("Got %s after %d draws!", name, state.count)
+					return false
+				end
+				table.insert(got, name)
+			end
+			state.status = string.format("%d draws, %d tickets left. Last: %s", state.count, tickets - size, table.concat(got, ", "):sub(1, 90))
+			return true
+		end)
+	end
+
+	-- Summons.
+	heading(rollsPage, "Summons")
+	segmented(rollsPage, "Pull size", "PullSize", { "x1", "x10" })
+	segmented(rollsPage, "Stop at", "PullStop", { "Legendary", "Mythic", "Divine" })
+	toggle(rollsPage, "Use summon tickets when I have them", "PullTickets")
+	slider(rollsPage, "Stop after (0 = no limit)", "PullMax", 0, 500, 10, function(v) return v == 0 and "No limit" or (v .. " pulls") end)
+	roller(rollsPage, "summons", function(state)
+		if Config.PullMax > 0 and state.count >= Config.PullMax then
+			state.status = string.format("Stopped at the %d pull limit", state.count)
+			return false
+		end
+		local size = Config.PullSize == "x10" and 10 or 1
+		local tickets = tonumber(data() and data().Tickets) or 0
+		local accepted, message, payload = fire("RivalsPull", "std", size, Config.PullTickets and tickets >= size)
+		if not accepted then
+			state.status = "Stopped: " .. tostring(message ~= "" and message or "pull refused")
+			return false
+		end
+		state.count = state.count + size
+		cachedAt = 0
+		local want = rarityRank(PART_RARITY, Config.PullStop)
+		local best, bestRank = nil, 0
+		for _, entry in ipairs(decode(payload) or {}) do
+			if type(entry) == "table" then
+				local rarity = entry.rarity or (Catalog and Catalog.RARITY and Catalog.RARITY[entry.kind] and Catalog.RARITY[entry.kind][entry.id])
+				local rank = rarityRank(PART_RARITY, rarity)
+				if rank > bestRank then
+					best, bestRank = string.format("%s %s (%s)", tostring(rarity), tostring(entry.id), tostring(entry.kind)), rank
+				end
+			end
+		end
+		if bestRank >= want then
+			state.status = string.format("Got %s after %d pulls!", best, state.count)
+			return false
+		end
+		state.status = string.format("%d pulls. Best last pull: %s", state.count, tostring(best))
+		return true
+	end)
+
+	-- Surnames.
+	if Names then
+		heading(rollsPage, "Surnames")
+		segmented(rollsPage, "Stop at", "NameStop", { "Epic", "Legendary", "Mythic" })
+		toggle(rollsPage, "Use lucky spins", "NameLucky")
+		slider(rollsPage, "Stop after (0 = no limit)", "NameMax", 0, 300, 5, function(v) return v == 0 and "No limit" or (v .. " spins") end)
+		hint(rollsPage, "Each spin replaces the surname in your active slot")
+		roller(rollsPage, "surname spins", function(state)
+			local nameData = data() and data().Name
+			local want = Names.rarity(Config.NameStop)
+			local wantOrder = type(want) == "table" and want.order or 5
+			local current = type(nameData) == "table" and nameData.id ~= "" and Names.get(nameData.id)
+			if state.count == 0 and current and Names.rarity(current.rarity).order >= wantOrder then
+				state.status = string.format("Your active surname %s is already %s. Switch to an empty slot first.", Names.display(current.id), current.rarity)
+				return false
+			end
+			if Config.NameMax > 0 and state.count >= Config.NameMax then
+				state.status = string.format("Stopped at the %d spin limit", state.count)
+				return false
+			end
+			local lucky = Config.NameLucky and type(nameData) == "table" and (nameData.lucky or 0) > 0
+			local accepted, message, payload = fire("RivalsNameRoll", lucky == true)
+			if not accepted then
+				state.status = "Stopped: " .. tostring(message ~= "" and message or "spin refused")
+				return false
+			end
+			state.count = state.count + 1
+			cachedAt = 0
+			local result = decode(payload)
+			local rolled = type(result) == "table" and Names.get(result.id)
+			if rolled then
+				local order = Names.rarity(rolled.rarity).order
+				if order >= wantOrder then
+					state.status = string.format("Got %s (%s) after %d spins!", Names.display(rolled.id), rolled.rarity, state.count)
+					return false
+				end
+				state.status = string.format("%d spins. Last: %s (%s)", state.count, Names.display(rolled.id), rolled.rarity)
+			else
+				state.status = string.format("%d spins", state.count)
+			end
+			return true
+		end)
+	end
+
+	-- Freebies.
+	heading(rollsPage, "Free stuff")
+	local freeState = { status = "Claims the daily gift, level rewards, premium rewards and the Halloween treat" }
+	local freeRow = rowBase(rollsPage, 38, true)
+	create("TextLabel", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		FontFace = BODY_BOLD,
+		Text = "Claim everything free",
+		TextColor3 = GOLD,
+		TextSize = 15,
+		Parent = freeRow,
+	})
+	local freeLine = create("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 44),
+		BackgroundTransparency = 1,
+		FontFace = BODY_FONT,
+		Text = freeState.status,
+		TextColor3 = MUTED,
+		TextSize = 13,
+		TextWrapped = true,
+		LayoutOrder = nextOrder(),
+		Parent = rollsPage,
+	})
+	freeRow.MouseButton1Click:Connect(function()
+		task.spawn(function()
+			local lines = {}
+			local function try(label, name, ...)
+				local accepted, message = fire(name, ...)
+				table.insert(lines, label .. ": " .. (accepted and "claimed" or tostring(message ~= "" and message or "nothing")))
+				freeLine.Text = table.concat(lines, "  |  ")
+				task.wait(0.5)
+			end
+			try("Gift", "RivalsGift")
+			try("Levels", "RivalsClaim", "levels", "")
+			try("Premium", "RivalsClaim", "premiums", "")
+			if Halloween then
+				try("Treat", "HalloweenAct", "treat", "")
+			end
+		end)
+	end)
+end
 
 -- Stats page.
 local statsPage = makePage("Stats")
@@ -1651,7 +3035,9 @@ local unloadButton = create("TextButton", {
 }, { corner(6) })
 
 makeTab("Battle", 0)
-makeTab("Stats", 72)
+makeTab("Traits", 72)
+makeTab("Rolls", 140)
+makeTab("Stats", 200)
 screenGui.Parent = guiParent
 task.defer(selectTab, "Battle")
 
@@ -1712,7 +3098,14 @@ end))
 
 ---Undo every hook and connection.
 function BeyRivals.detach()
+	BeyRivals.detached = true
 	saveSettings()
+	if stopTraitRolling then
+		stopTraitRolling()
+	end
+	if stopAllRollers then
+		stopAllRollers()
+	end
 	if BattleInput.sample == sampleHook then
 		BattleInput.sample = originalSample
 	end
@@ -1732,4 +3125,10 @@ unloadButton.MouseButton1Click:Connect(BeyRivals.detach)
 
 shared.BeyRivals = BeyRivals
 getgenv().BeyRivalsConfig = Config
-print("[Bey Rivals] Loaded. Right Ctrl toggles the panel.")
+
+-- If another copy took over (or this one somehow wasn't replaced cleanly), step aside.
+table.insert(BeyRivals.connections, runService.Heartbeat:Connect(function()
+	if shared.BeyRivals ~= BeyRivals then
+		BeyRivals.detach()
+	end
+end))
