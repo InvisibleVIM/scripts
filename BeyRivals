@@ -3,7 +3,7 @@ local loadToken = {}
 getgenv().BeyRivalsLoadToken = loadToken
 
 -- Give the game time to load its battle modules (needed when auto-executed on join).
-task.wait(5)
+task.wait(7.5)
 if getgenv().BeyRivalsLoadToken ~= loadToken then
 	return
 end
