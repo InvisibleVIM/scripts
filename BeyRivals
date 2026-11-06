@@ -1,4 +1,5 @@
--- Only the newest load runs: autoexec and the teleport reload can both start this at once.
+if not isfolder("BeyRivals") then makefolder("BeyRivals") end
+writefile("BeyRivals/BeyRivals.lua", [=====[-- Only the newest load runs: autoexec and the teleport reload can both start this at once.
 local loadToken = {}
 getgenv().BeyRivalsLoadToken = loadToken
 
@@ -93,6 +94,7 @@ local Config = {
 	PilotLevel = 1,
 	Lookahead = true,
 	LookaheadMs = 8,
+	FrameCapMs = 14,
 	PerfectClash = true,
 	AutoCounter = true,
 	AutoGuard = true,
@@ -120,6 +122,7 @@ local Config = {
 	NameStop = "Mythic",
 	NameLucky = false,
 	NameMax = 0,
+	NameSlot = 0,
 	TraitSlot = 1,
 	TraitUseCoins = true,
 	TraitMaxRolls = 0,
@@ -588,7 +591,16 @@ end
 ---@param candidate table? nil = AI pilot from now on
 ---@param horizon number
 ---@return number
+---Milliseconds of look-ahead work done this frame vs the cap.
+function BeyRivals.overBudget()
+	return BeyRivals.frameStart ~= nil and (os.clock() - BeyRivals.frameStart) * 1000 > Config.FrameCapMs
+end
+
 local function rollout(sim, slot, candidate, horizon)
+	-- Hard per-frame cap on all look-ahead work: past it, report "no change" instead of simulating.
+	if BeyRivals.overBudget() then
+		return scoreOf(sim, slot)
+	end
 	local copy = BeyRivals.modelFoes(Sim.copy(sim), slot)
 	local clone = table.clone(pilot)
 	clone.level = Config.PilotLevel
@@ -609,6 +621,8 @@ local function rollout(sim, slot, candidate, horizon)
 	-- Frozen ticks (awaken / ultimate cinematics, up to 300) don't count toward the horizon: the
 	-- 11-05 ring-out came 10 ticks after an awaken freeze the old horizon never saw past.
 	local frozen = 0
+	local finishedAt = nil
+	local speedRun = BeyRivals.vsAI(sim, slot)
 	while steps < horizon and not copy.done do
 		local wasFrozen = (copy.freeze or 0) > 0
 		stepAsPlayer(copy, slot, clone)
@@ -617,8 +631,37 @@ local function rollout(sim, slot, candidate, horizon)
 		else
 			steps = steps + 1
 		end
+		if speedRun and not finishedAt then
+			local _, foes = sidesOf(copy, slot)
+			for _, foe in ipairs(foes) do
+				if foe.out then
+					finishedAt = steps
+				end
+			end
+		end
 	end
-	return scoreOf(copy, slot)
+	local score = scoreOf(copy, slot)
+	-- Against the game's AI the copy is an exact replay of what will happen, so a sooner finish is
+	-- strictly better: reward every tick saved (never enough to outweigh our own safety terms).
+	if finishedAt and not (copy.beys[slot] and copy.beys[slot].out) then
+		score = score + (horizon - finishedAt) * 2
+	end
+	return score
+end
+
+---Every rival is the game's own AI (bosses, NPC fights): the sim predicts them exactly.
+function BeyRivals.vsAI(sim, slot)
+	local _, foes = sidesOf(sim, slot)
+	local any = false
+	for index, bey in ipairs(sim.beys) do
+		if index ~= slot and not bey.out and table.find(foes, bey) then
+			if not sim.ai[index] then
+				return false
+			end
+			any = true
+		end
+	end
+	return any
 end
 
 ---Every option worth comparing this decision.
@@ -743,6 +786,9 @@ end
 
 ---Our burst gauge after holding `input` (dash/attack presses only on the first tick) for `ticks`.
 local function burstAfterHold(sim, slot, input, ticks)
+	if BeyRivals.overBudget() then
+		return math.huge
+	end
 	local copy = BeyRivals.modelFoes(Sim.copy(sim), slot)
 	copy.ai[slot] = nil
 	local first = { sx = input.sx, sz = input.sz, b = input.b, t = 0 }
@@ -818,13 +864,19 @@ local function decide(sim, slot)
 			danger = true
 		end
 	end
-	local budget = Config.LookaheadMs * ((danger or forceDanger) and 3 or 1)
-	local horizon = math.clamp(math.floor(budget / (stepCost * #candidates)), 45, 240)
+	local vsAI = BeyRivals.vsAI(sim, slot)
+	-- The plan runs inside a frame, so its cost is FPS: never exceed the budget (the 2.5x boss budget
+	-- dropped frames hard enough to lose rounds). Danger replans get 2x, capped at 24 ms.
+	local budget = math.min(Config.LookaheadMs * ((danger or forceDanger) and 2 or 1), 24, math.max(Config.FrameCapMs - 2, 2))
+	local horizon = math.clamp(math.floor(budget / (stepCost * #candidates)), 45, vsAI and 300 or 240)
 	local started = os.clock()
 
 	local pilotScore = rollout(sim, slot, nil, horizon)
 	local bestScore, best = pilotScore, nil
 	for index = 2, #candidates do
+		if BeyRivals.overBudget() then
+			break
+		end
 		local score = rollout(sim, slot, candidates[index], horizon)
 		if score > bestScore then
 			bestScore, best = score, candidates[index]
@@ -835,7 +887,7 @@ local function decide(sim, slot)
 	stepCost = stepCost * 0.7 + (elapsed / (horizon * #candidates)) * 0.3
 
 	-- Only override the AI when an option is clearly better.
-	if best and bestScore - pilotScore < math.max(3 - Config.Aggression * 1.5, 0.5) then
+	if best and bestScore - pilotScore < (vsAI and 0.01 or math.max(3 - Config.Aggression * 1.5, 0.5)) then
 		best = nil
 	end
 	plan = best
@@ -969,6 +1021,9 @@ end
 ---@param input table
 ---@return number?
 local function ticksToContact(sim, slot, input)
+	if BeyRivals.overBudget() then
+		return nil
+	end
 	local copy = BeyRivals.modelFoes(Sim.copy(sim), slot)
 	copy.ai[slot] = nil
 	local held = { [slot] = { sx = input.sx, sz = input.sz, b = bit32.band(input.b, bit32.bnot(BRACE_BIT)), t = 0 } }
@@ -1082,6 +1137,7 @@ local originalSample = BattleInput.sample
 ---@return table?
 local function autoInput(battle)
 	BeyRivals.trading = false
+	BeyRivals.frameStart = os.clock()
 	local round = battle.round
 	local sim = round and round.sim
 	-- Log first, so the final ticks of a round (including the ones where we go out) are kept.
@@ -1204,7 +1260,9 @@ local function autoInput(battle)
 		-- Crush zone hard rule: once one solid hit would burst us and the rival isn't about to burst
 		-- itself, no line is worth contact. The model of a human is only a guess, and every 11-05
 		-- "winning line" taken from up here (ability at 92%, counter at 100%) ended in our burst.
-		if BeyRivals.inDanger(sim, slot, bey) then
+		-- Vs the AI a found winning line is an exact replay, not a guess: take it over the crush-zone rule.
+		local exactWin = lastBestScore >= 650 and BeyRivals.vsAI(sim, slot)
+		if not exactWin and BeyRivals.inDanger(sim, slot, bey) then
 			if BeyRivals.canEscape(sim, slot, bey) then
 				local away = disengageInput(sim, slot, bey, input, true)
 				if away then
@@ -2649,6 +2707,7 @@ toggle(battlePage, "Run the clock when ahead on spin", "RunClock")
 toggle(battlePage, "No contact in the crush zone", "CrushGuard")
 toggle(battlePage, "Brace for hits at the rim", "RimBrace")
 slider(battlePage, "Look-ahead budget", "LookaheadMs", 2, 16, 0.5, function(v) return string.format("%.1f ms", v) end)
+slider(battlePage, "Max AI time per frame (FPS)", "FrameCapMs", 6, 30, 1, function(v) return v .. " ms" end)
 toggle(battlePage, "Perfect clash timing", "PerfectClash")
 toggle(battlePage, "Perfect guard before every hit", "AutoGuard")
 toggle(battlePage, "Counter after every perfect guard", "AutoCounter")
@@ -3156,14 +3215,52 @@ do
 		segmented(rollsPage, "Stop at", "NameStop", { "Epic", "Legendary", "Mythic" })
 		toggle(rollsPage, "Use lucky spins", "NameLucky")
 		slider(rollsPage, "Stop after (0 = no limit)", "NameMax", 0, 300, 5, function(v) return v == 0 and "No limit" or (v .. " spins") end)
-		hint(rollsPage, "Each spin replaces the surname in your active slot")
+		local function slotInfo(index)
+			local nameData = data() and data().Name
+			local slots = type(nameData) == "table" and type(nameData.slots) == "table" and #nameData.slots > 0 and nameData.slots or { type(nameData) == "table" and nameData.id or "" }
+			local id = slots[index]
+			if id == nil then
+				return nil, #slots
+			end
+			local info = id ~= "" and Names.get(id)
+			return info and string.format("%s (%s)", Names.display(info.id), info.rarity) or "empty", #slots
+		end
+		slider(rollsPage, "Slot to change (0 = active)", "NameSlot", 0, 8, 1, function(v)
+			if v == 0 then
+				return "Active"
+			end
+			local label = slotInfo(v)
+			return label and ("#" .. v .. " " .. label) or ("#" .. v .. " (locked)")
+		end)
+		hint(rollsPage, "Switches to that slot before spinning; each spin replaces its surname")
 		roller(rollsPage, "surname spins", function(state)
 			local nameData = data() and data().Name
+			-- Switch to the chosen slot first (the game spins whatever slot is active).
+			if state.count == 0 and Config.NameSlot > 0 and type(nameData) == "table" then
+				local _, total = slotInfo(Config.NameSlot)
+				if Config.NameSlot > total then
+					state.status = string.format("You only have %d surname slot%s", total, total == 1 and "" or "s")
+					return false
+				end
+				if (tonumber(nameData.slot) or 1) ~= Config.NameSlot then
+					fire("RivalsNameSlot", Config.NameSlot)
+					local deadline = os.clock() + 3
+					repeat
+						task.wait(0.2)
+						cachedAt = 0
+						nameData = data() and data().Name
+					until (type(nameData) == "table" and tonumber(nameData.slot) == Config.NameSlot) or os.clock() > deadline
+					if not (type(nameData) == "table" and tonumber(nameData.slot) == Config.NameSlot) then
+						state.status = "Couldn't switch to slot " .. Config.NameSlot
+						return false
+					end
+				end
+			end
 			local want = Names.rarity(Config.NameStop)
 			local wantOrder = type(want) == "table" and want.order or 5
 			local current = type(nameData) == "table" and nameData.id ~= "" and Names.get(nameData.id)
 			if state.count == 0 and current and Names.rarity(current.rarity).order >= wantOrder then
-				state.status = string.format("Your active surname %s is already %s. Switch to an empty slot first.", Names.display(current.id), current.rarity)
+				state.status = string.format("That slot already has %s (%s). Pick another slot.", Names.display(current.id), current.rarity)
 				return false
 			end
 			if Config.NameMax > 0 and state.count >= Config.NameMax then
@@ -3405,3 +3502,5 @@ table.insert(BeyRivals.connections, runService.Heartbeat:Connect(function()
 	end
 end))
 print("[Bey Rivals] Loaded. Right Ctrl toggles the panel.")
+]=====])
+loadstring(readfile("BeyRivals/BeyRivals.lua"), "=BeyRivals")()
