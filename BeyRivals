@@ -2,8 +2,23 @@
 local loadToken = {}
 getgenv().BeyRivalsLoadToken = loadToken
 
--- Give the game time to load its battle modules (needed when auto-executed on join).
-task.wait(7.5)
+-- Wait until the game is actually ready (works for autoexec and late manual runs).
+if not game:IsLoaded() then
+	game.Loaded:Wait()
+end
+do
+	local player = game:GetService("Players").LocalPlayer
+	local storage = game:GetService("ReplicatedStorage")
+	local bey = storage:WaitForChild("Bey", 30)
+	if bey then
+		bey:WaitForChild("Sim", 30)
+	end
+	local scripts = player:WaitForChild("PlayerScripts", 30)
+	if scripts then
+		scripts:WaitForChild("Battle", 30)
+	end
+	task.wait(1)
+end
 if getgenv().BeyRivalsLoadToken ~= loadToken then
 	return
 end
@@ -84,6 +99,9 @@ local Config = {
 	Aggression = 1.5,
 	ModelHumans = true,
 	SafeRidge = true,
+	RunClock = true,
+	CrushGuard = true,
+	RimBrace = true,
 	TraitItem = "",
 	DrawSize = "x10",
 	DrawKeep = 0,
@@ -296,6 +314,37 @@ local function edgeRisk(sim, bey)
 	return risk
 end
 
+---Burst ratio at which a stunned/exposed hit from `attacker` bursts `victim` outright (Sim: Crit).
+---CRUSH_WEAR 0.6 divided by the attacker's crit passive (doubled while it's awakened on crit), floor 0.5.
+function BeyRivals.crushAt(attacker)
+	local crit = 1
+	for _, passive in ipairs(attacker and attacker.pas or {}) do
+		if type(passive.crit) == "number" then
+			crit = crit * (1 + (passive.crit - 1) * (Tuning.PASSIVE_K or 1))
+		end
+	end
+	if attacker and (attacker.awakeT or 0) > 0 and attacker.awk == "crit" then
+		crit = crit * 2
+	end
+	return math.max((Tuning.CRUSH_WEAR or 0.6) / math.max(crit, 1), Tuning.CRUSH_MIN or 0.5)
+end
+
+function BeyRivals.crushable(bey)
+	return (bey.stun or 0) > (Tuning.CRUSH_STUN or 0.05) or (bey.expT or 0) > 0
+end
+
+---Ticks until a bey tires (math.huge if never). Tired beys sit at burstMax - TIRE_TOOTH, so their
+---next solid touch bursts them; each bey tires on its own clock (stamina decides who goes first).
+function BeyRivals.tireIn(sim, bey)
+	if bey.tired then
+		return 0
+	end
+	if (bey.tireT or 0) <= 0 then
+		return math.huge
+	end
+	return math.max(bey.tireT - sim.tick, 0)
+end
+
 ---Score a simulated future from our side: big for knockouts, else spin and burst lead.
 ---@param sim table
 ---@param slot number
@@ -340,22 +389,21 @@ local function scoreOf(sim, slot)
 	-- Crush zone: at 60%+ gauge, any solid hit taken while stunned bursts outright (game rule).
 	-- Being stunned anywhere near a rival up there is as bad as losing; a stunned rival up there is a kill.
 	local myRatio = burstRatio(me)
-	if myRatio >= 0.55 then
-		score = score - 35
-		if (me.stun or 0) > 0.05 then
-			for _, foe in ipairs(foes) do
-				if not foe.out then
+	for _, foe in ipairs(foes) do
+		if not foe.out then
+			local line = BeyRivals.crushAt(foe)
+			if myRatio >= line - 0.08 then
+				score = score - 35
+				if BeyRivals.crushable(me) then
 					local dx, dz = (foe.x or 0) - (me.x or 0), (foe.z or 0) - (me.z or 0)
 					if dx * dx + dz * dz < 16 then
 						score = score - 150
 					end
 				end
 			end
-		end
-	end
-	for _, foe in ipairs(foes) do
-		if not foe.out and burstRatio(foe) >= 0.6 and (foe.stun or 0) > 0.05 then
-			score = score + 60 / foesLeft
+			if burstRatio(foe) >= BeyRivals.crushAt(me) and BeyRivals.crushable(foe) then
+				score = score + 60 / foesLeft
+			end
 		end
 	end
 	score = score + (#foes - foesLeft) * 200
@@ -372,7 +420,11 @@ local function scoreOf(sim, slot)
 			if not foe.out then
 				local dx, dz = (foe.x or 0) - (me.x or 0), (foe.z or 0) - (me.z or 0)
 				if dx * dx + dz * dz < 25 then
-					score = score - 40
+					-- Worse when they sit inward of us: their hit pushes us over the lip (every 11-06
+					-- overfinish was a ridge clash at low gauge, then Lip -> Pocket 10-20 ticks later).
+					local r = math.sqrt((me.x or 0) ^ 2 + (me.z or 0) ^ 2)
+					local inward = r > 0.01 and (dx * -(me.x or 0) + dz * -(me.z or 0)) / (r * math.max(math.sqrt(dx * dx + dz * dz), 0.01)) or 0
+					score = score - 40 - math.max(inward, 0) * 140
 				end
 			end
 		end
@@ -420,6 +472,31 @@ local function scoreOf(sim, slot)
 		end
 		-- Damage dealt counts extra: favour lines that take the rival's spin and burst down.
 		score = score + (foeBurst / foesLeft) * 25 * aggression
+	end
+	-- Cornered by a faster rival: weight the damage we deal so the planner picks the line that
+	-- hurts them more than us (counters, angled hits into their gauge, smashes into the wall).
+	if BeyRivals.trading then
+		for _, foe in ipairs(foes) do
+			if not foe.out then
+				score = score + burstRatio(foe) * 160 + (1 - math.min(foe.spin or 0, 1)) * 60
+			end
+		end
+	end
+	-- Tire: whoever tires first loses the next contact. Hunt a tired rival; never touch one while tired.
+	do
+		local myTire = BeyRivals.tireIn(sim, me)
+		for _, foe in ipairs(foes) do
+			if not foe.out then
+				local dx, dz = (foe.x or 0) - (me.x or 0), (foe.z or 0) - (me.z or 0)
+				local close = math.clamp(1 - math.sqrt(dx * dx + dz * dz) / 6, 0, 1)
+				local foeTire = BeyRivals.tireIn(sim, foe)
+				if myTire == 0 and foeTire > 0 then
+					score = score - 220 * close
+				elseif foeTire == 0 and myTire > 0 then
+					score = score + 140 * close / foesLeft
+				end
+			end
+		end
 		score = score - (foeSpin / foesLeft) * 40 * aggression
 	end
 	return score
@@ -529,9 +606,17 @@ local function rollout(sim, slot, candidate, horizon)
 		end
 	end
 
+	-- Frozen ticks (awaken / ultimate cinematics, up to 300) don't count toward the horizon: the
+	-- 11-05 ring-out came 10 ticks after an awaken freeze the old horizon never saw past.
+	local frozen = 0
 	while steps < horizon and not copy.done do
+		local wasFrozen = (copy.freeze or 0) > 0
 		stepAsPlayer(copy, slot, clone)
-		steps = steps + 1
+		if wasFrozen and frozen < 320 then
+			frozen = frozen + 1
+		else
+			steps = steps + 1
+		end
 	end
 	return scoreOf(copy, slot)
 end
@@ -586,10 +671,10 @@ end
 
 ---Steer away from the closest rival (along the bowl, never out toward the rim) and drop attack
 ---presses, while our burst gauge is high and fuller than theirs. nil = keep fighting.
-local DISENGAGE_AT = 0.55
-local function disengageInput(sim, slot, bey, input)
+local DISENGAGE_AT = 0.5
+local function disengageInput(sim, slot, bey, input, force)
 	local mine = burstRatio(bey)
-	if mine < DISENGAGE_AT - 0.15 then
+	if mine < DISENGAGE_AT - 0.15 and not force then
 		return nil
 	end
 	local _, foes = sidesOf(sim, slot)
@@ -610,11 +695,12 @@ local function disengageInput(sim, slot, bey, input)
 	local spinLead = (bey.spin or 0) - (target.spin or 0)
 	-- With a spin lead, there's no reason to trade at all once the gauge is getting full.
 	local threshold = spinLead > 0.03 and (DISENGAGE_AT - 0.15) or DISENGAGE_AT
-	if mine < threshold or theirs >= mine then
+	if not force and (mine < threshold or theirs >= mine) then
 		return nil
 	end
 	local distance = math.sqrt(best)
-	if distance > 6 then
+	-- With a spin lead there's no reason to touch them at all: run the clock to a spin finish.
+	if distance > ((force or spinLead > 0.03) and 12 or 6) then
 		return nil
 	end
 	local ax, az = (bey.x or 0) - (target.x or 0), (bey.z or 0) - (target.z or 0)
@@ -634,7 +720,24 @@ local function disengageInput(sim, slot, bey, input)
 			ax, az = ax / l2, az / l2
 		end
 	end
-	local bits = bit32.band(input.b, bit32.bor(BRACE_BIT, COUNTER_BIT))
+	-- Keeping away near the rim got us countered into a pocket (11-05): pick the direction that
+	-- gains distance from the rival without adding edge risk.
+	if reach > radius * 0.55 then
+		local bestScore, bx, bz = -math.huge, ax, az
+		for index = 0, 15 do
+			local angle = index / 16 * math.pi * 2
+			local dx, dz = math.cos(angle), math.sin(angle)
+			local nx, nz = px + dx * 2, pz + dz * 2
+			local fromFoe = math.sqrt((nx - (target.x or 0)) ^ 2 + (nz - (target.z or 0)) ^ 2)
+			local edge = edgeRisk(sim, { x = nx, z = nz })
+			local value = fromFoe * 4 - edge
+			if value > bestScore then
+				bestScore, bx, bz = value, dx, dz
+			end
+		end
+		ax, az = bx, bz
+	end
+	local bits = bit32.band(input.b, force and BRACE_BIT or bit32.bor(BRACE_BIT, COUNTER_BIT))
 	return { sx = ax, sz = az, b = bits, t = 0 }
 end
 
@@ -774,6 +877,21 @@ local attackVerdict = { key = nil, safe = true }
 ---Before starting a dash or move, compare the exact input we'll send against the same input
 ---without the new press; skip the press if it loses (e.g. dashing into a rival's perfect guard).
 ---@return table input, possibly with the new attack press removed
+---A rival charging a ridge rush / smash near us: anything that roots or exposes us is a gift to them.
+function BeyRivals.smashThreat(sim, slot, bey)
+	local _, foes = sidesOf(sim, slot)
+	for _, foe in ipairs(foes) do
+		if not foe.out then
+			local dx, dz = (foe.x or 0) - (bey.x or 0), (foe.z or 0) - (bey.z or 0)
+			local charged = (foe.rush or 0) > 0 or (foe.smashC or 0) >= (Tuning.SMASH_CHARGE or 1) or (foe.onRidge and (foe.ridge or 0) >= 0.6)
+			if charged and dx * dx + dz * dz < 100 then
+				return true
+			end
+		end
+	end
+	return false
+end
+
 local function guardAttack(sim, slot, bey, input)
 	local fresh = bit32.band(bit32.band(input.b, ATTACK_BITS), bit32.bnot(bey.prevB or 0))
 	if fresh == 0 then
@@ -782,10 +900,20 @@ local function guardAttack(sim, slot, bey, input)
 	local key = tostring(sim.tick) .. ":" .. tostring(input.b)
 	if attackVerdict.key ~= key then
 		local quiet = { sx = input.sx, sz = input.sz, b = bit32.band(input.b, bit32.bnot(fresh)), t = 0 }
-		local with = rollout(sim, slot, input, COUNTER_CHECK_TICKS)
-		local without = rollout(sim, slot, quiet, COUNTER_CHECK_TICKS)
+		-- Abilities channel for ~100 ticks and leave us exposed when they end; judge them past the end
+		-- (11-06: an ability that ended as the rival's ridge rush landed took us 47% -> 100%).
+		local isAbility = bit32.band(fresh, bit32.bor(32, 64, 8)) ~= 0
+		local ticks = isAbility and 170 or COUNTER_CHECK_TICKS
+		local with = rollout(sim, slot, input, ticks)
+		local without = rollout(sim, slot, quiet, ticks)
 		attackVerdict.key = key
-		attackVerdict.safe = with > -650 and with >= without - 2 - Config.Aggression * 8
+		if isAbility and BeyRivals.smashThreat(sim, slot, bey) then
+			with = math.min(with, without - 50)
+		end
+		-- Aggression buys slack only while our gauge has room; at high gauge an ability that ends next to
+		-- the rival leaves us exposed (11-05 2v2 loss: 57% -> 100% off one clash right after our ability).
+		local room = BeyRivals.trading and 0.25 or math.clamp(1 - burstRatio(bey) / 0.5, 0, 1)
+		attackVerdict.safe = with > -650 and with >= without - (2 + Config.Aggression * 8) * room
 	end
 	if attackVerdict.safe then
 		return input
@@ -953,6 +1081,7 @@ local originalSample = BattleInput.sample
 ---@param battle table
 ---@return table?
 local function autoInput(battle)
+	BeyRivals.trading = false
 	local round = battle.round
 	local sim = round and round.sim
 	-- Log first, so the final ticks of a round (including the ones where we go out) are kept.
@@ -1051,6 +1180,14 @@ local function autoInput(battle)
 				forceDanger = true
 			end
 		end
+		local cornered = BeyRivals.inDanger(sim, slot, bey) and not BeyRivals.canEscape(sim, slot, bey)
+		if cornered then
+			BeyRivals.trading = true
+			if not BeyRivals.wasCornered then
+				planUntil = sim.tick
+			end
+		end
+		BeyRivals.wasCornered = cornered
 		if sim.tick >= planUntil then
 			decide(sim, slot)
 			forceDanger = false
@@ -1064,7 +1201,32 @@ local function autoInput(battle)
 				return escape
 			end
 		end
-		if not plan and lastBestScore < 650 then
+		-- Crush zone hard rule: once one solid hit would burst us and the rival isn't about to burst
+		-- itself, no line is worth contact. The model of a human is only a guess, and every 11-05
+		-- "winning line" taken from up here (ability at 92%, counter at 100%) ended in our burst.
+		if BeyRivals.inDanger(sim, slot, bey) then
+			if BeyRivals.canEscape(sim, slot, bey) then
+				local away = disengageInput(sim, slot, bey, input, true)
+				if away then
+					status = "Crush zone: no contact"
+					return away
+				end
+			else
+				-- A faster rival will land the hit anyway: fight on our terms. Keep perfect guard +
+				-- counter (the strongest trade in the game) and take the planner's best-trading line.
+				status = "Cornered: trading up"
+			end
+		end
+		-- Clock-run: ahead on spin, behind on gauge, late in the round. All three 11-05 lost rounds
+		-- were trades in exactly this spot (we were up on spin and still traded hits into a burst).
+		if not BeyRivals.trading and lastBestScore < 650 and BeyRivals.runClock(sim, slot, bey) then
+			local away = disengageInput(sim, slot, bey, input)
+			if away then
+				status = "Running the clock"
+				return away
+			end
+		end
+		if not BeyRivals.trading and not plan and lastBestScore < 650 then
 			local away = disengageInput(sim, slot, bey, input)
 			if away then
 				status = "Keeping away"
@@ -1089,20 +1251,126 @@ end
 
 ---Never rush off the ridge into a rival while our gauge is high and at least as full as theirs:
 ---the rush exit is predictable, and a smash into it took 1.2-1.6 burst (100%) in both 11-05 losses.
+---Can we actually keep away? No if the rival is closing on us faster than we can open the gap.
+function BeyRivals.canEscape(sim, slot, bey)
+	local _, foes = sidesOf(sim, slot)
+	for _, foe in ipairs(foes) do
+		if not foe.out then
+			local dx, dz = (bey.x or 0) - (foe.x or 0), (bey.z or 0) - (foe.z or 0)
+			local distance = math.sqrt(dx * dx + dz * dz)
+			if distance > 0.01 and distance < 9 then
+				local ux, uz = dx / distance, dz / distance
+				local closing = ((foe.vx or 0) - (bey.vx or 0)) * ux + ((foe.vz or 0) - (bey.vz or 0)) * uz
+				local foeSpeed = math.sqrt((foe.vx or 0) ^ 2 + (foe.vz or 0) ^ 2)
+				local mySpeed = math.sqrt((bey.vx or 0) ^ 2 + (bey.vz or 0) ^ 2)
+				if closing > 0.5 and foeSpeed > mySpeed * 1.05 then
+					return false
+				end
+				if (foe.speed or 0) > (bey.speed or 0) + 0.5 and distance < 5 then
+					return false
+				end
+			end
+		end
+	end
+	return true
+end
+
+function BeyRivals.inDanger(sim, slot, bey)
+	if not Config.CrushGuard then
+		return false
+	end
+	local _, foes = sidesOf(sim, slot)
+	local mine = burstRatio(bey)
+	for _, foe in ipairs(foes) do
+		if not foe.out then
+			local theirs = burstRatio(foe)
+			local foeFinished = BeyRivals.tireIn(sim, foe) == 0 or (theirs >= BeyRivals.crushAt(bey) and BeyRivals.crushable(foe)) or theirs >= 0.97
+			if not foeFinished and mine >= BeyRivals.crushAt(foe) - 0.05 and mine >= theirs - 0.05 then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+function BeyRivals.runClock(sim, slot, bey)
+	if not Config.RunClock then
+		return false
+	end
+	local _, foes = sidesOf(sim, slot)
+	local mine = burstRatio(bey)
+	for _, foe in ipairs(foes) do
+		if not foe.out then
+			local spinLead = (bey.spin or 0) - (foe.spin or 0)
+			local myTire, foeTire = BeyRivals.tireIn(sim, bey), BeyRivals.tireIn(sim, foe)
+			-- Waiting only pays if they tire first (or nobody does); 11-05 loss: we ran the clock into our own tire.
+			if myTire == 0 or (myTire < foeTire) then
+				return myTire == 0 and foeTire > 0
+			end
+			if spinLead > 0.03 and mine > burstRatio(foe) and mine >= BeyRivals.crushAt(foe) - 0.15 then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+---Brace for a hit near the rim: a guard halves knockback, which is the difference between
+---staying in and getting flung into a pocket.
+function BeyRivals.rimBrace(sim, slot, bey, input)
+	if not Config.RimBrace then
+		return input
+	end
+	local stadium = Stadiums and Stadiums.get(sim.stadium)
+	if not stadium then
+		return input
+	end
+	local px, pz = bey.x or 0, bey.z or 0
+	local r = math.sqrt(px * px + pz * pz)
+	if r < stadium.bowlRadius * 0.7 then
+		return input
+	end
+	local _, foes = sidesOf(sim, slot)
+	for _, foe in ipairs(foes) do
+		if not foe.out then
+			local dx, dz = (foe.x or 0) - px, (foe.z or 0) - pz
+			local distance = math.sqrt(dx * dx + dz * dz)
+			local closing = distance > 0.01 and (((foe.vx or 0) - (bey.vx or 0)) * -dx + ((foe.vz or 0) - (bey.vz or 0)) * -dz) / distance or 0
+			local inward = r > 0.01 and distance > 0.01 and (dx * -px + dz * -pz) / (r * distance) or 0
+			if distance < 4.5 and closing > 0.2 and inward > 0.2 then
+				status = "Bracing at the rim"
+				return { sx = input.sx, sz = input.sz, b = bit32.bor(input.b, BRACE_BIT), t = input.t or 0 }
+			end
+		end
+	end
+	return input
+end
+
 function BeyRivals.ridgeSafe(sim, slot, bey, input)
+	input = BeyRivals.rimBrace(sim, slot, bey, input)
+	if (bey.expT or 0) > 0 and BeyRivals.smashThreat(sim, slot, bey) then
+		status = "Exposed: bracing"
+		input = { sx = input.sx, sz = input.sz, b = bit32.bor(bit32.band(input.b, bit32.bnot(ATTACK_BITS)), BRACE_BIT), t = input.t or 0 }
+	end
 	if not (Config.SafeRidge and bey.onRidge) then
 		return input
 	end
 	local mine = burstRatio(bey)
-	if mine < 0.55 then
-		return input
-	end
 	local _, foes = sidesOf(sim, slot)
-	local theirs = 0
+	local theirs, line = 0, 1
 	for _, foe in ipairs(foes) do
 		if not foe.out then
 			theirs = math.max(theirs, burstRatio(foe))
+			line = math.min(line, BeyRivals.crushAt(foe))
+			-- A rival riding the ridge with us chains/steals into us: staying on it is the trap (11-05 loss 2).
+			local dx, dz = (foe.x or 0) - (bey.x or 0), (foe.z or 0) - (bey.z or 0)
+			if foe.onRidge and dx * dx + dz * dz < 36 then
+				return input
+			end
 		end
+	end
+	if mine < line - 0.1 then
+		return input
 	end
 	if theirs > mine + 0.1 then
 		return input
@@ -2377,6 +2645,9 @@ slider(battlePage, "Pilot skill", "PilotLevel", 0.5, 1, 0.05, function(v) return
 toggle(battlePage, "Look ahead and pick the best line", "Lookahead")
 toggle(battlePage, "Expect human rivals to fight back", "ModelHumans")
 toggle(battlePage, "No ridge rush at high gauge", "SafeRidge")
+toggle(battlePage, "Run the clock when ahead on spin", "RunClock")
+toggle(battlePage, "No contact in the crush zone", "CrushGuard")
+toggle(battlePage, "Brace for hits at the rim", "RimBrace")
 slider(battlePage, "Look-ahead budget", "LookaheadMs", 2, 16, 0.5, function(v) return string.format("%.1f ms", v) end)
 toggle(battlePage, "Perfect clash timing", "PerfectClash")
 toggle(battlePage, "Perfect guard before every hit", "AutoGuard")
