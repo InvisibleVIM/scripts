@@ -105,6 +105,7 @@ local Config = {
 	AbsBurst = true,
 	SpinOutRace = true,
 	StadiumAware = true,
+	BossCrushGuard = true,
 	RimBrace = true,
 	SweepDodge = true,
 	SpinRace = true,
@@ -1503,7 +1504,19 @@ local function autoInput(battle)
 		-- itself, no line is worth contact. The model of a human is only a guess, and every 11-05
 		-- "winning line" taken from up here (ability at 92%, counter at 100%) ended in our burst.
 		-- Vs the AI a found winning line is an exact replay, not a guess: take it over the crush-zone rule.
-		local trustPlan = BeyRivals.vsAI(sim, slot) and lastBestScore > -650
+		-- In the crush zone only an actual winning line is worth trusting over the no-contact rule:
+		-- 11-07 Volt (Hard boss): "not losing" plan at 70% gauge, ability + ridge rush into its Spring
+		-- dash took 3.35 (70% -> 100%). Boss AIs don't replay exactly, so "not worse" isn't safe up here.
+		local inCrush = false
+		do
+			local _, foes = sidesOf(sim, slot)
+			for _, foe in ipairs(foes) do
+				if not foe.out and burstRatio(bey) >= BeyRivals.crushAt(foe) - 0.05 then
+					inCrush = true
+				end
+			end
+		end
+		local trustPlan = BeyRivals.vsAI(sim, slot) and (lastBestScore >= 650 or (lastBestScore > -650 and not (inCrush and Config.BossCrushGuard)))
 		if not trustPlan and danger then
 			if BeyRivals.escapeNow then
 				local away = disengageInput(sim, slot, bey, input, true)
@@ -2129,6 +2142,13 @@ local function nextJoin(result)
 	end)
 	-- 11-07 Challenge mode: each period pays once and Specials once a day, so don't loop them or fall
 	-- back to the previous join (that would drop us into ranked). Pick the next challenge by hand.
+	-- Evolve bosses (Volt / Rentaro) are the exception: every win rolls the 4% disc/driver drop, so rematch.
+	if lastJoin and lastJoin.packet == "ChallengeFight" and type(lastJoin.args) == "table" and lastJoin.args[1] == "boss" then
+		local args = lastJoin.args
+		return "Boss rematch", function()
+			return firePacket("ChallengeFight", "boss", tonumber(args[2]) or 1, tonumber(args[3]) or 0)
+		end
+	end
 	if lastJoin and (lastJoin.packet == "ChallengeFight" or lastJoin.packet == "TrainerChallenge") then
 		return "Challenge", function()
 			return false, "challenge done - pick the next one"
@@ -3099,6 +3119,7 @@ toggle(battlePage, "No contact in the crush zone", "CrushGuard")
 toggle(battlePage, "Burst race by HP left (not %)", "AbsBurst")
 toggle(battlePage, "Fight when keep-away would lose on spin", "SpinOutRace")
 toggle(battlePage, "Adapt to challenge stadium mechanics", "StadiumAware")
+toggle(battlePage, "Vs bots: no contact in the crush zone unless winning", "BossCrushGuard")
 toggle(battlePage, "Brace for hits at the rim", "RimBrace")
 toggle(battlePage, "Dodge rival abilities (sweeps, AoE, waves)", "SweepDodge")
 toggle(battlePage, "Go for the burst when losing on spin", "SpinRace")
