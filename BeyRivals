@@ -307,6 +307,11 @@ local function edgeRisk(sim, bey)
 	local reach = math.sqrt(x * x + z * z) / stadium.bowlRadius
 	-- Both logged ring-out losses were a hit on the ridge followed by a slide into an exit pocket.
 	local risk = math.clamp((reach - 0.5) / 0.5, 0, 1) ^ 1.6 * 70
+	-- Spike has no exit pockets (ring-outs need an over-wall at speed 32); its walls cost burst instead,
+	-- which the rollouts already count, so the rim is far less of a ring-out threat there.
+	if #(stadium.pockets or {}) == 0 then
+		risk = risk * 0.3
+	end
 	if risk <= 0 then
 		return 0
 	end
@@ -366,6 +371,21 @@ function BeyRivals.myPoints()
 	return points
 end
 
+---Points the rival side has scored this match.
+function BeyRivals.theirPoints()
+	local match = BeyRivals.currentMatch
+	if not match then
+		return 0
+	end
+	local points = 0
+	for _, round in ipairs(match.rounds or {}) do
+		if round.done and round.loser == match.mySlot then
+			points = points + (round.finish == "Burst" and 2 or 1)
+		end
+	end
+	return points
+end
+
 ---Score a simulated future from our side: big for knockouts, else spin and burst lead.
 ---@param sim table
 ---@param slot number
@@ -374,6 +394,10 @@ local function scoreOf(sim, slot)
 	local me, foes = sidesOf(sim, slot)
 	-- Ranked scoring: a burst is worth 2 points, a ring-out or spin finish 1.
 	if me.out then
+		-- Match point against us: any finish ends the match, so a ring-out or spin-out is as fatal as a burst.
+		if BeyRivals.theirPoints() >= 2 then
+			return -1000 + sim.tick * 0.01
+		end
 		return (me.out == "Burst" and -1000 or -720) + sim.tick * 0.01
 	end
 
@@ -394,7 +418,8 @@ local function scoreOf(sim, slot)
 		end
 		-- Vs bots: burst once, then ring out. With 2 points banked a ring-out ends the match exactly like
 		-- a burst, and ring-outs come much sooner, so value them the same and let speed decide.
-		if not bursted and BeyRivals.vsAI(sim, slot) and BeyRivals.myPoints() >= 2 then
+		-- Our match point (any mode): a ring-out or spin finish wins just like a burst.
+		if not bursted and BeyRivals.myPoints() >= 2 then
 			return 1000 - sim.tick * 0.01
 		end
 		return (bursted and 1000 or 780) - sim.tick * 0.01
