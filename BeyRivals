@@ -1088,6 +1088,9 @@ local function guardAttack(sim, slot, bey, input)
 	if fresh == 0 then
 		return input
 	end
+	if BeyRivals.noAttack then
+		return { sx = input.sx, sz = input.sz, b = bit32.band(input.b, bit32.bnot(fresh)), t = input.t or 0 }
+	end
 	local key = tostring(sim.tick) .. ":" .. tostring(input.b)
 	if attackVerdict.key ~= key then
 		local quiet = { sx = input.sx, sz = input.sz, b = bit32.band(input.b, bit32.bnot(fresh)), t = 0 }
@@ -1295,6 +1298,7 @@ local originalSample = BattleInput.sample
 ---@return table?
 local function autoInput(battle)
 	BeyRivals.trading = false
+	BeyRivals.noAttack = false
 	BeyRivals.frameStart = os.clock()
 	local round = battle.round
 	local sim = round and round.sim
@@ -1330,6 +1334,12 @@ local function autoInput(battle)
 	if Config.PerfectClash and inClash(sim, slot) then
 		status = "Clash"
 		input.b = bit32.bor(bit32.band(input.b, bit32.bnot(CLASH_BIT)), clashBits(sim, bey, nextTick))
+		-- The game AI's input passes through here unfiltered, and it fires abilities mid-clash. At high
+		-- gauge the ability's own contact pushes us to 100% (11-07: a Finisher at 90% burst us, an ability
+		-- at 94% into a 99% rival teetered both into a draw), so no ability presses from up here.
+		if burstRatio(bey) >= 0.6 then
+			input.b = bit32.band(input.b, bit32.bnot(bit32.bor(32, 64, 8)))
+		end
 		return input
 	end
 
@@ -1448,6 +1458,9 @@ local function autoInput(battle)
 					status = "Crush zone: no contact"
 					return away
 				end
+				-- Out of range already: keep it that way. 11-07: from beyond flee range the plan's "winning
+				-- line" dashed in at 73%, the rival dodged, and the clash took us to 100%.
+				BeyRivals.noAttack = true
 			else
 				-- A faster rival will land the hit anyway: fight on our terms. Keep perfect guard +
 				-- counter (the strongest trade in the game) and take the planner's best-trading line.
@@ -1540,7 +1553,7 @@ function BeyRivals.inDanger(sim, slot, bey)
 	for _, foe in ipairs(foes) do
 		if not foe.out then
 			local theirs = burstRatio(foe)
-			local foeFinished = BeyRivals.tireIn(sim, foe) == 0 or (theirs >= BeyRivals.crushAt(bey) and BeyRivals.crushable(foe)) or theirs >= 0.97
+			local foeFinished = BeyRivals.tireIn(sim, foe) == 0 or (theirs >= BeyRivals.crushAt(bey) and BeyRivals.crushable(foe)) or (theirs >= 0.97 and mine < 0.85)
 			if not foeFinished and mine >= BeyRivals.crushAt(foe) - 0.05 and mine >= theirs - 0.05 then
 				return true
 			end
