@@ -1122,7 +1122,11 @@ local function guardAttack(sim, slot, bey, input)
 		-- Aggression buys slack only while our gauge has room; at high gauge an ability that ends next to
 		-- the rival leaves us exposed (11-05 2v2 loss: 57% -> 100% off one clash right after our ability).
 		local room = BeyRivals.trading and 0.25 or math.clamp(1 - burstRatio(bey) / 0.5, 0, 1)
-		if BeyRivals.vsAI(sim, slot) then
+		if BeyRivals.outspun(sim, slot, bey) then
+			-- Projected spin-out loss: holding back is a slow certain loss the short rollout can't see.
+			-- 11-07 vs Fafnir/Weight: 2 dashes in a 4388-tick round, then spin-finished. Swing unless it bursts us.
+			attackVerdict.safe = with > -650
+		elseif BeyRivals.vsAI(sim, slot) then
 			-- Exact prediction: attack whenever it's not actually worse.
 			attackVerdict.safe = with > -650 and with >= without - 1
 		else
@@ -1310,6 +1314,7 @@ local function autoInput(battle)
 	if not sim or battle.watch or round.phase ~= "Battle" or sim.done then
 		return nil
 	end
+	pcall(BeyRivals.recordSpin, sim)
 	local slot = battle.mySlot
 	local bey = sim.beys[slot]
 	if not bey or bey.out then
@@ -1528,34 +1533,47 @@ end
 
 ---Behind on spin late in a round: waiting only hands them a spin finish (11-06: two rounds lost at
 ---0.05 spin vs 0.28 while we kept away in the crush zone). Time to trade for a burst instead.
----Ticks until a bey spins out at its recent decay rate (nil while there's too little history).
-function BeyRivals.spinTTL(sim, bey)
+---Live spin history per slot (the game swaps round.sim objects mid-round, so never key by table identity).
+function BeyRivals.recordSpin(sim)
 	local hist = BeyRivals.spinHist
-	if not hist or hist.sim ~= sim then
-		hist = { sim = sim }
+	if not hist or (hist.tick and sim.tick < hist.tick - 5) then
+		hist = {}
 		BeyRivals.spinHist = hist
 	end
-	local h = hist[bey]
-	if not h then
-		h = {}
-		hist[bey] = h
+	if hist.tick and sim.tick - hist.tick < 30 then
+		return
 	end
-	local last = h[#h]
-	if not last or sim.tick - last.t >= 30 then
+	hist.tick = sim.tick
+	for i, bey in ipairs(sim.beys) do
+		local h = hist[i]
+		if not h then
+			h = {}
+			hist[i] = h
+		end
 		table.insert(h, { t = sim.tick, s = bey.spin or 0 })
 		if #h > 8 then
 			table.remove(h, 1)
 		end
 	end
+end
+
+---Ticks until a bey spins out at its recent decay rate (nil while there's too little history).
+function BeyRivals.spinTTL(sim, bey)
+	local hist = BeyRivals.spinHist
+	local i = table.find(sim.beys, bey)
+	local h = hist and i and hist[i]
+	if not h or #h < 7 then
+		return nil
+	end
 	local a, b = h[1], h[#h]
-	if #h < 7 or b.t - a.t < 180 then
+	if b.t - a.t < 180 then
 		return nil
 	end
 	local rate = (a.s - b.s) / (b.t - a.t)
 	if rate <= 1e-5 then
 		return math.huge
 	end
-	return (b.s or 0) / rate
+	return (bey.spin or b.s or 0) / rate
 end
 
 ---Keep-away only pays if we outlast them. 11-07 vs Fafnir/Weight: crush-zone keep-away from 53% gauge,
