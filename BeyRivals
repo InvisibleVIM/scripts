@@ -1,5 +1,4 @@
-if not isfolder("BeyRivals") then makefolder("BeyRivals") end
-writefile("BeyRivals/BeyRivals.lua", [=====[-- Only the newest load runs: autoexec and the teleport reload can both start this at once.
+-- Only the newest load runs: autoexec and the teleport reload can both start this at once.
 local loadToken = {}
 getgenv().BeyRivalsLoadToken = loadToken
 
@@ -103,6 +102,7 @@ local Config = {
 	SafeRidge = true,
 	RunClock = true,
 	CrushGuard = true,
+	AbsBurst = true,
 	RimBrace = true,
 	SweepDodge = true,
 	SpinRace = true,
@@ -1541,6 +1541,22 @@ function BeyRivals.losingSpinRace(sim, slot, bey)
 	return false
 end
 
+---Who bursts first: compare burst HP left, not gauge %. 11-07: Omega Horus (10.6 max) vs us (9.6) sat at
+---the same % while it had ~0.6 more HP left, so "even" trades were losing ones (2 bursts, 0-4).
+function BeyRivals.burstBehind(bey, foe, mine, theirs, slack)
+	slack = slack or 0.05
+	if not Config.AbsBurst then
+		return slack == 0 and mine > theirs or mine >= theirs - slack
+	end
+	local myMax = (bey.burstMax and bey.burstMax > 0) and bey.burstMax or 1
+	local foeMax = (foe.burstMax and foe.burstMax > 0) and foe.burstMax or myMax
+	local myLeft, foeLeft = myMax * (1 - mine), foeMax * (1 - theirs)
+	if slack == 0 then
+		return myLeft < foeLeft
+	end
+	return myLeft <= foeLeft + slack * myMax
+end
+
 function BeyRivals.inDanger(sim, slot, bey)
 	if BeyRivals.losingSpinRace(sim, slot, bey) then
 		return false
@@ -1554,7 +1570,7 @@ function BeyRivals.inDanger(sim, slot, bey)
 		if not foe.out then
 			local theirs = burstRatio(foe)
 			local foeFinished = BeyRivals.tireIn(sim, foe) == 0 or (theirs >= BeyRivals.crushAt(bey) and BeyRivals.crushable(foe)) or (theirs >= 0.97 and mine < 0.85)
-			if not foeFinished and mine >= BeyRivals.crushAt(foe) - 0.05 and mine >= theirs - 0.05 then
+			if not foeFinished and mine >= BeyRivals.crushAt(foe) - 0.05 and BeyRivals.burstBehind(bey, foe, mine, theirs) then
 				return true
 			end
 			-- An armed rival (ability off cooldown / ultimate charged) can crit us from close range no
@@ -1585,7 +1601,7 @@ function BeyRivals.runClock(sim, slot, bey)
 			if myTire == 0 or (myTire < foeTire) then
 				return myTire == 0 and foeTire > 0
 			end
-			if spinLead > 0.03 and mine > burstRatio(foe) and mine >= BeyRivals.crushAt(foe) - 0.15 then
+			if spinLead > 0.03 and BeyRivals.burstBehind(bey, foe, mine, burstRatio(foe), 0) and mine >= BeyRivals.crushAt(foe) - 0.15 then
 				return true
 			end
 		end
@@ -2955,6 +2971,7 @@ toggle(battlePage, "Expect human rivals to fight back", "ModelHumans")
 toggle(battlePage, "No ridge rush at high gauge", "SafeRidge")
 toggle(battlePage, "Run the clock when ahead on spin", "RunClock")
 toggle(battlePage, "No contact in the crush zone", "CrushGuard")
+toggle(battlePage, "Burst race by HP left (not %)", "AbsBurst")
 toggle(battlePage, "Brace for hits at the rim", "RimBrace")
 toggle(battlePage, "Dodge rival abilities (sweeps, AoE, waves)", "SweepDodge")
 toggle(battlePage, "Go for the burst when losing on spin", "SpinRace")
@@ -3830,5 +3847,3 @@ table.insert(BeyRivals.connections, runService.Heartbeat:Connect(function()
 	end
 end))
 print("[Bey Rivals] Loaded. Right Ctrl toggles the panel.")
-]=====])
-loadstring(readfile("BeyRivals/BeyRivals.lua"), "=BeyRivals")()
