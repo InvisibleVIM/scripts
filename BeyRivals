@@ -104,6 +104,9 @@ local Config = {
 	RunClock = true,
 	CrushGuard = true,
 	RimBrace = true,
+	SweepDodge = true,
+	SpinRace = true,
+	ClassicAI = true,
 	TraitItem = "",
 	DrawSize = "x10",
 	DrawKeep = 0,
@@ -348,6 +351,21 @@ function BeyRivals.tireIn(sim, bey)
 	return math.max(bey.tireT - sim.tick, 0)
 end
 
+---Points we've scored this match from logged rounds (burst 2, other finishes 1).
+function BeyRivals.myPoints()
+	local match = BeyRivals.currentMatch
+	if not match then
+		return 0
+	end
+	local points = 0
+	for _, round in ipairs(match.rounds or {}) do
+		if round.done and round.loser and round.loser ~= 0 and round.loser ~= match.mySlot then
+			points = points + (round.finish == "Burst" and 2 or 1)
+		end
+	end
+	return points
+end
+
 ---Score a simulated future from our side: big for knockouts, else spin and burst lead.
 ---@param sim table
 ---@param slot number
@@ -373,6 +391,11 @@ local function scoreOf(sim, slot)
 			if foe.out == "Burst" then
 				bursted = true
 			end
+		end
+		-- Vs bots: burst once, then ring out. With 2 points banked a ring-out ends the match exactly like
+		-- a burst, and ring-outs come much sooner, so value them the same and let speed decide.
+		if not bursted and BeyRivals.vsAI(sim, slot) and BeyRivals.myPoints() >= 2 then
+			return 1000 - sim.tick * 0.01
 		end
 		return (bursted and 1000 or 780) - sim.tick * 0.01
 	end
@@ -475,6 +498,18 @@ local function scoreOf(sim, slot)
 		end
 		-- Damage dealt counts extra: favour lines that take the rival's spin and burst down.
 		score = score + (foeBurst / foesLeft) * 25 * aggression
+	end
+	-- Vs the game's AI the rollout is exact, so damage dealt is real progress: pay for every bit of
+	-- the boss's gauge and spin we take, so the planner keeps pressing instead of waiting for a finish
+	-- it can't see yet (rounds are ~1,700 ticks, the look-ahead ~300).
+	if BeyRivals.vsAI(sim, slot) then
+		-- (Driving the boss to the rim at match point was tried 11-06 and reverted: it's heavy, never
+		-- went out in 17 matches, and chasing it to the rim got us smashed into a pocket instead.)
+		for _, foe in ipairs(foes) do
+			if not foe.out then
+				score = score + burstRatio(foe) * 220 + (1 - math.min(foe.spin or 0, 1)) * 120
+			end
+		end
 	end
 	-- Cornered by a faster rival: weight the damage we deal so the planner picks the line that
 	-- hurts them more than us (counters, angled hits into their gauge, smashes into the wall).
@@ -935,13 +970,92 @@ function BeyRivals.smashThreat(sim, slot, bey)
 	for _, foe in ipairs(foes) do
 		if not foe.out then
 			local dx, dz = (foe.x or 0) - (bey.x or 0), (foe.z or 0) - (bey.z or 0)
-			local charged = (foe.rush or 0) > 0 or (foe.smashC or 0) >= (Tuning.SMASH_CHARGE or 1) or (foe.onRidge and (foe.ridge or 0) >= 0.6)
+			-- Humans hold a charged ridge through freezes and rush the moment we're exposed (11-06 loss:
+			-- ridge full at 522, our ability ended at 521, rush landed for 34% after a freeze), so any
+			-- ridge build counts against a human; the AI only rushes when nearly full.
+			local ridgeLine = sim.ai[table.find(sim.beys, foe) or 0] and 0.6 or 0.25
+			local charged = (foe.rush or 0) > 0 or (foe.smashC or 0) >= (Tuning.SMASH_CHARGE or 1) or (foe.onRidge and (foe.ridge or 0) >= ridgeLine) or (foe.ridge or 0) >= 0.9
 			if charged and dx * dx + dz * dz < 100 then
 				return true
 			end
 		end
 	end
 	return false
+end
+
+---Sweep abilities lift every rival inside their field and slam them (Swept -> AbilityHit, often a
+---Crit). The sim skips anyone who dashed in the last DODGE_WIN (0.22 s). Both 11-06 ranked losses
+---were repeated sweeps at 75%+ gauge, so check a few ticks ahead on a copy and dash through it.
+function BeyRivals.sweepDodge(sim, slot, bey, input)
+	if not Config.SweepDodge or BeyRivals.overBudget() then
+		return nil
+	end
+	local _, foes = sidesOf(sim, slot)
+	local casting = false
+	for _, foe in ipairs(foes) do
+		if not foe.out and (foe.ab or 0) ~= 0 then
+			casting = true
+		end
+	end
+	if not casting then
+		BeyRivals.dodgeCache = nil
+		return nil
+	end
+	-- Re-search every 3 ticks; hold the chosen dodge in between.
+	local cache = BeyRivals.dodgeCache
+	if cache and sim.tick - cache.tick < 3 then
+		return cache.input
+	end
+	-- Abilities track us (sweeps lift, AoE pulses every few ticks, waves): judge every option on a copy
+	-- by the gauge it costs us over the next pulses (11-06: four AoE pulses in a row while we "kept
+	-- away" burst us at 74%). Dashing also grants DODGE_WIN immunity to sweeps and chains.
+	local function cost(candidate, ticks)
+		local copy = BeyRivals.modelFoes(Sim.copy(sim), slot)
+		copy.ai[slot] = nil
+		local start = copy.beys[slot].burst or 0
+		local penalty = 0
+		for _ = 1, ticks do
+			stepAsPlayer(copy, slot, nil, candidate)
+			local me = copy.beys[slot]
+			if me.out then
+				return math.huge
+			end
+			if (me.sweptBy or 0) ~= 0 then
+				penalty = penalty + 0.5
+			end
+		end
+		local me = copy.beys[slot]
+		local edge = edgeRisk(copy, me) * 0.004
+		return (me.burst or 0) - start + penalty * (me.burstMax or 1) + edge
+	end
+	local horizon = 14
+	local stay = cost(input, horizon)
+	local burstMax = (bey.burstMax and bey.burstMax > 0) and bey.burstMax or 1
+	if stay < burstMax * 0.03 then
+		BeyRivals.dodgeCache = { tick = sim.tick, input = nil }
+		return nil
+	end
+	local best, bestCost = nil, stay
+	local px, pz = bey.x or 0, bey.z or 0
+	local r = math.sqrt(px * px + pz * pz)
+	for index = 0, 7 do
+		local angle = index / 8 * math.pi * 2
+		local dx, dz = math.cos(angle), math.sin(angle)
+		if not (r > 7 and (dx * px + dz * pz) / math.max(r, 0.01) > 0.3) then
+			for _, bits in ipairs({ DASH_BIT, BRACE_BIT, 0 }) do
+				if BeyRivals.overBudget() then
+					break
+				end
+				local candidate = { sx = dx, sz = dz, b = bits, t = 0 }
+				local value = cost(candidate, horizon)
+				if value < bestCost - burstMax * 0.02 then
+					best, bestCost = candidate, value
+				end
+			end
+		end
+	end
+	BeyRivals.dodgeCache = { tick = sim.tick, input = best }
+	return best
 end
 
 local function guardAttack(sim, slot, bey, input)
@@ -954,7 +1068,21 @@ local function guardAttack(sim, slot, bey, input)
 		local quiet = { sx = input.sx, sz = input.sz, b = bit32.band(input.b, bit32.bnot(fresh)), t = 0 }
 		-- Abilities channel for ~100 ticks and leave us exposed when they end; judge them past the end
 		-- (11-06: an ability that ended as the rival's ridge rush landed took us 47% -> 100%).
-		local isAbility = bit32.band(fresh, bit32.bor(32, 64, 8)) ~= 0
+		-- Never swing into a rival with a guard up while one stun would crit us: a perfect guard stuns
+		-- the attacker (11-06: our dash at 52% got guarded, their rush crit us to 100%).
+		if not Config.ClassicAI and not BeyRivals.vsAI(sim, slot) and not BeyRivals.losingSpinRace(sim, slot, bey) then
+			local _, foes = sidesOf(sim, slot)
+			for _, foe in ipairs(foes) do
+				if not foe.out and (foe.guardN or 0) > 0 and (foe.gbT or 0) <= 0 then
+					local dx, dz = (foe.x or 0) - (bey.x or 0), (foe.z or 0) - (bey.z or 0)
+					if dx * dx + dz * dz < 64 and burstRatio(bey) >= BeyRivals.crushAt(foe) - 0.12 then
+						attackVerdict.key, attackVerdict.tick, attackVerdict.safe = key, sim.tick, false
+						return { sx = input.sx, sz = input.sz, b = quiet.b, t = 0 }
+					end
+				end
+			end
+		end
+		local isAbility = not Config.ClassicAI and bit32.band(fresh, bit32.bor(32, 64, 8)) ~= 0
 		local ticks = isAbility and 170 or COUNTER_CHECK_TICKS
 		local with = rollout(sim, slot, input, ticks)
 		local without = rollout(sim, slot, quiet, ticks)
@@ -965,7 +1093,12 @@ local function guardAttack(sim, slot, bey, input)
 		-- Aggression buys slack only while our gauge has room; at high gauge an ability that ends next to
 		-- the rival leaves us exposed (11-05 2v2 loss: 57% -> 100% off one clash right after our ability).
 		local room = BeyRivals.trading and 0.25 or math.clamp(1 - burstRatio(bey) / 0.5, 0, 1)
-		attackVerdict.safe = with > -650 and with >= without - (2 + Config.Aggression * 8) * room
+		if BeyRivals.vsAI(sim, slot) then
+			-- Exact prediction: attack whenever it's not actually worse.
+			attackVerdict.safe = with > -650 and with >= without - 1
+		else
+			attackVerdict.safe = with > -650 and with >= without - (2 + Config.Aggression * 8) * room
+		end
 	end
 	if attackVerdict.safe then
 		return input
@@ -1182,6 +1315,17 @@ local function autoInput(battle)
 		return input
 	end
 
+	-- Rival ability live: dodge first, before guard/counter checks spend the frame budget
+	-- (11-06: the dodge search ran last, ran out of budget, and an ability hit took 71% -> 100%).
+	do
+		local dodge = BeyRivals.sweepDodge(sim, slot, bey, input)
+		if dodge then
+			status = "Dodging ability"
+			planUntil = sim.tick
+			return dodge
+		end
+	end
+
 	-- We own the Brace bit: strip the AI's guesses and tap only before predicted contact.
 	if Config.AutoGuard then
 		input.b = bit32.band(input.b, bit32.bnot(BRACE_BIT))
@@ -1236,7 +1380,17 @@ local function autoInput(battle)
 				forceDanger = true
 			end
 		end
-		local cornered = BeyRivals.inDanger(sim, slot, bey) and not BeyRivals.canEscape(sim, slot, bey)
+		-- Commit to flee-or-fight for a while: flipping every few ticks (11-07: "no contact" and "trading
+		-- up" alternated 6 times in 25 ticks) gets the worst of both, half-run then half-hit.
+		local danger = BeyRivals.inDanger(sim, slot, bey)
+		local escape = Config.ClassicAI or BeyRivals.canEscape(sim, slot, bey)
+		if BeyRivals.modeUntil and sim.tick < BeyRivals.modeUntil and BeyRivals.modeTick and sim.tick >= BeyRivals.modeTick then
+			escape = BeyRivals.modeEscape
+		elseif danger then
+			BeyRivals.modeEscape, BeyRivals.modeUntil, BeyRivals.modeTick = escape, sim.tick + 30, sim.tick
+		end
+		BeyRivals.escapeNow = escape
+		local cornered = (danger and not escape) or BeyRivals.losingSpinRace(sim, slot, bey)
 		if cornered then
 			BeyRivals.trading = true
 			if not BeyRivals.wasCornered then
@@ -1261,9 +1415,9 @@ local function autoInput(battle)
 		-- itself, no line is worth contact. The model of a human is only a guess, and every 11-05
 		-- "winning line" taken from up here (ability at 92%, counter at 100%) ended in our burst.
 		-- Vs the AI a found winning line is an exact replay, not a guess: take it over the crush-zone rule.
-		local exactWin = lastBestScore >= 650 and BeyRivals.vsAI(sim, slot)
-		if not exactWin and BeyRivals.inDanger(sim, slot, bey) then
-			if BeyRivals.canEscape(sim, slot, bey) then
+		local trustPlan = BeyRivals.vsAI(sim, slot) and lastBestScore > -650
+		if not trustPlan and danger then
+			if BeyRivals.escapeNow then
 				local away = disengageInput(sim, slot, bey, input, true)
 				if away then
 					status = "Crush zone: no contact"
@@ -1277,14 +1431,14 @@ local function autoInput(battle)
 		end
 		-- Clock-run: ahead on spin, behind on gauge, late in the round. All three 11-05 lost rounds
 		-- were trades in exactly this spot (we were up on spin and still traded hits into a burst).
-		if not BeyRivals.trading and lastBestScore < 650 and BeyRivals.runClock(sim, slot, bey) then
+		if not trustPlan and not BeyRivals.trading and lastBestScore < 650 and BeyRivals.runClock(sim, slot, bey) then
 			local away = disengageInput(sim, slot, bey, input)
 			if away then
 				status = "Running the clock"
 				return away
 			end
 		end
-		if not BeyRivals.trading and not plan and lastBestScore < 650 then
+		if not trustPlan and not BeyRivals.trading and not plan and lastBestScore < 650 then
 			local away = disengageInput(sim, slot, bey, input)
 			if away then
 				status = "Keeping away"
@@ -1333,7 +1487,26 @@ function BeyRivals.canEscape(sim, slot, bey)
 	return true
 end
 
+---Behind on spin late in a round: waiting only hands them a spin finish (11-06: two rounds lost at
+---0.05 spin vs 0.28 while we kept away in the crush zone). Time to trade for a burst instead.
+function BeyRivals.losingSpinRace(sim, slot, bey)
+	if Config.ClassicAI or not Config.SpinRace then
+		return false
+	end
+	local _, foes = sidesOf(sim, slot)
+	local mine = bey.spin or 0
+	for _, foe in ipairs(foes) do
+		if not foe.out and mine < 0.4 and (foe.spin or 0) > mine + 0.08 then
+			return true
+		end
+	end
+	return false
+end
+
 function BeyRivals.inDanger(sim, slot, bey)
+	if BeyRivals.losingSpinRace(sim, slot, bey) then
+		return false
+	end
 	if not Config.CrushGuard then
 		return false
 	end
@@ -1345,6 +1518,15 @@ function BeyRivals.inDanger(sim, slot, bey)
 			local foeFinished = BeyRivals.tireIn(sim, foe) == 0 or (theirs >= BeyRivals.crushAt(bey) and BeyRivals.crushable(foe)) or theirs >= 0.97
 			if not foeFinished and mine >= BeyRivals.crushAt(foe) - 0.05 and mine >= theirs - 0.05 then
 				return true
+			end
+			-- An armed rival (ability off cooldown / ultimate charged) can crit us from close range no
+			-- matter whose gauge is fuller (11-06: we pressed a 91% rival at 60%, their strike crit us).
+			if not Config.ClassicAI and not foeFinished and mine >= BeyRivals.crushAt(foe) - 0.05 and not sim.ai[table.find(sim.beys, foe) or 0] then
+				local armed = (foe.ab or 0) == 0 and ((foe.cd1 or 1) <= 0 or (foe.cd2 or 1) <= 0 or (foe.special or 0) >= 1)
+				local dx, dz = (foe.x or 0) - (bey.x or 0), (foe.z or 0) - (bey.z or 0)
+				if armed and dx * dx + dz * dz < 100 then
+					return true
+				end
 			end
 		end
 	end
@@ -1376,7 +1558,7 @@ end
 ---Brace for a hit near the rim: a guard halves knockback, which is the difference between
 ---staying in and getting flung into a pocket.
 function BeyRivals.rimBrace(sim, slot, bey, input)
-	if not Config.RimBrace then
+	if Config.ClassicAI or not Config.RimBrace then
 		return input
 	end
 	local stadium = Stadiums and Stadiums.get(sim.stadium)
@@ -1406,7 +1588,20 @@ end
 
 function BeyRivals.ridgeSafe(sim, slot, bey, input)
 	input = BeyRivals.rimBrace(sim, slot, bey, input)
-	if (bey.expT or 0) > 0 and BeyRivals.smashThreat(sim, slot, bey) then
+	-- Humans hold a charged ridge through a freeze and rush the first tick it ends (11-07: a full-ridge
+	-- rush right after the opening freeze knocked us from the centre into a pocket at 0% gauge).
+	-- Be braced as the freeze runs out and for the first few ticks after it.
+	if (sim.freeze or 0) > 0 then
+		BeyRivals.freezeEndedAt = nil
+	elseif BeyRivals.freezeEndedAt == nil then
+		BeyRivals.freezeEndedAt = sim.tick
+	end
+	local afterFreeze = (sim.freeze or 0) > 0 and (sim.freeze or 0) <= 4 or (BeyRivals.freezeEndedAt and sim.tick - BeyRivals.freezeEndedAt <= 8)
+	if not Config.ClassicAI and afterFreeze and not BeyRivals.vsAI(sim, slot) and BeyRivals.smashThreat(sim, slot, bey) then
+		status = "Bracing for the post-freeze rush"
+		input = { sx = input.sx, sz = input.sz, b = bit32.bor(bit32.band(input.b, bit32.bnot(ATTACK_BITS)), BRACE_BIT), t = input.t or 0 }
+	end
+	if not Config.ClassicAI and (bey.expT or 0) > 0 and BeyRivals.smashThreat(sim, slot, bey) then
 		status = "Exposed: bracing"
 		input = { sx = input.sx, sz = input.sz, b = bit32.bor(bit32.band(input.b, bit32.bnot(ATTACK_BITS)), BRACE_BIT), t = input.t or 0 }
 	end
@@ -1415,6 +1610,19 @@ function BeyRivals.ridgeSafe(sim, slot, bey, input)
 	end
 	local mine = burstRatio(bey)
 	local _, foes = sidesOf(sim, slot)
+	-- Low gauge is not a free pass against humans: every 11-06 overfinish was our rush (often + dash)
+	-- off the ridge straight into a rival who guarded or smashed it back, sending us over the lip.
+	local punisher = nil
+	for _, foe in ipairs(foes) do
+		local index = table.find(sim.beys, foe) or 0
+		if not Config.ClassicAI and not foe.out and not sim.ai[index] then
+			local dx, dz = (foe.x or 0) - (bey.x or 0), (foe.z or 0) - (bey.z or 0)
+			local ready = (foe.guardN or 0) > 0 or (foe.smashC or 0) >= (Tuning.SMASH_CHARGE or 1) or (foe.rush or 0) > 0 or (foe.ridge or 0) >= 0.25
+			if dx * dx + dz * dz < 64 and ready then
+				punisher = foe
+			end
+		end
+	end
 	local theirs, line = 0, 1
 	for _, foe in ipairs(foes) do
 		if not foe.out then
@@ -1422,15 +1630,12 @@ function BeyRivals.ridgeSafe(sim, slot, bey, input)
 			line = math.min(line, BeyRivals.crushAt(foe))
 			-- A rival riding the ridge with us chains/steals into us: staying on it is the trap (11-05 loss 2).
 			local dx, dz = (foe.x or 0) - (bey.x or 0), (foe.z or 0) - (bey.z or 0)
-			if foe.onRidge and dx * dx + dz * dz < 36 then
+			if foe.onRidge and dx * dx + dz * dz < 36 and not punisher then
 				return input
 			end
 		end
 	end
-	if mine < line - 0.1 then
-		return input
-	end
-	if theirs > mine + 0.1 then
+	if not punisher and (mine < line - 0.1 or theirs > mine + 0.1) then
 		return input
 	end
 	local px, pz = bey.x or 0, bey.z or 0
@@ -1443,9 +1648,14 @@ function BeyRivals.ridgeSafe(sim, slot, bey, input)
 	if inward <= (Tuning.RUSH_DOT or 0.3) - 0.1 then
 		return input
 	end
-	-- Keep riding around the bowl instead (tangent in the direction we're already going).
+	-- Keep riding around the bowl instead: away from the rival who'd punish the rush, otherwise in the
+	-- direction we're already going.
 	local tx, tz = -pz / r, px / r
-	if (bey.vx or 0) * tx + (bey.vz or 0) * tz < 0 then
+	if punisher then
+		if ((punisher.x or 0) - px) * tx + ((punisher.z or 0) - pz) * tz > 0 then
+			tx, tz = -tx, -tz
+		end
+	elseif (bey.vx or 0) * tx + (bey.vz or 0) * tz < 0 then
 		tx, tz = -tx, -tz
 	end
 	status = "Safe ridge"
@@ -2101,6 +2311,7 @@ local function openMatch(battle)
 	}
 	currentRound = nil
 	table.insert(MatchLog, currentMatch)
+	BeyRivals.currentMatch = currentMatch
 	return true
 end
 
@@ -2701,11 +2912,14 @@ toggle(battlePage, "Tilt launch to the ridge", "TiltLaunch")
 heading(battlePage, "Fight")
 slider(battlePage, "Pilot skill", "PilotLevel", 0.5, 1, 0.05, function(v) return math.floor(v * 100 + 0.5) .. "%" end)
 toggle(battlePage, "Look ahead and pick the best line", "Lookahead")
+toggle(battlePage, "Classic AI (the 89-win version, rules after 11-05 off)", "ClassicAI")
 toggle(battlePage, "Expect human rivals to fight back", "ModelHumans")
 toggle(battlePage, "No ridge rush at high gauge", "SafeRidge")
 toggle(battlePage, "Run the clock when ahead on spin", "RunClock")
 toggle(battlePage, "No contact in the crush zone", "CrushGuard")
 toggle(battlePage, "Brace for hits at the rim", "RimBrace")
+toggle(battlePage, "Dodge rival abilities (sweeps, AoE, waves)", "SweepDodge")
+toggle(battlePage, "Go for the burst when losing on spin", "SpinRace")
 slider(battlePage, "Look-ahead budget", "LookaheadMs", 2, 16, 0.5, function(v) return string.format("%.1f ms", v) end)
 slider(battlePage, "Max AI time per frame (FPS)", "FrameCapMs", 6, 30, 1, function(v) return v .. " ms" end)
 toggle(battlePage, "Perfect clash timing", "PerfectClash")
@@ -3360,6 +3574,82 @@ statRow("Win rate", "rate")
 statRow("Perfect rips", "rips")
 statRow("Perfect guards", "guards")
 statRow("Counters thrown", "counters")
+
+-- Account: everything the profile holds worth seeing at a glance (read live from the save).
+do
+	local function commas(n)
+		n = math.floor(tonumber(n) or 0)
+		local text = tostring(math.abs(n)):reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", "")
+		return (n < 0 and "-" or "") .. text
+	end
+	local rows = {
+		{ "Wallet" },
+		{ "Coins", function(top) return commas(top.Coins) end },
+		{ "Trait tokens", function(_, d) return commas(d.Tokens) end },
+		{ "Summon tickets", function(_, d) return commas(d.Tickets) end },
+		{ "Soul draw tickets", function(_, d) local e = d.Event and d.Event.hw26 return e and commas(e.t) or "-" end },
+		{ "Lucky surname spins", function(_, d) return d.Name and commas(d.Name.lucky) or "-" end },
+		{ "Burst tokens today", function(_, d) return d.BurstTokens and commas(d.BurstTokens.n) or "-" end },
+		{ "Win tokens today", function(_, d) return d.WinTokens and commas(d.WinTokens.n) or "-" end },
+		{ "Profile" },
+		{ "Level", function(_, d) return commas(d.Level) end },
+		{ "Rank", function() return tostring(localPlayer:GetAttribute("RivalsTier") or "-") end },
+		{ "Elo (peak)", function(_, d) return string.format("%s (%s)", commas(d.Elo), commas(d.Peak)) end },
+		{ "Ranked W-L", function(_, d) return string.format("%s-%s", commas(d.RankedWins), commas(d.RankedLosses)) end },
+		{ "Power", function() return commas(localPlayer:GetAttribute("RivalsPower")) end },
+		{ "Win streak (best)", function(_, d) return d.Streak and string.format("%s (%s)", commas(d.Streak.now), commas(d.Streak.best)) or "-" end },
+		{ "Surname", function(_, d) return d.Name and tostring(d.Name.id) or "-" end },
+		{ "Club", function(_, d) return d.Club and d.Club.tag and string.format("[%s] %s", d.Club.tag, tostring(d.Club.name)) or "None" end },
+		{ "Lifetime (game)" },
+		{ "Matches", function(_, d) return d.Stats and commas(d.Stats.matches) or "-" end },
+		{ "Wins-Losses", function(_, d) return d.Stats and string.format("%s-%s", commas(d.Stats.wins), commas(d.Stats.losses)) or "-" end },
+		{ "Bursts dealt", function(_, d) return d.Stats and commas(d.Stats.bursts) or "-" end },
+		{ "Ring-outs", function(_, d) return d.Stats and commas(d.Stats.ringouts) or "-" end },
+		{ "Smashes", function(_, d) return d.Stats and commas(d.Stats.smashes) or "-" end },
+		{ "Perfect clashes", function(_, d) return d.Stats and commas(d.Stats.clashPerfect) or "-" end },
+		{ "Summon pulls", function(_, d) return d.Stats and commas(d.Stats.pulls) or "-" end },
+		{ "Club wins", function(_, d) return d.Stats and commas(d.Stats.clubWins) or "-" end },
+	}
+	local labels = {}
+	for _, entry in ipairs(rows) do
+		if not entry[2] then
+			heading(statsPage, entry[1])
+		else
+			local row = rowBase(statsPage, 30, false)
+			rowLabel(row, entry[1])
+			labels[entry] = create("TextLabel", {
+				AnchorPoint = Vector2.new(1, 0.5),
+				Position = UDim2.new(1, -8, 0.5, 0),
+				Size = UDim2.fromOffset(150, 20),
+				BackgroundTransparency = 1,
+				FontFace = BODY_BOLD,
+				Text = "-",
+				TextColor3 = TEXT,
+				TextSize = 14,
+				TextTruncate = Enum.TextTruncate.AtEnd,
+				TextXAlignment = Enum.TextXAlignment.Right,
+				Parent = row,
+			})
+		end
+	end
+	task.spawn(function()
+		-- GC scans are slow, so find the save once a minute and read the cached table in between.
+		local top, scannedAt = nil, -math.huge
+		while not BeyRivals.detached and statsPage.Parent do
+			if not top or os.clock() - scannedAt > 60 then
+				top, scannedAt = filtergc("table", { Keys = { "Coins", "Rivals" } }, true), os.clock()
+			end
+			local d = type(top) == "table" and type(top.Rivals) == "table" and top.Rivals or nil
+			if type(d) == "table" then
+				for entry, label in pairs(labels) do
+					local ok, text = pcall(entry[2], top or {}, d)
+					label.Text = ok and tostring(text) or "-"
+				end
+			end
+			task.wait(3)
+		end
+	end)
+end
 
 -- Footer.
 local footer = create("Frame", {
