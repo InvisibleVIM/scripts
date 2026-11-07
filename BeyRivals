@@ -103,6 +103,7 @@ local Config = {
 	RunClock = true,
 	CrushGuard = true,
 	AbsBurst = true,
+	SpinOutRace = true,
 	RimBrace = true,
 	SweepDodge = true,
 	SpinRace = true,
@@ -1527,7 +1528,59 @@ end
 
 ---Behind on spin late in a round: waiting only hands them a spin finish (11-06: two rounds lost at
 ---0.05 spin vs 0.28 while we kept away in the crush zone). Time to trade for a burst instead.
+---Ticks until a bey spins out at its recent decay rate (nil while there's too little history).
+function BeyRivals.spinTTL(sim, bey)
+	local hist = BeyRivals.spinHist
+	if not hist or hist.sim ~= sim then
+		hist = { sim = sim }
+		BeyRivals.spinHist = hist
+	end
+	local h = hist[bey]
+	if not h then
+		h = {}
+		hist[bey] = h
+	end
+	local last = h[#h]
+	if not last or sim.tick - last.t >= 30 then
+		table.insert(h, { t = sim.tick, s = bey.spin or 0 })
+		if #h > 8 then
+			table.remove(h, 1)
+		end
+	end
+	local a, b = h[1], h[#h]
+	if #h < 7 or b.t - a.t < 180 then
+		return nil
+	end
+	local rate = (a.s - b.s) / (b.t - a.t)
+	if rate <= 1e-5 then
+		return math.huge
+	end
+	return (b.s or 0) / rate
+end
+
+---Keep-away only pays if we outlast them. 11-07 vs Fafnir/Weight: crush-zone keep-away from 53% gauge,
+---we lost spin 2x faster (0.72->0.42 vs 0.75->0.60) and got spin-finished twice. Projected loss -> fight.
+function BeyRivals.outspun(sim, slot, bey)
+	if not Config.SpinOutRace then
+		return false
+	end
+	local _, foes = sidesOf(sim, slot)
+	local mine = BeyRivals.spinTTL(sim, bey)
+	for _, foe in ipairs(foes) do
+		if not foe.out then
+			local theirs = BeyRivals.spinTTL(sim, foe)
+			if mine and theirs and mine < theirs * 0.85 and (bey.spin or 0) < (foe.spin or 0) + 0.05 then
+				return true
+			end
+		end
+	end
+	return false
+end
+
 function BeyRivals.losingSpinRace(sim, slot, bey)
+	if BeyRivals.outspun(sim, slot, bey) then
+		return true
+	end
 	if Config.ClassicAI or not Config.SpinRace then
 		return false
 	end
@@ -2972,6 +3025,7 @@ toggle(battlePage, "No ridge rush at high gauge", "SafeRidge")
 toggle(battlePage, "Run the clock when ahead on spin", "RunClock")
 toggle(battlePage, "No contact in the crush zone", "CrushGuard")
 toggle(battlePage, "Burst race by HP left (not %)", "AbsBurst")
+toggle(battlePage, "Fight when keep-away would lose on spin", "SpinOutRace")
 toggle(battlePage, "Brace for hits at the rim", "RimBrace")
 toggle(battlePage, "Dodge rival abilities (sweeps, AoE, waves)", "SweepDodge")
 toggle(battlePage, "Go for the burst when losing on spin", "SpinRace")
