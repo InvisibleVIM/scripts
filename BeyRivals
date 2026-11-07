@@ -104,6 +104,7 @@ local Config = {
 	CrushGuard = true,
 	AbsBurst = true,
 	SpinOutRace = true,
+	StadiumAware = true,
 	RimBrace = true,
 	SweepDodge = true,
 	SpinRace = true,
@@ -127,6 +128,7 @@ local Config = {
 	NameLucky = false,
 	NameMax = 0,
 	NameSlot = 0,
+	NameBoost = 0,
 	TraitSlot = 1,
 	TraitUseCoins = true,
 	TraitMaxRolls = 0,
@@ -293,6 +295,36 @@ local stadiumCache = {}
 
 ---How exposed a bey is to a ring-out: steep past 55% of the bowl, doubled near an exit pocket.
 ---@param sim table
+---Stadium id -> { base, mods = set, list, wallK, label }. Challenge stadiums are "Infinity|vents|magnet|...":
+---the Sim runs those mechanics itself (so every rollout already plays them); this only feeds the hand rules.
+function BeyRivals.stadiumInfo(id)
+	id = tostring(id or "")
+	local cache = BeyRivals.stadiumInfoCache or {}
+	BeyRivals.stadiumInfoCache = cache
+	if cache[id] then
+		return cache[id]
+	end
+	local parts = string.split(id, "|")
+	local info = { base = parts[1], mods = {}, list = {}, wallK = 1 }
+	for i = 2, #parts do
+		info.mods[parts[i]] = true
+		table.insert(info.list, parts[i])
+	end
+	local data = Stadiums and Stadiums.get(id)
+	local base = Stadiums and Stadiums.get(info.base)
+	if data and base and data.wallHeight and base.wallHeight and data.wallHeight > 0 then
+		-- Open Stadium: walls at 45% height, ring-outs go over the wall anywhere.
+		info.wallK = math.clamp(base.wallHeight / data.wallHeight, 1, 2.5)
+	end
+	local pretty = {}
+	for _, m in ipairs(info.list) do
+		table.insert(pretty, (m:gsub("_", " ")))
+	end
+	info.label = #pretty > 0 and (info.base .. ": " .. table.concat(pretty, ", ")) or info.base
+	cache[id] = info
+	return info
+end
+
 ---@param bey table
 ---@return number 0..80
 local function edgeRisk(sim, bey)
@@ -310,8 +342,20 @@ local function edgeRisk(sim, bey)
 	local risk = math.clamp((reach - 0.5) / 0.5, 0, 1) ^ 1.6 * 70
 	-- Spike has no exit pockets (ring-outs need an over-wall at speed 32); its walls cost burst instead,
 	-- which the rollouts already count, so the rim is far less of a ring-out threat there.
-	if #(stadium.pockets or {}) == 0 then
+	local info = BeyRivals.stadiumInfo(sim.stadium)
+	if #(stadium.pockets or {}) == 0 and info.wallK <= 1 then
 		risk = risk * 0.3
+	end
+	local pocketK = 1.2
+	if #info.list > 0 and Config.StadiumAware then
+		risk = risk * info.wallK
+		if info.mods.rubber_ring or info.mods.rebound_walls then
+			risk = risk * 0.6
+		end
+		-- Pocket drains pull beys out from the rim with no hit at all (probe: 12/48 rim spots went out).
+		if info.mods.suction then
+			pocketK = 2.6
+		end
 	end
 	if risk <= 0 then
 		return 0
@@ -320,7 +364,7 @@ local function edgeRisk(sim, bey)
 	for _, pocket in ipairs(stadium.pockets or {}) do
 		local off = math.abs((degrees - pocket + 180) % 360 - 180)
 		if off < 32 then
-			return risk * (1 + 1.2 * (1 - off / 32))
+			return risk * (1 + pocketK * (1 - off / 32))
 		end
 	end
 	return risk
@@ -1315,6 +1359,9 @@ local function autoInput(battle)
 		return nil
 	end
 	pcall(BeyRivals.recordSpin, sim)
+	if BeyRivals.liveStadium ~= sim.stadium then
+		BeyRivals.liveStadium = sim.stadium
+	end
 	local slot = battle.mySlot
 	local bey = sim.beys[slot]
 	if not bey or bey.out then
@@ -2014,7 +2061,7 @@ end
 -- ranked queue and the Halloween boss fight.
 local hookedPackets = {}
 if Packets then
-	for _, name in ipairs({ "ModePlay", "RankedQueue", "HalloweenAct" }) do
+	for _, name in ipairs({ "ModePlay", "RankedQueue", "HalloweenAct", "ChallengeFight", "TrainerChallenge" }) do
 		local packet = Packets[name]
 		if type(packet) == "table" and rawget(packet, "Fire") == nil then
 			local original = packet.Fire
@@ -2080,8 +2127,15 @@ local function nextJoin(result)
 			lastJoin = httpService:JSONDecode(readfile(JOIN_FILE))
 		end
 	end)
+	-- 11-07 Challenge mode: each period pays once and Specials once a day, so don't loop them or fall
+	-- back to the previous join (that would drop us into ranked). Pick the next challenge by hand.
+	if lastJoin and (lastJoin.packet == "ChallengeFight" or lastJoin.packet == "TrainerChallenge") then
+		return "Challenge", function()
+			return false, "challenge done - pick the next one"
+		end
+	end
 	if type(result) == "table" then
-		if result.mode == "Horseman" then
+		if result.mode == "Horseman" and workspace:GetAttribute("Halloween") == true then
 			return "Boss fight", function()
 				return firePacket("HalloweenAct", "fight", "")
 			end
@@ -2106,7 +2160,7 @@ local function nextJoin(result)
 			end
 		end
 	end
-	if lastJoin and lastJoin.packet == "HalloweenAct" then
+	if lastJoin and lastJoin.packet == "HalloweenAct" and workspace:GetAttribute("Halloween") == true then
 		return "Boss fight", function()
 			return firePacket("HalloweenAct", "fight", "")
 		end
@@ -2661,7 +2715,7 @@ local statusLabel = create("TextLabel", {
 	Name = "Status",
 	AnchorPoint = Vector2.new(1, 0),
 	Position = UDim2.new(1, -18, 0, 24),
-	Size = UDim2.fromOffset(130, 18),
+	Size = UDim2.fromOffset(260, 18),
 	BackgroundTransparency = 1,
 	FontFace = BODY_FONT,
 	Text = "",
@@ -3044,6 +3098,7 @@ toggle(battlePage, "Run the clock when ahead on spin", "RunClock")
 toggle(battlePage, "No contact in the crush zone", "CrushGuard")
 toggle(battlePage, "Burst race by HP left (not %)", "AbsBurst")
 toggle(battlePage, "Fight when keep-away would lose on spin", "SpinOutRace")
+toggle(battlePage, "Adapt to challenge stadium mechanics", "StadiumAware")
 toggle(battlePage, "Brace for hits at the rim", "RimBrace")
 toggle(battlePage, "Dodge rival abilities (sweeps, AoE, waves)", "SweepDodge")
 toggle(battlePage, "Go for the burst when losing on spin", "SpinRace")
@@ -3355,6 +3410,10 @@ do
 		Halloween = require(game:GetService("ReplicatedStorage").Rivals.Halloween)
 		Names = require(game:GetService("ReplicatedStorage").Rivals.Names)
 	end)
+	-- 11-07: the event ended (Workspace.Halloween = false); hide the soul draw and the treat claim.
+	if workspace:GetAttribute("Halloween") ~= true then
+		Halloween = nil
+	end
 	setthreadidentity(8)
 
 	local PART_RARITY = { "Common", "Rare", "Epic", "Legendary", "Mythic", "Divine" }
@@ -3574,6 +3633,11 @@ do
 			return label and ("#" .. v .. " " .. label) or ("#" .. v .. " (locked)")
 		end)
 		hint(rollsPage, "Switches to that slot before spinning; each spin replaces its surname")
+		-- 11-07 update: RivalsNameRoll(lucky, boost) - boost doubles one surname's chance (Names.BOOST).
+		slider(rollsPage, "Boost surname (2x chance)", "NameBoost", 0, #Names.List, 1, function(v)
+			local entry = Names.List[v]
+			return entry and string.format("%s (%s)", Names.display(entry.id), tostring(entry.rarity)) or "None"
+		end)
 		roller(rollsPage, "surname spins", function(state)
 			local nameData = data() and data().Name
 			-- Switch to the chosen slot first (the game spins whatever slot is active).
@@ -3609,7 +3673,8 @@ do
 				return false
 			end
 			local lucky = Config.NameLucky and type(nameData) == "table" and (nameData.lucky or 0) > 0
-			local accepted, message, payload = fire("RivalsNameRoll", lucky == true)
+			local boost = Names.List[Config.NameBoost] and Config.NameBoost or 0
+			local accepted, message, payload = fire("RivalsNameRoll", lucky == true, boost)
 			if not accepted then
 				state.status = "Stopped: " .. tostring(message ~= "" and message or "spin refused")
 				return false
@@ -3634,7 +3699,7 @@ do
 
 	-- Freebies.
 	heading(rollsPage, "Free stuff")
-	local freeState = { status = "Claims the daily gift, level rewards, premium rewards and the Halloween treat" }
+	local freeState = { status = "Claims the daily gift, level rewards and premium rewards" }
 	local freeRow = rowBase(rollsPage, 38, true)
 	create("TextLabel", {
 		Size = UDim2.fromScale(1, 1),
@@ -3714,14 +3779,17 @@ do
 		{ "Coins", function(top) return commas(top.Coins) end },
 		{ "Trait tokens", function(_, d) return commas(d.Tokens) end },
 		{ "Summon tickets", function(_, d) return commas(d.Tickets) end },
-		{ "Soul draw tickets", function(_, d) local e = d.Event and d.Event.hw26 return e and commas(e.t) or "-" end },
+		{ "Limit Breakers", function(_, d) return d.Mats and commas(d.Mats.limit_breaker) or "0" end },
+		{ "Evolution materials", function(_, d) local n = 0 for _, v in pairs(d.Mats or {}) do n += tonumber(v) or 0 end return commas(n) end },
 		{ "Lucky surname spins", function(_, d) return d.Name and commas(d.Name.lucky) or "-" end },
 		{ "Burst tokens today", function(_, d) return d.BurstTokens and commas(d.BurstTokens.n) or "-" end },
 		{ "Win tokens today", function(_, d) return d.WinTokens and commas(d.WinTokens.n) or "-" end },
 		{ "Profile" },
 		{ "Level", function(_, d) return commas(d.Level) end },
 		{ "Rank", function() return tostring(localPlayer:GetAttribute("RivalsTier") or "-") end },
-		{ "Elo (peak)", function(_, d) return string.format("%s (%s)", commas(d.Elo), commas(d.Peak)) end },
+		{ "1v1 Elo (peak)", function(_, d) return string.format("%s (%s)", commas(d.Elo), commas(d.Peak)) end },
+		{ "2v2 Elo (peak)", function(_, d) return string.format("%s (%s)", commas(d.Elo2), commas(d.Peak2)) end },
+		{ "3v3 Elo (peak)", function(_, d) return string.format("%s (%s)", commas(d.Elo3), commas(d.Peak3)) end },
 		{ "Ranked W-L", function(_, d) return string.format("%s-%s", commas(d.RankedWins), commas(d.RankedLosses)) end },
 		{ "Power", function() return commas(localPlayer:GetAttribute("RivalsPower")) end },
 		{ "Win streak (best)", function(_, d) return d.Streak and string.format("%s (%s)", commas(d.Streak.now), commas(d.Streak.best)) or "-" end },
@@ -3856,7 +3924,9 @@ end
 table.insert(BeyRivals.connections, runService.RenderStepped:Connect(function(dt)
 	if Config.AutoBattle then
 		beyMark.Rotation = (beyMark.Rotation + dt * 720) % 360
-		statusLabel.Text = status
+		local stadiumId = BeyRivals.liveStadium
+		local info = stadiumId and BeyRivals.stadiumInfo(stadiumId)
+		statusLabel.Text = (info and #info.list > 0) and (status .. " | " .. info.label) or status
 		statusLabel.TextColor3 = (status == "Behind" or status == "Defending") and LOSS or GOLD
 	elseif Config.AutoQueue then
 		statusLabel.Text = status == "Idle" and "Auto queue on" or status
