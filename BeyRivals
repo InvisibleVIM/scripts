@@ -51,19 +51,11 @@ local localPlayer = playersService.LocalPlayer
 -- Constants.
 local SETTINGS_FOLDER = "BeyRivals"
 local SETTINGS_FILE = SETTINGS_FOLDER .. "/settings.json"
-local SAVE_INTERVAL = 0.5
 local RIP_PRESS = 16
 local BRACE_BIT = 4
 local DIRECTIONS = 8
-local LAUNCH_PLAN_TIME = 4
-local QUEUE_RETRY_EVERY = 1.5
-local QUEUE_GIVE_UP = 90
-local ANTI_AFK_EVERY = 60
-local SKIP_DELAY = 0.6
 local LAUNCH_FRAME_MS = 14
-local LAUNCH_HORIZON = 600
 -- The game's AI rival launches at 0.60 of the bowl, within about +-0.36 rad of its stance.
-local FOE_LAUNCH_D = 0.6
 local FOE_ANGLE_SPREAD = { -0.3, 0, 0.3 }
 local LAUNCH_ANGLES = 16
 local LAUNCH_DISTANCES = { 0.55, 0.85, 0.35, 0.15, 0.7 }
@@ -106,6 +98,20 @@ local Config = {
 	SpinOutRace = true,
 	StadiumAware = true,
 	BossCrushGuard = true,
+	DeepFinish = true,
+	AbilityCrushGuard = true,
+	MutualCrush = true,
+	PlayStyle = "Auto",
+	RimAbilityGuard = true,
+	LongGuardVeto = true,
+	RushGuard = true,
+	RushGuardSpeed = 22,
+	Spot2v2 = "1st",
+	Spot3v3 = "1st",
+	AutoReady = true,
+	DeepMs = 5,
+	DeepHorizon = 600,
+	DeepTolerance = 0.3,
 	RimBrace = true,
 	SweepDodge = true,
 	SpinRace = true,
@@ -212,7 +218,6 @@ local CLASH_BIT = Tuning.CLASH_Q_BIT
 local CLASH_NOTES = Tuning.CLASH_NOTES
 local COUNTER_BIT = Tuning.CA_BIT
 local GUARD_WINDOW = Tuning.GUARD_WIN * Tuning.GUARD_WIN_ATK_MOVE
-local GUARD_LOOKAHEAD = 6
 local GUARD_PRESS_LEAD = 3
 
 -- State.
@@ -436,6 +441,22 @@ end
 ---@param sim table
 ---@param slot number
 ---@return number
+---Play profile by our bey's type (or the PlayStyle override). The game's own pilot already moves by
+---type (Attack rides the rim, Stamina/Defense hold the centre); this tunes our scoring and rules on top.
+BeyRivals.PROFILES = {
+	Attack = { spinK = 1, burstK = 1, aggrK = 1, clock = false },
+	Balance = { spinK = 1.3, burstK = 0.95, aggrK = 0.7, clock = true },
+	Stamina = { spinK = 1.7, burstK = 0.85, aggrK = 0.35, clock = true },
+	Defense = { spinK = 1.3, burstK = 1.05, aggrK = 0.55, clock = false },
+}
+function BeyRivals.profileOf(bey)
+	local pick = Config.PlayStyle
+	if pick == "Auto" or not BeyRivals.PROFILES[pick] then
+		pick = bey and BeyRivals.PROFILES[bey.typ] and bey.typ or "Attack"
+	end
+	return BeyRivals.PROFILES[pick], pick
+end
+
 local function scoreOf(sim, slot)
 	local me, foes = sidesOf(sim, slot)
 	-- Ranked scoring: a burst is worth 2 points, a ring-out or spin finish 1.
@@ -471,8 +492,9 @@ local function scoreOf(sim, slot)
 		return (bursted and 1000 or 780) - sim.tick * 0.01
 	end
 
-	local score = ((me.spin or 0) - foeSpin / foesLeft) * 100
-	score = score + (foeBurst / foesLeft - burstRatio(me)) * 90
+	local profile = BeyRivals.profileOf(me)
+	local score = ((me.spin or 0) - foeSpin / foesLeft) * 100 * profile.spinK
+	score = score + (foeBurst / foesLeft - burstRatio(me)) * 90 * profile.burstK
 	-- Near the burst limit any hit ends the round: steep cost for us, bonus for pressing a near-burst rival.
 	local function nearBurst(ratio)
 		return math.clamp((ratio - 0.4) / 0.55, 0, 1) ^ 1.5 * 160
@@ -689,6 +711,7 @@ local function stepAsPlayer(copy, slot, clone, override)
 	end
 	copy.ai[slot] = nil
 	Sim.step(copy, { [slot] = input })
+	return input
 end
 
 ---Try a candidate for PLAN_TICKS, then play on like live, and score the future.
@@ -960,6 +983,178 @@ end
 ---Pick the best plan for the next few ticks within the frame budget.
 ---@param sim table
 ---@param slot number
+---Deep finish search (vs the game's AI only). The sim is deterministic, so a whole finishing line can be
+---searched ahead of time and replayed input-for-input. While the search runs (spread over frames at
+---Config.DeepMs), we play the exact inputs of a pre-advanced copy, so its end state is where we'll be.
+---Every tick is checked against the predicted positions; any mismatch drops back to the normal AI.
+BeyRivals.deepStats = BeyRivals.deepStats or { found = 0, done = 0, diverged = 0, none = 0 }
+function BeyRivals.deepStep(sim, slot, bey)
+	local d = BeyRivals.deep
+	local t = sim.tick
+	-- Ticks restart every round: a cooldown from last round must not block this one.
+	if BeyRivals.deepLastTick and t < BeyRivals.deepLastTick then
+		BeyRivals.deepCooldown = 0
+	end
+	BeyRivals.deepLastTick = t
+	if d and (t < d.t0 or d.sim ~= sim.stadium or d.slot ~= slot) then
+		BeyRivals.deep, d = nil, nil
+	end
+	if d then
+		local cp = d.check[t]
+		if cp then
+			local me, foe = sim.beys[slot], sim.beys[d.foe]
+			-- Live vs copy drift by ~0.05 over 300 ticks (float noise); a real mismatch is metres off.
+			-- Tighter near the burst limit, and bail the moment we're taking damage the line didn't predict
+			-- (11-08 unevolved Fenrir vs Volt: two replays ate +2.10 / +1.82 hits before positions drifted).
+			local tol = Config.DeepTolerance * math.clamp(1 - burstRatio(me), 0.35, 1)
+			if cp[5] and (me.burst or 0) - cp[5] > 0.25 then
+				BeyRivals.deepStats.diverged += 1
+				BeyRivals.deep = nil
+				BeyRivals.deepCooldown = t + 30
+				return nil
+			end
+			if math.abs((me.x or 0) - cp[1]) > tol or math.abs((me.z or 0) - cp[2]) > tol
+				or (foe and (math.abs((foe.x or 0) - cp[3]) > tol or math.abs((foe.z or 0) - cp[4]) > tol)) then
+				BeyRivals.deepStats.diverged += 1
+				BeyRivals.deep = nil
+				BeyRivals.deepCooldown = t + 30
+				return nil
+			end
+		end
+		if d.mode == "search" then
+			BeyRivals.deepWork(d, slot)
+		end
+		local input = d.inputs[t + 1]
+		if not input then
+			if d.mode == "exec" then
+				BeyRivals.deepStats.done += 1
+			end
+			BeyRivals.deep = nil
+			return nil
+		end
+		return { sx = input.sx, sz = input.sz, b = input.b, t = 0 }, d
+	end
+	if (BeyRivals.deepCooldown or 0) > t and (BeyRivals.deepCooldown or 0) - t < 2000 then
+		return nil
+	end
+	-- Start: pre-advance a copy by the time the search will take, recording our exact inputs.
+	local foeIndex
+	for index, other in ipairs(sim.beys) do
+		if index ~= slot and not other.out then
+			foeIndex = index
+		end
+	end
+	if not foeIndex or not pilot then
+		return nil
+	end
+	local base = Sim.copy(sim)
+	local clone = table.clone(pilot)
+	clone.level = Config.PilotLevel
+	local cands = candidateList(base.beys[slot], base, slot)
+	local horizon = Config.DeepHorizon
+	local cost = math.max(stepCost or 0.03, 0.005)
+	local frames = math.ceil(#cands * horizon * cost / math.max(Config.DeepMs, 1))
+	local lead = math.clamp(math.floor(frames * 1.4) + 12, 30, 420)
+	d = { t0 = t, sim = sim.stadium, slot = slot, foe = foeIndex, inputs = {}, check = {}, mode = "search" }
+	local startBurst = base.beys[slot].burst or 0
+	for _ = 1, lead do
+		if base.done then
+			return nil
+		end
+		local applied = stepAsPlayer(base, slot, clone)
+		local me, foe = base.beys[slot], base.beys[foeIndex]
+		d.inputs[base.tick] = applied
+		d.check[base.tick] = { me.x or 0, me.z or 0, foe.x or 0, foe.z or 0, me.burst or 0 }
+		if me.out then
+			BeyRivals.deepCooldown = t + 30
+			return nil
+		end
+		if foe.out then
+			-- The plain line already finishes inside the lead: just replay it.
+			d.mode = "exec"
+			d.finishAt = base.tick
+			BeyRivals.deepStats.found += 1
+			BeyRivals.deep = d
+			return BeyRivals.deepStep(sim, slot, bey)
+		end
+	end
+	if ((base.beys[slot].burst or 0) - startBurst) / math.max(base.beys[slot].burstMax or 1, 1) > 0.25 then
+		BeyRivals.deepCooldown = t + 30
+		return nil
+	end
+	d.base, d.clone, d.cands, d.ci, d.lead = base, clone, cands, 1, lead
+	d.need = math.max(3 - BeyRivals.myPoints(), 1)
+	BeyRivals.deep = d
+	return BeyRivals.deepStep(sim, slot, bey)
+end
+
+---Advance the candidate search within this frame's budget.
+function BeyRivals.deepWork(d, slot)
+	local deadline = os.clock() + Config.DeepMs / 1000
+	while d.ci <= #d.cands and os.clock() < deadline do
+		local run = d.run
+		if not run then
+			local cand = d.cands[d.ci]
+			local clone = table.clone(d.clone)
+			run = { copy = Sim.copy(d.base), clone = clone, k = 0, cand = cand, inputs = {}, check = {} }
+			d.run = run
+		end
+		local copy = run.copy
+		while run.k < Config.DeepHorizon and not copy.done and os.clock() < deadline do
+			run.k += 1
+			local override = nil
+			if run.cand then
+				if run.k == 1 then
+					override = run.cand
+				elseif run.k <= PLAN_TICKS then
+					override = { sx = run.cand.sx, sz = run.cand.sz, b = 0, t = 0 }
+				end
+			end
+			local applied = stepAsPlayer(copy, slot, run.clone, override)
+			local me, foe = copy.beys[slot], copy.beys[d.foe]
+			run.inputs[copy.tick] = applied
+			run.check[copy.tick] = { me.x or 0, me.z or 0, foe.x or 0, foe.z or 0, me.burst or 0 }
+			if me.out then
+				run.k = math.huge
+				break
+			end
+			if foe.out then
+				local gained = math.min(foe.out == "Burst" and 2 or 1, d.need)
+				local rate = gained / (copy.tick - d.t0)
+				if not d.best or rate > d.best.rate then
+					d.best = { rate = rate, inputs = run.inputs, check = run.check, at = copy.tick, kind = tostring(foe.out) }
+				end
+				run.k = math.huge
+				break
+			end
+		end
+		if run.k >= Config.DeepHorizon or copy.done then
+			d.run = nil
+			d.ci += 1
+		end
+	end
+	if d.ci > #d.cands then
+		d.base, d.cands, d.clone, d.run = nil, nil, nil, nil
+		if d.best then
+			for tick, input in pairs(d.best.inputs) do
+				d.inputs[tick] = input
+			end
+			for tick, cp in pairs(d.best.check) do
+				d.check[tick] = cp
+			end
+			d.finishAt, d.kind, d.mode = d.best.at, d.best.kind, "exec"
+			d.best = nil
+			BeyRivals.deepStats.found += 1
+		else
+			-- Nothing finishes inside the horizon: finish the pre-advanced stretch, then let the normal
+			-- AI take over and search again a bit later.
+			BeyRivals.deepStats.none += 1
+			d.mode = "tail"
+			BeyRivals.deepCooldown = d.t0 + d.lead + 60
+		end
+	end
+end
+
 local function decide(sim, slot)
 	local candidates = candidateList(sim.beys[slot], sim, slot)
 	-- See further while a rival's ability is in flight: that is when we get knocked out.
@@ -1011,13 +1206,12 @@ local function decide(sim, slot)
 end
 
 local COUNTER_CHECK_TICKS = 60
-local COUNTER_CHECK_EVERY = 4
 local counterVerdict = { tick = -math.huge, safe = false }
 
 ---Compare countering now against holding off (both followed by the full-skill AI) on copies.
 ---@return boolean
 local function counterIsSafe(sim, slot, input, window)
-	if counterVerdict.window == window and sim.tick - counterVerdict.tick < COUNTER_CHECK_EVERY then
+	if counterVerdict.window == window and sim.tick - counterVerdict.tick < (4) then
 		return counterVerdict.safe
 	end
 	-- The counter lunges at the rival; the only reason to skip it is that the lunge rings us out.
@@ -1129,6 +1323,7 @@ function BeyRivals.sweepDodge(sim, slot, bey, input)
 	return best
 end
 
+BeyRivals.LONG_GUARD = { StormSpriggan = true }
 local function guardAttack(sim, slot, bey, input)
 	local fresh = bit32.band(bit32.band(input.b, ATTACK_BITS), bit32.bnot(bey.prevB or 0))
 	if fresh == 0 then
@@ -1137,6 +1332,13 @@ local function guardAttack(sim, slot, bey, input)
 	if BeyRivals.noAttack then
 		return { sx = input.sx, sz = input.sz, b = bit32.band(input.b, bit32.bnot(fresh)), t = input.t or 0 }
 	end
+	-- No fresh ability starts on the rim next to a pocket (vs humans the rollout can't see their pushes).
+	-- 11-08 Fenrir vs Longinox: abilities at 565/571 on the rim -> Lip 585 -> Pocket 595, self ring-out.
+	if Config.RimAbilityGuard and not BeyRivals.vsAI(sim, slot) and bit32.band(fresh, bit32.bor(32, 64, 8)) ~= 0
+		and edgeRisk(sim, bey) >= 45 and lastBestScore < 650 then
+		status = "No ability at the pocket"
+		return { sx = input.sx, sz = input.sz, b = bit32.band(input.b, bit32.bnot(bit32.band(fresh, bit32.bor(32, 64, 8)))), t = input.t or 0 }
+	end
 	local key = tostring(sim.tick) .. ":" .. tostring(input.b)
 	if attackVerdict.key ~= key then
 		local quiet = { sx = input.sx, sz = input.sz, b = bit32.band(input.b, bit32.bnot(fresh)), t = 0 }
@@ -1144,7 +1346,18 @@ local function guardAttack(sim, slot, bey, input)
 		-- (11-06: an ability that ended as the rival's ridge rush landed took us 47% -> 100%).
 		-- Never swing into a rival with a guard up while one stun would crit us: a perfect guard stuns
 		-- the attacker (11-06: our dash at 52% got guarded, their rush crit us to 100%).
-		if not Config.ClassicAI and not BeyRivals.vsAI(sim, slot) and not BeyRivals.losingSpinRace(sim, slot, bey) then
+		-- Classic keeps this veto off, except vs long-guard beys (Spriggan: 2x perfect-guard window). 11-08 x2:
+		-- both Spriggan losses ended on its counter (our dash at ~87% -> countered to 100%).
+		local guardVeto = not Config.ClassicAI
+		if not guardVeto and Config.LongGuardVeto then
+			local _, foes = sidesOf(sim, slot)
+			for _, foe in ipairs(foes) do
+				if not foe.out and foe.combo and BeyRivals.LONG_GUARD[foe.combo.layer] then
+					guardVeto = true
+				end
+			end
+		end
+		if guardVeto and not BeyRivals.vsAI(sim, slot) and not BeyRivals.losingSpinRace(sim, slot, bey) then
 			local _, foes = sidesOf(sim, slot)
 			for _, foe in ipairs(foes) do
 				if not foe.out and (foe.guardN or 0) > 0 and (foe.gbT or 0) <= 0 then
@@ -1167,6 +1380,7 @@ local function guardAttack(sim, slot, bey, input)
 		-- Aggression buys slack only while our gauge has room; at high gauge an ability that ends next to
 		-- the rival leaves us exposed (11-05 2v2 loss: 57% -> 100% off one clash right after our ability).
 		local room = BeyRivals.trading and 0.25 or math.clamp(1 - burstRatio(bey) / 0.5, 0, 1)
+		room = room * BeyRivals.profileOf(bey).aggrK
 		if BeyRivals.outspun(sim, slot, bey) then
 			-- Projected spin-out loss: holding back is a slow certain loss the short rollout can't see.
 			-- 11-07 vs Fafnir/Weight: 2 dashes in a 4388-tick round, then spin-finished. Swing unless it bursts us.
@@ -1238,7 +1452,7 @@ local function ticksToContact(sim, slot, input)
 	local copy = BeyRivals.modelFoes(Sim.copy(sim), slot)
 	copy.ai[slot] = nil
 	local held = { [slot] = { sx = input.sx, sz = input.sz, b = bit32.band(input.b, bit32.bnot(BRACE_BIT)), t = 0 } }
-	for step = 1, GUARD_LOOKAHEAD do
+	for step = 1, (6) do
 		Sim.step(copy, held)
 		for _, event in ipairs(copy.events) do
 			local kind = event.kind
@@ -1284,6 +1498,30 @@ local function guardBits(sim, slot, bey, input)
 	-- A fresh edge is needed; if last tick held Brace, release this tick.
 	if bit32.band(bey.prevB or 0, BRACE_BIT) ~= 0 then
 		return 0
+	end
+	-- Kinematic fallback vs humans: the rollout plays them as the game AI, which never ridge-rushes, so a
+	-- full-ridge rush never shows up as contact. 11-08 Fenrir vs Longinox/Magnum: three unguarded rushes
+	-- (+2.90 / +2.48 / +2.90, ~35% each) while "Ahead". Fast, on-target and about to land -> guard.
+	if Config.RushGuard and not BeyRivals.vsAI(sim, slot) then
+		local _, foes = sidesOf(sim, slot)
+		for _, foe in ipairs(foes) do
+			if not foe.out then
+				local dx, dz = (bey.x or 0) - (foe.x or 0), (bey.z or 0) - (foe.z or 0)
+				local vx, vz = (foe.vx or 0) - (bey.vx or 0), (foe.vz or 0) - (bey.vz or 0)
+				local dist = math.sqrt(dx * dx + dz * dz)
+				local speed = math.sqrt(vx * vx + vz * vz)
+				if dist > 1e-3 and speed > Config.RushGuardSpeed then
+					local closing = (dx * vx + dz * vz) / dist
+					local gap = dist - (bey.radius or 0.5) - (foe.radius or 0.5)
+					-- Perpendicular miss distance of the rival's relative path past us.
+					local miss = math.abs(dx * vz - dz * vx) / speed
+					if closing > Config.RushGuardSpeed * 0.8 and miss < 1.4 and gap / closing * 60 <= GUARD_PRESS_LEAD + 1 then
+						BeyRivals.rushGuards = (BeyRivals.rushGuards or 0) + 1
+						return BRACE_BIT
+					end
+				end
+			end
+		end
 	end
 	local contact, kind = ticksToContact(sim, slot, input)
 	if not (contact and contact <= GUARD_PRESS_LEAD) then
@@ -1360,6 +1598,10 @@ local function autoInput(battle)
 		return nil
 	end
 	pcall(BeyRivals.recordSpin, sim)
+	do
+		local _, name = BeyRivals.profileOf(sim.beys[battle.mySlot])
+		BeyRivals.liveProfile = name
+	end
 	if BeyRivals.liveStadium ~= sim.stadium then
 		BeyRivals.liveStadium = sim.stadium
 	end
@@ -1381,6 +1623,23 @@ local function autoInput(battle)
 	if not bey.launched then
 		status = bey.ripTick == 0 and "Ripping" or "Launching"
 		return { sx = 0, sz = 0, b = bey.ripTick == 0 and ripBits(nextTick) or 0, t = 0 }
+	end
+
+	if Config.DeepFinish and Config.Lookahead and BeyRivals.vsAI(sim, slot) then
+		local ok, deepInput, d = pcall(BeyRivals.deepStep, sim, slot, bey)
+		if ok and deepInput then
+			if d and d.mode == "exec" and d.finishAt then
+				status = string.format("Finishing line: %s in %d", tostring(d.kind or "out"), d.finishAt - sim.tick)
+			elseif d and d.mode == "search" then
+				status = string.format("Searching finish (%d/%d)", (d.ci or 1), d.cands and #d.cands or 0)
+			else
+				status = "Replaying"
+			end
+			return deepInput
+		elseif not ok then
+			BeyRivals.deep = nil
+			BeyRivals.deepError = tostring(deepInput)
+		end
 	end
 
 	local input = pilotInput(sim, slot)
@@ -1701,8 +1960,27 @@ function BeyRivals.inDanger(sim, slot, bey)
 		if not foe.out then
 			local theirs = burstRatio(foe)
 			local foeFinished = BeyRivals.tireIn(sim, foe) == 0 or (theirs >= BeyRivals.crushAt(bey) and BeyRivals.crushable(foe)) or (theirs >= 0.97 and mine < 0.85)
-			if not foeFinished and mine >= BeyRivals.crushAt(foe) - 0.05 and BeyRivals.burstBehind(bey, foe, mine, theirs) then
+			-- Mutual crush zone (both crit-able): fleeing a rival as fast as us just hands them a hit from
+			-- behind. 11-07 Longinox mirror x2: "no contact" at 57% vs 52%, rammed 57% -> 94%. Let the planner
+			-- strike/guard first unless we're clearly behind on HP or their ability is live (rule above).
+			local mutual = Config.MutualCrush and theirs >= BeyRivals.crushAt(bey) - 0.05 and (foe.ab or 0) == 0
+			if mutual then
+				local myLeft = (bey.burstMax or 1) * (1 - mine)
+				local foeLeft = (foe.burstMax or 1) * (1 - theirs)
+				local mySpeed = math.sqrt((bey.vx or 0) ^ 2 + (bey.vz or 0) ^ 2)
+				mutual = myLeft >= foeLeft * 0.8 and (foe.speed or 0) >= (bey.speed or 0) * 0.9 and mySpeed >= 0
+			end
+			if not foeFinished and not mutual and mine >= BeyRivals.crushAt(foe) - 0.05 and BeyRivals.burstBehind(bey, foe, mine, theirs) then
 				return true
+			end
+			-- Rival ability in flight while we're crushable: get out regardless of who's ahead. 11-07 Longinox
+			-- mirror: guarded its Dragon Crush, stayed in ("Ahead", 1.44 vs 0.84 HP left), the homing slam then
+			-- exposed us and the follow-up dash crit 85% -> 100%. Same shape as the Volt R1 burst.
+			if Config.AbilityCrushGuard and not foeFinished and (foe.ab or 0) ~= 0 and mine >= BeyRivals.crushAt(foe) - 0.05 then
+				local dx, dz = (foe.x or 0) - (bey.x or 0), (foe.z or 0) - (bey.z or 0)
+				if dx * dx + dz * dz < 144 then
+					return true
+				end
 			end
 			-- An armed rival (ability off cooldown / ultimate charged) can crit us from close range no
 			-- matter whose gauge is fuller (11-06: we pressed a 91% rival at 60%, their strike crit us).
@@ -1734,6 +2012,13 @@ function BeyRivals.runClock(sim, slot, bey)
 			end
 			if spinLead > 0.03 and BeyRivals.burstBehind(bey, foe, mine, burstRatio(foe), 0) and mine >= BeyRivals.crushAt(foe) - 0.15 then
 				return true
+			end
+			-- Stamina/Balance profiles win by outlasting: ahead on spin and projected to outlast them, keep away.
+			if BeyRivals.profileOf(bey).clock and spinLead > 0.04 then
+				local myTTL, foeTTL = BeyRivals.spinTTL(sim, bey), BeyRivals.spinTTL(sim, foe)
+				if myTTL and foeTTL and myTTL > foeTTL * 1.1 then
+					return true
+				end
 			end
 		end
 	end
@@ -1914,7 +2199,7 @@ local function scoreLaunchOnce(sim, slot, candidate, foeOffset)
 		elseif (bey.aimS or 0) == 0 then
 			-- Rival aim is unknown until both lock in: model the AI's habit.
 			local stand = Stadiums and Stadiums.standAngle(index, count) or 0
-			Sim.setAim(copy, index, stand + foeOffset, FOE_LAUNCH_D, "Power")
+			Sim.setAim(copy, index, stand + foeOffset, (0.6), "Power")
 		end
 		if not copy.ai[index] then
 			copy.ai[index] = freshPilot()
@@ -1922,7 +2207,7 @@ local function scoreLaunchOnce(sim, slot, candidate, foeOffset)
 	end
 	copy.ai[slot] = nil
 	local clone = freshPilot()
-	for _ = 1, LAUNCH_HORIZON do
+	for _ = 1, (600) do
 		if copy.done then
 			break
 		end
@@ -1960,7 +2245,7 @@ local function planAndLaunch(battle)
 	if Config.PlanLaunch then
 		status = "Planning launch"
 		local candidates = launchCandidates(defaultAngle)
-		local deadline = os.clock() + LAUNCH_PLAN_TIME
+		local deadline = os.clock() + (4)
 		launchFrameStart = os.clock()
 		local bestScore, tried = -math.huge, 0
 
@@ -2050,7 +2335,6 @@ end
 -- ============================================================
 
 local JOIN_FILE = SETTINGS_FOLDER .. "/lastjoin.json"
-local RESULT_WAIT = 20
 
 -- The last way the player (or we) entered a battle: { packet = name, args = {...}, at = os.time() }.
 local lastJoin = nil
@@ -2074,7 +2358,7 @@ end
 -- ranked queue and the Halloween boss fight.
 local hookedPackets = {}
 if Packets then
-	for _, name in ipairs({ "ModePlay", "RankedQueue", "HalloweenAct", "ChallengeFight", "TrainerChallenge" }) do
+	for _, name in ipairs({ "ModePlay", "RankedQueue", "HalloweenAct", "ChallengeFight", "TrainerChallenge", "PvpChallenge", "RankedChallenge" }) do
 		local packet = Packets[name]
 		if type(packet) == "table" and rawget(packet, "Fire") == nil then
 			local original = packet.Fire
@@ -2142,11 +2426,36 @@ local function nextJoin(result)
 	end)
 	-- 11-07 Challenge mode: each period pays once and Specials once a day, so don't loop them or fall
 	-- back to the previous join (that would drop us into ranked). Pick the next challenge by hand.
+	-- A remembered join only describes THIS battle if it was sent just before the battle started. Lobby NPC
+	-- fights start server-side (no join packet), so a stale boss join kept sending us to Volt after them.
+	do
+		local latest = BeyRivals.currentMatch or (BeyRivals.matchLog and BeyRivals.matchLog[#BeyRivals.matchLog])
+		local startedAt = latest and tonumber(latest.at)
+		if lastJoin and lastJoin.packet ~= "RankedQueue" and startedAt and tonumber(lastJoin.at) and lastJoin.at < startedAt - 90 then
+			lastJoin = nil
+		end
+	end
+	-- Ranked series finished (1v1/2v2/3v3): queue the same ladder again.
+	if BeyRivals.ranked and (BeyRivals.ranked.state == "home" or BeyRivals.ranked.state == "nocontest") then
+		local ladder = BeyRivals.rankedMode or "1v1"
+		return "Ranked " .. ladder, function()
+			local accepted, reason = firePacket("RankedQueue", "again")
+			if not accepted then
+				accepted, reason = firePacket("RankedQueue", ladder)
+			end
+			return accepted, reason, true
+		end
+	end
 	-- Evolve bosses (Volt / Rentaro) are the exception: every win rolls the 4% disc/driver drop, so rematch.
 	if lastJoin and lastJoin.packet == "ChallengeFight" and type(lastJoin.args) == "table" and lastJoin.args[1] == "boss" then
 		local args = lastJoin.args
 		return "Boss rematch", function()
 			return firePacket("ChallengeFight", "boss", tonumber(args[2]) or 1, tonumber(args[3]) or 0)
+		end
+	end
+	if lastJoin and (lastJoin.packet == "PvpChallenge" or lastJoin.packet == "RankedChallenge") then
+		return "Player challenge", function()
+			return false, "player challenge done - queue the next one"
 		end
 	end
 	if lastJoin and (lastJoin.packet == "ChallengeFight" or lastJoin.packet == "TrainerChallenge") then
@@ -2219,14 +2528,14 @@ local function joinNextBattle(endedToken)
 	status = "Waiting for results"
 	repeat
 		task.wait(0.25)
-	until lastResultAt >= endedAt or os.clock() - endedAt > RESULT_WAIT or run ~= queueRun or not Config.AutoQueue or inNewBattle(endedToken)
+	until lastResultAt >= endedAt or os.clock() - endedAt > (20) or run ~= queueRun or not Config.AutoQueue or inNewBattle(endedToken)
 	if run ~= queueRun or not Config.AutoQueue or inNewBattle(endedToken) or BeyRivals.detached then
 		return
 	end
 
 	local result = lastResultAt >= endedAt and lastResult or nil
 	local label, attempt = nextJoin(result)
-	local giveUp = os.clock() + QUEUE_GIVE_UP
+	local giveUp = os.clock() + (90)
 	while os.clock() < giveUp and run == queueRun and Config.AutoQueue and not BeyRivals.detached do
 		if inNewBattle(endedToken) then
 			return
@@ -2242,7 +2551,7 @@ local function joinNextBattle(endedToken)
 		if type(reason) == "string" and reason ~= "" then
 			status = label .. ": " .. reason
 		end
-		task.wait(QUEUE_RETRY_EVERY)
+		task.wait((1.5))
 	end
 	if run == queueRun and not inNewBattle(endedToken) then
 		status = "Couldn't join the next battle"
@@ -2255,7 +2564,93 @@ local function queueAfter(battle)
 		return
 	end
 	queuedToken = battle.token
+	-- 2v2/3v3 ranked is a series of duels the server runs back to back: only queue once it's over.
+	if BeyRivals.rankedSeriesLive() then
+		task.spawn(function()
+			local deadline = os.clock() + 120
+			while os.clock() < deadline do
+				local battleNow = currentBattle()
+				if battleNow and battleNow.token ~= battle.token then
+					return
+				end
+				if not BeyRivals.rankedSeriesLive() then
+					break
+				end
+				task.wait(0.5)
+			end
+			if Config.AutoQueue then
+				joinNextBattle(battle.token)
+			end
+		end)
+		return
+	end
 	task.spawn(joinNextBattle, battle.token)
+end
+
+---Ranked state from the server (JSON): queue -> found -> spot pick (order) -> ready -> play ... -> home.
+BeyRivals.RANKED_LIVE = { found = true, play = true, waiting = true, here = true, ready = true, wait = true }
+function BeyRivals.rankedSeriesLive()
+	local r = BeyRivals.ranked
+	return r ~= nil and BeyRivals.RANKED_LIVE[r.state] == true and os.clock() - (BeyRivals.rankedAt or 0) < 900
+end
+
+function BeyRivals.onRankedState(raw)
+	local ok, data = pcall(function()
+		return type(raw) == "string" and httpService:JSONDecode(raw) or raw
+	end)
+	if not ok or type(data) ~= "table" then
+		return
+	end
+	BeyRivals.ranked, BeyRivals.rankedAt = data, os.clock()
+	if type(data.mode) == "string" and data.mode:match("^%dv%d$") then
+		BeyRivals.rankedMode = data.mode
+	end
+	-- Pick your spot (2v2/3v3): our preferred turn, else the next free one.
+	local order = data.order
+	local size = type(order) == "table" and (tonumber(order.size) or (data.mode == "3v3" and 3 or 2)) or 0
+	local choice = size == 3 and Config.Spot3v3 or Config.Spot2v2
+	local want = ({ ["1st"] = 1, ["2nd"] = 2, ["3rd"] = 3 })[tostring(choice)]
+	if want and type(order) == "table" and order.mine == nil then
+		want = math.clamp(want, 1, size)
+		local taken = type(order.taken) == "table" and order.taken or {}
+		local function free(spot)
+			return not (taken[spot] or taken[tostring(spot)])
+		end
+		local pick = nil
+		for offset = 0, size - 1 do
+			local spot = (want - 1 + offset) % size + 1
+			if free(spot) then
+				pick = spot
+				break
+			end
+		end
+		local key = tostring(data.since or "") .. ":" .. tostring(pick)
+		if pick and BeyRivals.spotKey ~= key then
+			BeyRivals.spotKey = key
+			task.delay(0.4, function()
+				firePacket("RankedOrder", pick)
+				status = "Picked spot " .. pick
+			end)
+		end
+	end
+	-- Ready check.
+	if Config.AutoReady and (data.state == "ready" or data.need ~= nil) and not data.here then
+		local key = "ready:" .. tostring(data.since or "")
+		if BeyRivals.readyKey ~= key then
+			BeyRivals.readyKey = key
+			task.delay(0.6, function()
+				firePacket("RankedReady")
+			end)
+		end
+	end
+end
+
+if Packets and Packets.RankedState and Packets.RankedState.OnClientEvent then
+	pcall(function()
+		table.insert(BeyRivals.connections, Packets.RankedState.OnClientEvent:Connect(function(raw)
+			pcall(BeyRivals.onRankedState, raw)
+		end))
+	end)
 end
 
 -- Survive teleports (ranked and event servers): reload this script in the next server.
@@ -2315,7 +2710,7 @@ do
 	local elapsed = 0
 	table.insert(BeyRivals.connections, runService.Heartbeat:Connect(function(dt)
 		elapsed = elapsed + dt
-		if elapsed < ANTI_AFK_EVERY then
+		if elapsed < (60) then
 			return
 		end
 		elapsed = 0
@@ -2357,7 +2752,7 @@ table.insert(BeyRivals.connections, runService.Heartbeat:Connect(function()
 	if skippedReplay == active then
 		return
 	end
-	skipAt = skipAt or (os.clock() + SKIP_DELAY)
+	skipAt = skipAt or (os.clock() + (0.6))
 	if os.clock() < skipAt then
 		return
 	end
@@ -2385,8 +2780,6 @@ do
 -- ============================================================
 
 local MATCH_FILE = SETTINGS_FOLDER .. "/matches.json"
-local MATCH_KEEP = 150
-local TIMELINE_KEEP = 220
 
 ---JSON-safe copy of a game table (no functions/instances, bounded size).
 local function safeCopy(value, depth)
@@ -2424,7 +2817,7 @@ end
 BeyRivals.matchLog = MatchLog
 
 local function saveMatches()
-	while #MatchLog > MATCH_KEEP do
+	while #MatchLog > (150) do
 		table.remove(MatchLog, 1)
 	end
 	pcall(function()
@@ -2486,7 +2879,7 @@ end
 
 local function note(round, tick, text)
 	table.insert(round.timeline, { t = tick, e = text })
-	if #round.timeline > TIMELINE_KEEP then
+	if #round.timeline > (220) then
 		table.remove(round.timeline, 1)
 	end
 end
@@ -3120,6 +3513,14 @@ toggle(battlePage, "Burst race by HP left (not %)", "AbsBurst")
 toggle(battlePage, "Fight when keep-away would lose on spin", "SpinOutRace")
 toggle(battlePage, "Adapt to challenge stadium mechanics", "StadiumAware")
 toggle(battlePage, "Vs bots: no contact in the crush zone unless winning", "BossCrushGuard")
+toggle(battlePage, "Vs bots: deep finish search (fastest wins)", "DeepFinish")
+toggle(battlePage, "Leave when a rival ability is live in the crush zone", "AbilityCrushGuard")
+toggle(battlePage, "Both crushable + rival as fast: strike/guard, don't flee", "MutualCrush")
+segmented(battlePage, "Play style", "PlayStyle", { "Auto", "Attack", "Balance", "Stamina", "Defense" })
+toggle(battlePage, "No ability starts on the rim next to a pocket", "RimAbilityGuard")
+toggle(battlePage, "Vs Spriggan: don't attack into its ready guard", "LongGuardVeto")
+toggle(battlePage, "Guard incoming rushes (physics check vs players)", "RushGuard")
+slider(battlePage, "Deep search time per frame", "DeepMs", 2, 10, 1, function(v) return v .. " ms" end)
 toggle(battlePage, "Brace for hits at the rim", "RimBrace")
 toggle(battlePage, "Dodge rival abilities (sweeps, AoE, waves)", "SweepDodge")
 toggle(battlePage, "Go for the burst when losing on spin", "SpinRace")
@@ -3134,6 +3535,9 @@ hint(battlePage, "Higher presses the rival and pushes them to the rim harder")
 heading(battlePage, "Next battle")
 toggle(battlePage, "Auto queue after each battle", "AutoQueue")
 segmented(battlePage, "Join by", "QueueMode", { "Queue", "Rematch" })
+segmented(battlePage, "2v2 auto spot", "Spot2v2", { "None", "1st", "2nd" })
+segmented(battlePage, "3v3 auto spot", "Spot3v3", { "None", "1st", "2nd", "3rd" })
+toggle(battlePage, "Ranked: auto ready up", "AutoReady")
 toggle(battlePage, "Auto skip replay", "AutoSkipReplay")
 toggle(battlePage, "Stay active when Roblox is unfocused", "StayActive")
 hint(battlePage, "Keeps going with Roblox in the background")
@@ -3147,7 +3551,6 @@ do
 -- ============================================================
 
 local Catalog = filtergc("table", { Keys = { "trait", "traitSlots", "TRAIT_ROLL_BP" } }, true)
-local TRAIT_ROLL_GAP = 0.3
 
 local cachedData, cachedAt = nil, 0
 local function playerData()
@@ -3276,7 +3679,7 @@ local function startRolling()
 					return stopRolling(string.format("Got %s on slot %d after %d rolls (%d with coins)", traitName(rolled), slot, rolls, coinRolls))
 				end
 			end
-			task.wait(TRAIT_ROLL_GAP)
+			task.wait((0.3))
 		end
 	end)
 end
@@ -3929,7 +4332,7 @@ do
 	local elapsed = 0
 	table.insert(BeyRivals.connections, runService.Heartbeat:Connect(function(dt)
 		elapsed = elapsed + dt
-		if elapsed < SAVE_INTERVAL then
+		if elapsed < (0.5) then
 			return
 		end
 		elapsed = 0
@@ -3947,7 +4350,11 @@ table.insert(BeyRivals.connections, runService.RenderStepped:Connect(function(dt
 		beyMark.Rotation = (beyMark.Rotation + dt * 720) % 360
 		local stadiumId = BeyRivals.liveStadium
 		local info = stadiumId and BeyRivals.stadiumInfo(stadiumId)
-		statusLabel.Text = (info and #info.list > 0) and (status .. " | " .. info.label) or status
+		local text = (info and #info.list > 0) and (status .. " | " .. info.label) or status
+		if BeyRivals.liveProfile and BeyRivals.liveProfile ~= "Attack" then
+			text = text .. " [" .. BeyRivals.liveProfile .. "]"
+		end
+		statusLabel.Text = text
 		statusLabel.TextColor3 = (status == "Behind" or status == "Defending") and LOSS or GOLD
 	elseif Config.AutoQueue then
 		statusLabel.Text = status == "Idle" and "Auto queue on" or status
