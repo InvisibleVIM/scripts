@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v80", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v81", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 
 -- Unload a previous execution before touching anything.
 if shared.AnimeAdventures then
@@ -1069,7 +1069,20 @@ end
 ---Farm kills mode (takedowns for evolutions): everything at the very front on Weakest, the whole
 ---team placed before anything is upgraded, then the farm maxed, then upgrades by efficiency.
 function AA.killsMode()
-	return Config.Mode == "Kills"
+	if Config.Mode ~= "Kills" then
+		return false
+	end
+	-- Only on the stage the mode farms: a portal or story match opened by hand with the mode
+	-- still selected plays normally (seen live: a 15-wave portal got the farm maxed first).
+	local id = not IS_LOBBY and AA.Match and AA.Match.levelId
+	if not id then
+		return IS_LOBBY
+	end
+	id = tostring(id):lower()
+	if Config.KillsStage == "Summer" then
+		return id:find("summer") ~= nil
+	end
+	return id:find("^aot") ~= nil and id:find("infinite") ~= nil
 end
 
 ---The stretch of a road where enemies are meant to die in a fast match: from its spawn to where
@@ -2496,29 +2509,26 @@ local function planAction()
 		local option = options[i]
 		table.insert(Match.lastOptions, string.format("%s %s %d %.3g", option.kind, option.kind == "place" and option.entry.id or option.unit._stats.id.Value, option.cost, option.score))
 	end
-	-- Save for the best damage per cash instead of spending on whatever is affordable. (The old
-	-- rule bought anything 30% as good the moment the top pick couldn't be paid, so three extra
-	-- Shadow Sorcerers went down while a 5000 Elyssia upgrade worth six times their damage per
-	-- cash never got saved for.) The cheaper option is taken only when it is nearly as good, or
-	-- when the wait is long for how much better the top pick is: 20 s per "times better", between
-	-- 15 and 75 s, and never longer than the match has left.
-	if money < pick.cost and pick.score < 1e5 then
+	-- What to buy is the best damage per cash once the wait for it is priced in: an option's score
+	-- halves for every 45 s of saving it needs, and anything the match ends before affording is
+	-- out. (The old rule kept naming a 35000 upgrade as the target in a 15-wave stage it could
+	-- never pay for, and took whatever was affordable instead of waiting 5 s for something better.)
+	if pick.score < 1e5 then
 		local income = math.max(Match.incomeRate or 0, 1)
-		local wait = (pick.cost - money) / income
-		local alternative
+		local horizon = math.max(left, 1) * 30
+		local best, bestValue
 		for _, option in ipairs(options) do
-			if option.cost <= money and option.score < 1e5 then
-				alternative = option
-				break
+			local wait = math.max(0, option.cost - money) / income
+			if option.score < 1e5 and wait <= horizon and not (rush and wait > 0) then
+				local value = option.score * 0.5 ^ (wait / 45)
+				if not bestValue or value > bestValue then
+					best, bestValue = option, value
+				end
 			end
 		end
-		if alternative then
-			local ratio = pick.score / math.max(alternative.score, 1e-6)
-			local patience = math.min(math.clamp(20 * ratio, 15, 75), math.max(left, 1) * 10)
-			if rush or ratio < 1.25 or wait > patience then
-				return alternative, money
-			end
-			Match.savingFor = string.format("%s %s", pick.kind, pick.kind == "place" and pick.entry.id or pick.unit._stats.id.Value)
+		if best then
+			pick = best
+			Match.savingFor = money < pick.cost and string.format("%s %s", pick.kind, pick.kind == "place" and pick.entry.id or pick.unit._stats.id.Value) or nil
 		end
 	end
 	-- Under threat, don't sit saving for something expensive: buy the best thing we can afford now.
@@ -3109,7 +3119,8 @@ do
 					soon = true
 				end
 			end
-			if best and not (bestRate <= 0 and soon) then
+			-- (Two mains never fire on the same opening: the first one's buff takes a moment to arrive.)
+			if best and not (bestRate <= 0 and soon) and now - (Conductor.lastMain[name] or -math.huge) >= 1.5 then
 				cast(best, "main", name, math.min(1, (1 + buff.pct) * (1 + bestRate) - 1))
 			end
 			-- Supports.
