@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v81", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v82", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 
 -- Unload a previous execution before touching anything.
 if shared.AnimeAdventures then
@@ -1074,9 +1074,17 @@ function AA.killsMode()
 	end
 	-- Only on the stage the mode farms: a portal or story match opened by hand with the mode
 	-- still selected plays normally (seen live: a 15-wave portal got the farm maxed first).
-	local id = not IS_LOBBY and AA.Match and AA.Match.levelId
+	if IS_LOBBY then
+		return true
+	end
+	-- And only in a match the script started in this mode itself.
+	local session = AA.progress and AA.progress.session
+	if type(session) ~= "table" or session.job ~= game.JobId or session.mode ~= "Kills" then
+		return false
+	end
+	local id = AA.Match and AA.Match.levelId
 	if not id then
-		return IS_LOBBY
+		return false
 	end
 	id = tostring(id):lower()
 	if Config.KillsStage == "Summer" then
@@ -3571,6 +3579,7 @@ local function resetMatch()
 	Match.extraDamage = nil
 	Match.dropLog = nil
 	Match.killsPhase = nil
+	Match.voteNoted = nil
 	Match.pendingAtStart, Match.pendingCheck = nil, nil
 	Match.killTime, Match.lastKillTime, Match.killWave, Match.everLong, Match.paceSeeded, Match.hubMoved = nil, nil, nil, nil, nil, nil
 	Match.earned, Match.lastCash, Match.teamIds, Match.spawnOwner, Match.summoners, Match.unreported = nil, nil, nil, nil, nil, nil
@@ -3583,6 +3592,16 @@ local function matchLoop()
 		return task.wait(1e6)
 	end
 	workspace:WaitForChild("_MAP_CONFIG", 30)
+	do
+		local started = AA.progress.started
+		if type(started) == "table" then
+			if started.user == localPlayer.UserId and os.time() - (started.at or 0) < 300 then
+				AA.progress.session = { job = game.JobId, mode = started.mode }
+			end
+			AA.progress.started = nil
+			AA.saveProgress()
+		end
+	end
 	readLevelData()
 	AA.checkExpected()
 	AA.startDetail()
@@ -3667,7 +3686,16 @@ local function matchLoop()
 				elseif Config.AutoStart and os.clock() - lastStart > 3 then
 					lastStart = os.clock()
 					readLevelData()
-					invoke("vote_start")
+					-- (Spawned: nothing may hold the loop while the server answers.)
+					task.spawn(invoke, "vote_start")
+					local votes = data and data:FindFirstChild("VoteStart") and data.VoteStart:FindFirstChild("Votes")
+					if not Match.voteNoted then
+						Match.voteNoted = true
+						note("vote", { votes = votes and votes.Value, players = #playersService:GetPlayers() })
+					end
+					if #playersService:GetPlayers() > 1 then
+						status = "Voted to start: waiting for the other players"
+					end
 				end
 			else
 				Match.idleSince = nil
@@ -4348,6 +4376,12 @@ local function joinGame()
 		task.wait(1)
 	end
 	local id, difficulty, kind, group = chooseTarget()
+	if id and (type(AA.progress.started) ~= "table" or AA.progress.started.mode ~= Config.Mode or os.time() - (AA.progress.started.at or 0) > 20) then
+		-- The match about to load was started by the script in this mode (mode rules such as
+		-- Farm kills only apply to those, never to a match opened by hand).
+		AA.progress.started = { mode = Config.Mode, at = os.time(), user = localPlayer.UserId }
+		AA.saveProgress()
+	end
 	if not id then
 		status = kind == "portal" and "No portal items" or kind == "raid" and "Waiting for a raid" or (kind == "challenge" and "No challenge left" or ((kind == "artifact" or kind == "locked") and "Locked: clear the story first" or "Nothing to join"))
 		return false
@@ -9206,13 +9240,13 @@ do
 		if kind == "castle" then
 			targetLine.Text = "Next: Infinity Castle room " .. tostring(id) .. " (" .. tostring(difficulty) .. ")"
 		elseif kind == "skip" then
-			targetLine.Text = "Next: skip " .. worldName(id) .. " to Act 6"
+			targetLine.Text = "Next: skip " .. tostring(worldName(id)) .. " to Act 6"
 		elseif kind == "dungeon" or kind == "tournament" then
 			targetLine.Text = "Next: " .. (kind == "dungeon" and "Dungeon run" or "Tournament")
 		elseif not id then
 			targetLine.Text = kind == "raid" and "Next: waiting for a raid to open" or ((kind == "artifact" or kind == "locked") and "Next: locked (clear the story acts before it)" or "Next: nothing open")
 		else
-			targetLine.Text = "Next: " .. (level and (worldName(level.world) .. " " .. tostring(level.name) .. (difficulty and (" on " .. tostring(difficulty)) or "")) or tostring(id))
+			targetLine.Text = "Next: " .. (level and (tostring(worldName(level.world) or "Portal") .. " " .. tostring(level.name) .. (difficulty and (" on " .. tostring(difficulty)) or "")) or tostring(id))
 		end
 		if not IS_LOBBY then
 			local health, maxHealth = baseHealth()
@@ -9229,7 +9263,7 @@ do
 			if not IS_LOBBY then
 				local health, maxHealth = baseHealth()
 				local level = Match.levelId and Levels[Match.levelId]
-				local place = level and (worldName(level.world) .. " " .. tostring(level.name)) or ((Match.levelData or {}).name or matchKind())
+				local place = level and ((worldName(level.world) and (worldName(level.world) .. " ") or "") .. tostring(level.name)) or ((Match.levelData or {}).name or matchKind())
 				local total = Match.totalWaves
 				sub = string.format("%s, wave %d%s, base %d%%", tostring(place), currentWave(), total and (" of " .. total) or "", maxHealth > 0 and math.floor(health / maxHealth * 100 + 0.5) or 0)
 				healthFraction = maxHealth > 0 and health / maxHealth or 0
@@ -9263,7 +9297,7 @@ do
 			local session = AA.session()
 			local level = Match.levelId and Levels[Match.levelId]
 			over.mode.Text = IS_LOBBY and tostring(Config.Mode) or matchKind()
-			over.map.Text = IS_LOBBY and (targetLine.Text:gsub("^Next: ", "")) or (level and (worldName(level.world) .. ", " .. tostring(level.name)) or tostring((Match.levelData or {}).name or "?"))
+			over.map.Text = IS_LOBBY and (targetLine.Text:gsub("^Next: ", "")) or (level and ((worldName(level.world) and (worldName(level.world) .. ", ") or "") .. tostring(level.name)) or tostring((Match.levelData or {}).name or "?"))
 			over.place.Text = IS_LOBBY and "Decided in the match" or (Match.pace == "speed" and "Front, enemies are weak" or "Normal, enemies are strong")
 			over.tiles["Wins"].Text = tostring(session.wins)
 			over.tiles["Losses"].Text = tostring(session.losses)
