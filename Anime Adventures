@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v125", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v128", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 
 -- Unload a previous execution before touching anything.
 if shared.AnimeAdventures then
@@ -191,6 +191,9 @@ local Config = {
 	WhChallengeRecord = true,
 	WhTimers = false,
 	PlaceStyle = "Auto",
+	WarlordMode = "Auto",
+	RitualAuto = true,
+	RitualRush = true,
 	OrderOn = false,
 	OrderPlacement = "Smart",
 	OrderData = "[]",
@@ -262,10 +265,11 @@ do
 		PlaceStyle = { "Auto", "Front", "Normal" },
 		SnipeMode = { "Normal", "Middle" },
 		OrderPlacement = { "Smart", "Front" },
+		WarlordMode = { "Auto", "Boss", "Front", "Range", "Leave" },
 		OrderAddKind = { "Place", "Upgrade" },
 		Targeting = { "Smart", "First", "Last", "Closest", "Farthest", "Strongest", "Weakest", "Off" },
 	}
-	local defaults = { OrderPlacement = "Smart", OrderAddKind = "Place", Mode = "Story", AfterGame = "Auto", Difficulty = "Normal", PlaceStyle = "Auto", SnipeMode = "Normal", Targeting = "Smart" }
+	local defaults = { WarlordMode = "Auto", OrderPlacement = "Smart", OrderAddKind = "Place", Mode = "Story", AfterGame = "Auto", Difficulty = "Normal", PlaceStyle = "Auto", SnipeMode = "Normal", Targeting = "Smart" }
 	for key, list in pairs(choices) do
 		if not table.find(list, Config[key]) then
 			Config[key] = defaults[key]
@@ -1303,6 +1307,24 @@ function AA.killsMode()
 	return id:find("^aot") ~= nil and id:find("infinite") ~= nil
 end
 
+---Our Holy Warlord, when one stands (Shadow Sorcerer (Ritual)'s summon; one at a time).
+function AA.ownWarlord()
+	local folder = workspace:FindFirstChild("_UNITS")
+	for _, unit in ipairs(folder and folder:GetChildren() or {}) do
+		local unitStats = unit:FindFirstChild("_stats")
+		local id, owner = unitStats and unitStats:FindFirstChild("id"), unitStats and unitStats:FindFirstChild("player")
+		if id and id.Value == "mahoraga" and owner and owner.Value == localPlayer then
+			return unit
+		end
+	end
+	return nil
+end
+---Does this unit end in the Ritual (its last upgrade unlocks the sacrifice for Holy Warlord)?
+function AA.ritualUnit(data)
+	local last = data and data.upgrade and data.upgrade[#data.upgrade]
+	return last ~= nil and tostring(last.active_attack):find(":mahoraga", 1, true) ~= nil
+end
+
 ---Build order: the user's own list of steps ({ kind = "place" | "upgrade", unit = id, times = n }),
 ---followed one step at a time instead of the planner's own choice. Kept in Config.OrderData
 ---(JSON), saved setups in <Game>/orders/<name>.json together with the placement style.
@@ -1920,6 +1942,11 @@ do
 			return nil
 		end
 		local data = Units[id]
+		-- A freshly evolved unit has no numbers of its own yet: its base form's stand in.
+		local from = data and type(data.evolved) == "table" and data.evolved.from
+		if from and not (own(id) or own(id .. "@speed") or own(id .. "#lo") or own(id .. "#lo@speed")) and (own(from) or own(from .. "@speed")) then
+			id = from
+		end
 		-- Two sheets: stages where weak enemies come in crowds (area damage shines: Shadow
 		-- Sorcerer did 26% of a legend stage's damage for 19k cash) and stages with strong
 		-- enemies (single-target damage shines: Elyssia did 10x his damage over a long infinite
@@ -2921,8 +2948,23 @@ local function planAction()
 				-- Support / summoner: one copy once the lane is held.
 				score = 1e5
 			end
+			if score > 0 and score < 1e5 and Config.RitualRush and left >= 5 and (placed[entry.id] or 0) == 0 and AA.ritualUnit(entry.data) and not AA.ownWarlord() then
+				score *= 3
+			end
 			if score > 0 then
 				table.insert(options, { kind = "place", entry = entry, cost = cost, score = score })
+			end
+		end
+	end
+	-- Ritual: Shadow Sorcerer (Ritual) at max level is sacrificed for Holy Warlord, who hits for
+	-- about seven times the Sorcerer's damage and adapts further (measured: 19M damage in his
+	-- first two waves against 62M from the whole team in nineteen). While no Warlord stands and
+	-- the match is long enough to pay for it (106k in all), the furthest-along copy is rushed.
+	local ritualLead
+	if left >= 5 and not AA.ownWarlord() then
+		for _, unit in ipairs(units) do
+			if AA.ritualUnit(Units[unit._stats.id.Value]) and (not ritualLead or unit._stats.upgrade.Value > ritualLead._stats.upgrade.Value) then
+				ritualLead = unit
 			end
 		end
 	end
@@ -2964,6 +3006,9 @@ local function planAction()
 					end
 					if score <= 0 then
 						score = 1e-6
+					end
+					if unit == ritualLead and Config.RitualRush then
+						score *= 4
 					end
 				end
 				if score > 0 then
@@ -3862,6 +3907,24 @@ local function useAbilities()
 		-- Some actives only unlock at an upgrade: the tower's own value says whether it has one now.
 		local live = unit._stats:FindFirstChild("active_attack")
 		local hasActive = data and ((live and live.Value ~= "nil" and live.Value ~= "") or (not live and (data.active_attack or data.show_active_attack)))
+		-- Ritual (Shadow Sorcerer (Ritual) at max level): the unit is sacrificed and Holy Warlord
+		-- arrives 6 s later, one at a time. Cast as soon as it unlocks, but never while a
+		-- Warlord of ours stands or another ritual is on its way (that would only lose the unit).
+		if hasActive and live and tostring(live.Value):find(":mahoraga", 1, true) then
+			local warlord = AA.ownWarlord() ~= nil or not Config.RitualAuto
+			if not warlord and now - (Match.ritualAt or 0) > 15 then
+				Match.ritualAt = now
+				Match.abilityAt[unit] = now
+				note("ritual", { wave = currentWave() })
+				task.spawn(invoke, "use_active_attack", unit)
+			end
+			continue
+		end
+		-- Holy Warlord's own button doesn't attack: it switches what he hunts. Handled with his
+		-- adaptations (the conductor), never fired on a timer.
+		if unit._stats.id.Value == "mahoraga" then
+			continue
+		end
 		-- Buff actives are timed by the buff conductor below.
 		if hasActive and not AA.buffInfo(data) and now - (Match.abilityAt[unit] or 0) > 1 and #enemies > 0 and ready(unit) then
 			-- Damage actives: only when something is actually inside the unit's range (a cast
@@ -3999,6 +4062,27 @@ do
 		for _, unit in ipairs(folder and folder:GetChildren() or {}) do
 			local unitStats = unit:FindFirstChild("_stats")
 			local id, owner = unitStats and unitStats:FindFirstChild("id"), unitStats and unitStats:FindFirstChild("player")
+			if id and id.Value == "mahoraga" and owner and owner.Value == localPlayer and Config.WarlordMode ~= "Leave" and os.clock() - (Conductor.modeAt or 0) > 2 then
+				-- What he hunts (his button cycles 1 strongest "BOSS", 2 first "DEF", 3 range):
+				-- Auto = the boss while one is on the road, otherwise the front of the wave.
+				local want = Config.WarlordMode == "Boss" and 1 or Config.WarlordMode == "Front" and 2 or Config.WarlordMode == "Range" and 3 or nil
+				if not want then
+					local boss = false
+					for _, enemy in ipairs(scanField().enemies) do
+						local enemyId = enemy._stats:FindFirstChild("id") and enemy._stats.id.Value or enemy.Name
+						local enemyData = Units[enemyId]
+						if (enemyData and enemyData.boss) or (tostring(enemyId):find("boss") and not tostring(enemyId):find("miniboss")) then
+							boss = true
+						end
+					end
+					want = boss and 1 or 2
+				end
+				if (unit:GetAttribute("_mahoragamode") or 1) ~= want then
+					Conductor.modeAt = os.clock()
+					note("warlordMode", { from = unit:GetAttribute("_mahoragamode") or 1, to = want })
+					task.spawn(invoke, "use_active_attack", unit)
+				end
+			end
 			if id and id.Value == "mahoraga" and owner and owner.Value == localPlayer and not unit:GetAttribute("_mahoraga_completed")
 				and (unit:GetAttribute("_mahoraga_takedowns") or 0) >= 50 and os.clock() - (Conductor.adaptAt or 0) > 2 then
 				for _, name in ipairs(ADAPTATIONS) do
@@ -4593,7 +4677,7 @@ local function resetMatch()
 	Match.enemyMedian, Match.tankNoted = nil, nil
 	AA.Macro.reset()
 	Match.missionOpen, Match.leftLogged, Match.finishedSince, Match.frontForced = nil, nil, nil, nil
-	Match.orderSkip, Match.orderStep = nil, nil
+	Match.orderSkip, Match.orderStep, Match.ritualAt = nil, nil, nil
 	Match.dpsSample, Match.peakDps, Match.pressure, Match.pressByWave, Match.pressAt = nil, nil, nil, nil, nil
 	Match.pendingAtStart, Match.pendingCheck = nil, nil
 	Match.killTime, Match.lastKillTime, Match.killWave, Match.everLong, Match.paceSeeded, Match.hubMoved = nil, nil, nil, nil, nil, nil
@@ -10019,6 +10103,19 @@ do
 			task.wait(2)
 		end
 	end)
+	heading(page, "Holy Warlord")
+	toggle(page, "Use the Ritual", "RitualAuto")
+	hint(page, "Shadow Sorcerer (Ritual) at max level is sacrificed and Holy Warlord arrives six seconds later. He hits for about seven times the Sorcerer's damage, walks the road, and only one can stand at a time: the script never sacrifices a second Sorcerer while yours is alive. His adaptations are picked for you (extra attack, flying, knockback).")
+	toggle(page, "Rush the Ritual", "RitualRush")
+	hint(page, "While you have no Warlord, the Sorcerer that is furthest along gets his upgrades ahead of the rest of the team (106k cash for all eight). Only in matches with at least five waves left.")
+	UI.dropdown(page, "Warlord hunts", function()
+		return { "Auto", "Boss", "Front", "Range", "Leave" }
+	end, function()
+		return Config.WarlordMode
+	end, function(option)
+		Config.WarlordMode = option
+	end)
+	hint(page, "His own button in the game: Boss goes for the strongest enemy, Front for the first one on the road, Range is his third setting. Auto uses Boss while a boss is out and Front otherwise. Leave never touches it.")
 	heading(page, "Targeting")
 	segmented(page, "", "Targeting", { "Smart", "First", "Last", "Closest" })
 	segmented(page, "", "Targeting", { "Farthest", "Strongest", "Weakest", "Off" })
