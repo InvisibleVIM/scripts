@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v135", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v136", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 
 -- Unload a previous execution before touching anything.
 if shared.AnimeAdventures then
@@ -814,6 +814,16 @@ function AA.lostWave(levelId)
 		return entry.wave, entry.n, tonumber(entry.low) or entry.wave
 	end
 	return nil
+end
+---A stage lost in its first waves is played without skipping until two waves past that point:
+---skipping brings the next wave while the last one is still on the road.
+function AA.holdSkip()
+	local _, _, lostLow = AA.lostWave(AA.Match and AA.Match.levelId)
+	if lostLow and lostLow <= 8 then
+		local wave = workspace:FindFirstChild("_wave_num")
+		return (wave and wave.Value or 0) <= lostLow + 2
+	end
+	return false
 end
 ---Lost three or more times in the last day.
 function AA.tooHard(levelId)
@@ -1970,18 +1980,23 @@ do
 	---scripted attacks and summons don't show in the data tables. 1 until it has been measured.
 	---Falls back to the unit's other form (Zombie <-> Zombie (Risen)).
 	function AA.measureFactor(id, level)
+		local data = Units[id]
+		-- A freshly evolved unit borrows its base form's numbers sheet by sheet, until it has
+		-- its own for that sheet (Shadow Sorcerer (Ritual) had a general number after one long
+		-- run but nothing for crowd stages, where the Sorcerer is at his best).
+		local from = data and type(data.evolved) == "table" and data.evolved.from
 		local function own(unitId)
 			local entry = AA.Measured[unitId]
 			if type(entry) == "table" and (entry.gsecs or 0) >= AA.MEASURE_SECONDS and (entry.g or 0) > 0 then
 				return entry.g / entry.gsecs
 			end
+			if type(from) == "string" and unitId:sub(1, #id) == id then
+				entry = AA.Measured[from .. unitId:sub(#id + 1)]
+				if type(entry) == "table" and (entry.gsecs or 0) >= AA.MEASURE_SECONDS and (entry.g or 0) > 0 then
+					return entry.g / entry.gsecs
+				end
+			end
 			return nil
-		end
-		local data = Units[id]
-		-- A freshly evolved unit has no numbers of its own yet: its base form's stand in.
-		local from = data and type(data.evolved) == "table" and data.evolved.from
-		if from and not (own(id) or own(id .. "@speed") or own(id .. "#lo") or own(id .. "#lo@speed")) and (own(from) or own(from .. "@speed")) then
-			id = from
 		end
 		-- Two sheets: stages where weak enemies come in crowds (area damage shines: Shadow
 		-- Sorcerer did 26% of a legend stage's damage for 19k cash) and stages with strong
@@ -2936,6 +2951,10 @@ local function planAction()
 	-- the rush replay of a wave-15 boss loss played the whole act without its farm and lost again.
 	-- Only around the wave it was lost at. (From wave 1 up to it, as before, meant a loss at wave
 	-- 13 put the whole next run in rush: nothing saved for, no farm, Elyssia level 0 at wave 10.)
+	-- Lost in the first waves (a challenge on a hard act: base of 228, dead at wave 6 with one
+	-- upgraded Zombie and a fresh Sorcerer, twice the same way): until that wave is behind us
+	-- more units come before upgrades, and the waves are not skipped (see AA.holdSkip).
+	local wallOpening = lostLow ~= nil and lostLow <= 8 and wave <= lostLow + 1
 	local rush = lostAt ~= nil and wave >= lostAt - 2 and wave <= lostAt + 1 and lostAt <= math.max((Match.totalWaves or 15) * 0.6, 5)
 	if rush then
 		safe = false
@@ -3084,6 +3103,9 @@ local function planAction()
 					end
 					if unit == ritualLead and Config.RitualRush then
 						score *= 4
+					end
+					if wallOpening and damagePlaced < 3 then
+						score *= 0.4
 					end
 				end
 				if score > 0 then
@@ -4772,7 +4794,7 @@ local function resetMatch()
 	Match.enemyMedian, Match.tankNoted = nil, nil
 	AA.Macro.reset()
 	Match.missionOpen, Match.leftLogged, Match.finishedSince, Match.frontForced = nil, nil, nil, nil
-	Match.orderSkip, Match.orderStep, Match.ritualAt = nil, nil, nil
+	Match.orderSkip, Match.orderStep, Match.ritualAt, Match.skipHeld = nil, nil, nil, nil
 	Match.dpsSample, Match.peakDps, Match.pressure, Match.pressByWave, Match.pressAt = nil, nil, nil, nil, nil
 	Match.pendingAtStart, Match.pendingCheck = nil, nil
 	Match.killTime, Match.lastKillTime, Match.killWave, Match.everLong, Match.paceSeeded, Match.hubMoved = nil, nil, nil, nil, nil, nil
@@ -4877,7 +4899,12 @@ local function matchLoop()
 				AA.startDetail()
 			end
 			if Config.AutoSkip then
-				setGameSetting("autoskip_waves", true)
+				local hold = AA.holdSkip()
+				if hold ~= Match.skipHeld then
+					Match.skipHeld = hold
+					note("skip", { on = not hold })
+				end
+				setGameSetting("autoskip_waves", not hold)
 			end
 			if Config.SkipCards then
 				setGameSetting("skip_card_votes", true)
