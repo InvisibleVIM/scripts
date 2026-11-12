@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v136", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v137", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 
 -- Unload a previous execution before touching anything.
 if shared.AnimeAdventures then
@@ -2054,6 +2054,32 @@ function AA.shieldCount()
 	Match.shieldHits = math.max(Match.shieldHits or 0, count)
 	return Match.shieldHits
 end
+---Are the shields the real health of this match's enemies? Each shield eats one hit whatever
+---its damage, so when stripping them takes more hits than the health behind them does, what
+---counts is hits per second: many units, fast attackers, and upgrades are nearly worthless.
+---(A Shield Enemies challenge on Walled City Act 6 was lost twice at wave 6 with one upgraded
+---Zombie, 7 s between her hits, against enemies the user describes as very weak under the
+---shields. The Daily with 3 shields on 200k+ enemies is the other kind: there damage counts.)
+function AA.shieldMode(towers)
+	local count = AA.shieldCount()
+	if count < 3 then
+		return false
+	end
+	local median = Match.enemyMedian
+	local total, n = 0, 0
+	for _, unit in ipairs(towers or {}) do
+		local damage = unit._stats:FindFirstChild("damage")
+		if damage and damage.Value > 0 then
+			total += damage.Value
+			n += 1
+		end
+	end
+	if not median or n == 0 then
+		-- Nothing measured yet: a shield challenge is treated as one until the numbers say otherwise.
+		return true
+	end
+	return count >= median / (total / n)
+end
 local function unitPower(id, unit)
 	local data = Units[id]
 	if not data then
@@ -2960,6 +2986,11 @@ local function planAction()
 		safe = false
 	end
 
+	local shieldMode = AA.shieldMode(units)
+	if shieldMode ~= Match.shieldMode then
+		Match.shieldMode = shieldMode
+		note("shieldMode", { on = shieldMode, shields = AA.shieldCount(), median = Match.enemyMedian and math.floor(Match.enemyMedian) })
+	end
 	local options = {}
 	for _, entry in ipairs(equipped) do
 		local data = entry.data
@@ -3037,6 +3068,10 @@ local function planAction()
 				-- Support / summoner: one copy once the lane is held.
 				score = 1e5
 			end
+			if shieldMode and score < 1e5 and base.damage > 0 and farmTop <= 0 and (score > 0 or buff) then
+				-- Shields decide: a body is worth its hits per second for the cash.
+				score = 1e6 / math.max(base.cooldown, 0.5) / cost
+			end
 			if score > 0 and score < 1e5 and Config.RitualRush and left >= 5 and (placed[entry.id] or 0) == 0 and AA.ritualUnit(entry.data) and not AA.ownWarlord() and AA.ritualPayable(entry.data, -1, money, left) then
 				score *= 3
 			end
@@ -3106,6 +3141,11 @@ local function planAction()
 					end
 					if wallOpening and damagePlaced < 3 then
 						score *= 0.4
+					end
+					if shieldMode then
+						-- Only a faster attack helps against shields.
+						local faster = 1 / math.max(unitStatsAt(data, level + 1).cooldown, 0.5) - 1 / math.max(unitStatsAt(data, level).cooldown, 0.5)
+						score = math.max(1e6 * faster / math.max(cost, 1), 1e-6)
 					end
 				end
 				if score > 0 then
@@ -4790,7 +4830,7 @@ local function resetMatch()
 	Match.dropLog = nil
 	Match.killsPhase = nil
 	Match.voteNoted = nil
-	Match.shieldHits, Match.shieldAt = nil, nil
+	Match.shieldHits, Match.shieldAt, Match.shieldMode = nil, nil, nil
 	Match.enemyMedian, Match.tankNoted = nil, nil
 	AA.Macro.reset()
 	Match.missionOpen, Match.leftLogged, Match.finishedSince, Match.frontForced = nil, nil, nil, nil
