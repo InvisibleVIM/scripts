@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v105", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v107", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 
 -- Unload a previous execution before touching anything.
 if shared.AnimeAdventures then
@@ -1079,6 +1079,31 @@ local function buildPath()
 	end
 	return points
 end
+---The world whose daily kill mission is active and unfinished ("Defeat 2500 Curses": 500 gems
+---and that world's evolution items every day). Returns the world id, kills done, kills needed.
+function AA.dailyKillQuest()
+	local handler = profile().quest_handler
+	local best
+	for _, quest in pairs(type(handler) == "table" and type(handler.quests) == "table" and handler.quests or {}) do
+		local info = type(quest) == "table" and quest.quest_info
+		local id = type(info) == "table" and tostring(info.id or "") or ""
+		local worldId = id:match("^(.-)_daily$")
+		local class = type(info) == "table" and info.quest_class
+		if worldId and type(class) == "table" and tostring(class.class):find("kill") then
+			local need = tonumber(class.amount) or 2500
+			local have = type(quest.quest_progress) == "table" and tonumber(quest.quest_progress.amount) or 0
+			local world = Worlds[worldId]
+			if have < need and world and world.infinite and world.infinite.id then
+				best = best or { world = worldId, have = have, need = need, level = world.infinite.id }
+			end
+		end
+	end
+	if best then
+		return best.world, best.have, best.need, best.level
+	end
+	return nil
+end
+
 ---Farm kills mode (takedowns for evolutions): everything at the very front on Weakest, the whole
 ---team placed before anything is upgraded, then the farm maxed, then upgrades by efficiency.
 function AA.killsMode()
@@ -1102,6 +1127,9 @@ function AA.killsMode()
 	id = tostring(id):lower()
 	if Config.KillsStage == "Summer" then
 		return id:find("summer") ~= nil
+	end
+	if Config.KillsStage == "Daily quest" then
+		return id:find("infinite") ~= nil or id:find("_level_") ~= nil
 	end
 	return id:find("^aot") ~= nil and id:find("infinite") ~= nil
 end
@@ -4752,6 +4780,23 @@ chooseTarget = function(modeOverride)
 		if Config.KillsStage == "Summer" then
 			return chooseTarget("Summer")
 		end
+		if Config.KillsStage == "Daily quest" then
+			-- The infinite stage of the world whose daily kill mission is still open; with none
+			-- open (done for today), the Titan map below.
+			local questWorld, _, _, level = AA.dailyKillQuest()
+			if level and Levels[level] and levelUnlocked(level, done) then
+				return level, "Hard", "story"
+			end
+			-- Infinite still locked there: the furthest act of that world that is open (its
+			-- enemies count for the mission just the same).
+			local world = questWorld and Worlds[questWorld]
+			for act = 6, 1, -1 do
+				local entry = world and world.levels and (world.levels[tostring(act)] or world.levels[act])
+				if entry and levelUnlocked(entry.id, done) then
+					return entry.id, "Normal", "story"
+				end
+			end
+		end
 		-- Walled City (the Titan map) on infinite.
 		local world = Worlds.aot
 		local id = (world and world.infinite and world.infinite.id) or "aot_infinite"
@@ -5526,6 +5571,52 @@ local function summonStep()
 		Stats.summons += count
 	end
 	AA.summonSettle(count)
+end
+
+---What each equipped unit still needs to evolve: one line per unit, with where the missing
+---items come from (the game's own "obtained from" text).
+function AA.evolveNeeds()
+	if not AA.itemInfo then
+		AA.itemInfo = {}
+		pcall(function()
+			for _, module in ipairs(replicatedStorage.src.Data.Items:GetDescendants()) do
+				if module:IsA("ModuleScript") then
+					local data = gameRequire(module)
+					for id, item in pairs(type(data) == "table" and data or {}) do
+						if type(item) == "table" and item.name then
+							AA.itemInfo[id] = { name = item.name, from = item.obtain_info }
+						end
+					end
+				end
+			end
+		end)
+	end
+	local lines = {}
+	local data = collectionData()
+	local owned = data.owned_units or {}
+	for _, uuid in pairs(data.equipped_units or {}) do
+		local unit = owned[uuid]
+		local unitData = unit and Units[unit.unit_id]
+		local evolve = unitData and type(unitData.evolve) == "table" and unitData.evolve
+		local recipe = evolve and (evolve[unit.shiny and "shiny" or "normal"] or evolve.normal)
+		if type(recipe) == "table" then
+			local missing = {}
+			local need = tonumber(recipe._takedown_requirement)
+			if need and (tonumber(unit.total_takedowns) or 0) < need then
+				table.insert(missing, string.format("takedowns %d/%d", unit.total_takedowns or 0, need))
+			end
+			for _, item in ipairs(recipe.item_requirement or {}) do
+				local have, amount = itemCount(item.item_id), item.amount or 1
+				if have < amount then
+					local info = AA.itemInfo[item.item_id] or {}
+					table.insert(missing, string.format("%s %d/%d%s", tostring(info.name or item.item_id), have, amount, info.from and (" (" .. tostring(info.from):gsub("^Obtained from ", ""):gsub("[!%.]$", "") .. ")") or ""))
+				end
+			end
+			local into = evolve.evolve_unit and Units[evolve.evolve_unit] and Units[evolve.evolve_unit].name or "evolved form"
+			table.insert(lines, string.format("%s > %s: %s", tostring(unitData.name), tostring(into), #missing == 0 and "ready" or table.concat(missing, ", ")))
+		end
+	end
+	return lines
 end
 
 ---Summon sniper: a wanted unit is featured on a banner right now and isn't owned yet. Returns the
@@ -9003,7 +9094,8 @@ do
 
 	heading(page, "Mode settings", "right")
 	only({ "Summer", "Cursed Womb", "Tournament", "Dungeon", "Portals", "None" }, hint(page, "This mode has no settings of its own."))
-	segmented(page, "Farm kills on", "KillsStage", { "Walled City", "Summer" })
+	segmented(page, "Farm kills on", "KillsStage", { "Walled City", "Summer", "Daily quest" })
+	hint(page, "Daily quest: plays the infinite stage of whichever world's daily kill mission is open (2500 kills for 500 gems and that world's evolution items), then falls back to Walled City once it is done.")
 	only({ "Kills" })
 	hint(page, "Farms takedowns for evolutions, on Walled City infinite or the Summer Hunt. Every unit is placed at the very front and set to Weakest. The order: the whole team goes down first with no upgrades (the four Windsongs of the buff chain included), then Bulby is placed and maxed, then everything is upgraded by damage per cash.")
 	segmented(page, "Difficulty", "Difficulty", { "Normal", "Hard" })
@@ -9533,6 +9625,16 @@ do
 	toggle(page, "Auto feed XP food", "AutoFeed")
 	hint(page, "Feeds every XP item to your lowest-level damage unit")
 	toggle(page, "Auto evolve when items are ready", "AutoEvolve")
+	do
+		local evolveLine = infoLine(page, 60)
+		task.spawn(function()
+			while AA.alive and evolveLine.Parent do
+				local ok, lines = pcall(AA.evolveNeeds)
+				evolveLine.Text = ok and (#lines > 0 and table.concat(lines, "\n") or "Nothing on your team has an evolution left.") or ""
+				task.wait(15)
+			end
+		end)
+	end
 	toggle(page, "Buy missing Star Fruits (merchant, gems)", "BuyEvolveFruit")
 	cycler(page, "Merchant sniper", function()
 		local options, picked, seen = {}, {}, {}
