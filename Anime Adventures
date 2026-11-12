@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v123", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v124", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 
 -- Unload a previous execution before touching anything.
 if shared.AnimeAdventures then
@@ -152,6 +152,13 @@ local Config = {
 	DailyGiveUp = true,
 	ChallengeLeave = false,
 	Matchmaking = false,
+	MatchDaily = false,
+	MatchChallenge = false,
+	MatchInfinite = false,
+	MatchLegend = false,
+	MatchRaid = false,
+	MatchSummer = false,
+	MatchCastle = false,
 	KillsStage = "Walled City",
 	DailyWithChallenges = true,
 	TestUnproven = true,
@@ -239,6 +246,13 @@ do
 	end
 	if Config.KillsStage ~= "Summer" then
 		Config.KillsStage = "Walled City"
+	end
+	if Config.Matchmaking then
+		-- The old single switch: carried over as "on for everything", then retired.
+		Config.Matchmaking = false
+		for _, key in ipairs({ "MatchDaily", "MatchChallenge", "MatchInfinite", "MatchLegend", "MatchRaid", "MatchSummer", "MatchCastle" }) do
+			Config[key] = true
+		end
 	end
 	-- A saved choice that is no longer an option (an older version's) goes back to its default.
 	local choices = {
@@ -5498,19 +5512,31 @@ local function joinGame()
 		status = kind == "wombkey" and "No Cursed Womb Key (drops in Haunted Academy infinite)" or kind == "portal" and "No portal items" or kind == "raid" and "Waiting for a raid" or (kind == "challenge" and "No challenge left" or ((kind == "artifact" or kind == "locked") and "Locked: clear the story first" or "Nothing to join"))
 		return false
 	end
-	if Config.Matchmaking then
-		-- The game's own queue (request_matchmaking). Ids, from its lobby code: the Daily and the
+	do
+		-- The game's own queue (request_matchmaking), switched on per kind of match. Ids, from its lobby code: the Daily and the
 		-- half-hour challenge have fixed names, the mansion a room id, and any level whose data has
 		-- a _MATCHMAKING table (infinite, legend stages, raids, the Summer Hunt) its own id.
-		local queueId
+		local queueId, wanted
 		if kind == "challenge" then
 			queueId = group == "DailyChallenge" and "__DAILY_CHALLENGE" or "__NORMAL_CHALLENGE"
+			wanted = group == "DailyChallenge" and Config.MatchDaily or group ~= "DailyChallenge" and Config.MatchChallenge
 		elseif kind == "castle" then
 			queueId = string.format("__INFINITE_TOWER:%d:%s", id, difficulty or "Normal")
+			wanted = Config.MatchCastle
 		elseif type(id) == "string" and Levels[id] and Levels[id]._MATCHMAKING then
 			queueId = id
+			local lower = id:lower()
+			if lower:find("summer") then
+				wanted = Config.MatchSummer
+			elseif Levels[id].is_raid or kind == "raid" then
+				wanted = Config.MatchRaid
+			elseif lower:find("infinite") then
+				wanted = Config.MatchInfinite
+			else
+				wanted = Config.MatchLegend
+			end
 		end
-		if queueId and os.clock() - ((AA.queueFailed or {})[queueId] or -1e9) > 600 then
+		if queueId and wanted and os.clock() - ((AA.queueFailed or {})[queueId] or -1e9) > 600 then
 			status = "Finding a match"
 			local ok, accepted = invoke("request_matchmaking", queueId)
 			note("queue", { id = queueId, ok = ok and accepted ~= false })
@@ -9659,8 +9685,15 @@ do
 	heading(page, "After a game", "left")
 	segmented(page, "After a win or loss", "AfterGame", { "Auto", "Next", "Replay", "Lobby" })
 	hint(page, "Auto goes to the next act after a win, retries a loss, and climbs rooms in the castle.")
-	toggle(page, "Find a match with other players", "Matchmaking")
-	hint(page, "Uses the game's matchmaking wherever it exists: the Daily, half-hour challenges, infinite, legend stages, raids, the Summer Hunt and Infinity Mansion. Story acts have none. If nobody is found in 45 seconds it starts the stage alone.")
+	heading(page, "Play with other players", "left")
+	toggle(page, "Daily Challenge", "MatchDaily")
+	hint(page, "Each switch uses the game's matchmaking for that kind of match; off means you start it alone. If nobody is found in 45 seconds the stage starts alone anyway. Story acts and portals have no matchmaking.")
+	toggle(page, "Half-hour challenges", "MatchChallenge")
+	toggle(page, "Infinite", "MatchInfinite")
+	toggle(page, "Legend stages", "MatchLegend")
+	toggle(page, "Raids", "MatchRaid")
+	toggle(page, "Summer Hunt", "MatchSummer")
+	toggle(page, "Infinity Mansion", "MatchCastle")
 	toggle(page, "Friends only lobby", "FriendsOnly")
 	hint(page, "Keeps strangers out of lobbies and portals the script opens itself. Matchmaking ignores it.")
 	do
