@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v130", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v133", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 
 -- Unload a previous execution before touching anything.
 if shared.AnimeAdventures then
@@ -4118,19 +4118,15 @@ do
 			local unitStats = unit:FindFirstChild("_stats")
 			local id, owner = unitStats and unitStats:FindFirstChild("id"), unitStats and unitStats:FindFirstChild("player")
 			if id and id.Value == "mahoraga" and owner and owner.Value == localPlayer and Config.WarlordMode ~= "Leave" and os.clock() - (Conductor.modeAt or 0) > 4 then
-				-- What he hunts (his button cycles 1 strongest "BOSS", 2 first "DEF", 3 range):
-				-- Auto = the boss while one is on the road, otherwise the front of the wave.
+				-- What he hunts (his button cycles 1 strongest "BOSS", 2 first "DEF", 3 range "ATK").
+				-- Measured over nine 26 s windows at waves 45-50: his own damage was ~1.1M/s on
+				-- BOSS against ~0.7M/s on both DEF and ATK. Auto = BOSS, and DEF for a minute after
+				-- the base loses health. (Not "an enemy is deep": with Elyssia's jellyfish walking
+				-- up from the base a few enemies are always past 80%, and he sat on DEF, passing
+				-- through ATK on every switch back.)
 				local want = Config.WarlordMode == "Boss" and 1 or Config.WarlordMode == "Front" and 2 or Config.WarlordMode == "Range" and 3 or nil
 				if not want then
-					local boss = false
-					for _, enemy in ipairs(scanField().enemies) do
-						local enemyId = enemy._stats:FindFirstChild("id") and enemy._stats.id.Value or enemy.Name
-						local enemyData = Units[enemyId]
-						if (enemyData and enemyData.boss) or (tostring(enemyId):find("boss") and not tostring(enemyId):find("miniboss")) then
-							boss = true
-						end
-					end
-					want = boss and 1 or 2
+					want = (Match.bleedAt and os.clock() - Match.bleedAt < 60) and 2 or 1
 				end
 				if (unit:GetAttribute("_mahoragamode") or 1) ~= want then
 					Conductor.modeAt = os.clock()
@@ -10170,7 +10166,7 @@ do
 	end, function(option)
 		Config.WarlordMode = option
 	end)
-	hint(page, "His own button in the game: Boss goes for the strongest enemy, Front for the first one on the road, Range is his third setting. Auto uses Boss while a boss is out and Front otherwise. Leave never touches it.")
+	hint(page, "His own button in the game: Boss (BOSS) goes for the strongest enemy, Front (DEF) for the first one on the road, Range (ATK) is his third setting. Auto keeps him on Boss, where he dealt the most damage when measured, and switches to Front for a minute whenever your base loses health. Leave never touches it.")
 	heading(page, "Targeting")
 	segmented(page, "", "Targeting", { "Smart", "First", "Last", "Closest" })
 	segmented(page, "", "Targeting", { "Farthest", "Strongest", "Weakest", "Off" })
