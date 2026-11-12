@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v83", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v84", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 
 -- Unload a previous execution before touching anything.
 if shared.AnimeAdventures then
@@ -4556,6 +4556,14 @@ end
 -- Types: 0 curse, 1 shop, 2 money, 3 gold treasure, 4 treasure, 5 final boss, 6 open chests, 7 shrine.
 local ROOM_VALUE = { ["3"] = 6, ["4"] = 5, ["6"] = 4, ["2"] = 3, ["5"] = 3, ["7"] = 2, ["1"] = 1, ["0"] = -6 }
 
+-- Shop order (lower buys first): loot and luck, cheaper units, then damage.
+local DUNGEON_SHOP_RANK = {}
+for rank, id in ipairs({ "gold_shroom", "gold_mask", "genie_lamp", "moon_fragment", "philospher_stone", "gold_branch", "hook2", "hook", "deathcap", "tome", "sword3", "frost_axe", "icebane", "bow_legendary", "stormbringer", "mage_coat", "sword2", "bow3", "bow2", "bow1", "scythe", "boots", "sword1", "belt", "cloak", "hammer_legendary", "fire_axe", "axe", "axe_legendary", "celestial_blade" }) do
+	DUNGEON_SHOP_RANK[id] = rank
+end
+-- Shrine curses: true = leave it.
+local DUNGEON_SHRINE_SKIP = { _curse_super_chaos = true, _curse_super_speed = true, _curse_super_regen = true, _curse_super_armored = false, _curse_super_burst = false, _curse_super_explode = false, _curse_super_health = false }
+
 local function dungeonKeys()
 	local inventory = profile().inventory
 	local items = inventory and inventory.normal_items
@@ -4620,14 +4628,36 @@ function AA.dungeonStep()
 			status = "Dungeon: shop"
 			local dungeon = findData("DungeonServiceCore", "sum_item_values")
 			local items = dungeon and dungeon.ITEMS or {}
+			-- What the team can use: an item that only lifts physical (or magic) damage is skipped
+			-- when nobody equipped deals it.
+			local deals = {}
+			for _, entry in ipairs(equippedUnits()) do
+				if unitStatsAt(entry.data, 0).damage > 0 or AA.isSummoner(entry.id) then
+					deals[entry.data._base_damage_type == "magic" and "magic" or "physical"] = true
+				end
+			end
 			local offers = {}
 			for index, offer in pairs(room) do
 				local item = type(offer) == "table" and items[offer.id]
 				if item and item.cost and not item.curse_chance and not item.curse_super_chance then
-					table.insert(offers, { index = index, cost = item.cost })
+					local useful = true
+					for _, effect in pairs(type(item.wave_modifier_effects) == "table" and item.wave_modifier_effects or {}) do
+						local stat = type(effect) == "table" and tostring(effect.stat or "") or ""
+						if (stat:find("physical") and not deals.physical) or (stat:find("magic") and not deals.magic) or stat:find("true_damage") then
+							useful = false
+						end
+					end
+					if useful then
+						table.insert(offers, { index = index, cost = item.cost, rank = DUNGEON_SHOP_RANK[offer.id] or 50 })
+					end
 				end
 			end
+			-- Best first (rewards and cheaper units, then damage), not cheapest first: the run's
+			-- money used to go on tier-1 daggers before a Golden Mushroom could be paid for.
 			table.sort(offers, function(x, y)
+				if x.rank ~= y.rank then
+					return x.rank < y.rank
+				end
 				return x.cost < y.cost
 			end)
 			for _, offer in ipairs(offers) do
@@ -4640,8 +4670,27 @@ function AA.dungeonStep()
 				end
 			end
 		elseif kind == "7" then
-			status = "Dungeon: shrine"
-			invoke("dungeon_shrine_accept")
+			-- A shrine trades a super curse for loot. Faster, regenerating or random-curse enemies
+			-- are the ones that end runs: those are walked past.
+			local curse
+			local function scan(value, depth)
+				if type(value) == "string" and DUNGEON_SHRINE_SKIP[value] ~= nil then
+					curse = value
+				elseif type(value) == "table" and depth < 4 then
+					for key, inner in pairs(value) do
+						scan(key, depth + 1)
+						scan(inner, depth + 1)
+					end
+				end
+			end
+			scan(room, 0)
+			if curse and DUNGEON_SHRINE_SKIP[curse] then
+				status = "Dungeon: shrine skipped"
+			else
+				status = "Dungeon: shrine"
+				invoke("dungeon_shrine_accept")
+			end
+			pcall(note, "shrine", { c = tostring(curse), took = not (curse and DUNGEON_SHRINE_SKIP[curse]) })
 			task.wait(0.6)
 		end
 		invoke("dungeon_continue_shop")
