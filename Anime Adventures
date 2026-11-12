@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v112", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v113", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 
 -- Unload a previous execution before touching anything.
 if shared.AnimeAdventures then
@@ -226,6 +226,9 @@ do
 				Config[key] = value
 			end
 		end
+	end
+	if Config.KillsStage ~= "Summer" then
+		Config.KillsStage = "Walled City"
 	end
 end
 
@@ -814,6 +817,7 @@ end
 
 if IS_LOBBY then
 	AA.progress["cleared_" .. tostring(localPlayer.UserId)] = {}
+	AA.progress.expect = nil
 	AA.saveProgress()
 end
 
@@ -1082,9 +1086,28 @@ local function buildPath()
 end
 ---The world whose daily kill mission is active and unfinished ("Defeat 2500 Curses": 500 gems
 ---and that world's evolution items every day). Returns the world id, kills done, kills needed.
-function AA.dailyKillQuest()
+function AA.dailyKillQuest(forLevel)
 	local handler = profile().quest_handler
 	local best
+	local onlyWorld
+	if forLevel then
+		-- Only the mission of the world this level belongs to.
+		for worldId, world in pairs(Worlds) do
+			if type(world) == "table" then
+				if world.infinite and world.infinite.id == forLevel then
+					onlyWorld = worldId
+				end
+				for _, entry in pairs(type(world.levels) == "table" and world.levels or {}) do
+					if type(entry) == "table" and entry.id == forLevel then
+						onlyWorld = worldId
+					end
+				end
+			end
+		end
+		if not onlyWorld then
+			return nil
+		end
+	end
 	for _, quest in pairs(type(handler) == "table" and type(handler.quests) == "table" and handler.quests or {}) do
 		local info = type(quest) == "table" and quest.quest_info
 		local id = type(info) == "table" and tostring(info.id or "") or ""
@@ -1094,8 +1117,11 @@ function AA.dailyKillQuest()
 			local need = tonumber(class.amount) or 2500
 			local have = type(quest.quest_progress) == "table" and tonumber(quest.quest_progress.amount) or 0
 			local world = Worlds[worldId]
-			if have < need and world and world.infinite and world.infinite.id then
-				best = best or { world = worldId, have = have, need = need, level = world.infinite.id }
+			if have < need and world and world.infinite and world.infinite.id and (not onlyWorld or onlyWorld == worldId) then
+				-- Several open at once: always the same one first (pairs order changes).
+				if not best or worldId < best.world then
+					best = { world = worldId, have = have, need = need, level = world.infinite.id }
+				end
 			end
 		end
 	end
@@ -1238,7 +1264,7 @@ local function buildSpots()
 			if onRoad and (nearest >= 1.4 or Config.RoadSpots) then
 				local hit = workspace:Raycast(Vector3.new(x, topY + 80, z), Vector3.new(0, -200, 0), params)
 				if hit and hit.Normal.Y > 0.6 and hit.Instance.Name ~= "_donotplace" then
-					local spot = { position = hit.Position, gap = nearest, progress = onRoad.progress }
+					local spot = { position = hit.Position, gap = nearest, progress = onRoad.progress, lane = onRoad.lane }
 					if ground and hit.Instance:IsDescendantOf(ground) then
 						table.insert(spots.ground, spot)
 					elseif hill and hit.Instance:IsDescendantOf(hill) then
@@ -1257,7 +1283,7 @@ local function buildSpots()
 			task.wait()
 		end
 	end
-	Match.spots = spots
+	Match.spots, Match.spotsRoad = spots, Config.RoadSpots
 	return spots
 end
 
@@ -1847,6 +1873,9 @@ local function insideHub(p, circles)
 end
 
 local function bestSpot(data, focus)
+	if Match.spots and Match.spotsRoad ~= Config.RoadSpots then
+		Match.spots = nil
+	end
 	local spots = Match.spots or buildSpots()
 	if not spots then
 		return nil
@@ -2063,7 +2092,7 @@ local function bestSpot(data, focus)
 						-- spots), off the kerb. Weak enemies: the very front, like everything else. A
 						-- summoner at 70% took the whole buff group with her, and Shadow Sorcerers at
 						-- the far end of the road did no damage at all while everything died at the spawn.
-						local aim = Match.pace == "speed" and 0.02 or 0.6
+						local aim = Match.pace == "speed" and (Match.laneJunction and Match.laneJunction[spot.lane] or 0.02) or 0.6
 						local score = -math.abs(progress - aim) * 10 + math.min(spot.gap, range) * (Match.pace == "speed" and -0.05 or 0.1)
 						if score > bestScore then
 							best, bestScore = spot, score
@@ -3541,9 +3570,10 @@ do
 	end
 
 	local function cast(unit, role, name, rate)
-		Conductor.pending[unit] = os.clock()
+		local lastMainBefore, stamp = Conductor.lastMain[name], os.clock()
+		Conductor.pending[unit] = stamp
 		if role == "main" then
-			Conductor.lastMain[name] = os.clock()
+			Conductor.lastMain[name] = stamp
 		end
 		task.spawn(function()
 			local sent = os.clock()
@@ -3560,7 +3590,14 @@ do
 				note("buff", { u = unit._stats.id.Value, r = role, pct = math.floor(rate * 100 + 0.5) })
 			else
 				-- Refused (still cooling down on the server's clock): look again in a moment.
-				Conductor.readyAt[unit] = os.clock() + 0.3
+				-- (A late refusal of a doubled request must not wipe the cooldown of the cast that
+				-- went through, and a main that didn't cast must not hold the supports back.)
+				if (Conductor.readyAt[unit] or 0) < os.clock() + 0.3 then
+					Conductor.readyAt[unit] = os.clock() + 0.3
+				end
+				if role == "main" and Conductor.lastMain[name] == stamp then
+					Conductor.lastMain[name] = lastMainBefore
+				end
 			end
 		end)
 	end
@@ -3687,9 +3724,11 @@ do
 			-- Supports.
 			if next(supports) and now - (Conductor.lastMain[name] or -math.huge) >= SUPPORT_DELAY and now - (Conductor.lastSupport[name] or -math.huge) >= 2 then
 				local open = false
-				for unit in pairs(mains) do
+				-- (Chain mains only: a copy standing alone is out of the supports' reach, and
+				-- counting it kept this true forever.)
+				for index, unit in ipairs(chain) do
 					local _, ends = Conductor.rate(unit, name)
-					if ends <= now and not Conductor.pending[unit] then
+					if index <= 2 and ends <= now and not Conductor.pending[unit] then
 						open = true
 					end
 				end
@@ -3997,7 +4036,7 @@ local function finishMatch()
 	elseif opened and after == "Auto" then
 		-- A challenge opened while the in-between mode was running: this match is done, go take it.
 		after = "Lobby"
-	elseif castle then
+	elseif castle and after == "Auto" then
 		-- The in-game "next room" keeps this match's difficulty (and a fixed room would climb):
 		-- a different difficulty or a fixed room goes through the lobby.
 		after = (data._difficulty ~= AA.castleDifficulty(floor) or Config.CastleFloor > 0) and "Lobby" or "Castle"
@@ -4037,7 +4076,7 @@ local function finishMatch()
 		elseif Config.Mode == "Missions" and not story then
 			-- Infinite for a mission: again while it is open; once it is complete, the lobby (the
 			-- reward is claimed there and the next target picked).
-			after = AA.dailyKillQuest() and "Replay" or "Lobby"
+			after = AA.dailyKillQuest(id) and "Replay" or "Lobby"
 		elseif Config.Mode == "Missions" and won and story then
 			-- An act of the mission's world, played because its infinite is still locked: climb
 			-- (the next act loads here in seconds; kills count on every act), and after Act 6 go
@@ -4139,7 +4178,7 @@ end
 ---Everything that belongs to one match, wiped when a replay / next act starts in the same server.
 local function resetMatch()
 	Match.ended = false
-	Match.capped, Match.maxed, Match.failStreak = {}, {}, {}
+	Match.capped, Match.maxed, Match.failStreak, Match.badSpots, Match.recent = {}, {}, {}, {}, nil
 	Match.depthByWave, Match.pace, Match.farmsSold, Match.meas, Match.foldAt = {}, "speed", nil, {}, nil
 	Match.fightDepth, Match.result, Match.roguelike, Match.cardPower, Match.cardOffer = nil, nil, nil, nil, nil
 	Match.totalWaves, Match.infinite, Match.bleedAt, Match.lastHealth, Match.firstPlaceAt, Match.leakRisk, Match.threatAt = nil, nil, nil, nil, nil, nil, nil
@@ -4151,13 +4190,27 @@ local function resetMatch()
 	Match.shieldHits, Match.shieldAt = nil, nil
 	Match.enemyMedian, Match.tankNoted = nil, nil
 	AA.Macro.reset()
-	Match.missionOpen = nil
+	Match.missionOpen, Match.leftLogged, Match.finishedSince = nil, nil, nil
 	Match.dpsSample, Match.peakDps, Match.pressure, Match.pressByWave, Match.pressAt = nil, nil, nil, nil, nil
 	Match.pendingAtStart, Match.pendingCheck = nil, nil
 	Match.killTime, Match.lastKillTime, Match.killWave, Match.everLong, Match.paceSeeded, Match.hubMoved = nil, nil, nil, nil, nil, nil
 	Match.earned, Match.lastCash, Match.teamIds, Match.spawnOwner, Match.summoners, Match.unreported = nil, nil, nil, nil, nil, nil
 	Match.towerProgress, Match.guardAt, Match.relocateAt, Match.relocated, Match.shortUntil, Match.idleSince = nil, nil, nil, nil, nil, nil
 	Match.startedAt = os.clock()
+end
+
+---Leaving a running match for the lobby: logged once, the macro recording saved, and the teleport
+---asked again every 10 s until it goes through.
+function AA.leaveMatch(summary)
+	if not Match.leftLogged then
+		Match.leftLogged = true
+		logMatch(summary)
+		saveDetail(summary)
+		pcall(AA.Macro.stop)
+	end
+	Match.ended = true
+	invoke("teleport_back_to_lobby")
+	task.wait(10)
 end
 
 local function matchLoop()
@@ -4212,8 +4265,19 @@ local function matchLoop()
 					invoke("teleport_back_to_lobby")
 				end
 			end
+			if Match.ended and Config.AutoJoin and matchKind() ~= "Dungeon" then
+				-- Still on the result screen a minute later (a vote or teleport that didn't go
+				-- through, or the script was reloaded here): the lobby, asked again every 30 s.
+				Match.finishedSince = Match.finishedSince or os.clock()
+				if os.clock() - Match.finishedSince > (Match.finishedAsked and 30 or 60) then
+					Match.finishedSince, Match.finishedAsked = os.clock(), true
+					note("stuck", { level = Match.levelId })
+					invoke("teleport_back_to_lobby")
+				end
+			end
 			task.wait(0.5)
 		else
+			Match.finishedSince, Match.finishedAsked = nil, nil
 			if Match.ended then
 				-- Replayed (or moved to the next act) in the same server: start fresh.
 				local want = Match.wantDifficulty
@@ -4274,43 +4338,31 @@ local function matchLoop()
 				Match.idleSince = nil
 				local wave = currentWave()
 				if Match.missionOpen == nil then
-					Match.missionOpen = AA.dailyKillQuest() ~= nil
+					Match.missionOpen = AA.dailyKillQuest(Match.levelId) ~= nil
 				end
 				if Config.LeaveAtWave > 0 and wave >= Config.LeaveAtWave and Config.AutoJoin then
 					status = "Leaving"
 					local summary = { level = Match.levelId, won = true, wave = wave, left = true, at = os.time(), mode = matchKind(), picked = Config.Mode, time = math.floor(os.clock() - Match.startedAt) }
-					logMatch(summary)
-					saveDetail(summary)
-					invoke("teleport_back_to_lobby")
-					task.wait(10)
+					AA.leaveMatch(summary)
 				elseif AA.leaveForChallenge(matchKind()) then
 					status = "New challenge: leaving"
 					note("leave", { why = "challenge" })
 					local summary = { level = Match.levelId, won = false, wave = wave, left = true, at = os.time(), mode = matchKind(), picked = Config.Mode, time = math.floor(os.clock() - Match.startedAt), after = "Challenge" }
-					logMatch(summary)
-					saveDetail(summary)
-					invoke("teleport_back_to_lobby")
-					task.wait(10)
-				elseif Config.SellAtWave > 0 and wave >= Config.SellAtWave then
-					status = "Sold out"
-					sellAll()
-				elseif Config.Mode == "Missions" and Config.AutoJoin and Match.missionOpen and not AA.dailyKillQuest() and os.clock() - Match.startedAt > 30 then
+					AA.leaveMatch(summary)
+				elseif Config.Mode == "Missions" and Config.AutoJoin and Match.missionOpen and not AA.dailyKillQuest(Match.levelId) and os.clock() - Match.startedAt > 30 then
 					-- The mission this run was for is complete: claim it and move on.
 					status = "Mission complete: leaving"
 					note("leave", { why = "mission" })
 					local summary = { level = Match.levelId, won = true, wave = wave, left = true, at = os.time(), mode = matchKind(), picked = Config.Mode, time = math.floor(os.clock() - Match.startedAt) }
-					logMatch(summary)
-					saveDetail(summary)
-					invoke("teleport_back_to_lobby")
-					task.wait(10)
+					AA.leaveMatch(summary)
 				elseif (Config.LeaveAfterMinutes or 0) > 0 and Config.AutoJoin and os.clock() - Match.startedAt >= Config.LeaveAfterMinutes * 60 then
 					status = "Time up: leaving"
 					note("leave", { why = "minutes" })
 					local summary = { level = Match.levelId, won = true, wave = wave, left = true, at = os.time(), mode = matchKind(), picked = Config.Mode, time = math.floor(os.clock() - Match.startedAt) }
-					logMatch(summary)
-					saveDetail(summary)
-					invoke("teleport_back_to_lobby")
-					task.wait(10)
+					AA.leaveMatch(summary)
+				elseif Config.SellAtWave > 0 and wave >= Config.SellAtWave then
+					status = "Sold out"
+					sellAll()
 				else
 					if (Config.SellFarmsAtWave or 0) > 0 and wave >= Config.SellFarmsAtWave and not Match.farmsSold then
 						-- Farms have paid what they will: their refund goes back into damage.
@@ -5531,7 +5583,7 @@ end
 ---rarer than Legendary (Mythic, Secret) switches auto summon off. Works the same for single
 ---pulls and for 10 at a time (all ten land in the collection together; one Mythic among them
 ---is enough). True when it stopped.
-function AA.summonStop()
+function AA.summonStop(quiet)
 	local owned = collectionData().owned_units or {}
 	local seen, hit = {}, nil
 	for uuid, unit in pairs(owned) do
@@ -5545,7 +5597,7 @@ function AA.summonStop()
 		end
 	end
 	AA.summonSeen = seen
-	if hit and Config.SummonStopMythic then
+	if hit and Config.SummonStopMythic and not quiet then
 		Config.AutoSummon = false
 		AA.summonSeen = nil
 		AA.lastPull = hit
@@ -5560,7 +5612,7 @@ function AA.summonStop()
 end
 ---After a pull: give the new units a moment to land in the collection, then check them, so a
 ---Mythic stops the summoning before the next pull is paid for.
-function AA.summonSettle(count)
+function AA.summonSettle(count, quiet)
 	local before = 0
 	for _ in pairs(AA.summonSeen or {}) do
 		before += 1
@@ -5578,19 +5630,20 @@ function AA.summonSettle(count)
 		end
 		task.wait(0.1)
 	end
-	return AA.summonStop()
+	return AA.summonStop(quiet)
 end
 
-local function summonStep()
-	if not Config.AutoSummon then
+local function summonStep(snipeBanner)
+	if not snipeBanner and not Config.AutoSummon then
 		AA.summonSeen = nil
 		return
 	end
-	local banner = Banners[Config.Banner]
+	local bannerId = snipeBanner or Config.Banner
+	local banner = Banners[bannerId]
 	if not (banner and banner.active) then
 		return
 	end
-	if AA.summonStop() then
+	if not snipeBanner and AA.summonStop() then
 		return
 	end
 	setGameSetting("quick_summon", true)
@@ -5598,10 +5651,10 @@ local function summonStep()
 	setGameSetting("autosell_epic", Config.SellEpic)
 	if not banner._no_summon_ticket and itemCount("summon_ticket") > 0 then
 		status = "Summoning (ticket)"
-		if invoke("buy_from_banner", Config.Banner, "ticket") then
+		if invoke("buy_from_banner", bannerId, "ticket") then
 			Stats.summons += 1
 		end
-		AA.summonSettle(1)
+		AA.summonSettle(1, snipeBanner ~= nil)
 		return
 	end
 	local costId = banner.resource_cost and banner.resource_cost.id or "Gems"
@@ -5616,10 +5669,10 @@ local function summonStep()
 		return
 	end
 	status = "Summoning"
-	if invoke("buy_from_banner", Config.Banner, count == 10 and "gems10" or "gems") then
+	if invoke("buy_from_banner", bannerId, count == 10 and "gems10" or "gems") then
 		Stats.summons += count
 	end
-	AA.summonSettle(count)
+	AA.summonSettle(count, snipeBanner ~= nil)
 end
 
 ---What each equipped unit still needs to evolve: one line per unit, with where the missing
@@ -5755,10 +5808,7 @@ function AA.snipeStep()
 		return
 	end
 	-- The normal summon routine, pointed at that banner for one pull (it keeps the gem reserve).
-	local banner, auto, stop = Config.Banner, Config.AutoSummon, Config.SummonStopMythic
-	Config.Banner, Config.AutoSummon, Config.SummonStopMythic = bannerId, true, false
-	pcall(summonStep)
-	Config.Banner, Config.AutoSummon, Config.SummonStopMythic = banner, auto, stop
+	pcall(summonStep, bannerId)
 	status = "Sniping " .. tostring(Units[id] and Units[id].name or id)
 end
 
@@ -6057,14 +6107,6 @@ local function lobbyLoop()
 	end
 end
 
--- Anti-AFK.
-table.insert(AA.connections, localPlayer.Idled:Connect(function()
-	if Config.AntiAfk then
-		local vu = game:GetService("VirtualUser")
-		vu:CaptureController()
-		vu:ClickButton2(Vector2.new())
-	end
-end))
 
 -- Where the public copy lives (the script itself and the files it fetches on first use).
 AA.REPO = "https://raw.githubusercontent.com/InvisibleVIM/scripts/main/"
@@ -6645,9 +6687,18 @@ local function measureLoop()
 	end
 end
 
+-- Anti-AFK.
+table.insert(AA.connections, localPlayer.Idled:Connect(function()
+	if Config.AntiAfk then
+		local vu = game:GetService("VirtualUser")
+		vu:CaptureController()
+		vu:ClickButton2(Vector2.new())
+	end
+end))
+
 -- Auto rejoin: when Roblox shows a disconnect/kick prompt, go back to the lobby (the hub and the
 -- autoexec start everything again there).
-if Config.AutoRejoin ~= false then
+do
 	pcall(function()
 		local guiService = game:GetService("GuiService")
 		table.insert(AA.connections, guiService.ErrorMessageChanged:Connect(function(message)
@@ -8015,7 +8066,9 @@ do
 	end
 
 	function UI.button(page, text, action)
-		return pushButton({ Size = UDim2.new(1, 0, 0, 32), LayoutOrder = UI.nextOrder(), Parent = slot(page, 32) }, text, action)
+		local made = pushButton({ Size = UDim2.new(1, 0, 0, 32), LayoutOrder = UI.nextOrder(), Parent = slot(page, 32) }, text, action)
+		UI.lastRow[page] = nil
+		return made
 	end
 
 	local SHORT_KEYS = { RightControl = "Right Ctrl", LeftControl = "Left Ctrl", RightShift = "Right Shift", LeftShift = "Left Shift", RightAlt = "Right Alt", LeftAlt = "Left Alt", Insert = "Insert", Delete = "Delete" }
@@ -8412,6 +8465,7 @@ do
 	---Two buttons side by side in one row.
 	function UI.buttonPair(page, leftText, leftAction, rightText, rightAction)
 		local row = UI.rowBase(page, 32, false)
+		UI.lastRow[page] = nil
 		pushButton({ Position = UDim2.new(0, 0, 0, 0), Size = UDim2.new(0.5, -4, 1, 0), Parent = row }, leftText, leftAction)
 		pushButton({ Position = UDim2.new(0.5, 4, 0, 0), Size = UDim2.new(0.5, -4, 1, 0), Parent = row }, rightText, rightAction)
 		return row
@@ -9065,13 +9119,6 @@ do
 				panel.Visible = not panel.Visible
 			end
 		end))
-		table.insert(AA.connections, localPlayer.Idled:Connect(function()
-			if Config.AntiAfk then
-				local virtualUser = game:GetService("VirtualUser")
-				virtualUser:CaptureController()
-				virtualUser:ClickButton2(Vector2.new())
-			end
-		end))
 		if Config.HideOnExecute and not Config.MuteNotifications then
 			pcall(function()
 				game:GetService("StarterGui"):SetCore("SendNotification", {
@@ -9189,11 +9236,11 @@ do
 	heading(page, "Mode", "left")
 	toggle(page, "Join and requeue on its own", "AutoJoin")
 	UI.dropdown(page, "Game mode", function()
-		return { "Story", "Level", "Infinite", "Legend", "Raid", "Artifact", "Challenge", "Daily", "Missions", "Summer", "Cursed Womb", "Tournament", "Castle", "Dungeon", "Portals", "Kills" }
+		return { "Story", "Level", "Infinite", "Legend", "Raid", "Artifact", "Challenge", "Daily", "Missions", "Summer", "Cursed Womb", "Tournament", "Castle", "Dungeon", "Portals", "Farm kills" }
 	end, function()
 		return Config.Mode == "Kills" and "Farm kills" or Config.Mode
 	end, function(option)
-		Config.Mode = option
+		Config.Mode = option == "Farm kills" and "Kills" or option
 		AA.refreshPlay()
 	end)
 	hint(page, "Story climbs the acts in order. Level replays one world and act. Challenge plays each half-hour challenge (and the Daily), then the mode picked under Challenges. The settings on the right change with the mode.")
@@ -9213,10 +9260,12 @@ do
 	heading(page, "Drops", "left")
 	UI.playDrops = infoLine(page, 44)
 	heading(page, "After a game", "left")
-	segmented(page, "", "AfterGame", { "Auto", "Next", "Replay", "Lobby" })
+	segmented(page, "After a win or loss", "AfterGame", { "Auto", "Next", "Replay", "Lobby" })
+	hint(page, "Auto goes to the next act after a win, retries a loss, and climbs rooms in the castle.")
 	toggle(page, "Find a match with other players", "Matchmaking")
 	hint(page, "Uses the game's matchmaking wherever it exists: the Daily, half-hour challenges, infinite, legend stages, raids, the Summer Hunt and Infinity Mansion. Story acts have none. If nobody is found in 45 seconds it starts the stage alone.")
 	toggle(page, "Friends only lobby", "FriendsOnly")
+	hint(page, "Keeps strangers out of lobbies and portals the script opens itself. Matchmaking ignores it.")
 	do
 		local friendBox = UI.textbox(page, "Join this player's lobby", "user or display name")
 		friendBox.Text = tostring(Config.JoinFriend or "")
@@ -9225,7 +9274,6 @@ do
 		end)
 		hint(page, "With auto join on, the script waits for this player to open a lobby in your server, steps into it and lets them start. Leave empty to open your own.")
 	end
-	hint(page, "Keeps strangers out of lobbies and portals the script opens itself. Matchmaking ignores it. After a game, Auto goes to the next act after a win, retries a loss, and climbs rooms in the castle.")
 
 	heading(page, "Mode settings", "right")
 	only({ "Summer", "Cursed Womb", "Tournament", "Dungeon", "Portals", "None" }, hint(page, "This mode has no settings of its own."))
@@ -9246,7 +9294,7 @@ do
 	end, function(option)
 		Config.World = option.id
 	end)
-	only({ "Level", "Infinite" })
+	only({ "Level", "Infinite", "Missions" })
 	segmented(page, "Act", "Act", { 1, 2, 3, 4, 5, 6 })
 	only({ "Level" })
 	cycler(page, "Legend stage", function()
@@ -9427,6 +9475,7 @@ do
 	toggle(page, "Auto-skip card votes", "SkipCards")
 	heading(page, "Units")
 	toggle(page, "Auto place units", "AutoPlace")
+	hint(page, "Places along the path where each unit covers the most road")
 	toggle(page, "Auto upgrade units", "AutoUpgrade")
 	slider(page, "Max of each unit", "MaxPerUnit", 1, 10, 1, function(v)
 		return tostring(v)
@@ -9435,7 +9484,6 @@ do
 	hint(page, "Auto reads how strong the enemies are: how long the toughest one on the road takes to kill, and how far down the road they get. Weak enemies: every unit goes to the very front so each one dies as it appears. Strong enemies: units are placed for the most damage over the road. Front and Normal force one or the other.")
 	toggle(page, "Farm units first", "FarmFirst")
 	toggle(page, "Auto use unit abilities", "AutoAbility")
-	hint(page, "Places along the path where each unit covers the most road")
 	hint(page, "Buff units (Windsong, Commander): four copies in each other's range, cast in a timed chain that holds +100% damage on everything of their type nearby")
 	heading(page, "Event cards")
 	toggle(page, "Auto pick cards", "AutoCards")
@@ -9570,6 +9618,7 @@ do
 	end, function(option)
 		Config.Banner = option.id
 	end)
+	hint(page, "Summer2026 spends Summer Pearls; tickets are used first")
 	button(page, "Summon x1 now", function()
 		return AA.summonNow(1)
 	end)
@@ -9578,10 +9627,11 @@ do
 	end)
 	toggle(page, "Summon 10 at a time", "SummonTen")
 	toggle(page, "Stop when a Mythic is pulled", "SummonStopMythic")
+	hint(page, "Auto summon switches itself off as soon as a Mythic or Secret unit lands in your collection. With 10 at a time, the rest of that batch is already pulled.")
 	toggle(page, "Summon sniper", "SnipeOn")
+	hint(page, "Summons only while a unit on your sniper list is featured on a banner and you don't own it yet, on whichever banner has it. Uses the same gem reserve as auto summon. Works with auto summon off.")
 	segmented(page, "Sniper mode", "SnipeMode", { "Normal", "Middle" })
 	hint(page, "Normal: summons whenever a unit on your list is featured anywhere on a banner. Middle: only while it sits in the banner's middle slot, the one with the highest chance (50% of featured Mythic pulls on the rotating banners).")
-	hint(page, "Summons only while a unit on your sniper list is featured on a banner and you don't own it yet, on whichever banner has it. Uses the same gem reserve as auto summon. Works with auto summon off.")
 	cycler(page, "Sniper list", function()
 		local options = {}
 		local picked = {}
@@ -9626,8 +9676,6 @@ do
 		end
 		Config.SnipeUnits = table.concat(list, ",")
 	end)
-	hint(page, "Auto summon switches itself off as soon as a Mythic or Secret unit lands in your collection. With 10 at a time, the rest of that batch is already pulled.")
-	hint(page, "Summer2026 spends Summer Pearls; tickets are used first")
 	slider(page, "Keep gems", "KeepGems", 0, 20000, 50, function(v)
 		return tostring(v)
 	end)
@@ -9773,6 +9821,7 @@ do
 		end)
 	end
 	toggle(page, "Buy missing Star Fruits (merchant, gems)", "BuyEvolveFruit")
+	hint(page, "Only fruits the equipped team still needs to evolve. Keeps the Keep gems reserve.")
 	cycler(page, "Merchant sniper", function()
 		local options, picked, seen = {}, {}, {}
 		for id in tostring(Config.MerchantWant):gmatch("[^,]+") do
@@ -9817,7 +9866,6 @@ do
 		Config.MerchantWant = table.concat(list, ",")
 	end)
 	hint(page, "Buys every item on this list whenever the travelling merchant stocks it, with gems or gold, keeping your reserves. The list grows with what he has been seen selling.")
-	hint(page, "Only fruits the equipped team still needs to evolve; keeps 500 gems")
 	toggle(page, "Rejoin after a disconnect", "AutoRejoin")
 	toggle(page, "Auto reroll trait (tokens)", "AutoTrait")
 	cycler(page, "Target trait", function()
