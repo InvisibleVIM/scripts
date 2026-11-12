@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v115", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v116", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 
 -- Unload a previous execution before touching anything.
 if shared.AnimeAdventures then
@@ -156,6 +156,7 @@ local Config = {
 	TestUnproven = true,
 	AutoSummon = false,
 	Banner = "EventClover",
+	PortalPick = "",
 	SummonTen = true,
 	SummonStopMythic = true,
 	CompassPick = "",
@@ -1144,6 +1145,30 @@ function AA.dailyKillQuest(forLevel)
 		return best.world, best.have, best.need, best.level
 	end
 	return nil
+end
+
+---Every portal item in the inventory: { uuid, id, name, tries, left, made }.
+function AA.portalItems()
+	local list = {}
+	local unique = (profile().inventory or {}).unique_items
+	for _, item in pairs(type(unique) == "table" and unique or {}) do
+		local itemId = type(item) == "table" and tostring(item.item_id or "") or ""
+		if itemId:lower():find("portal", 1, true) and type(item.uuid) == "string" then
+			local extra = type(item._unique_item_data) == "table" and item._unique_item_data or {}
+			local tries, max = tonumber(extra._portal_tries) or 0, tonumber(extra._portal_max_tries) or 1
+			if not AA.portalNames then
+				AA.portalNames = {}
+			end
+			if AA.portalNames[itemId] == nil then
+				local ok, data = pcall(function()
+					return gameRequire(replicatedStorage.src.Data.Items)[itemId]
+				end)
+				AA.portalNames[itemId] = ok and type(data) == "table" and data.name or false
+			end
+			table.insert(list, { uuid = item.uuid, id = itemId, name = AA.portalNames[itemId] or itemId, tries = tries, left = max - tries, made = tonumber(item._creation_time) or 0 })
+		end
+	end
+	return list
 end
 
 ---Farm kills mode (takedowns for evolutions): everything at the very front on Weakest, the whole
@@ -4962,17 +4987,18 @@ chooseTarget = function(modeOverride)
 		end
 		return "summer2_event", "Hard", "event"
 	elseif mode == "Portals" then
-		-- Portal items from the inventory (unique items whose id says portal), oldest first.
-		local inventory = profile().inventory or {}
-		for _, bucket in pairs(inventory) do
-			if type(bucket) == "table" then
-				for uuid, item in pairs(bucket) do
-					local itemId = type(item) == "table" and (item.item_id or item.id) or nil
-					if type(uuid) == "string" and itemId and tostring(itemId):lower():find("portal") and not (AA.portalTried and AA.portalTried[uuid]) then
-						return uuid, itemId, "portal"
-					end
+		-- A portal item from the inventory: the picked kind (or any), one already started first,
+		-- then the oldest. use_portal takes the item's uuid.
+		local best
+		for _, item in ipairs(AA.portalItems()) do
+			if (Config.PortalPick == "" or item.id == Config.PortalPick) and item.left > 0 and not (AA.portalTried and AA.portalTried[item.uuid]) then
+				if not best or (item.tries > 0) ~= (best.tries > 0) and item.tries > 0 or (item.tries > 0) == (best.tries > 0) and item.made < best.made then
+					best = item
 				end
 			end
+		end
+		if best then
+			return best.uuid, best.name, "portal"
 		end
 		return nil, nil, "portal"
 	elseif mode == "Cursed Womb" then
@@ -9291,7 +9317,40 @@ do
 	end
 
 	heading(page, "Mode settings", "right")
-	only({ "Summer", "Cursed Womb", "Tournament", "Dungeon", "Portals", "None" }, hint(page, "This mode has no settings of its own."))
+	only({ "Summer", "Cursed Womb", "Tournament", "Dungeon", "None" }, hint(page, "This mode has no settings of its own."))
+	do
+		local function portalLabel(id)
+			local count, left, name = 0, 0, id
+			for _, item in ipairs(AA.portalItems()) do
+				if item.id == id then
+					count, left, name = count + 1, left + math.max(item.left, 0), item.name
+				end
+			end
+			return ("%s (%d, %d runs left)"):format(tostring(name), count, left)
+		end
+		cycler(page, "Portal", function()
+			local options, seen = { { id = "", name = "Any portal", current = Config.PortalPick == "" } }, {}
+			for _, item in ipairs(AA.portalItems()) do
+				if not seen[item.id] then
+					seen[item.id] = true
+					table.insert(options, { id = item.id, name = portalLabel(item.id), current = item.id == Config.PortalPick })
+				end
+			end
+			table.sort(options, function(a, b)
+				return a.id < b.id
+			end)
+			return options
+		end, function()
+			return Config.PortalPick == "" and "Any portal" or portalLabel(Config.PortalPick)
+		end, function(option)
+			Config.PortalPick = option.id
+			AA.portalTried = nil
+			AA.refreshPlay()
+		end)
+		only({ "Portals" })
+		hint(page, "Which portal from your inventory to open. A portal already started is finished first, then the oldest. When none of the picked kind is left, the script waits; Any portal uses whatever you have.")
+		only({ "Portals" })
+	end
 	only({ "Missions" }, hint(page, "Plays the world whose daily kill mission is open (2500 kills for 500 gems and that world's evolution items): its infinite stage, or its acts in order until infinite unlocks. Normal play, not Farm kills. When the mission is done it claims it in the lobby and plays infinite on the world picked under Infinite."))
 	segmented(page, "Farm kills on", "KillsStage", { "Walled City", "Summer" })
 	only({ "Kills" })
