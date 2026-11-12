@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v108", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v109", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 
 -- Unload a previous execution before touching anything.
 if shared.AnimeAdventures then
@@ -2691,8 +2691,18 @@ local function planAction()
 			end
 		end
 		if #phase > 0 then
-			-- One at a time, cheapest first: nothing here is worth holding cash back for.
+			-- One at a time, cheapest first: nothing here is worth holding cash back for. Units
+			-- that deal the damage go down before the buff chain (four Elfys used to open every
+			-- match with nothing on the field to buff).
+			local function buffer(option)
+				local optionData = option.kind == "place" and option.entry.data or Units[option.unit._stats.id.Value]
+				return AA.buffInfo(optionData) ~= nil
+			end
 			table.sort(phase, function(x, y)
+				local bx, by = buffer(x), buffer(y)
+				if bx ~= by then
+					return by
+				end
 				return x.cost < y.cost
 			end)
 			local first = phase[1]
