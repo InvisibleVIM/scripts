@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v114", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v115", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 
 -- Unload a previous execution before touching anything.
 if shared.AnimeAdventures then
@@ -5760,7 +5760,7 @@ function AA.bannerFeatured()
 				table.insert(slots, { id = id, name = tostring(unitData.name or id), rarity = tostring(config.rarity or unitData.rarity or "?"), chance = chance })
 			end
 			for _, slot in ipairs(slots) do
-				slot.top = slot.rarity == "Mythic" and slot.chance >= best and best > 0
+				slot.top = slot.rarity == "Mythic" and slot.chance >= best and best >= 0.5
 			end
 			table.sort(slots, function(a, b)
 				if a.top ~= b.top then
