@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v116", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v117", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 
 -- Unload a previous execution before touching anything.
 if shared.AnimeAdventures then
@@ -1163,12 +1163,31 @@ function AA.portalItems()
 				local ok, data = pcall(function()
 					return gameRequire(replicatedStorage.src.Data.Items)[itemId]
 				end)
-				AA.portalNames[itemId] = ok and type(data) == "table" and data.name or false
+				local static = ok and type(data) == "table" and data.static_portal_copy_to_level_params
+				AA.portalNames[itemId] = { name = ok and type(data) == "table" and data.name or itemId, group = type(static) == "table" and static.portal_group or nil }
 			end
-			table.insert(list, { uuid = item.uuid, id = itemId, name = AA.portalNames[itemId] or itemId, tries = tries, left = max - tries, made = tonumber(item._creation_time) or 0 })
+			local known = AA.portalNames[itemId]
+			local own = type(extra._unique_portal_data) == "table" and extra._unique_portal_data.level_id
+			local group = known.group or (own and Levels[own] and Levels[own].portal_group) or nil
+			table.insert(list, { uuid = item.uuid, id = itemId, name = known.name, group = group, tries = tries, left = max - tries, made = tonumber(item._creation_time) or 0 })
 		end
 	end
 	return list
+end
+
+---The portal to open next: the picked kind (or any), one already started first, then the oldest.
+---With a group (the running portal match's), only portals the game lets that match go on with.
+function AA.portalChoose(group)
+	local best
+	for _, item in ipairs(AA.portalItems()) do
+		if (Config.PortalPick == "" or item.id == Config.PortalPick) and item.left > 0 and not (AA.portalTried and AA.portalTried[item.uuid]) and (not group or not item.group or item.group == group) then
+			local started, bestStarted = item.tries > 0, best and best.tries > 0
+			if not best or (started and not bestStarted) or (started == bestStarted and item.made < best.made) then
+				best = item
+			end
+		end
+	end
+	return best
 end
 
 ---Farm kills mode (takedowns for evolutions): everything at the very front on Weakest, the whole
@@ -4132,11 +4151,21 @@ local function finishMatch()
 			after = "Replay"
 		end
 	end
-	note("end", { won = won, after = after })
+	local portalNext
+	if kind == "Portal" and after ~= "Lobby" and Config.AutoJoin and Config.Mode == "Portals" then
+		-- The next portal straight from the result screen (the game's own "replay with another
+		-- portal" button), no lobby in between. None left of the picked kind: the lobby.
+		task.wait(1.5)
+		portalNext = AA.portalChoose(data.portal_group)
+		after = portalNext and "Replay" or "Lobby"
+	end
+	note("end", { won = won, after = after, portal = portalNext and portalNext.id or nil })
 	if after == "Castle" then
 		task.spawn(invoke, "request_start_infinite_tower_from_game", (won and floor) and floor + 1 or floor or 1)
 	elseif after == "Next" then
 		task.spawn(invoke, "set_game_finished_vote", "next_story")
+	elseif after == "Replay" and portalNext then
+		task.spawn(invoke, "set_game_finished_vote", "replay", { item_uuid = portalNext.uuid })
 	elseif after == "Replay" then
 		task.spawn(invoke, "set_game_finished_vote", "replay")
 	end
@@ -4989,14 +5018,7 @@ chooseTarget = function(modeOverride)
 	elseif mode == "Portals" then
 		-- A portal item from the inventory: the picked kind (or any), one already started first,
 		-- then the oldest. use_portal takes the item's uuid.
-		local best
-		for _, item in ipairs(AA.portalItems()) do
-			if (Config.PortalPick == "" or item.id == Config.PortalPick) and item.left > 0 and not (AA.portalTried and AA.portalTried[item.uuid]) then
-				if not best or (item.tries > 0) ~= (best.tries > 0) and item.tries > 0 or (item.tries > 0) == (best.tries > 0) and item.made < best.made then
-					best = item
-				end
-			end
-		end
+		local best = AA.portalChoose()
 		if best then
 			return best.uuid, best.name, "portal"
 		end
