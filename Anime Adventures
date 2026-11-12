@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v107", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v108", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 
 -- Unload a previous execution before touching anything.
 if shared.AnimeAdventures then
@@ -4011,6 +4011,17 @@ local function finishMatch()
 				else
 					after = "Lobby"
 				end
+			end
+		elseif Config.Mode == "Kills" and Config.KillsStage == "Daily quest" and won and story then
+			-- An act of the mission's world, played because its infinite is still locked: climb
+			-- (the next act loads here in seconds; kills count on every act), and after Act 6 go
+			-- to the lobby, where infinite is open now.
+			local nextId = AA.nextStory(id)
+			if nextId and Levels[nextId] and Levels[nextId].world == level.world then
+				after = "Next"
+				AA.expectMatch(nextId, "Normal")
+			else
+				after = "Lobby"
 			end
 		else
 			after = "Replay"
