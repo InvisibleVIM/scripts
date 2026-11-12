@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v102", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v103", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 
 -- Unload a previous execution before touching anything.
 if shared.AnimeAdventures then
@@ -127,6 +127,9 @@ local Config = {
 	FarmFirst = true,
 	SellAtWave = 0,
 	LeaveAtWave = 0,
+	SellFarmsAtWave = 0,
+	LeaveAfterMinutes = 0,
+	StartDelay = 0,
 	-- Lobby
 	AutoCodes = true,
 	AutoDaily = true,
@@ -2522,7 +2525,7 @@ local function planAction()
 				-- Income over the rest of the match against the price (first level only: upgrades compete separately).
 				local income = math.max(base.farm, 0) * math.max(left - 1, 0)
 				local path = farmTop * math.max(left - 3, 0)
-				if Config.FarmFirst and safe and (income > cost * 1.3 or path > cost * 4) then
+				if Config.FarmFirst and safe and not Match.farmsSold and (income > cost * 1.3 or path > cost * 4) then
 					score = 1e6 + math.max(income, path) / cost
 				end
 			elseif copyPower(data, unit, maxLevel) > 0 then
@@ -3897,7 +3900,7 @@ local function matchLoop()
 						note("difficulty", { d = want })
 						invoke("select_difficulty", want)
 					end
-				elseif Config.AutoStart and os.clock() - lastStart > 3 then
+				elseif Config.AutoStart and os.clock() - lastStart > 3 and os.clock() - (Match.startedAt or 0) >= (Config.StartDelay or 0) then
 					lastStart = os.clock()
 					readLevelData()
 					-- (Spawned: nothing may hold the loop while the server answers.)
@@ -3932,7 +3935,26 @@ local function matchLoop()
 				elseif Config.SellAtWave > 0 and wave >= Config.SellAtWave then
 					status = "Sold out"
 					sellAll()
+				elseif (Config.LeaveAfterMinutes or 0) > 0 and Config.AutoJoin and os.clock() - Match.startedAt >= Config.LeaveAfterMinutes * 60 then
+					status = "Time up: leaving"
+					note("leave", { why = "minutes" })
+					local summary = { level = Match.levelId, won = true, wave = wave, left = true, at = os.time(), mode = matchKind(), picked = Config.Mode, time = math.floor(os.clock() - Match.startedAt) }
+					logMatch(summary)
+					saveDetail(summary)
+					invoke("teleport_back_to_lobby")
+					task.wait(10)
 				else
+					if (Config.SellFarmsAtWave or 0) > 0 and wave >= Config.SellFarmsAtWave and not Match.farmsSold then
+						-- Farms have paid what they will: their refund goes back into damage.
+						Match.farmsSold = true
+						for _, unit in ipairs(myUnits()) do
+							local farmData = Units[unit._stats.id.Value]
+							if farmData and unitStatsAt(farmData, farmData.upgrade and #farmData.upgrade or 0).farm > 0 then
+								note("sell", { u = unit._stats.id.Value, why = "farm wave" })
+								invoke("sell_unit_ingame", unit)
+							end
+						end
+					end
 					matchStep()
 					useAbilities()
 					targetingStep()
@@ -8748,6 +8770,10 @@ do
 	local page = makePage("Match")
 	heading(page, "Game")
 	toggle(page, "Auto start", "AutoStart")
+	slider(page, "Wait before start", "StartDelay", 0, 60, 1, function(v)
+		return v == 0 and "Off" or (tostring(v) .. " s")
+	end)
+	hint(page, "Holds the start vote this many seconds after the map loads, e.g. to let friends join.")
 	toggle(page, "Auto skip waves", "AutoSkip")
 	toggle(page, "Auto-skip card votes", "SkipCards")
 	heading(page, "Units")
@@ -8792,6 +8818,14 @@ do
 	slider(page, "Leave at wave", "LeaveAtWave", 0, 100, 1, function(v)
 		return v == 0 and "Off" or tostring(v)
 	end)
+	slider(page, "Sell farms at wave", "SellFarmsAtWave", 0, 100, 1, function(v)
+		return v == 0 and "Off" or tostring(v)
+	end)
+	hint(page, "Sells Bulby and other money units once this wave starts, so their refund goes into damage for the end of the match. They are not placed again that match.")
+	slider(page, "Leave after minutes", "LeaveAfterMinutes", 0, 120, 1, function(v)
+		return v == 0 and "Off" or (tostring(v) .. " min")
+	end)
+	hint(page, "Leaves a match that has run this long and queues the next one. Needs auto join on.")
 	matchLine = infoLine(page, 92)
 	button(page, "Sell all units now", function()
 		sellAll()
@@ -9419,6 +9453,29 @@ end
 -- Misc page.
 do
 	local page = makePage("Misc")
+	heading(page, "Server")
+	button(page, "Back to lobby", function()
+		if IS_LOBBY then
+			return "Already there"
+		end
+		task.spawn(invoke, "teleport_back_to_lobby")
+		return "Leaving"
+	end)
+	button(page, "Copy server id", function()
+		if setclipboard then
+			setclipboard(game.JobId)
+			return "Copied"
+		end
+		return "No clipboard"
+	end)
+	button(page, "Rejoin this server", function()
+		task.spawn(function()
+			pcall(function()
+				game:GetService("TeleportService"):TeleportToPlaceInstance(game.PlaceId, game.JobId, localPlayer)
+			end)
+		end)
+		return "Rejoining"
+	end)
 	heading(page, "Free rewards")
 	toggle(page, "Auto redeem codes", "AutoCodes")
 	toggle(page, "Auto daily and level rewards", "AutoDaily")
