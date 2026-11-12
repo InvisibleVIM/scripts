@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v109", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v110", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 
 -- Unload a previous execution before touching anything.
 if shared.AnimeAdventures then
@@ -1128,9 +1128,7 @@ function AA.killsMode()
 	if Config.KillsStage == "Summer" then
 		return id:find("summer") ~= nil
 	end
-	if Config.KillsStage == "Daily quest" then
-		return id:find("infinite") ~= nil or id:find("_level_") ~= nil
-	end
+
 	return id:find("^aot") ~= nil and id:find("infinite") ~= nil
 end
 
@@ -4022,7 +4020,11 @@ local function finishMatch()
 					after = "Lobby"
 				end
 			end
-		elseif Config.Mode == "Kills" and Config.KillsStage == "Daily quest" and won and story then
+		elseif Config.Mode == "Missions" and not story then
+			-- Infinite for a mission: again while it is open; once it is complete, the lobby (the
+			-- reward is claimed there and the next target picked).
+			after = AA.dailyKillQuest() and "Replay" or "Lobby"
+		elseif Config.Mode == "Missions" and won and story then
 			-- An act of the mission's world, played because its infinite is still locked: climb
 			-- (the next act loads here in seconds; kills count on every act), and after Act 6 go
 			-- to the lobby, where infinite is open now.
@@ -4135,6 +4137,7 @@ local function resetMatch()
 	Match.shieldHits, Match.shieldAt = nil, nil
 	Match.enemyMedian, Match.tankNoted = nil, nil
 	AA.Macro.reset()
+	Match.missionOpen = nil
 	Match.dpsSample, Match.peakDps, Match.pressure, Match.pressByWave, Match.pressAt = nil, nil, nil, nil, nil
 	Match.pendingAtStart, Match.pendingCheck = nil, nil
 	Match.killTime, Match.lastKillTime, Match.killWave, Match.everLong, Match.paceSeeded, Match.hubMoved = nil, nil, nil, nil, nil, nil
@@ -4256,6 +4259,9 @@ local function matchLoop()
 			else
 				Match.idleSince = nil
 				local wave = currentWave()
+				if Match.missionOpen == nil then
+					Match.missionOpen = AA.dailyKillQuest() ~= nil
+				end
 				if Config.LeaveAtWave > 0 and wave >= Config.LeaveAtWave and Config.AutoJoin then
 					status = "Leaving"
 					local summary = { level = Match.levelId, won = true, wave = wave, left = true, at = os.time(), mode = matchKind(), picked = Config.Mode, time = math.floor(os.clock() - Match.startedAt) }
@@ -4274,6 +4280,15 @@ local function matchLoop()
 				elseif Config.SellAtWave > 0 and wave >= Config.SellAtWave then
 					status = "Sold out"
 					sellAll()
+				elseif Config.Mode == "Missions" and Config.AutoJoin and Match.missionOpen and not AA.dailyKillQuest() and os.clock() - Match.startedAt > 30 then
+					-- The mission this run was for is complete: claim it and move on.
+					status = "Mission complete: leaving"
+					note("leave", { why = "mission" })
+					local summary = { level = Match.levelId, won = true, wave = wave, left = true, at = os.time(), mode = matchKind(), picked = Config.Mode, time = math.floor(os.clock() - Match.startedAt) }
+					logMatch(summary)
+					saveDetail(summary)
+					invoke("teleport_back_to_lobby")
+					task.wait(10)
 				elseif (Config.LeaveAfterMinutes or 0) > 0 and Config.AutoJoin and os.clock() - Match.startedAt >= Config.LeaveAfterMinutes * 60 then
 					status = "Time up: leaving"
 					note("leave", { why = "minutes" })
@@ -4797,26 +4812,25 @@ chooseTarget = function(modeOverride)
 			return nil, nil, "locked"
 		end
 		return level and level.id, Config.Difficulty, "story"
+	elseif mode == "Missions" then
+		-- Daily kill missions ("Defeat 2500 Curses": 500 gems and that world's evolution items):
+		-- the mission world's infinite stage, or its furthest open act while infinite is locked,
+		-- played normally. With every mission done, plain infinite on the picked world.
+		local questWorld, _, _, level = AA.dailyKillQuest()
+		if level and Levels[level] and levelUnlocked(level, done) then
+			return level, "Hard", "story"
+		end
+		local world = questWorld and Worlds[questWorld]
+		for act = 6, 1, -1 do
+			local entry = world and world.levels and (world.levels[tostring(act)] or world.levels[act])
+			if entry and levelUnlocked(entry.id, done) then
+				return entry.id, "Normal", "story"
+			end
+		end
+		return chooseTarget("Infinite")
 	elseif mode == "Kills" then
 		if Config.KillsStage == "Summer" then
 			return chooseTarget("Summer")
-		end
-		if Config.KillsStage == "Daily quest" then
-			-- The infinite stage of the world whose daily kill mission is still open; with none
-			-- open (done for today), the Titan map below.
-			local questWorld, _, _, level = AA.dailyKillQuest()
-			if level and Levels[level] and levelUnlocked(level, done) then
-				return level, "Hard", "story"
-			end
-			-- Infinite still locked there: the furthest act of that world that is open (its
-			-- enemies count for the mission just the same).
-			local world = questWorld and Worlds[questWorld]
-			for act = 6, 1, -1 do
-				local entry = world and world.levels and (world.levels[tostring(act)] or world.levels[act])
-				if entry and levelUnlocked(entry.id, done) then
-					return entry.id, "Normal", "story"
-				end
-			end
 		end
 		-- Walled City (the Titan map) on infinite.
 		local world = Worlds.aot
@@ -9075,7 +9089,7 @@ do
 	heading(page, "Mode", "left")
 	toggle(page, "Join and requeue on its own", "AutoJoin")
 	UI.dropdown(page, "Game mode", function()
-		return { "Story", "Level", "Infinite", "Legend", "Raid", "Artifact", "Challenge", "Daily", "Summer", "Cursed Womb", "Tournament", "Castle", "Dungeon", "Portals", "Kills" }
+		return { "Story", "Level", "Infinite", "Legend", "Raid", "Artifact", "Challenge", "Daily", "Missions", "Summer", "Cursed Womb", "Tournament", "Castle", "Dungeon", "Portals", "Kills" }
 	end, function()
 		return Config.Mode == "Kills" and "Farm kills" or Config.Mode
 	end, function(option)
@@ -9115,8 +9129,8 @@ do
 
 	heading(page, "Mode settings", "right")
 	only({ "Summer", "Cursed Womb", "Tournament", "Dungeon", "Portals", "None" }, hint(page, "This mode has no settings of its own."))
-	segmented(page, "Farm kills on", "KillsStage", { "Walled City", "Summer", "Daily quest" })
-	hint(page, "Daily quest: plays the infinite stage of whichever world's daily kill mission is open (2500 kills for 500 gems and that world's evolution items), then falls back to Walled City once it is done.")
+	only({ "Missions" }, hint(page, "Plays the world whose daily kill mission is open (2500 kills for 500 gems and that world's evolution items): its infinite stage, or its acts in order until infinite unlocks. Normal play, not Farm kills. When the mission is done it claims it in the lobby and plays infinite on the world picked under Infinite."))
+	segmented(page, "Farm kills on", "KillsStage", { "Walled City", "Summer" })
 	only({ "Kills" })
 	hint(page, "Farms takedowns for evolutions, on Walled City infinite or the Summer Hunt. Every unit is placed at the very front and set to Weakest. The order: the whole team goes down first with no upgrades (the four Windsongs of the buff chain included), then Bulby is placed and maxed, then everything is upgraded by damage per cash.")
 	segmented(page, "Difficulty", "Difficulty", { "Normal", "Hard" })
