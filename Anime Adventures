@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v101", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v102", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 
 -- Unload a previous execution before touching anything.
 if shared.AnimeAdventures then
@@ -119,6 +119,7 @@ local Config = {
 	AutoUpgrade = true,
 	AutoAbility = true,
 	PlaceStart = true,
+	RoadSpots = true,
 	Targeting = "Smart",
 	LeakGuard = true,
 	LeakSell = true,
@@ -1178,8 +1179,9 @@ local function buildSpots()
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Include
 	local filter = { terrain }
-	if workspace:FindFirstChild("_road") then
-		table.insert(filter, workspace._road)
+	local roadModel = workspace:FindFirstChild("_road")
+	if roadModel then
+		table.insert(filter, roadModel)
 	end
 	params.FilterDescendantsInstances = filter
 
@@ -1196,7 +1198,7 @@ local function buildSpots()
 		for z = minZ - margin, maxZ + margin, step do
 			-- Near the path at all?
 			local onRoad, nearest = nearestPath(Vector3.new(x, 0, z), margin)
-			if onRoad and nearest >= 1.4 then
+			if onRoad and (nearest >= 1.4 or Config.RoadSpots) then
 				local hit = workspace:Raycast(Vector3.new(x, topY + 80, z), Vector3.new(0, -200, 0), params)
 				if hit and hit.Normal.Y > 0.6 and hit.Instance.Name ~= "_donotplace" then
 					local spot = { position = hit.Position, gap = nearest, progress = onRoad.progress }
@@ -1204,6 +1206,12 @@ local function buildSpots()
 						table.insert(spots.ground, spot)
 					elseif hill and hit.Instance:IsDescendantOf(hill) then
 						table.insert(spots.hill, spot)
+					elseif Config.RoadSpots and roadModel and hit.Instance:IsDescendantOf(roadModel) then
+						-- The road itself: the game's own placing won't offer it, the server takes
+						-- it for ground units (tested: ground and hybrid units yes, hill-only no,
+						-- inside another unit no).
+						spot.road = true
+						table.insert(spots.ground, spot)
 					end
 				end
 			end
@@ -8772,6 +8780,8 @@ do
 	hint(page, "Smart: First by the base, Strongest on bosses, Flying on hills")
 	heading(page, "Placement")
 	toggle(page, "Place near the enemy spawn", "PlaceStart")
+	toggle(page, "Use spots on the road", "RoadSpots")
+	hint(page, "Lets ground units stand on the enemy road itself, which the game's own placing doesn't offer. More and closer spots on maps with little ground. Applies from the next match.")
 	toggle(page, "Leak guard near the base", "LeakGuard")
 	toggle(page, "Leak guard may sell and move units", "LeakSell")
 	hint(page, "Selling only refunds 25%: used when a new unit isn't affordable")
