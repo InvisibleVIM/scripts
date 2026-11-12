@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v87", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v89", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 
 -- Unload a previous execution before touching anything.
 if shared.AnimeAdventures then
@@ -2283,6 +2283,38 @@ local function enemyState()
 		state.flying = state.flying or (flying ~= nil and flying.Value > 0)
 		state.soaring = state.soaring or (soaring ~= nil and soaring.Value > 0)
 	end
+	-- A tank: one enemy with at least five times the health of the usual one on this wave
+	-- (Mineral Elemental: 4.2M among 600k bandits, walked to the base at full health behind them
+	-- while every unit shot the bandits). Not "can it kill the base": past the first waves they all can.
+	local healths, list = {}, {}
+	for _, enemy in ipairs(scanField().enemies) do
+		local humanoid = enemy:FindFirstChildOfClass("Humanoid")
+		if humanoid and humanoid.MaxHealth > 0 then
+			table.insert(healths, humanoid.MaxHealth)
+			table.insert(list, { max = humanoid.MaxHealth, progress = pathProgress(enemy:GetPivot().Position) })
+		end
+	end
+	if #healths >= 3 then
+		table.sort(healths)
+		Match.enemyMedian = healths[math.ceil(#healths / 2)]
+	end
+	local usual = Match.enemyMedian
+	if usual then
+		for _, entry in ipairs(list) do
+			if entry.max >= usual * 5 then
+				state.tank = true
+				state.tankProgress = math.max(state.tankProgress or 0, entry.progress)
+			end
+		end
+		if state.tank then
+			-- A small one about to leak ahead of the tank comes first.
+			for _, entry in ipairs(list) do
+				if entry.max < usual * 5 and entry.progress >= 0.8 and entry.progress > state.tankProgress + 0.05 then
+					state.smallAhead = true
+				end
+			end
+		end
+	end
 	return state
 end
 
@@ -2781,6 +2813,12 @@ local function targetingStep()
 	end
 	Match.targetAt = os.clock()
 	local enemies = mode == "Smart" and enemyState() or nil
+	if enemies and enemies.tank and not Match.tankNoted then
+		Match.tankNoted = true
+		note("tank", { p = math.floor((enemies.tankProgress or 0) * 100) })
+	elseif enemies and not enemies.tank then
+		Match.tankNoted = nil
+	end
 	Match.towerProgress = Match.towerProgress or setmetatable({}, { __mode = "k" })
 	for _, unit in ipairs(myUnits()) do
 		local unitStats = unit._stats
@@ -2803,6 +2841,8 @@ local function targetingStep()
 				end
 				local shape = attackShape(data, unitStats.upgrade.Value)
 				local onHill = unit:GetAttribute("_on_hill") == true
+				-- (Focusing a tank with the units by the base was tried in v88: the Daily it was built
+				-- for was lost three waves EARLIER, at the wave-10 boss. Tanks are only logged now.)
 				if progress >= 0.7 then
 					want = "first"
 				elseif enemies.soaring and onHill then
@@ -3682,6 +3722,7 @@ local function resetMatch()
 	Match.killsPhase = nil
 	Match.voteNoted = nil
 	Match.shieldHits, Match.shieldAt = nil, nil
+	Match.enemyMedian, Match.tankNoted = nil, nil
 	Match.pendingAtStart, Match.pendingCheck = nil, nil
 	Match.killTime, Match.lastKillTime, Match.killWave, Match.everLong, Match.paceSeeded, Match.hubMoved = nil, nil, nil, nil, nil, nil
 	Match.earned, Match.lastCash, Match.teamIds, Match.spawnOwner, Match.summoners, Match.unreported = nil, nil, nil, nil, nil, nil
