@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v124", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v125", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 
 -- Unload a previous execution before touching anything.
 if shared.AnimeAdventures then
@@ -1200,10 +1200,65 @@ function AA.portalItems()
 	return list
 end
 
+---Every kind of portal this account has had, as far as the script has seen: the ones in the
+---inventory now, plus the ones remembered from earlier (progress file, seeded once from the match
+---log's drops). The game keeps no such record itself. Returns { { id, name } }.
+function AA.portalKinds()
+	local seen = AA.progress.portalsSeen
+	if type(seen) ~= "table" then
+		seen = {}
+		AA.progress.portalsSeen = seen
+	end
+	local changed = false
+	if not AA.progress.portalsSeeded then
+		AA.progress.portalsSeeded = true
+		changed = true
+		pcall(function()
+			local log = httpService:JSONDecode(readfile(SETTINGS_FOLDER .. "/matches.json"))
+			for _, entry in ipairs(type(log) == "table" and log or {}) do
+				for itemId in pairs(type(entry) == "table" and type(entry.items) == "table" and entry.items or {}) do
+					if tostring(itemId):lower():find("portal", 1, true) and seen[itemId] == nil then
+						seen[itemId] = true
+					end
+				end
+			end
+		end)
+	end
+	for _, item in ipairs(AA.portalItems()) do
+		if seen[item.id] ~= item.name then
+			seen[item.id] = item.name
+			changed = true
+		end
+	end
+	local list = {}
+	for id, name in pairs(seen) do
+		if name == true then
+			-- Known from a drop log only: look its name up once.
+			local ok, data = pcall(function()
+				return gameRequire(replicatedStorage.src.Data.Items)[id]
+			end)
+			name = ok and type(data) == "table" and data.item_group == "Portals" and data.name or false
+			seen[id] = name
+			changed = true
+		end
+		if name then
+			table.insert(list, { id = id, name = name })
+		end
+	end
+	if changed then
+		pcall(AA.saveProgress)
+	end
+	table.sort(list, function(a, b)
+		return a.name < b.name
+	end)
+	return list
+end
+
 ---The portal to open next: the picked kind (or any), one already started first, then the oldest.
 ---With a group (the running portal match's), only portals the game lets that match go on with.
 function AA.portalChoose(group)
 	local best
+	pcall(AA.portalKinds)
 	for _, item in ipairs(AA.portalItems()) do
 		if (Config.PortalPick == "" or item.id == Config.PortalPick) and item.left > 0 and not (AA.portalTried and AA.portalTried[item.uuid]) and (not group or not item.group or item.group == group) then
 			local started, bestStarted = item.tries > 0, best and best.tries > 0
@@ -9710,24 +9765,26 @@ do
 	do
 		local function portalLabel(id)
 			local count, left, name = 0, 0, id
+			for _, kind in ipairs(AA.portalKinds()) do
+				if kind.id == id then
+					name = kind.name
+				end
+			end
 			for _, item in ipairs(AA.portalItems()) do
 				if item.id == id then
-					count, left, name = count + 1, left + math.max(item.left, 0), item.name
+					count, left = count + 1, left + math.max(item.left, 0)
 				end
+			end
+			if count == 0 then
+				return tostring(name) .. " (none right now)"
 			end
 			return ("%s (%d, %d runs left)"):format(tostring(name), count, left)
 		end
 		cycler(page, "Portal", function()
-			local options, seen = { { id = "", name = "Any portal", current = Config.PortalPick == "" } }, {}
-			for _, item in ipairs(AA.portalItems()) do
-				if not seen[item.id] then
-					seen[item.id] = true
-					table.insert(options, { id = item.id, name = portalLabel(item.id), current = item.id == Config.PortalPick })
-				end
+			local options = { { id = "", name = "Any portal", current = Config.PortalPick == "" } }
+			for _, kind in ipairs(AA.portalKinds()) do
+				table.insert(options, { id = kind.id, name = portalLabel(kind.id), current = kind.id == Config.PortalPick })
 			end
-			table.sort(options, function(a, b)
-				return a.id < b.id
-			end)
 			return options
 		end, function()
 			return Config.PortalPick == "" and "Any portal" or portalLabel(Config.PortalPick)
@@ -9737,7 +9794,7 @@ do
 			AA.refreshPlay()
 		end)
 		only({ "Portals" })
-		hint(page, "Which portal from your inventory to open. A portal already started is finished first, then the oldest. When none of the picked kind is left, the script waits; Any portal uses whatever you have.")
+		hint(page, "Which portal to open. The list keeps every kind of portal you have had since the script started tracking, so you can leave one picked while you have none: the script then waits for it, or plays your Otherwise mode. A portal already started is finished first, then the oldest. Any portal uses whatever you have.")
 		only({ "Portals" })
 	end
 	only({ "Missions" }, hint(page, "Plays the world whose daily kill mission is open (2500 kills for 500 gems and that world's evolution items): its infinite stage, or its acts in order until infinite unlocks. Normal play, not Farm kills. When the mission is done it claims it in the lobby and plays infinite on the world picked under Infinite."))
