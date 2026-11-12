@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v86", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v87", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 
 -- Unload a previous execution before touching anything.
 if shared.AnimeAdventures then
@@ -1576,7 +1576,7 @@ do
 	---How much harder a unit really hits than its sheet (with this copy's level and traits) says:
 	---scripted attacks and summons don't show in the data tables. 1 until it has been measured.
 	---Falls back to the unit's other form (Zombie <-> Zombie (Risen)).
-	function AA.measureFactor(id)
+	function AA.measureFactor(id, level)
 		local function own(unitId)
 			local entry = AA.Measured[unitId]
 			if type(entry) == "table" and (entry.gsecs or 0) >= AA.MEASURE_SECONDS and (entry.g or 0) > 0 then
@@ -1590,6 +1590,20 @@ do
 		-- enemies (single-target damage shines: Elyssia did 10x his damage over a long infinite
 		-- run). A match reads the sheet of its own kind first.
 		local crowd = not IS_LOBBY and Match.pace == "speed"
+		if level and level <= 1 then
+			-- A fresh copy has its own sheet: Water Goddess measured 5.6x her paper damage, nearly
+			-- all of it at level 4-5, and that number put four level-0 copies down before Elyssia
+			-- in a Daily that was lost at wave 6. Unmeasured at low level: the general number,
+			-- kept close to the paper.
+			local low = own(crowd and (id .. "#lo@speed") or (id .. "#lo")) or own(id .. "#lo") or own(id .. "#lo@speed")
+			if low then
+				return math.clamp(low, 0.25, 20), true
+			end
+			local general = own(crowd and (id .. "@speed") or id) or own(id) or own(id .. "@speed")
+			if general then
+				return math.clamp(general, 0.6, 1.6), true
+			end
+		end
 		local value = own(crowd and (id .. "@speed") or id) or own(id) or own(id .. "@speed")
 		if not value and data then
 			local from = type(data.evolved) == "table" and data.evolved.from
@@ -1627,31 +1641,6 @@ function AA.shieldCount()
 	Match.shieldHits = math.max(Match.shieldHits or 0, count)
 	return Match.shieldHits
 end
----Share of a unit's sheet damage left on shielded enemies: an enemy is in range for about 8 s,
----and the time its hits spend on shields is lost. Summoners keep theirs (many small attackers).
-function AA.shieldMul(data, level, id)
-	local shields = IS_LOBBY and 0 or AA.shieldCount()
-	if shields <= 0 or not data or AA.isSummoner(id) then
-		return 1
-	end
-	local attackId = data.primary_attack or data.primary_attack_no_upgrades
-	for i = 1, level do
-		local up = data.upgrade and data.upgrade[i]
-		if up and up.primary_attack then
-			attackId = up.primary_attack
-		end
-	end
-	local hits = 0
-	local attack = attackId and Attacks[attackId]
-	for _, entry in pairs(attack and type(attack.aoe) == "table" and attack.aoe or {}) do
-		if type(entry) == "table" and type(entry.hit) == "table" then
-			hits += 1
-		end
-	end
-	local perSecond = math.max(hits, 1) / math.max(unitStatsAt(data, level).cooldown, 0.1)
-	return 1 / (1 + shields / perSecond / 8)
-end
-
 local function unitPower(id, unit)
 	local data = Units[id]
 	if not data then
@@ -2319,7 +2308,7 @@ local function planAction()
 		placed[id] = (placed[id] or 0) + 1
 		local entry = byId[id]
 		if entry then
-			local power = copyPower(entry.data, entry.unit, unit._stats.upgrade.Value) * AA.measureFactor(id) * AA.shieldMul(entry.data, unit._stats.upgrade.Value, id)
+			local power = copyPower(entry.data, entry.unit, unit._stats.upgrade.Value) * AA.measureFactor(id, unit._stats.upgrade.Value)
 			if power > 0 then
 				damagePlaced += 1
 				table.insert(powerUnits, { data = entry.data, power = power, id = id, unit = unit })
@@ -2401,7 +2390,7 @@ local function planAction()
 			local maxLevel = data.upgrade and #data.upgrade or 0
 			local base = unitStatsAt(data, 0)
 			local farmTop = unitStatsAt(data, maxLevel).farm
-			local factor = AA.measureFactor(entry.id)
+			local factor = AA.measureFactor(entry.id, 0)
 			local score = 0
 			local buff = AA.buffInfo(data)
 			if buff and damagePlaced >= 2 and (placed[entry.id] or 0) < AA.buffCopies(buff, data) then
@@ -2443,7 +2432,7 @@ local function planAction()
 					spend += math.ceil((data.upgrade[level].cost or 0) * scale)
 					best = math.max(best, copyPower(data, unit, level) / spend * 0.9)
 				end
-				score = best * factor * AA.shieldMul(data, 0, entry.id)
+				score = best * factor
 				-- Aura units (Water Goddess: +50% to Water units in range): worth what they add.
 				local aura = AA.synergyInfo(entry.id)
 				if aura and not aura.stacks and (placed[entry.id] or 0) == 0 then
@@ -2499,7 +2488,7 @@ local function planAction()
 						best = math.max(best, (copyPower(data, record, target) - now) / math.max(spend, 1) * (target == level + 1 and 1 or 0.9))
 					end
 					-- Units sitting where the fight is are worth more than ones enemies already passed.
-					score = best * AA.measureFactor(id) * AA.shieldMul(data, level + 1, id)
+					score = best * AA.measureFactor(id, level + 1)
 					if Match.pace == "speed" and not AA.buffInfo(data) and not AA.isSummoner(id) and not AA.reachesKillZone(unit, unitStatsAt(data, level + 1).range * statMul(record, "range") + 1) then
 						score *= 0.25
 					end
@@ -2586,18 +2575,29 @@ local function planAction()
 		local option = options[i]
 		table.insert(Match.lastOptions, string.format("%s %s %d %.3g", option.kind, option.kind == "place" and option.entry.id or option.unit._stats.id.Value, option.cost, option.score))
 	end
-	-- What to buy is the best damage per cash once the wait for it is priced in: an option's score
-	-- halves for every 45 s of saving it needs, and anything the match ends before affording is
-	-- out. (The old rule kept naming a 35000 upgrade as the target in a 15-wave stage it could
-	-- never pay for, and took whatever was affordable instead of waiting 5 s for something better.)
+	-- What to buy: the best damage per cash, saved for when it can't be paid yet. With a steady
+	-- income that order gives the most damage over the rest of the match (a cheaper, weaker buy
+	-- now only pushes the better one back). What changes it is the clock: an option is worth its
+	-- score times the share of the remaining match it will be on the field for, so near the end
+	-- the affordable one wins and anything the match ends before affording is out. (v81 halved a
+	-- score for every 45 s of saving: Elyssia's 10000 upgrade topped the list for six waves of a
+	-- Daily while cheaper upgrades half as good were bought instead, and the run was lost.)
 	if pick.score < 1e5 then
 		local income = math.max(Match.incomeRate or 0, 1)
-		local horizon = math.max(left, 1) * 30
+		local elapsed = os.clock() - (Match.startedAt or os.clock())
+		local perWave = math.clamp(elapsed / math.max(wave, 1), 15, 60)
+		local horizon = math.clamp(math.max(left, 1) * perWave, 20, 600)
+		if danger then
+			-- Under threat only the next half minute counts. (The old rule took the first
+			-- affordable thing on the list: 6000 went into Elfy upgrades worth a tenth of the
+			-- Water Goddess upgrade that was two seconds of income away.)
+			horizon = math.min(horizon, 30)
+		end
 		local best, bestValue
 		for _, option in ipairs(options) do
 			local wait = math.max(0, option.cost - money) / income
-			if option.score < 1e5 and wait <= horizon and not (rush and wait > 0) then
-				local value = option.score * 0.5 ^ (wait / 45)
+			if option.score < 1e5 and wait < horizon * 0.8 and not (rush and wait > 0) then
+				local value = option.score * (1 - wait / horizon)
 				if not bestValue or value > bestValue then
 					best, bestValue = option, value
 				end
@@ -2609,7 +2609,7 @@ local function planAction()
 		end
 	end
 	-- Under threat, don't sit saving for something expensive: buy the best thing we can afford now.
-	if danger and money < pick.cost then
+	if danger and money < pick.cost and pick.score >= 1e5 then
 		for _, option in ipairs(options) do
 			if option.cost <= money and option.score < 1e5 then
 				return option, money
@@ -5786,6 +5786,9 @@ local function measureLoop()
 				local entry = tracked[unit]
 				local gained = math.max(total.Value - (entry and entry.last or 0), 0)
 				record(ownerId, gained, 0, 0)
+				if owner._stats:FindFirstChild("upgrade") and owner._stats.upgrade.Value <= 1 then
+					record(ownerId .. "#lo", gained, 0, 0)
+				end
 				counted += gained
 				Match.extraDamage = Match.extraDamage or {}
 				Match.extraDamage[owner] = (Match.extraDamage[owner] or 0) + gained
@@ -5823,6 +5826,9 @@ local function measureLoop()
 					if busy or gained > 0 then
 						local seconds = now - entry.at
 						record(id, gained, seconds, copyPower(data, ownedOf(unit), level) * seconds)
+						if level <= 1 then
+							record(id .. "#lo", gained, seconds, copyPower(data, ownedOf(unit), level) * seconds)
+						end
 					end
 				end
 				-- A tower in the fight whose own counter stays at zero deals its damage where the
