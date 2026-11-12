@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v110", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v111", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 
 -- Unload a previous execution before touching anything.
 if shared.AnimeAdventures then
@@ -128,6 +128,7 @@ local Config = {
 	SellAtWave = 0,
 	LeaveAtWave = 0,
 	SnipeOn = false,
+	SnipeMode = "Normal",
 	SnipeUnits = "",
 	MerchantWant = "",
 	JoinFriend = "",
@@ -5654,8 +5655,55 @@ function AA.evolveNeeds()
 	return lines
 end
 
+---What every banner features right now: { banner, slots = { { id, name, rarity, chance, top } } },
+---the top slot first. (Top = the slot with the banner's highest rate-up chance, the "middle" one
+---on the summon screen: 50% of featured Mythic pulls on the rotating banners.) The summon data is
+---only loaded in the lobby; in a match the last lobby reading is returned.
+function AA.bannerFeatured()
+	local service = IS_LOBBY and filtergc("table", { Keys = { "BANNER_UNITS" } }, true) or nil
+	if not (service and type(service.BANNER_UNITS) == "table") then
+		return type(AA.progress.banners) == "table" and AA.progress.banners.list or {}, type(AA.progress.banners) == "table" and AA.progress.banners.at or nil
+	end
+	local list = {}
+	for bannerId, data in pairs(service.BANNER_UNITS) do
+		local banner = Banners[bannerId]
+		if type(banner) == "table" and banner.active and type(data) == "table" and type(data.rateup_units) == "table" then
+			local slots, best = {}, 0
+			for slot, id in pairs(data.rateup_units) do
+				local config = type(banner.rateup_units) == "table" and banner.rateup_units[slot] or {}
+				local chance = tonumber(config.rateup_chance) or 0
+				local unitData = Units[id] or {}
+				if (config.rarity or unitData.rarity) == "Mythic" then
+					best = math.max(best, chance)
+				end
+				table.insert(slots, { id = id, name = tostring(unitData.name or id), rarity = tostring(config.rarity or unitData.rarity or "?"), chance = chance })
+			end
+			for _, slot in ipairs(slots) do
+				slot.top = slot.rarity == "Mythic" and slot.chance >= best and best > 0
+			end
+			table.sort(slots, function(a, b)
+				if a.top ~= b.top then
+					return a.top
+				end
+				return a.chance > b.chance
+			end)
+			table.insert(list, { banner = bannerId, slots = slots })
+		end
+	end
+	table.sort(list, function(a, b)
+		return a.banner < b.banner
+	end)
+	local signature = httpService:JSONEncode(list)
+	if type(AA.progress.banners) ~= "table" or AA.progress.banners.signature ~= signature then
+		AA.progress.banners = { list = list, at = os.time(), signature = signature }
+		AA.progressDirty = true
+	end
+	return list, os.time()
+end
+
 ---Summon sniper: a wanted unit is featured on a banner right now and isn't owned yet. Returns the
----banner and the unit (nil when there is nothing to snipe).
+---banner and the unit (nil when there is nothing to snipe). Mode "Middle": only when the wanted
+---unit holds the banner's top slot (the 50% one).
 function AA.snipeFind()
 	if tostring(Config.SnipeUnits) == "" then
 		return nil
@@ -5671,14 +5719,13 @@ function AA.snipeFind()
 			owned[data.evolved.from] = true
 		end
 	end
-	local service = filtergc("table", { Keys = { "BANNER_UNITS" } }, true)
-	for bannerId, data in pairs(service and service.BANNER_UNITS or {}) do
-		local banner = Banners[bannerId]
-		if type(banner) == "table" and banner.active and type(data) == "table" then
-			for _, id in pairs(type(data.rateup_units) == "table" and data.rateup_units or {}) do
-				if wanted[id] and not owned[id] then
-					return bannerId, id
-				end
+	if not IS_LOBBY then
+		return nil
+	end
+	for _, entry in ipairs((AA.bannerFeatured())) do
+		for _, slot in ipairs(entry.slots) do
+			if wanted[slot.id] and not owned[slot.id] and (Config.SnipeMode ~= "Middle" or slot.top) then
+				return entry.banner, slot.id
 			end
 		end
 	end
@@ -9049,6 +9096,29 @@ do
 	heading(page, "Challenges", "right")
 	over.half = UI.kv(page, "Half-hour")
 	over.daily = UI.kv(page, "Daily")
+	heading(page, "Summon banners", "right")
+	over.banners = infoLine(page, 60)
+	task.spawn(function()
+		while AA.alive and over.banners.Parent do
+			local ok, list, at = pcall(AA.bannerFeatured)
+			local lines = {}
+			for _, entry in ipairs(ok and list or {}) do
+				local names = {}
+				for _, slot in ipairs(entry.slots) do
+					local chance = slot.chance > 0 and string.format(" %d%%", slot.chance * 100 + 0.5) or ""
+					table.insert(names, (slot.top and "[" .. slot.name .. chance .. "]" or slot.name .. chance) .. (slot.rarity == "Secret" and " (Secret)" or ""))
+				end
+				table.insert(lines, entry.banner .. ": " .. table.concat(names, ", "))
+			end
+			if #lines == 0 then
+				over.banners.Text = "Open the lobby once to read the banners."
+			else
+				local age = (not IS_LOBBY and at) and string.format("\nAs of %d min ago (banners are read in the lobby).", math.max(0, (os.time() - at) / 60)) or ""
+				over.banners.Text = table.concat(lines, "\n") .. "\n[ ] = middle slot" .. age
+			end
+			task.wait(IS_LOBBY and 20 or 60)
+		end
+	end)
 	heading(page, "Drops", "right")
 	over.drops = infoLine(page, 44)
 	heading(page, "Items this session", "right")
@@ -9479,6 +9549,8 @@ do
 	toggle(page, "Summon 10 at a time", "SummonTen")
 	toggle(page, "Stop when a Mythic is pulled", "SummonStopMythic")
 	toggle(page, "Summon sniper", "SnipeOn")
+	segmented(page, "Sniper mode", "SnipeMode", { "Normal", "Middle" })
+	hint(page, "Normal: summons whenever a unit on your list is featured anywhere on a banner. Middle: only while it sits in the banner's middle slot, the one with the highest chance (50% of featured Mythic pulls on the rotating banners).")
 	hint(page, "Summons only while a unit on your sniper list is featured on a banner and you don't own it yet, on whichever banner has it. Uses the same gem reserve as auto summon. Works with auto summon off.")
 	cycler(page, "Sniper list", function()
 		local options = {}
