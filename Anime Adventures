@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v119", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v120", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 
 -- Unload a previous execution before touching anything.
 if shared.AnimeAdventures then
@@ -183,10 +183,13 @@ local Config = {
 	WhChallengeRecord = true,
 	WhTimers = false,
 	PlaceStyle = "Auto",
-	PriorityOn = false,
-	PriorityStyle = "Smart",
-	PlaceOrder = "",
-	UpgradeOrder = "",
+	OrderOn = false,
+	OrderPlacement = "Smart",
+	OrderData = "[]",
+	OrderName = "",
+	OrderAddKind = "Place",
+	OrderAddUnit = "",
+	OrderAddTimes = 1,
 	DailyFront = true,
 	BuyCapsules = false,
 	OpenCapsules = false,
@@ -243,10 +246,11 @@ do
 		Difficulty = { "Normal", "Hard" },
 		PlaceStyle = { "Auto", "Front", "Normal" },
 		SnipeMode = { "Normal", "Middle" },
-		PriorityStyle = { "Smart", "Place first", "Upgrade first" },
+		OrderPlacement = { "Smart", "Front" },
+		OrderAddKind = { "Place", "Upgrade" },
 		Targeting = { "Smart", "First", "Last", "Closest", "Farthest", "Strongest", "Weakest", "Off" },
 	}
-	local defaults = { PriorityStyle = "Smart", Mode = "Story", AfterGame = "Auto", Difficulty = "Normal", PlaceStyle = "Auto", SnipeMode = "Normal", Targeting = "Smart" }
+	local defaults = { OrderPlacement = "Smart", OrderAddKind = "Place", Mode = "Story", AfterGame = "Auto", Difficulty = "Normal", PlaceStyle = "Auto", SnipeMode = "Normal", Targeting = "Smart" }
 	for key, list in pairs(choices) do
 		if not table.find(list, Config[key]) then
 			Config[key] = defaults[key]
@@ -1229,33 +1233,104 @@ function AA.killsMode()
 	return id:find("^aot") ~= nil and id:find("infinite") ~= nil
 end
 
----The user's priority list (Config.PlaceOrder / UpgradeOrder) against the equipped team: the ids
----in order, units missing from the saved list added at the end, units no longer equipped dropped.
-function AA.priorityList(key)
-	local team, seen, list = {}, {}, {}
-	for _, entry in ipairs(equippedUnits()) do
-		team[entry.id] = true
-	end
-	for id in tostring(Config[key] or ""):gmatch("[^,]+") do
-		if team[id] and not seen[id] then
-			seen[id] = true
-			table.insert(list, id)
+---Build order: the user's own list of steps ({ kind = "place" | "upgrade", unit = id, times = n }),
+---followed one step at a time instead of the planner's own choice. Kept in Config.OrderData
+---(JSON), saved setups in <Game>/orders/<name>.json together with the placement style.
+AA.Order = {}
+function AA.Order.steps()
+	if AA.Order.cacheText ~= Config.OrderData then
+		local ok, data = pcall(function()
+			return httpService:JSONDecode(Config.OrderData)
+		end)
+		local steps = {}
+		for _, step in ipairs(ok and type(data) == "table" and data or {}) do
+			if type(step) == "table" and type(step.unit) == "string" and (step.kind == "place" or step.kind == "upgrade") then
+				table.insert(steps, { kind = step.kind, unit = step.unit, times = math.clamp(math.floor(tonumber(step.times) or 1), 1, 20) })
+			end
 		end
+		AA.Order.cacheText, AA.Order.cache = Config.OrderData, steps
 	end
-	for _, entry in ipairs(equippedUnits()) do
-		if not seen[entry.id] then
-			seen[entry.id] = true
-			table.insert(list, entry.id)
-		end
-	end
-	return list
+	return AA.Order.cache
 end
-function AA.priorityRanks(key)
-	local ranks = {}
-	for index, id in ipairs(AA.priorityList(key)) do
-		ranks[id] = index
+function AA.Order.set(steps)
+	Config.OrderData = httpService:JSONEncode(steps)
+end
+function AA.Order.active()
+	return Config.OrderOn and not IS_LOBBY and #AA.Order.steps() > 0 and not AA.killsMode()
+end
+---Front placement picked for the build order.
+function AA.Order.front()
+	return Config.OrderPlacement == "Front" and AA.Order.active()
+end
+function AA.Order.file(name)
+	return SETTINGS_FOLDER .. "/orders/" .. tostring(name):gsub("[^%w%-_ ]", "_") .. ".json"
+end
+function AA.Order.list()
+	local names = {}
+	pcall(function()
+		if isfolder(SETTINGS_FOLDER .. "/orders") then
+			for _, path in ipairs(listfiles(SETTINGS_FOLDER .. "/orders")) do
+				local name = tostring(path):match("([^/\\]+)%.json$")
+				if name then
+					table.insert(names, name)
+				end
+			end
+		end
+	end)
+	table.sort(names)
+	return names
+end
+function AA.Order.save(name)
+	return pcall(function()
+		if not isfolder(SETTINGS_FOLDER) then
+			makefolder(SETTINGS_FOLDER)
+		end
+		if not isfolder(SETTINGS_FOLDER .. "/orders") then
+			makefolder(SETTINGS_FOLDER .. "/orders")
+		end
+		writefile(AA.Order.file(name), httpService:JSONEncode({ placement = Config.OrderPlacement, steps = AA.Order.steps() }))
+	end)
+end
+function AA.Order.load(name)
+	local ok, data = pcall(function()
+		return httpService:JSONDecode(readfile(AA.Order.file(name)))
+	end)
+	if ok and type(data) == "table" and type(data.steps) == "table" then
+		Config.OrderPlacement = data.placement == "Front" and "Front" or "Smart"
+		Config.OrderData = httpService:JSONEncode(data.steps)
+		Config.OrderName = name
+		return true
 	end
-	return ranks
+	return false
+end
+---The step the match is on: the first one the field doesn't satisfy yet. Counted from the field
+---(copies standing, upgrade levels bought), so a reload or a replay picks up where it is.
+---Returns index, step, and what it needs ("place" / "upgrade"), or nil when the list is done.
+function AA.Order.current(towers, capOf)
+	local copies, levels = {}, {}
+	for _, unit in ipairs(towers) do
+		local id = unit._stats.id.Value
+		copies[id] = (copies[id] or 0) + 1
+		levels[id] = (levels[id] or 0) + unit._stats.upgrade.Value
+	end
+	local wantCopies, wantLevels = {}, {}
+	Match.orderSkip = Match.orderSkip or {}
+	for index, step in ipairs(AA.Order.steps()) do
+		local id = step.unit
+		if step.kind == "place" then
+			wantCopies[id] = (wantCopies[id] or 0) + 1
+			local cap = capOf and capOf(id)
+			if (copies[id] or 0) < wantCopies[id] and not (cap and (copies[id] or 0) >= cap) and not Match.orderSkip[index] then
+				return index, step
+			end
+		else
+			wantLevels[id] = (wantLevels[id] or 0) + step.times
+			if (levels[id] or 0) < wantLevels[id] and not Match.orderSkip[index] then
+				return index, step
+			end
+		end
+	end
+	return nil
 end
 
 ---Daily challenge with other players in the server: the whole team goes to the very front (the
@@ -1280,7 +1355,7 @@ end
 ---they have been dying, stretched to the first junction on maps with several roads.
 local function killZone(lane)
 	local zone = (Match.fightDepth or 0.1) + 0.06
-	if AA.killsMode() or AA.frontForced() then
+	if AA.killsMode() or AA.frontForced() or AA.Order.front() then
 		-- Kills mode: the fight is held at the spawn however deep later waves get.
 		zone = 0.1
 	end
@@ -2304,7 +2379,7 @@ local function bestSpot(data, focus)
 						direction = directionLater or directionNow
 					end
 					score -= spot.gap * 0.05
-					if (AA.killsMode() or AA.frontForced()) and not focus and score > 0 then
+					if (AA.killsMode() or AA.frontForced() or AA.Order.front()) and not focus and score > 0 then
 						-- Kills mode: the spot nearest the spawn that still reaches the road, nothing
 						-- else. (Coverage scoring settled the team at 11-31% of the road with two
 						-- hundred free spots in the first 5%.)
@@ -2632,7 +2707,7 @@ local function planAction()
 	-- Infinite and other long modes (25+ waves): enemies keep scaling, so play for the late game
 	-- from the start (coverage, clustering under buffs, farms) instead of racing the early waves.
 	-- (An unknown wave count, like the Daily Challenge, is not "long": it gets no farm bias.)
-	if AA.killsMode() or AA.frontForced() then
+	if AA.killsMode() or AA.frontForced() or AA.Order.front() then
 		Match.longHaul = false
 		Match.pace = "speed"
 	elseif Match.infinite or (Match.totalWaves or 0) > 25 then
@@ -2798,34 +2873,57 @@ local function planAction()
 			end
 		end
 	end
-	if Config.PriorityOn and not AA.killsMode() and not AA.Macro.playing then
-		-- The user's own order: only the first unit on the placing list that can still be placed
-		-- is placed, only the first on the upgrade list that can still be upgraded is upgraded.
-		-- Where they stand is still the planner's choice.
-		local placeRank, upgradeRank = AA.priorityRanks("PlaceOrder"), AA.priorityRanks("UpgradeOrder")
-		local bestPlace, bestUpgrade = math.huge, math.huge
-		for _, option in ipairs(options) do
-			if option.kind == "place" then
-				option.rank = placeRank[option.entry.id] or 99
-				bestPlace = math.min(bestPlace, option.rank)
-			else
-				option.rank = upgradeRank[option.unit._stats.id.Value] or 99
-				bestUpgrade = math.min(bestUpgrade, option.rank)
-			end
+	if AA.Order.active() then
+		-- The user's build order: exactly the next step on the list, saved for until it can be
+		-- paid. Which spot (and which copy gets the upgrade) is still the planner's choice. When
+		-- the list is finished the planner carries on by itself.
+		local byId = {}
+		for _, entry in ipairs(equippedUnits()) do
+			byId[entry.id] = entry
 		end
-		local kept = {}
-		for _, option in ipairs(options) do
-			local top = option.rank == (option.kind == "place" and bestPlace or bestUpgrade)
-			if top and Config.PriorityStyle == "Place first" and option.kind == "upgrade" and bestPlace < math.huge then
-				top = false
-			elseif top and Config.PriorityStyle == "Upgrade first" and option.kind == "place" and bestUpgrade < math.huge then
-				top = false
+		local index, step = AA.Order.current(units, function(id)
+			return byId[id] and placeCap(byId[id].data) or 0
+		end)
+		while index do
+			local best
+			for _, option in ipairs(options) do
+				local id = option.kind == "place" and option.entry.id or option.unit._stats.id.Value
+				if option.kind == step.kind and id == step.unit and (not best or option.score > best.score) then
+					best = option
+				end
 			end
-			if top then
-				table.insert(kept, option)
+			if best then
+				Match.lastOptions = { string.format("build order %d: %s %s %d", index, step.kind, step.unit, best.cost) }
+				Match.orderStep = index
+				return best, money
 			end
+			-- Nothing to buy for this step. Not on the team, nothing of it on the field to
+			-- upgrade, already maxed, or the server keeps refusing the placement: skip it.
+			-- Otherwise (waiting for a wave or a retry) hold the list here.
+			local entry = byId[step.unit]
+			local standing, open = 0, false
+			for _, unit in ipairs(units) do
+				if unit._stats.id.Value == step.unit then
+					standing += 1
+					local data = Units[step.unit]
+					if data and data.upgrade and unit._stats.upgrade.Value < #data.upgrade then
+						open = true
+					end
+				end
+			end
+			local stuck = not entry or (step.kind == "upgrade" and (standing == 0 or not open)) or (step.kind == "place" and (not Config.AutoPlace or Match.capped[entry.uuid] ~= nil))
+			if not stuck then
+				Match.orderStep = index
+				Match.lastOptions = { string.format("build order %d: waiting for %s %s", index, step.kind, step.unit) }
+				return nil, money
+			end
+			Match.orderSkip[index] = true
+			note("orderSkip", { i = index, k = step.kind, u = step.unit })
+			index, step = AA.Order.current(units, function(id)
+				return byId[id] and placeCap(byId[id].data) or 0
+			end)
 		end
-		options = kept
+		Match.orderStep = nil
 	end
 	if AA.killsMode() then
 		-- Phase 1: every unit of the team down (the buff chain's four copies included), nothing
@@ -4393,6 +4491,7 @@ local function resetMatch()
 	Match.enemyMedian, Match.tankNoted = nil, nil
 	AA.Macro.reset()
 	Match.missionOpen, Match.leftLogged, Match.finishedSince, Match.frontForced = nil, nil, nil, nil
+	Match.orderSkip, Match.orderStep = nil, nil
 	Match.dpsSample, Match.peakDps, Match.pressure, Match.pressByWave, Match.pressAt = nil, nil, nil, nil, nil
 	Match.pendingAtStart, Match.pendingCheck = nil, nil
 	Match.killTime, Match.lastKillTime, Match.killWave, Match.everLong, Match.paceSeeded, Match.hubMoved = nil, nil, nil, nil, nil, nil
@@ -6714,7 +6813,7 @@ local function measureLoop()
 				Match.killWave, Match.lastKillTime, Match.killTime = wave, Match.killTime, nil
 			end
 			local slowKill = (Match.lastKillTime or 0) > 10 or ((Match.killTime or 0) > 14 and #field.towers >= 3)
-			if Config.PlaceStyle == "Front" or AA.killsMode() or AA.frontForced() then
+			if Config.PlaceStyle == "Front" or AA.killsMode() or AA.frontForced() or AA.Order.front() then
 				pace = "speed"
 			elseif Config.PlaceStyle == "Normal" then
 				pace = "long"
@@ -9768,56 +9867,146 @@ do
 	end)
 end
 
--- Priority page: the user's own order for placing and upgrading.
-do
-	local page = makePage("Priority")
-	local ORDINALS = { "1st", "2nd", "3rd", "4th", "5th", "6th" }
-	local function nameOf(id)
-		return tostring(Units[id] and Units[id].name or id)
-	end
-	local function orderCard(title, side, key, verb)
-		heading(page, title, side)
-		for slotIndex = 1, 6 do
-			UI.dropdown(page, verb .. " " .. ORDINALS[slotIndex], function()
-				local names = {}
-				for _, id in ipairs(AA.priorityList(key)) do
-					table.insert(names, nameOf(id))
-				end
-				return names
-			end, function()
-				local id = AA.priorityList(key)[slotIndex]
-				return id and nameOf(id) or "--"
-			end, function(option)
-				-- The picked unit takes this place; the one that was here takes the picked one's.
-				local list = AA.priorityList(key)
-				for index, id in ipairs(list) do
-					if nameOf(id) == option and list[slotIndex] then
-						list[index], list[slotIndex] = list[slotIndex], list[index]
-						break
-					end
-				end
-				Config[key] = table.concat(list, ",")
-				for _, refresh in ipairs(UI.refreshers) do
-					pcall(refresh)
-				end
-			end)
-		end
-	end
-	heading(page, "Priority", "left")
-	toggle(page, "Use my order", "PriorityOn")
-	hint(page, "Off: the script decides what to place and upgrade (best damage for the cash). On: it follows the two lists. Where each unit stands is still chosen by the script. Farm kills mode and macros keep their own order.")
-	segmented(page, "Placing against upgrading", "PriorityStyle", { "Smart", "Place first", "Upgrade first" })
-	hint(page, "Smart: the script picks between the next placement and the next upgrade on your lists. Place first: every unit goes down before anything is upgraded. Upgrade first: units already down are upgraded before the next one is placed.")
-	orderCard("Placing order", "left", "PlaceOrder", "Placed")
-	hint(page, "Every copy of the 1st unit is placed before the 2nd, and so on. Picking a unit swaps it with the one that was in that place.")
-	orderCard("Upgrade order", "right", "UpgradeOrder", "Upgraded")
-	hint(page, "The 1st unit is taken to its max level before the 2nd gets an upgrade. A unit that isn't on the field yet is skipped until it is placed.")
-end
-
 -- Macro page.
 do
 	local page = makePage("Macro")
-	heading(page, "Record")
+	-- Build order: a list of steps made here, followed instead of the script's own choice.
+	do
+		local function nameOf(id)
+			return tostring(Units[id] and Units[id].name or id)
+		end
+		local function teamIds()
+			local ids = {}
+			for _, entry in ipairs(equippedUnits()) do
+				table.insert(ids, entry.id)
+			end
+			return ids
+		end
+		local listLine, setupLine
+		local function showList()
+			if not listLine then
+				return
+			end
+			local steps = AA.Order.steps()
+			local lines = {}
+			local current = not IS_LOBBY and Config.OrderOn and Match.orderStep or nil
+			for index, step in ipairs(steps) do
+				if index > #steps - 14 then
+					local text = step.kind == "place" and ("Place " .. nameOf(step.unit)) or ("Upgrade " .. nameOf(step.unit) .. " x" .. step.times)
+					table.insert(lines, (index == current and "> " or "") .. index .. ". " .. text)
+				end
+			end
+			if #steps > 14 then
+				table.insert(lines, 1, "(" .. (#steps - 14) .. " earlier steps)")
+			end
+			listLine.Text = #steps == 0 and "No steps yet. The first step is always a placement." or table.concat(lines, "\n")
+		end
+		heading(page, "Build order", "left")
+		toggle(page, "Follow my build order", "OrderOn")
+		hint(page, "The script does exactly the next step on your list, saving up for it when it has to, and picks the spot itself. When the list is finished it carries on by its own judgement. Farm kills mode and a playing macro keep their own order.")
+		segmented(page, "Placement", "OrderPlacement", { "Smart", "Front" })
+		hint(page, "Smart: every unit on the best spot the script can find. Front: everything at the very start of the road. Saved with the setup.")
+		segmented(page, "Next step", "OrderAddKind", { "Place", "Upgrade" })
+		UI.dropdown(page, "Unit", function()
+			local names = {}
+			for _, id in ipairs(teamIds()) do
+				table.insert(names, nameOf(id))
+			end
+			return names
+		end, function()
+			local ids = teamIds()
+			if not table.find(ids, Config.OrderAddUnit) then
+				Config.OrderAddUnit = ids[1] or ""
+			end
+			return Config.OrderAddUnit ~= "" and nameOf(Config.OrderAddUnit) or "--"
+		end, function(option)
+			for _, id in ipairs(teamIds()) do
+				if nameOf(id) == option then
+					Config.OrderAddUnit = id
+				end
+			end
+		end)
+		slider(page, "Upgrade how many times", "OrderAddTimes", 1, 10, 1, function(v)
+			return tostring(v)
+		end)
+		button(page, "Add step", function()
+			local steps = table.clone(AA.Order.steps())
+			local unit = Config.OrderAddUnit
+			if unit == "" then
+				return "Pick a unit"
+			end
+			local kind = (#steps == 0 or Config.OrderAddKind ~= "Upgrade") and "place" or "upgrade"
+			if kind == "upgrade" then
+				local placed = false
+				for _, step in ipairs(steps) do
+					placed = placed or (step.kind == "place" and step.unit == unit)
+				end
+				if not placed then
+					return "Place it first"
+				end
+			end
+			table.insert(steps, { kind = kind, unit = unit, times = kind == "upgrade" and Config.OrderAddTimes or 1 })
+			AA.Order.set(steps)
+			showList()
+			return "Added"
+		end)
+		UI.buttonPair(page, "Remove last", function()
+			local steps = table.clone(AA.Order.steps())
+			table.remove(steps)
+			AA.Order.set(steps)
+			showList()
+		end, "Clear list", function()
+			AA.Order.set({})
+			showList()
+		end)
+		listLine = infoLine(page, 230)
+		listLine.TextYAlignment = Enum.TextYAlignment.Top
+		heading(page, "Saved setups", "left")
+		local setupBox = UI.textbox(page, "Setup name", "e.g. daily front")
+		setupBox.Text = tostring(Config.OrderName or "")
+		UI.buttonPair(page, "Save setup", function()
+			local name = setupBox.Text:gsub("^%s+", ""):gsub("%s+$", "")
+			if name == "" then
+				setupLine.Text = "Name it first"
+				return
+			end
+			local ok = AA.Order.save(name)
+			Config.OrderName = ok and name or Config.OrderName
+			setupLine.Text = ok and ("Saved " .. name .. " (" .. #AA.Order.steps() .. " steps, " .. Config.OrderPlacement .. " placement)") or "Could not save"
+		end, "Delete setup", function()
+			if Config.OrderName == "" then
+				setupLine.Text = "Load one first"
+				return
+			end
+			pcall(delfile, AA.Order.file(Config.OrderName))
+			setupLine.Text = "Deleted " .. Config.OrderName
+			Config.OrderName = ""
+		end)
+		UI.dropdown(page, "Load a setup", function()
+			return AA.Order.list()
+		end, function()
+			return Config.OrderName ~= "" and Config.OrderName or "--"
+		end, function(option)
+			local ok = AA.Order.load(option)
+			setupBox.Text = ok and option or setupBox.Text
+			setupLine.Text = ok and ("Loaded " .. option .. " (" .. #AA.Order.steps() .. " steps, " .. Config.OrderPlacement .. " placement)") or "Could not load " .. tostring(option)
+			showList()
+			for _, refresh in ipairs(AA.segmentRefreshers) do
+				pcall(refresh)
+			end
+		end)
+		hint(page, "A setup is the whole list plus its placement style. Loading one replaces the list above.")
+		setupLine = infoLine(page, 22)
+		setupLine.Text = Config.OrderName ~= "" and ("Current: " .. Config.OrderName) or "Not saved yet"
+		showList()
+		task.spawn(function()
+			while AA.alive do
+				pcall(showList)
+				task.wait(1)
+			end
+		end)
+	end
+	heading(page, "Record a macro", "right")
 	local nameBox = UI.textbox(page, "Macro name", "e.g. daily shield")
 	local recordLine
 	button(page, "Start / stop recording", function()
@@ -9841,7 +10030,7 @@ do
 	hint(page, "Records every placement, upgrade and sale in this match with its wave and exact spot, whoever makes it: you by hand or the script's own play. Units already out are saved as the opening. It saves by itself when the match ends.")
 	recordLine = infoLine(page, 22)
 	recordLine.Text = "Not recording"
-	heading(page, "Play")
+	heading(page, "Play a macro", "right")
 	UI.dropdown(page, "Macro", function()
 		local names = AA.Macro.list()
 		table.insert(names, 1, "None")
