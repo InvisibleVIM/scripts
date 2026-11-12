@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v85", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v86", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 
 -- Unload a previous execution before touching anything.
 if shared.AnimeAdventures then
@@ -1604,6 +1604,54 @@ do
 	end
 end
 
+---Shields on this match's enemies (Shield Enemies challenges: 3 / 6 / 9, Steel-Plated: 20). Each
+---shield eats one hit whatever its damage, so slow single hits lose most of their worth.
+function AA.shieldCount()
+	if Match.shieldAt and os.clock() - Match.shieldAt < 3 then
+		return Match.shieldHits or 0
+	end
+	Match.shieldAt = os.clock()
+	local count = 0
+	local challenge = tostring((Match.levelData or {})._challenge or "")
+	if challenge == "hyper_shield_enemies" then
+		count = 20
+	elseif challenge:find("^shield_enemies") then
+		count = 3 * (tonumber(challenge:match("_(%d)$")) or 1)
+	end
+	for _, enemy in ipairs(scanField().enemies) do
+		local shield = enemy:FindFirstChild("_stats") and enemy._stats:FindFirstChild("max_shield")
+		if shield and shield.Value > count and shield.Value < 100 then
+			count = shield.Value
+		end
+	end
+	Match.shieldHits = math.max(Match.shieldHits or 0, count)
+	return Match.shieldHits
+end
+---Share of a unit's sheet damage left on shielded enemies: an enemy is in range for about 8 s,
+---and the time its hits spend on shields is lost. Summoners keep theirs (many small attackers).
+function AA.shieldMul(data, level, id)
+	local shields = IS_LOBBY and 0 or AA.shieldCount()
+	if shields <= 0 or not data or AA.isSummoner(id) then
+		return 1
+	end
+	local attackId = data.primary_attack or data.primary_attack_no_upgrades
+	for i = 1, level do
+		local up = data.upgrade and data.upgrade[i]
+		if up and up.primary_attack then
+			attackId = up.primary_attack
+		end
+	end
+	local hits = 0
+	local attack = attackId and Attacks[attackId]
+	for _, entry in pairs(attack and type(attack.aoe) == "table" and attack.aoe or {}) do
+		if type(entry) == "table" and type(entry.hit) == "table" then
+			hits += 1
+		end
+	end
+	local perSecond = math.max(hits, 1) / math.max(unitStatsAt(data, level).cooldown, 0.1)
+	return 1 / (1 + shields / perSecond / 8)
+end
+
 local function unitPower(id, unit)
 	local data = Units[id]
 	if not data then
@@ -2271,7 +2319,7 @@ local function planAction()
 		placed[id] = (placed[id] or 0) + 1
 		local entry = byId[id]
 		if entry then
-			local power = copyPower(entry.data, entry.unit, unit._stats.upgrade.Value) * AA.measureFactor(id)
+			local power = copyPower(entry.data, entry.unit, unit._stats.upgrade.Value) * AA.measureFactor(id) * AA.shieldMul(entry.data, unit._stats.upgrade.Value, id)
 			if power > 0 then
 				damagePlaced += 1
 				table.insert(powerUnits, { data = entry.data, power = power, id = id, unit = unit })
@@ -2395,7 +2443,7 @@ local function planAction()
 					spend += math.ceil((data.upgrade[level].cost or 0) * scale)
 					best = math.max(best, copyPower(data, unit, level) / spend * 0.9)
 				end
-				score = best * factor
+				score = best * factor * AA.shieldMul(data, 0, entry.id)
 				-- Aura units (Water Goddess: +50% to Water units in range): worth what they add.
 				local aura = AA.synergyInfo(entry.id)
 				if aura and not aura.stacks and (placed[entry.id] or 0) == 0 then
@@ -2451,7 +2499,7 @@ local function planAction()
 						best = math.max(best, (copyPower(data, record, target) - now) / math.max(spend, 1) * (target == level + 1 and 1 or 0.9))
 					end
 					-- Units sitting where the fight is are worth more than ones enemies already passed.
-					score = best * AA.measureFactor(id)
+					score = best * AA.measureFactor(id) * AA.shieldMul(data, level + 1, id)
 					if Match.pace == "speed" and not AA.buffInfo(data) and not AA.isSummoner(id) and not AA.reachesKillZone(unit, unitStatsAt(data, level + 1).range * statMul(record, "range") + 1) then
 						score *= 0.25
 					end
@@ -3633,6 +3681,7 @@ local function resetMatch()
 	Match.dropLog = nil
 	Match.killsPhase = nil
 	Match.voteNoted = nil
+	Match.shieldHits, Match.shieldAt = nil, nil
 	Match.pendingAtStart, Match.pendingCheck = nil, nil
 	Match.killTime, Match.lastKillTime, Match.killWave, Match.everLong, Match.paceSeeded, Match.hubMoved = nil, nil, nil, nil, nil, nil
 	Match.earned, Match.lastCash, Match.teamIds, Match.spawnOwner, Match.summoners, Match.unreported = nil, nil, nil, nil, nil, nil
