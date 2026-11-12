@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v128", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v129", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 
 -- Unload a previous execution before touching anything.
 if shared.AnimeAdventures then
@@ -4062,7 +4062,7 @@ do
 		for _, unit in ipairs(folder and folder:GetChildren() or {}) do
 			local unitStats = unit:FindFirstChild("_stats")
 			local id, owner = unitStats and unitStats:FindFirstChild("id"), unitStats and unitStats:FindFirstChild("player")
-			if id and id.Value == "mahoraga" and owner and owner.Value == localPlayer and Config.WarlordMode ~= "Leave" and os.clock() - (Conductor.modeAt or 0) > 2 then
+			if id and id.Value == "mahoraga" and owner and owner.Value == localPlayer and Config.WarlordMode ~= "Leave" and os.clock() - (Conductor.modeAt or 0) > 4 then
 				-- What he hunts (his button cycles 1 strongest "BOSS", 2 first "DEF", 3 range):
 				-- Auto = the boss while one is on the road, otherwise the front of the wave.
 				local want = Config.WarlordMode == "Boss" and 1 or Config.WarlordMode == "Front" and 2 or Config.WarlordMode == "Range" and 3 or nil
