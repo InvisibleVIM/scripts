@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v118", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v119", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 
 -- Unload a previous execution before touching anything.
 if shared.AnimeAdventures then
@@ -183,6 +183,10 @@ local Config = {
 	WhChallengeRecord = true,
 	WhTimers = false,
 	PlaceStyle = "Auto",
+	PriorityOn = false,
+	PriorityStyle = "Smart",
+	PlaceOrder = "",
+	UpgradeOrder = "",
 	DailyFront = true,
 	BuyCapsules = false,
 	OpenCapsules = false,
@@ -239,9 +243,10 @@ do
 		Difficulty = { "Normal", "Hard" },
 		PlaceStyle = { "Auto", "Front", "Normal" },
 		SnipeMode = { "Normal", "Middle" },
+		PriorityStyle = { "Smart", "Place first", "Upgrade first" },
 		Targeting = { "Smart", "First", "Last", "Closest", "Farthest", "Strongest", "Weakest", "Off" },
 	}
-	local defaults = { Mode = "Story", AfterGame = "Auto", Difficulty = "Normal", PlaceStyle = "Auto", SnipeMode = "Normal", Targeting = "Smart" }
+	local defaults = { PriorityStyle = "Smart", Mode = "Story", AfterGame = "Auto", Difficulty = "Normal", PlaceStyle = "Auto", SnipeMode = "Normal", Targeting = "Smart" }
 	for key, list in pairs(choices) do
 		if not table.find(list, Config[key]) then
 			Config[key] = defaults[key]
@@ -1194,7 +1199,12 @@ end
 ---Farm kills mode (takedowns for evolutions): everything at the very front on Weakest, the whole
 ---team placed before anything is upgraded, then the farm maxed, then upgrades by efficiency.
 function AA.killsMode()
-	if Config.Mode ~= "Kills" then
+	-- (Also as the mode played between challenges.)
+	local between = (Config.Mode == "Challenge" or Config.Mode == "Daily") and Config.ChallengeFallback == "Kills"
+	if Config.Mode ~= "Kills" and not between then
+		return false
+	end
+	if IS_LOBBY and between then
 		return false
 	end
 	-- Only on the stage the mode farms: a portal or story match opened by hand with the mode
@@ -1217,6 +1227,35 @@ function AA.killsMode()
 	end
 
 	return id:find("^aot") ~= nil and id:find("infinite") ~= nil
+end
+
+---The user's priority list (Config.PlaceOrder / UpgradeOrder) against the equipped team: the ids
+---in order, units missing from the saved list added at the end, units no longer equipped dropped.
+function AA.priorityList(key)
+	local team, seen, list = {}, {}, {}
+	for _, entry in ipairs(equippedUnits()) do
+		team[entry.id] = true
+	end
+	for id in tostring(Config[key] or ""):gmatch("[^,]+") do
+		if team[id] and not seen[id] then
+			seen[id] = true
+			table.insert(list, id)
+		end
+	end
+	for _, entry in ipairs(equippedUnits()) do
+		if not seen[entry.id] then
+			seen[entry.id] = true
+			table.insert(list, entry.id)
+		end
+	end
+	return list
+end
+function AA.priorityRanks(key)
+	local ranks = {}
+	for index, id in ipairs(AA.priorityList(key)) do
+		ranks[id] = index
+	end
+	return ranks
 end
 
 ---Daily challenge with other players in the server: the whole team goes to the very front (the
@@ -2758,6 +2797,35 @@ local function planAction()
 				end
 			end
 		end
+	end
+	if Config.PriorityOn and not AA.killsMode() and not AA.Macro.playing then
+		-- The user's own order: only the first unit on the placing list that can still be placed
+		-- is placed, only the first on the upgrade list that can still be upgraded is upgraded.
+		-- Where they stand is still the planner's choice.
+		local placeRank, upgradeRank = AA.priorityRanks("PlaceOrder"), AA.priorityRanks("UpgradeOrder")
+		local bestPlace, bestUpgrade = math.huge, math.huge
+		for _, option in ipairs(options) do
+			if option.kind == "place" then
+				option.rank = placeRank[option.entry.id] or 99
+				bestPlace = math.min(bestPlace, option.rank)
+			else
+				option.rank = upgradeRank[option.unit._stats.id.Value] or 99
+				bestUpgrade = math.min(bestUpgrade, option.rank)
+			end
+		end
+		local kept = {}
+		for _, option in ipairs(options) do
+			local top = option.rank == (option.kind == "place" and bestPlace or bestUpgrade)
+			if top and Config.PriorityStyle == "Place first" and option.kind == "upgrade" and bestPlace < math.huge then
+				top = false
+			elseif top and Config.PriorityStyle == "Upgrade first" and option.kind == "place" and bestUpgrade < math.huge then
+				top = false
+			end
+			if top then
+				table.insert(kept, option)
+			end
+		end
+		options = kept
 	end
 	if AA.killsMode() then
 		-- Phase 1: every unit of the team down (the buff chain's four copies included), nothing
@@ -5231,10 +5299,13 @@ local function joinGame()
 		return false
 	end
 	local id, difficulty, kind, group = chooseTarget()
-	if id and (type(AA.progress.started) ~= "table" or AA.progress.started.mode ~= Config.Mode or os.time() - (AA.progress.started.at or 0) > 20) then
+	-- (Farm kills picked as the mode between challenges counts as started in that mode; its
+	-- rules still only apply on its own stage, never in the challenge itself.)
+	local startedMode = ((Config.Mode == "Challenge" or Config.Mode == "Daily") and Config.ChallengeFallback == "Kills") and "Kills" or Config.Mode
+	if id and (type(AA.progress.started) ~= "table" or AA.progress.started.mode ~= startedMode or os.time() - (AA.progress.started.at or 0) > 20) then
 		-- The match about to load was started by the script in this mode (mode rules such as
 		-- Farm kills only apply to those, never to a match opened by hand).
-		AA.progress.started = { mode = Config.Mode, at = os.time(), user = localPlayer.UserId }
+		AA.progress.started = { mode = startedMode, at = os.time(), user = localPlayer.UserId }
 		AA.saveProgress()
 	end
 	if not id then
@@ -9500,11 +9571,11 @@ do
 	heading(page, "Challenges", "right")
 	only({ "Challenge", "Daily" }, UI.current[page].body.Parent)
 	UI.dropdown(page, "When challenges are done", function()
-		return { "Story", "Level", "Infinite", "Legend", "Raid", "Artifact", "Summer", "Tournament", "Castle", "Dungeon", "Portals", "None" }
+		return { "Story", "Level", "Infinite", "Legend", "Raid", "Artifact", "Summer", "Tournament", "Castle", "Dungeon", "Portals", "Farm kills", "None" }
 	end, function()
-		return Config.ChallengeFallback
+		return Config.ChallengeFallback == "Kills" and "Farm kills" or Config.ChallengeFallback
 	end, function(option)
-		Config.ChallengeFallback = option
+		Config.ChallengeFallback = option == "Farm kills" and "Kills" or option
 		AA.refreshPlay()
 	end)
 	hint(page, "A challenge pays once per half-hour rotation and the Daily once a day; in between, the script plays this mode (its settings show above). None waits in the lobby.")
@@ -9695,6 +9766,52 @@ do
 		invoke("teleport_back_to_lobby")
 		return "Teleporting"
 	end)
+end
+
+-- Priority page: the user's own order for placing and upgrading.
+do
+	local page = makePage("Priority")
+	local ORDINALS = { "1st", "2nd", "3rd", "4th", "5th", "6th" }
+	local function nameOf(id)
+		return tostring(Units[id] and Units[id].name or id)
+	end
+	local function orderCard(title, side, key, verb)
+		heading(page, title, side)
+		for slotIndex = 1, 6 do
+			UI.dropdown(page, verb .. " " .. ORDINALS[slotIndex], function()
+				local names = {}
+				for _, id in ipairs(AA.priorityList(key)) do
+					table.insert(names, nameOf(id))
+				end
+				return names
+			end, function()
+				local id = AA.priorityList(key)[slotIndex]
+				return id and nameOf(id) or "--"
+			end, function(option)
+				-- The picked unit takes this place; the one that was here takes the picked one's.
+				local list = AA.priorityList(key)
+				for index, id in ipairs(list) do
+					if nameOf(id) == option and list[slotIndex] then
+						list[index], list[slotIndex] = list[slotIndex], list[index]
+						break
+					end
+				end
+				Config[key] = table.concat(list, ",")
+				for _, refresh in ipairs(UI.refreshers) do
+					pcall(refresh)
+				end
+			end)
+		end
+	end
+	heading(page, "Priority", "left")
+	toggle(page, "Use my order", "PriorityOn")
+	hint(page, "Off: the script decides what to place and upgrade (best damage for the cash). On: it follows the two lists. Where each unit stands is still chosen by the script. Farm kills mode and macros keep their own order.")
+	segmented(page, "Placing against upgrading", "PriorityStyle", { "Smart", "Place first", "Upgrade first" })
+	hint(page, "Smart: the script picks between the next placement and the next upgrade on your lists. Place first: every unit goes down before anything is upgraded. Upgrade first: units already down are upgraded before the next one is placed.")
+	orderCard("Placing order", "left", "PlaceOrder", "Placed")
+	hint(page, "Every copy of the 1st unit is placed before the 2nd, and so on. Picking a unit swaps it with the one that was in that place.")
+	orderCard("Upgrade order", "right", "UpgradeOrder", "Upgraded")
+	hint(page, "The 1st unit is taken to its max level before the 2nd gets an upgrade. A unit that isn't on the field yet is skipped until it is placed.")
 end
 
 -- Macro page.
