@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v129", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v130", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 
 -- Unload a previous execution before touching anything.
 if shared.AnimeAdventures then
@@ -992,6 +992,7 @@ end
 local function myUnits()
 	return scanField().towers
 end
+AA.myTowers = myUnits
 
 ---The tower a summon belongs to (nil for anything that isn't a summon).
 local function summonOwner(unit)
@@ -1307,6 +1308,22 @@ function AA.killsMode()
 	return id:find("^aot") ~= nil and id:find("infinite") ~= nil
 end
 
+---How many of our Zombie (Risen) have this spot inside their range.
+function AA.blessedAt(position)
+	local count = 0
+	for _, unit in ipairs(AA.myTowers and AA.myTowers() or {}) do
+		if unit._stats.id.Value == "giselle_evolved" then
+			local range = unit._stats:FindFirstChild("range")
+			local at = unit:GetPivot().Position
+			local dx, dz = at.X - position.X, at.Z - position.Z
+			local reach = (range and range.Value or 21) * 0.95
+			if dx * dx + dz * dz <= reach * reach then
+				count += 1
+			end
+		end
+	end
+	return count
+end
 ---Our Holy Warlord, when one stands (Shadow Sorcerer (Ritual)'s summon; one at a time).
 function AA.ownWarlord()
 	local folder = workspace:FindFirstChild("_UNITS")
@@ -1875,9 +1892,13 @@ do
 	---{ pct, matches(id, data), coverage } for units whose value is what they add to others.
 	function AA.synergyInfo(id)
 		local base = tostring(id):gsub("_evolved$", "")
-		if base == "giselle" then
-			return { pct = 0.25, stacks = true, coverage = 1, matches = function(otherId)
-				return AA.isSummoner(otherId)
+		if id == "giselle_evolved" then
+			-- Undead Blessing comes with the evolution ("+25% Attack, +Bone Bomb Brigade, +Undead
+			-- Blessing"): plain Zombie has no passive and leaves no buff on units in her range
+			-- (checked live). Each Zombie (Risen) in range adds to summon damage, so summoners and
+			-- the Sorcerer whose Ritual becomes Holy Warlord stand inside her range.
+			return { pct = 0.25, stacks = true, coverage = 1, matches = function(otherId, otherData)
+				return AA.isSummoner(otherId) or AA.ritualUnit(otherData or Units[otherId])
 			end }
 		elseif base == "aqua" then
 			return { pct = 0.5, coverage = 0.6, matches = function(_, otherData)
@@ -2370,6 +2391,7 @@ local function bestSpot(data, focus)
 		end
 		-- Summoners: their summons walk the road from the base no matter where the unit stands, so
 		-- they never take a front spot. Road still inside their range, as far down the path as it goes.
+		-- (Inside a Zombie (Risen)'s range when one is down: her blessing is on summon damage.)
 		local range = math.max(unitStatsAt(data, 0).range * 0.8, 6)
 		local best, bestScore = nil, -math.huge
 		for _, list in ipairs(pool) do
@@ -2392,6 +2414,7 @@ local function bestSpot(data, focus)
 						-- the far end of the road did no damage at all while everything died at the spawn.
 						local aim = Match.pace == "speed" and (Match.laneJunction and Match.laneJunction[spot.lane] or 0.02) or 0.6
 						local score = -math.abs(progress - aim) * 10 + math.min(spot.gap, range) * (Match.pace == "speed" and -0.05 or 0.1)
+						score += AA.blessedAt(p) * 1.5
 						if score > bestScore then
 							best, bestScore = spot, score
 						end
@@ -2422,6 +2445,26 @@ local function bestSpot(data, focus)
 		circles, firstGap = buffHub(data)
 		if circles and #circles == 0 then
 			circles = nil
+		end
+	end
+	-- Zombie (Risen)'s blessing: she goes where the units it boosts are inside her range, and
+	-- those units go inside hers.
+	local blessTargets, blessReach, blessedUnit
+	do
+		local own = data.id and AA.synergyInfo(data.id)
+		if own and own.stacks and not focus then
+			blessTargets, blessReach = {}, unitStatsAt(data, 0).range * 0.9
+			for _, unit in ipairs(myUnits()) do
+				local allyId = unit._stats.id.Value
+				if allyId ~= data.id and own.matches(allyId, Units[allyId]) then
+					table.insert(blessTargets, unit:GetPivot().Position)
+				end
+			end
+			if #blessTargets == 0 then
+				blessTargets = nil
+			end
+		elseif not focus and data.id and (AA.isSummoner(data.id) or AA.ritualUnit(data)) then
+			blessedUnit = true
 		end
 	end
 	local checked, sliceStart = 0, os.clock()
@@ -2525,6 +2568,18 @@ local function bestSpot(data, focus)
 							end
 						end
 						score *= 1 + 0.07 * math.min(close, 5)
+					end
+					if blessedUnit and score > 0 then
+						score *= 1 + 0.3 * math.min(AA.blessedAt(p), 2)
+					elseif blessTargets and score > 0 then
+						local inside = 0
+						for _, target in ipairs(blessTargets) do
+							local dx, dz = target.X - p.X, target.Z - p.Z
+							if dx * dx + dz * dz <= blessReach * blessReach then
+								inside += 1
+							end
+						end
+						score *= 1 + 1.5 * inside / #blessTargets
 					end
 					if score > bestScore then
 						best, bestScore, bestDirection = spot, score, direction
