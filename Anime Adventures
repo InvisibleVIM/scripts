@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v122", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v123", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 
 -- Unload a previous execution before touching anything.
 if shared.AnimeAdventures then
@@ -148,6 +148,7 @@ local Config = {
 	AutoCards = true,
 	CardMode = "Balanced",
 	ChallengeFallback = "Story",
+	Otherwise = "None",
 	DailyGiveUp = true,
 	ChallengeLeave = false,
 	Matchmaking = false,
@@ -1204,7 +1205,7 @@ end
 ---team placed before anything is upgraded, then the farm maxed, then upgrades by efficiency.
 function AA.killsMode()
 	-- (Also as the mode played between challenges.)
-	local between = (Config.Mode == "Challenge" or Config.Mode == "Daily") and Config.ChallengeFallback == "Kills"
+	local between = ((Config.Mode == "Challenge" or Config.Mode == "Daily") and Config.ChallengeFallback == "Kills") or Config.Otherwise == "Kills"
 	if Config.Mode ~= "Kills" and not between then
 		return false
 	end
@@ -4355,6 +4356,9 @@ local function finishMatch()
 	elseif opened and after == "Auto" then
 		-- A challenge opened while the in-between mode was running: this match is done, go take it.
 		after = "Lobby"
+	elseif after == "Auto" and AA.betterWaiting() then
+		-- The fallback was only for while nothing better could be played.
+		after = "Lobby"
 	elseif castle and after == "Auto" then
 		-- The in-game "next room" keeps this match's difficulty (and a fixed room would climb):
 		-- a different difficulty or a fixed room goes through the lobby.
@@ -4412,7 +4416,7 @@ local function finishMatch()
 		end
 	end
 	local portalNext
-	if kind == "Portal" and after ~= "Lobby" and Config.AutoJoin and Config.Mode == "Portals" then
+	if kind == "Portal" and after ~= "Lobby" and Config.AutoJoin and AA.playMode() == "Portals" then
 		-- The next portal straight from the result screen (the game's own "replay with another
 		-- portal" button), no lobby in between. None left of the picked kind: the lobby.
 		task.wait(1.5)
@@ -5113,7 +5117,7 @@ local chooseTarget
 function AA.chooseTarget(...)
 	return chooseTarget(...)
 end
-chooseTarget = function(modeOverride)
+AA.chooseInner = function(modeOverride)
 	local mode = modeOverride or Config.Mode
 	local done = completedLevels()
 	-- An act lost three times in a day is too much for the team right now: farm the last act that
@@ -5327,12 +5331,66 @@ chooseTarget = function(modeOverride)
 		if Config.ChallengeFallback ~= "None" and not modeOverride then
 			local id, difficulty, kind, group = chooseTarget(Config.ChallengeFallback)
 			if id then
+				AA.targetMode = Config.ChallengeFallback
 				return id, difficulty, kind, group
 			end
 		end
 		return nil, nil, "challenge"
 	end
 	return nil
+end
+---What to join: the picked mode; for the challenge modes the mode set for between challenges;
+---and when none of that has anything to play (no portal left, a locked stage, no raid open),
+---the "Otherwise" mode. AA.targetMode says which of them the target came from.
+chooseTarget = function(modeOverride)
+	if modeOverride then
+		return AA.chooseInner(modeOverride)
+	end
+	AA.targetMode = Config.Mode
+	local id, difficulty, kind, group = AA.chooseInner()
+	if not id and Config.Otherwise ~= "None" and Config.Otherwise ~= Config.Mode then
+		local otherId, otherDifficulty, otherKind, otherGroup = AA.chooseInner(Config.Otherwise)
+		if otherId then
+			AA.targetMode = Config.Otherwise
+			return otherId, otherDifficulty, otherKind, otherGroup
+		end
+	end
+	return id, difficulty, kind, group
+end
+---The mode this match is being played in: the one the script started it in (a fallback counts
+---as itself), else the picked mode.
+function AA.playMode()
+	local session = AA.progress and AA.progress.session
+	if not IS_LOBBY and type(session) == "table" and session.job == game.JobId and session.mode then
+		return session.mode
+	end
+	return Config.Mode
+end
+---Playing a fallback while something earlier in the order has become playable (a portal dropped,
+---a stage unlocked)? Checked on the result screen, so the next match is the better one.
+function AA.betterWaiting()
+	local playing = AA.playMode()
+	if Config.Otherwise == "None" or playing ~= Config.Otherwise then
+		return false
+	end
+	local earlier = {}
+	if Config.Mode == "Challenge" or Config.Mode == "Daily" then
+		if Config.ChallengeFallback ~= "None" then
+			table.insert(earlier, Config.ChallengeFallback)
+		end
+	else
+		table.insert(earlier, Config.Mode)
+	end
+	for _, mode in ipairs(earlier) do
+		if mode == playing then
+			return false
+		end
+		local ok, id = pcall(AA.chooseInner, mode)
+		if ok and id then
+			return true
+		end
+	end
+	return false
 end
 
 local function lobbyFolder(kind, group)
@@ -5427,9 +5485,9 @@ local function joinGame()
 		return false
 	end
 	local id, difficulty, kind, group = chooseTarget()
-	-- (Farm kills picked as the mode between challenges counts as started in that mode; its
-	-- rules still only apply on its own stage, never in the challenge itself.)
-	local startedMode = ((Config.Mode == "Challenge" or Config.Mode == "Daily") and Config.ChallengeFallback == "Kills") and "Kills" or Config.Mode
+	-- (A match started through a fallback counts as started in that fallback's mode: its rules
+	-- apply there, and only there.)
+	local startedMode = AA.targetMode or Config.Mode
 	if id and (type(AA.progress.started) ~= "table" or AA.progress.started.mode ~= startedMode or os.time() - (AA.progress.started.at or 0) > 20) then
 		-- The match about to load was started by the script in this mode (mode rules such as
 		-- Farm kills only apply to those, never to a match opened by hand).
@@ -9551,6 +9609,9 @@ do
 		if Config.Mode == "Challenge" or Config.Mode == "Daily" then
 			active[tostring(Config.ChallengeFallback)] = true
 		end
+		if Config.Otherwise ~= "None" then
+			active[tostring(Config.Otherwise)] = true
+		end
 		for _, gate in ipairs(gated) do
 			local show = false
 			for _, mode in ipairs(gate.modes) do
@@ -9571,6 +9632,15 @@ do
 		AA.refreshPlay()
 	end)
 	hint(page, "Story climbs the acts in order. Level replays one world and act. Challenge plays each half-hour challenge (and the Daily), then the mode picked under Challenges. The settings on the right change with the mode.")
+	UI.dropdown(page, "Otherwise", function()
+		return { "None", "Story", "Level", "Infinite", "Legend", "Raid", "Artifact", "Summer", "Tournament", "Castle", "Dungeon", "Portals", "Farm kills" }
+	end, function()
+		return Config.Otherwise == "Kills" and "Farm kills" or Config.Otherwise
+	end, function(option)
+		Config.Otherwise = option == "Farm kills" and "Kills" or option
+		AA.refreshPlay()
+	end)
+	hint(page, "Played whenever the mode above has nothing to play: no portal left, a locked stage, no raid open, challenges done with nothing set for in between. Example: Challenge, then Portals between challenges, otherwise Infinite. Its settings show on the right. After each match the script checks whether something earlier in the order has become playable again.")
 	targetLine = hint(page, "")
 	button(page, "Join now", function()
 		if AA.joining then
