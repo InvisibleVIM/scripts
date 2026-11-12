@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v98", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v101", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 
 -- Unload a previous execution before touching anything.
 if shared.AnimeAdventures then
@@ -2425,6 +2425,8 @@ local function planAction()
 		local byWave = Match.pressByWave or {}
 		pressed = math.max(byWave[wave] or 0, byWave[wave - 1] or 0) >= 0.6
 	end
+	-- (Letting the farm cost twice the damage units was tried in v99: same final wave, but the
+	-- second Elyssia came 13 s later and wave 6 nearly leaked. The cap stays.)
 	local safe = damagePlaced >= 2 and not danger and not pressed and farmSpent < damageSpent
 	-- Only the three waves leading up to it: blocking farms from wave 1 starved the whole act
 	-- (Shibuya: farm never upgraded, Elyssia still level 1 at the boss).
@@ -2874,11 +2876,10 @@ local function targetingStep()
 	end
 	Match.targetAt = os.clock()
 	local enemies = mode == "Smart" and enemyState() or nil
-	if enemies and enemies.tank and not Match.tankNoted then
-		Match.tankNoted = true
+	if enemies and enemies.tank and Match.tankNoted ~= currentWave() then
+		-- (Once a wave: an infinite run logged it forty times in five minutes.)
+		Match.tankNoted = currentWave()
 		note("tank", { p = math.floor((enemies.tankProgress or 0) * 100) })
-	elseif enemies and not enemies.tank then
-		Match.tankNoted = nil
 	end
 	Match.towerProgress = Match.towerProgress or setmetatable({}, { __mode = "k" })
 	for _, unit in ipairs(myUnits()) do
