@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v103", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v104", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 
 -- Unload a previous execution before touching anything.
 if shared.AnimeAdventures then
@@ -127,6 +127,9 @@ local Config = {
 	FarmFirst = true,
 	SellAtWave = 0,
 	LeaveAtWave = 0,
+	MacroPlay = false,
+	MacroName = "",
+	MacroAnyMap = false,
 	SellFarmsAtWave = 0,
 	LeaveAfterMinutes = 0,
 	StartDelay = 0,
@@ -2940,8 +2943,290 @@ local function targetingStep()
 	end
 end
 
+
+-- Macros: a recorded match (every placement, upgrade and sale with its wave and exact spot) saved
+-- to <Game>/macros/<name>.json and played back step by step instead of the planner. Recording
+-- watches the field, so it captures hand play, the planner's own play or anything else.
+do
+	local Macro = { steps = {}, known = setmetatable({}, { __mode = "k" }), counts = {}, labels = {}, index = 1, fails = 0 }
+	AA.Macro = Macro
+	local FOLDER = SETTINGS_FOLDER .. "/macros"
+
+	local function fileOf(name)
+		return FOLDER .. "/" .. tostring(name):gsub("[^%w%-_ ]", "_") .. ".json"
+	end
+	function Macro.list()
+		local names = {}
+		pcall(function()
+			if isfolder(FOLDER) then
+				for _, path in ipairs(listfiles(FOLDER)) do
+					local name = tostring(path):match("([^/\\]+)%.json$")
+					if name then
+						table.insert(names, name)
+					end
+				end
+			end
+		end)
+		table.sort(names)
+		return names
+	end
+	function Macro.load(name)
+		if not name or name == "" then
+			return nil
+		end
+		if Macro.cache and Macro.cache.name == name then
+			return Macro.cache
+		end
+		local ok, data = pcall(function()
+			return httpService:JSONDecode(readfile(fileOf(name)))
+		end)
+		if ok and type(data) == "table" and type(data.steps) == "table" then
+			data.name = name
+			Macro.cache = data
+			return data
+		end
+		return nil
+	end
+	function Macro.delete(name)
+		Macro.cache = nil
+		return pcall(function()
+			delfile(fileOf(name))
+		end)
+	end
+
+	-- Recording.
+	local function push(step)
+		-- (Units already out when recording starts are the opening: no wave to wait for.)
+		step.w = Macro.opening and 0 or currentWave()
+		step.t = math.floor((os.clock() - (Macro.recordedAt or os.clock())) * 10) / 10
+		table.insert(Macro.steps, step)
+	end
+	function Macro.start(name)
+		Macro.recording, Macro.recordName = true, name
+		Macro.steps, Macro.counts, Macro.recordedAt = {}, {}, os.clock()
+		Macro.known = setmetatable({}, { __mode = "k" })
+		Macro.recordLevel = Match.levelId
+		Macro.opening = true
+	end
+	function Macro.stop()
+		if not Macro.recording then
+			return false, 0
+		end
+		Macro.recording = false
+		local count = #Macro.steps
+		if count == 0 then
+			return false, 0
+		end
+		local team = {}
+		for _, entry in ipairs(equippedUnits()) do
+			table.insert(team, entry.id)
+		end
+		local ok = pcall(function()
+			if not isfolder(SETTINGS_FOLDER) then
+				makefolder(SETTINGS_FOLDER)
+			end
+			if not isfolder(FOLDER) then
+				makefolder(FOLDER)
+			end
+			writefile(fileOf(Macro.recordName), httpService:JSONEncode({ level = Macro.recordLevel, team = team, made = os.time(), steps = Macro.steps }))
+		end)
+		Macro.cache = nil
+		return ok, count
+	end
+	function Macro.recordTick()
+		if not Macro.recording or IS_LOBBY then
+			return
+		end
+		if gameFinished() then
+			Macro.stop()
+			return
+		end
+		Macro.recordLevel = Macro.recordLevel or Match.levelId
+		local seen = {}
+		for _, unit in ipairs(myUnits()) do
+			seen[unit] = true
+			local id, level = unit._stats.id.Value, unit._stats.upgrade.Value
+			local entry = Macro.known[unit]
+			if not entry then
+				Macro.counts[id] = (Macro.counts[id] or 0) + 1
+				entry = { label = id .. "#" .. Macro.counts[id], level = 0 }
+				Macro.known[unit] = entry
+				local position = unit:GetPivot().Position
+				push({ k = "place", id = id, u = entry.label, x = position.X, y = position.Y, z = position.Z })
+			end
+			while entry.level < level do
+				entry.level += 1
+				push({ k = "up", u = entry.label, to = entry.level })
+			end
+		end
+		if Macro.opening and #Macro.steps > 0 then
+			-- The opening is replayed in a sensible order: everything placed, then upgrades
+			-- one level at a time across the field, farms first (not one unit to the top before the
+			-- next is even down).
+			local function isFarm(step)
+				local unitData = Units[step.id or tostring(step.u):match("^(.-)#") or ""]
+				return unitData ~= nil and unitStatsAt(unitData, unitData.upgrade and #unitData.upgrade or 0).farm > 0
+			end
+			for index, step in ipairs(Macro.steps) do
+				step.order = index
+			end
+			table.sort(Macro.steps, function(a, b)
+				local ka, kb = a.k == "place" and 0 or 1, b.k == "place" and 0 or 1
+				if ka ~= kb then
+					return ka < kb
+				end
+				if (a.to or 0) ~= (b.to or 0) then
+					return (a.to or 0) < (b.to or 0)
+				end
+				local fa, fb = (ka == 1 and isFarm(a)) and 0 or 1, (kb == 1 and isFarm(b)) and 0 or 1
+				if fa ~= fb then
+					return fa < fb
+				end
+				return a.order < b.order
+			end)
+			for _, step in ipairs(Macro.steps) do
+				step.order = nil
+			end
+		end
+		Macro.opening = false
+		for unit, entry in pairs(Macro.known) do
+			if not seen[unit] and not entry.gone then
+				entry.gone = true
+				push({ k = "sell", u = entry.label })
+			end
+		end
+	end
+
+	-- Playback.
+	function Macro.reset()
+		Macro.index, Macro.fails, Macro.labels, Macro.doneFor = 1, 0, {}, nil
+	end
+	---The macro to play in this match (nil = let the planner play).
+	function Macro.active()
+		if not Config.MacroPlay or Macro.recording then
+			return nil
+		end
+		local data = Macro.load(Config.MacroName)
+		if not data or (data.level and Match.levelId and data.level ~= Match.levelId and not Config.MacroAnyMap) then
+			return nil
+		end
+		return data
+	end
+	local function groundAt(step)
+		local terrain = workspace:FindFirstChild("_terrain")
+		local filter = { terrain }
+		if workspace:FindFirstChild("_road") then
+			table.insert(filter, workspace._road)
+		end
+		local params = RaycastParams.new()
+		params.FilterType = Enum.RaycastFilterType.Include
+		params.FilterDescendantsInstances = filter
+		local hit = terrain and workspace:Raycast(Vector3.new(step.x, step.y + 12, step.z), Vector3.new(0, -60, 0), params)
+		return hit and hit.Position or Vector3.new(step.x, step.y, step.z)
+	end
+	---One step per call; returns the line for the status strip.
+	function Macro.step(data)
+		local step = data.steps[Macro.index]
+		if not step then
+			return "Macro done (" .. #data.steps .. " steps)"
+		end
+		local function advance(skipped)
+			if skipped then
+				note("macroskip", { i = Macro.index, k = step.k, u = step.u })
+			end
+			Macro.index += 1
+			Macro.fails = 0
+		end
+		local where = string.format("Macro %d/%d", Macro.index, #data.steps)
+		if currentWave() < (step.w or 0) then
+			return where .. ": waiting for wave " .. step.w
+		end
+		local money = stats.resource.Value
+		if step.k == "place" then
+			local entry
+			for _, candidate in ipairs(equippedUnits()) do
+				if candidate.id == step.id then
+					entry = candidate
+				end
+			end
+			if not entry then
+				advance(true)
+				return where .. ": " .. tostring(step.id) .. " not equipped"
+			end
+			local cost = spawnCost(entry)
+			if money < cost then
+				return string.format("%s: %s %d/%d", where, step.id, money, cost)
+			end
+			local before = {}
+			for _, unit in ipairs(myUnits()) do
+				before[unit] = true
+			end
+			local position = groundAt(step)
+			local look = nearestPathPoint(position)
+			invoke("spawn_unit", entry.uuid, look and CFrame.lookAt(position, Vector3.new(look.X, position.Y, look.Z)) or CFrame.new(position))
+			local deadline = os.clock() + 1.5
+			local placed
+			while os.clock() < deadline and not placed do
+				for _, unit in ipairs(myUnits()) do
+					if not before[unit] and unit._stats.id.Value == step.id then
+						placed = unit
+					end
+				end
+				task.wait(0.1)
+			end
+			if placed then
+				Macro.labels[step.u] = placed
+				Stats.placed += 1
+				note("place", { u = step.id, macro = true, cash = math.floor(stats.resource.Value) })
+				advance()
+			else
+				Macro.fails += 1
+				if Macro.fails >= 4 then
+					advance(true)
+				end
+			end
+		elseif step.k == "up" then
+			local unit = Macro.labels[step.u]
+			local unitData = unit and unit.Parent and Units[unit._stats.id.Value]
+			if not unitData or unit._stats.upgrade.Value >= step.to then
+				advance(not unitData)
+				return where
+			end
+			local cost = upgradeCost(unit, unitData, unit._stats.upgrade.Value)
+			if money < cost then
+				return string.format("%s: upgrade %s %d/%d", where, step.u, money, cost)
+			end
+			if upgradeUnit(unit) then
+				if unit._stats.upgrade.Value >= step.to then
+					advance()
+				end
+			else
+				Macro.fails += 1
+				if Macro.fails >= 4 then
+					advance(true)
+				end
+			end
+		elseif step.k == "sell" then
+			local unit = Macro.labels[step.u]
+			if unit and unit.Parent then
+				AA.sellUnit(unit, "macro")
+			end
+			advance()
+		else
+			advance(true)
+		end
+		return where
+	end
+end
+
 local function matchStep()
 	if not (Config.AutoPlace or Config.AutoUpgrade) or not gameStarted() then
+		return
+	end
+	local macro = AA.Macro.active()
+	if macro then
+		-- A macro plays this match: its steps in its order, the planner stays out.
+		status = AA.Macro.step(macro)
 		return
 	end
 	if Config.AutoPlace and leakGuard() then
@@ -3796,6 +4081,7 @@ local function resetMatch()
 	Match.voteNoted = nil
 	Match.shieldHits, Match.shieldAt = nil, nil
 	Match.enemyMedian, Match.tankNoted = nil, nil
+	AA.Macro.reset()
 	Match.dpsSample, Match.peakDps, Match.pressure, Match.pressByWave, Match.pressAt = nil, nil, nil, nil, nil
 	Match.pendingAtStart, Match.pendingCheck = nil, nil
 	Match.killTime, Match.lastKillTime, Match.killWave, Match.everLong, Match.paceSeeded, Match.hubMoved = nil, nil, nil, nil, nil, nil
@@ -6062,6 +6348,12 @@ supervise("buffs", function()
 	end
 end)
 supervise("measure", measureLoop)
+supervise("macro", function()
+	while AA.alive do
+		AA.Macro.recordTick()
+		task.wait(0.3)
+	end
+end)
 if not IS_LOBBY then
 	task.delay(20, function()
 		pcall(AA.saveUnitCache)
@@ -8834,6 +9126,69 @@ do
 	button(page, "Back to lobby", function()
 		invoke("teleport_back_to_lobby")
 		return "Teleporting"
+	end)
+end
+
+-- Macro page.
+do
+	local page = makePage("Macro")
+	heading(page, "Record")
+	local nameBox = UI.textbox(page, "Macro name", "e.g. daily shield")
+	local recordLine
+	button(page, "Start / stop recording", function()
+		if AA.Macro.recording then
+			local ok, count = AA.Macro.stop()
+			if recordLine then
+				recordLine.Text = ok and ("Saved " .. count .. " steps as " .. tostring(AA.Macro.recordName)) or "Nothing recorded"
+			end
+			return ok and "Saved" or "Empty"
+		end
+		local name = nameBox.Text:gsub("^%s+", ""):gsub("%s+$", "")
+		if name == "" then
+			return "Name it first"
+		end
+		if IS_LOBBY then
+			return "Start in a match"
+		end
+		AA.Macro.start(name)
+		return "Recording"
+	end)
+	hint(page, "Records every placement, upgrade and sale in this match with its wave and exact spot, whoever makes it: you by hand or the script's own play. Units already out are saved as the opening. It saves by itself when the match ends.")
+	recordLine = infoLine(page, 22)
+	recordLine.Text = "Not recording"
+	heading(page, "Play")
+	UI.dropdown(page, "Macro", function()
+		local names = AA.Macro.list()
+		table.insert(names, 1, "None")
+		return names
+	end, function()
+		return Config.MacroName ~= "" and Config.MacroName or "None"
+	end, function(option)
+		Config.MacroName = option == "None" and "" or option
+	end)
+	toggle(page, "Play this macro", "MacroPlay")
+	hint(page, "Replaces the script's own placing and upgrading with the recorded steps, each waiting for its wave and for the cash. Buffs, targeting and cards still run. On other maps the script plays normally.")
+	toggle(page, "Play it on any map", "MacroAnyMap")
+	hint(page, "Spots are map positions: a macro from another map will mostly fail to place.")
+	button(page, "Delete this macro", function()
+		if Config.MacroName == "" then
+			return "Pick one"
+		end
+		AA.Macro.delete(Config.MacroName)
+		Config.MacroName = ""
+		return "Deleted"
+	end)
+	task.spawn(function()
+		while AA.alive do
+			if recordLine and recordLine.Parent then
+				if AA.Macro.recording then
+					recordLine.Text = "Recording " .. tostring(AA.Macro.recordName) .. ": " .. #AA.Macro.steps .. " steps"
+				elseif recordLine.Text:find("^Recording") then
+					recordLine.Text = "Saved " .. #AA.Macro.steps .. " steps as " .. tostring(AA.Macro.recordName)
+				end
+			end
+			task.wait(1)
+		end
 	end)
 end
 
