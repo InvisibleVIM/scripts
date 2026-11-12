@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v84", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v85", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 
 -- Unload a previous execution before touching anything.
 if shared.AnimeAdventures then
@@ -3065,10 +3065,34 @@ do
 		end)
 	end
 
+	-- Holy Warlord (the summon of Shadow Sorcerer (Ritual)): every 50 takedowns the game offers an
+	-- adaptation and waits for a click. Taken in this order: the extra attack, then reach on
+	-- flying enemies, then knockback. (use_custom_unit_control is what its buttons send.)
+	local ADAPTATIONS = { "_mahoraga_adaptation_third", "_mahoraga_adaptation_flying", "_mahoraga_adaptation_knockback" }
+	local function adaptStep()
+		local folder = workspace:FindFirstChild("_UNITS")
+		for _, unit in ipairs(folder and folder:GetChildren() or {}) do
+			local unitStats = unit:FindFirstChild("_stats")
+			local id, owner = unitStats and unitStats:FindFirstChild("id"), unitStats and unitStats:FindFirstChild("player")
+			if id and id.Value == "mahoraga" and owner and owner.Value == localPlayer and not unit:GetAttribute("_mahoraga_completed")
+				and (unit:GetAttribute("_mahoraga_takedowns") or 0) >= 50 and os.clock() - (Conductor.adaptAt or 0) > 2 then
+				for _, name in ipairs(ADAPTATIONS) do
+					if not unit:GetAttribute(name) then
+						Conductor.adaptAt = os.clock()
+						note("adapt", { a = name })
+						task.spawn(invoke, "use_custom_unit_control", unit, name)
+						break
+					end
+				end
+			end
+		end
+	end
+
 	function Conductor.step()
 		if not Config.AutoAbility or not gameStarted() or gameFinished() then
 			return
 		end
+		adaptStep()
 		local now = os.clock()
 		local towers = scanField().towers
 		-- Buffers by buff, oldest first (placement order decides the roles).
@@ -4317,6 +4341,17 @@ chooseTarget = function(modeOverride)
 			end
 		end
 		return nil, nil, "portal"
+	elseif mode == "Cursed Womb" then
+		-- Its own lobby (_DUNGEONS), one Cursed Womb Key per run. Keys drop in Haunted Academy
+		-- infinite; the Robux ones are never bought.
+		local items = (profile().inventory or {}).normal_items or {}
+		if (tonumber(items.key_jjk_finger) or 0) <= 0 then
+			return nil, nil, "wombkey"
+		end
+		if not levelUnlocked("jjk_finger", done) then
+			return nil, nil, "locked"
+		end
+		return "jjk_finger", "Hard", "womb"
 	elseif mode == "Tournament" then
 		return "tournament", nil, "tournament"
 	elseif mode == "Castle" then
@@ -4365,6 +4400,9 @@ local function lobbyFolder(kind, group)
 	elseif kind == "challenge" then
 		local challenges = workspace:FindFirstChild("_CHALLENGES")
 		return challenges and challenges:FindFirstChild(group or "Challenges")
+	elseif kind == "womb" then
+		local dungeons = workspace:FindFirstChild("_DUNGEONS")
+		return dungeons and dungeons:FindFirstChild("Lobbies")
 	end
 	return lobbies and lobbies:FindFirstChild("Story")
 end
@@ -4412,7 +4450,7 @@ local function joinGame()
 		AA.saveProgress()
 	end
 	if not id then
-		status = kind == "portal" and "No portal items" or kind == "raid" and "Waiting for a raid" or (kind == "challenge" and "No challenge left" or ((kind == "artifact" or kind == "locked") and "Locked: clear the story first" or "Nothing to join"))
+		status = kind == "wombkey" and "No Cursed Womb Key (drops in Haunted Academy infinite)" or kind == "portal" and "No portal items" or kind == "raid" and "Waiting for a raid" or (kind == "challenge" and "No challenge left" or ((kind == "artifact" or kind == "locked") and "Locked: clear the story first" or "Nothing to join"))
 		return false
 	end
 	if Config.Matchmaking then
@@ -4521,11 +4559,11 @@ local function joinGame()
 	end
 	for _, lobby in ipairs(folder:GetChildren()) do
 		local lobbyLevel = lobby:FindFirstChild("Level")
-		if lobby:IsA("Model") and not lobbyBusy(lobby) and (kind ~= "challenge" or (lobbyLevel and lobbyLevel.Value == id)) then
+		if lobby:IsA("Model") and not lobbyBusy(lobby) and ((kind ~= "challenge" and kind ~= "womb") or (lobbyLevel and lobbyLevel.Value == id)) then
 			status = "Joining " .. tostring(id)
 			local ok = invoke("request_join_lobby", lobby.Name)
 			if ok then
-				if kind ~= "challenge" then
+				if kind ~= "challenge" and kind ~= "womb" then
 					invoke("request_lock_level", lobby.Name, id, Config.FriendsOnly, difficulty)
 				end
 				task.wait(0.5)
@@ -8322,7 +8360,7 @@ do
 	heading(page, "Mode", "left")
 	toggle(page, "Join and requeue on its own", "AutoJoin")
 	UI.dropdown(page, "Game mode", function()
-		return { "Story", "Level", "Infinite", "Legend", "Raid", "Artifact", "Challenge", "Daily", "Summer", "Tournament", "Castle", "Dungeon", "Portals", "Kills" }
+		return { "Story", "Level", "Infinite", "Legend", "Raid", "Artifact", "Challenge", "Daily", "Summer", "Cursed Womb", "Tournament", "Castle", "Dungeon", "Portals", "Kills" }
 	end, function()
 		return Config.Mode == "Kills" and "Farm kills" or Config.Mode
 	end, function(option)
@@ -8353,7 +8391,7 @@ do
 	hint(page, "Keeps strangers out of lobbies and portals the script opens itself. Matchmaking ignores it. After a game, Auto goes to the next act after a win, retries a loss, and climbs rooms in the castle.")
 
 	heading(page, "Mode settings", "right")
-	only({ "Summer", "Tournament", "Dungeon", "Portals", "None" }, hint(page, "This mode has no settings of its own."))
+	only({ "Summer", "Cursed Womb", "Tournament", "Dungeon", "Portals", "None" }, hint(page, "This mode has no settings of its own."))
 	segmented(page, "Farm kills on", "KillsStage", { "Walled City", "Summer" })
 	only({ "Kills" })
 	hint(page, "Farms takedowns for evolutions, on Walled City infinite or the Summer Hunt. Every unit is placed at the very front and set to Weakest. The order: the whole team goes down first with no upgrades (the four Windsongs of the buff chain included), then Bulby is placed and maxed, then everything is upgraded by damage per cash.")
