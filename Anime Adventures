@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v104", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v105", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 
 -- Unload a previous execution before touching anything.
 if shared.AnimeAdventures then
@@ -127,6 +127,10 @@ local Config = {
 	FarmFirst = true,
 	SellAtWave = 0,
 	LeaveAtWave = 0,
+	SnipeOn = false,
+	SnipeUnits = "",
+	MerchantWant = "",
+	JoinFriend = "",
 	MacroPlay = false,
 	MacroName = "",
 	MacroAnyMap = false,
@@ -4906,10 +4910,51 @@ function AA.waitForTeleport(seconds)
 	end
 end
 
+---The lobby a named player has opened (their user or display name, any letter case).
+function AA.friendLobby()
+	local want = tostring(Config.JoinFriend):lower():gsub("^%s+", ""):gsub("%s+$", "")
+	if want == "" then
+		return nil
+	end
+	local folders = {}
+	for _, path in ipairs({ { "_LOBBIES", "Story" }, { "_RAID", "Raid" }, { "_CHALLENGES", "Challenges" }, { "_CHALLENGES", "DailyChallenge" }, { "_EVENT_CHALLENGES", "Lobbies" }, { "_DUNGEONS", "Lobbies" }, { "_PORTALS", "Lobbies" } }) do
+		local folder = workspace:FindFirstChild(path[1])
+		folder = folder and folder:FindFirstChild(path[2])
+		if folder then
+			table.insert(folders, folder)
+		end
+	end
+	for _, folder in ipairs(folders) do
+		for _, lobby in ipairs(folder:GetChildren()) do
+			local owner = lobby:FindFirstChild("Owner")
+			local player = owner and owner.Value
+			if player and player ~= localPlayer and (player.Name:lower() == want or player.DisplayName:lower() == want) then
+				return lobby, player
+			end
+		end
+	end
+	return nil
+end
+
 local function joinGame()
 	if #equippedUnits() == 0 then
 		equipBest()
 		task.wait(1)
+	end
+	if tostring(Config.JoinFriend) ~= "" then
+		-- A friend to play with: step into the lobby they open and let them start it; nothing of
+		-- our own is opened while waiting for them.
+		local lobby, player = AA.friendLobby()
+		local inLobby = localPlayer:FindFirstChild("AlreadyInLobby")
+		if lobby and not (inLobby and inLobby.Value) then
+			status = "Joining " .. player.DisplayName
+			note("friend", { n = player.Name })
+			invoke("request_join_lobby", lobby.Name)
+			AA.waitForTeleport(60)
+		else
+			status = lobby and ("In " .. player.DisplayName .. "'s lobby") or ("Waiting for " .. tostring(Config.JoinFriend) .. " to open a lobby")
+		end
+		return false
 	end
 	local id, difficulty, kind, group = chooseTarget()
 	if id and (type(AA.progress.started) ~= "table" or AA.progress.started.mode ~= Config.Mode or os.time() - (AA.progress.started.at or 0) > 20) then
@@ -5483,6 +5528,54 @@ local function summonStep()
 	AA.summonSettle(count)
 end
 
+---Summon sniper: a wanted unit is featured on a banner right now and isn't owned yet. Returns the
+---banner and the unit (nil when there is nothing to snipe).
+function AA.snipeFind()
+	if tostring(Config.SnipeUnits) == "" then
+		return nil
+	end
+	local wanted, owned = {}, {}
+	for id in tostring(Config.SnipeUnits):gmatch("[^,]+") do
+		wanted[id] = true
+	end
+	for _, unit in pairs(collectionData().owned_units or {}) do
+		owned[unit.unit_id] = true
+		local data = Units[unit.unit_id]
+		if data and type(data.evolved) == "table" and type(data.evolved.from) == "string" then
+			owned[data.evolved.from] = true
+		end
+	end
+	local service = filtergc("table", { Keys = { "BANNER_UNITS" } }, true)
+	for bannerId, data in pairs(service and service.BANNER_UNITS or {}) do
+		local banner = Banners[bannerId]
+		if type(banner) == "table" and banner.active and type(data) == "table" then
+			for _, id in pairs(type(data.rateup_units) == "table" and data.rateup_units or {}) do
+				if wanted[id] and not owned[id] then
+					return bannerId, id
+				end
+			end
+		end
+	end
+	return nil
+end
+function AA.snipeStep()
+	if not Config.SnipeOn then
+		AA.snipeTarget = nil
+		return
+	end
+	local bannerId, id = AA.snipeFind()
+	AA.snipeTarget = id
+	if not bannerId then
+		return
+	end
+	-- The normal summon routine, pointed at that banner for one pull (it keeps the gem reserve).
+	local banner, auto, stop = Config.Banner, Config.AutoSummon, Config.SummonStopMythic
+	Config.Banner, Config.AutoSummon, Config.SummonStopMythic = bannerId, true, false
+	pcall(summonStep)
+	Config.Banner, Config.AutoSummon, Config.SummonStopMythic = banner, auto, stop
+	status = "Sniping " .. tostring(Units[id] and Units[id].name or id)
+end
+
 ---One summon right now from the Units tab buttons (1 or 10), on the picked banner.
 function AA.summonNow(count)
 	if not IS_LOBBY then
@@ -5665,6 +5758,34 @@ function AA.shopStep()
 			end
 		end
 	end
+	-- Merchant sniper: anything on the want list, the moment the merchant stocks it (gems or gold,
+	-- both reserves kept). What he has been seen selling is remembered for the list in the menu.
+	do
+		local service = filtergc("table", { Keys = { "SELLING_ITEMS" } }, true)
+		local wanted = {}
+		for id in tostring(Config.MerchantWant):gmatch("[^,]+") do
+			wanted[id] = true
+		end
+		local bought = profile().bought_items or {}
+		AA.progress.merchantSeen = type(AA.progress.merchantSeen) == "table" and AA.progress.merchantSeen or {}
+		for uuid, item in pairs(service and service.SELLING_ITEMS or {}) do
+			local id = type(item) == "table" and (item.id or item.item_id)
+			if id then
+				if not AA.progress.merchantSeen[id] then
+					AA.progress.merchantSeen[id] = true
+					AA.progressDirty = true
+				end
+				local gems, gold = tonumber(item.gem_cost), tonumber(item.gold_cost)
+				local affordable = (gems and currency("Gems") >= gems + Config.KeepGems) or (gold and currency("Gold") >= gold + Config.KeepGold)
+				if wanted[id] and not bought[uuid] and affordable then
+					status = "Buying " .. tostring(id)
+					note("merchant", { id = id })
+					invoke("buy_travelling_merchant_item", uuid, "1")
+					task.wait(0.6)
+				end
+			end
+		end
+	end
 	if Config.BuyCapsules and currency("SummerPearls") >= 150 + Config.KeepPearls then
 		local n = math.floor((currency("SummerPearls") - Config.KeepPearls) / 150)
 		if n >= 1 then
@@ -5737,6 +5858,7 @@ local function lobbyLoop()
 				pcall(claimRewards)
 			end
 			pcall(summonStep)
+			pcall(AA.snipeStep)
 			if os.clock() - (AA.lastUnitStep or 0) > 30 then
 				AA.lastUnitStep = os.clock()
 				pcall(AA.compassStep)
@@ -8869,6 +8991,14 @@ do
 	toggle(page, "Find a match with other players", "Matchmaking")
 	hint(page, "Uses the game's matchmaking wherever it exists: the Daily, half-hour challenges, infinite, legend stages, raids, the Summer Hunt and Infinity Mansion. Story acts have none. If nobody is found in 45 seconds it starts the stage alone.")
 	toggle(page, "Friends only lobby", "FriendsOnly")
+	do
+		local friendBox = UI.textbox(page, "Join this player's lobby", "user or display name")
+		friendBox.Text = tostring(Config.JoinFriend or "")
+		friendBox.FocusLost:Connect(function()
+			Config.JoinFriend = friendBox.Text:gsub("^%s+", ""):gsub("%s+$", "")
+		end)
+		hint(page, "With auto join on, the script waits for this player to open a lobby in your server, steps into it and lets them start. Leave empty to open your own.")
+	end
 	hint(page, "Keeps strangers out of lobbies and portals the script opens itself. Matchmaking ignores it. After a game, Auto goes to the next act after a win, retries a loss, and climbs rooms in the castle.")
 
 	heading(page, "Mode settings", "right")
@@ -9221,6 +9351,52 @@ do
 	end)
 	toggle(page, "Summon 10 at a time", "SummonTen")
 	toggle(page, "Stop when a Mythic is pulled", "SummonStopMythic")
+	toggle(page, "Summon sniper", "SnipeOn")
+	hint(page, "Summons only while a unit on your sniper list is featured on a banner and you don't own it yet, on whichever banner has it. Uses the same gem reserve as auto summon. Works with auto summon off.")
+	cycler(page, "Sniper list", function()
+		local options = {}
+		local picked = {}
+		for id in tostring(Config.SnipeUnits):gmatch("[^,]+") do
+			picked[id] = true
+		end
+		for id, data in pairs(Units) do
+			if type(data) == "table" and data.cost and (data.rarity == "Mythic" or data.rarity == "Secret") and not data.hide_from_banner and not data.evolved then
+				table.insert(options, { id = id, name = (picked[id] and "[x] " or "[ ] ") .. tostring(data.name) .. (data.rarity == "Secret" and " (Secret)" or ""), current = picked[id] })
+			end
+		end
+		table.sort(options, function(a, b)
+			return a.name:sub(5) < b.name:sub(5)
+		end)
+		table.insert(options, 1, { id = "", name = "Clear the list" })
+		return options
+	end, function()
+		local names = {}
+		for id in tostring(Config.SnipeUnits):gmatch("[^,]+") do
+			table.insert(names, Units[id] and Units[id].name or id)
+		end
+		if #names == 0 then
+			return "None"
+		end
+		local _, target = AA.snipeFind()
+		return table.concat(names, ", ") .. (target and (" - " .. tostring(Units[target] and Units[target].name or target) .. " is up now") or "")
+	end, function(option)
+		if option.id == "" then
+			Config.SnipeUnits = ""
+			return
+		end
+		local list, found = {}, false
+		for id in tostring(Config.SnipeUnits):gmatch("[^,]+") do
+			if id == option.id then
+				found = true
+			else
+				table.insert(list, id)
+			end
+		end
+		if not found then
+			table.insert(list, option.id)
+		end
+		Config.SnipeUnits = table.concat(list, ",")
+	end)
 	hint(page, "Auto summon switches itself off as soon as a Mythic or Secret unit lands in your collection. With 10 at a time, the rest of that batch is already pulled.")
 	hint(page, "Summer2026 spends Summer Pearls; tickets are used first")
 	slider(page, "Keep gems", "KeepGems", 0, 20000, 50, function(v)
@@ -9358,6 +9534,50 @@ do
 	hint(page, "Feeds every XP item to your lowest-level damage unit")
 	toggle(page, "Auto evolve when items are ready", "AutoEvolve")
 	toggle(page, "Buy missing Star Fruits (merchant, gems)", "BuyEvolveFruit")
+	cycler(page, "Merchant sniper", function()
+		local options, picked, seen = {}, {}, {}
+		for id in tostring(Config.MerchantWant):gmatch("[^,]+") do
+			picked[id] = true
+			seen[id] = true
+		end
+		for id in pairs(type(AA.progress.merchantSeen) == "table" and AA.progress.merchantSeen or {}) do
+			seen[id] = true
+		end
+		local service = filtergc("table", { Keys = { "SELLING_ITEMS" } }, true)
+		for _, item in pairs(service and service.SELLING_ITEMS or {}) do
+			if type(item) == "table" and (item.id or item.item_id) then
+				seen[item.id or item.item_id] = true
+			end
+		end
+		for id in pairs(seen) do
+			table.insert(options, { id = id, name = (picked[id] and "[x] " or "[ ] ") .. tostring(id), current = picked[id] })
+		end
+		table.sort(options, function(a, b)
+			return a.id < b.id
+		end)
+		table.insert(options, 1, { id = "", name = "Clear the list" })
+		return options
+	end, function()
+		return tostring(Config.MerchantWant) == "" and "None" or tostring(Config.MerchantWant):gsub(",", ", ")
+	end, function(option)
+		if option.id == "" then
+			Config.MerchantWant = ""
+			return
+		end
+		local list, found = {}, false
+		for id in tostring(Config.MerchantWant):gmatch("[^,]+") do
+			if id == option.id then
+				found = true
+			else
+				table.insert(list, id)
+			end
+		end
+		if not found then
+			table.insert(list, option.id)
+		end
+		Config.MerchantWant = table.concat(list, ",")
+	end)
+	hint(page, "Buys every item on this list whenever the travelling merchant stocks it, with gems or gold, keeping your reserves. The list grows with what he has been seen selling.")
 	hint(page, "Only fruits the equipped team still needs to evolve; keeps 500 gems")
 	toggle(page, "Rejoin after a disconnect", "AutoRejoin")
 	toggle(page, "Auto reroll trait (tokens)", "AutoTrait")
