@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v82", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v83", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 
 -- Unload a previous execution before touching anything.
 if shared.AnimeAdventures then
@@ -1816,6 +1816,21 @@ local function bestSpot(data, focus)
 		for _, ally in ipairs(allies) do
 			total += ally.weight
 		end
+		-- Other players' units of the boosted type count too (the cast hits every ally in range):
+		-- they never outweigh my own team, they decide between spots that cover mine equally.
+		local guests, guestTotal = {}, 0
+		if activeBuff then
+			for _, unit in ipairs(scanField().others) do
+				local guestStats = unit:FindFirstChild("_stats")
+				local guestData = guestStats and guestStats:FindFirstChild("id") and Units[guestStats.id.Value]
+				if guestData and AA.buffMatches(activeBuff, guestData) and not AA.buffInfo(guestData) and unitStatsAt(guestData, 0).damage > 0 then
+					local level = guestStats:FindFirstChild("upgrade") and guestStats.upgrade.Value or 0
+					local weight = math.max(copyPower(guestData, nil, level), 1)
+					table.insert(guests, { position = unit:GetPivot().Position, weight = weight })
+					guestTotal += weight
+				end
+			end
+		end
 		local best, bestScore = nil, 0
 		for _, list in ipairs(pool) do
 			for _, spot in ipairs(list) do
@@ -1844,6 +1859,12 @@ local function bestSpot(data, focus)
 							local dx, dz = ally.position.X - p.X, ally.position.Z - p.Z
 							if dx * dx + dz * dz <= range * range then
 								score += ally.weight / math.max(total, 1)
+							end
+						end
+						for _, guest in ipairs(guests) do
+							local dx, dz = guest.position.X - p.X, guest.position.Z - p.Z
+							if dx * dx + dz * dz <= range * range then
+								score += 0.3 * guest.weight / math.max(guestTotal, 1)
 							end
 						end
 						if #partners > 0 then
@@ -2977,6 +2998,14 @@ do
 			return
 		end
 		-- A buffed caster passes on a stronger buff (measured: 30% from a caster at 30% = 69%).
+		if not Conductor.guestSeen then
+			-- Proof for the logs that a cast reaches other players' units.
+			local owner = unit:FindFirstChild("_stats") and unit._stats:FindFirstChild("player")
+			if owner and owner.Value and owner.Value ~= localPlayer then
+				Conductor.guestSeen = true
+				note("buffguest", { u = unit._stats:FindFirstChild("id") and unit._stats.id.Value })
+			end
+		end
 		local caster = params.attacker_unit
 		local own = typeof(caster) == "Instance" and Conductor.rate(caster, buff.Name) or 0
 		Conductor.active[unit] = Conductor.active[unit] or {}
