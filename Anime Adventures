@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v137", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v138", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 
 -- Unload a previous execution before touching anything.
 if shared.AnimeAdventures then
@@ -3072,9 +3072,6 @@ local function planAction()
 				-- Shields decide: a body is worth its hits per second for the cash.
 				score = 1e6 / math.max(base.cooldown, 0.5) / cost
 			end
-			if score > 0 and score < 1e5 and Config.RitualRush and left >= 5 and (placed[entry.id] or 0) == 0 and AA.ritualUnit(entry.data) and not AA.ownWarlord() and AA.ritualPayable(entry.data, -1, money, left) then
-				score *= 3
-			end
 			if score > 0 then
 				table.insert(options, { kind = "place", entry = entry, cost = cost, score = score })
 			end
@@ -3084,8 +3081,28 @@ local function planAction()
 	-- about seven times the Sorcerer's damage and adapts further (measured: 19M damage in his
 	-- first two waves against 62M from the whole team in nineteen). While no Warlord stands and
 	-- the match is long enough to pay for it (106k in all), the furthest-along copy is rushed.
+	-- Only once the economy and the rest of the team stand: every farm unit maxed (or sold) and
+	-- at least three damage units down. (Rushing from the first second put one Sorcerer on the
+	-- field alone until wave 12: with a single damage unit the lane never counted as safe, so
+	-- Bulby came at wave 14-18 and Elyssia at 12, and three infinite runs ended at 33, 15 and 24
+	-- where the build-up-first runs reached 41 and 52.)
+	local ritualReady = damagePlaced >= 3
+	for _, entry in ipairs(equipped) do
+		local top = entry.data.upgrade and #entry.data.upgrade or 0
+		if unitStatsAt(entry.data, top).farm > 0 and not Match.farmsSold then
+			local done = false
+			for _, unit in ipairs(units) do
+				if unit._stats.id.Value == entry.id and unit._stats.upgrade.Value >= top then
+					done = true
+				end
+			end
+			if not done then
+				ritualReady = false
+			end
+		end
+	end
 	local ritualLead
-	if left >= 5 and not AA.ownWarlord() then
+	if ritualReady and left >= 5 and not AA.ownWarlord() then
 		for _, unit in ipairs(units) do
 			if AA.ritualUnit(Units[unit._stats.id.Value]) and (not ritualLead or unit._stats.upgrade.Value > ritualLead._stats.upgrade.Value) then
 				ritualLead = unit
@@ -10269,7 +10286,7 @@ do
 	toggle(page, "Use the Ritual", "RitualAuto")
 	hint(page, "Shadow Sorcerer (Ritual) at max level is sacrificed and Holy Warlord arrives six seconds later. He hits for about seven times the Sorcerer's damage, walks the road, and only one can stand at a time: the script never sacrifices a second Sorcerer while yours is alive. His adaptations are picked for you (extra attack, flying, knockback).")
 	toggle(page, "Rush the Ritual", "RitualRush")
-	hint(page, "While you have no Warlord, the Sorcerer that is furthest along gets his upgrades ahead of the rest of the team (106k cash for all eight). Only in matches with at least five waves left.")
+	hint(page, "While you have no Warlord, the Sorcerer that is furthest along gets his upgrades ahead of the rest of the team (106k cash for all eight). It starts once your farm unit is maxed and three damage units are down, and only in matches that can pay for it.")
 	UI.dropdown(page, "Warlord hunts", function()
 		return { "Auto", "Boss", "Front", "Range", "Leave" }
 	end, function()
