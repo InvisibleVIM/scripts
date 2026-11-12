@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v133", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v135", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 
 -- Unload a previous execution before touching anything.
 if shared.AnimeAdventures then
@@ -1340,6 +1340,21 @@ end
 function AA.ritualUnit(data)
 	local last = data and data.upgrade and data.upgrade[#data.upgrade]
 	return last ~= nil and tostring(last.active_attack):find(":mahoraga", 1, true) ~= nil
+end
+
+---Can the rest of the match pay for the Ritual from this level on (cash now plus the income of
+---80% of the waves left)? Long modes always can. level -1 = not placed yet.
+function AA.ritualPayable(data, level, money, left)
+	if Match.longHaul or Match.infinite then
+		return true
+	end
+	local cost = level < 0 and (data.cost or 0) or 0
+	for target = math.max(level, 0) + 1, data.upgrade and #data.upgrade or 0 do
+		cost += data.upgrade[target].cost or 0
+	end
+	local elapsed = os.clock() - (Match.startedAt or os.clock())
+	local perWave = math.clamp(elapsed / math.max(currentWave(), 1), 15, 60)
+	return (money or 0) + (Match.incomeRate or 0) * perWave * (left or 0) * 0.8 >= cost
 end
 
 ---Build order: the user's own list of steps ({ kind = "place" | "upgrade", unit = id, times = n }),
@@ -3003,7 +3018,7 @@ local function planAction()
 				-- Support / summoner: one copy once the lane is held.
 				score = 1e5
 			end
-			if score > 0 and score < 1e5 and Config.RitualRush and left >= 5 and (placed[entry.id] or 0) == 0 and AA.ritualUnit(entry.data) and not AA.ownWarlord() then
+			if score > 0 and score < 1e5 and Config.RitualRush and left >= 5 and (placed[entry.id] or 0) == 0 and AA.ritualUnit(entry.data) and not AA.ownWarlord() and AA.ritualPayable(entry.data, -1, money, left) then
 				score *= 3
 			end
 			if score > 0 then
@@ -3021,6 +3036,11 @@ local function planAction()
 			if AA.ritualUnit(Units[unit._stats.id.Value]) and (not ritualLead or unit._stats.upgrade.Value > ritualLead._stats.upgrade.Value) then
 				ritualLead = unit
 			end
+		end
+		if ritualLead and not AA.ritualPayable(Units[ritualLead._stats.id.Value], ritualLead._stats.upgrade.Value, money, left) then
+			-- (A 15-wave challenge can't pay for it: the rush put three upgrades into the
+			-- Sorcerer there while Elyssia wasn't even placed by wave 10.)
+			ritualLead = nil
 		end
 	end
 	if Config.AutoUpgrade then
@@ -4117,20 +4137,44 @@ do
 		for _, unit in ipairs(folder and folder:GetChildren() or {}) do
 			local unitStats = unit:FindFirstChild("_stats")
 			local id, owner = unitStats and unitStats:FindFirstChild("id"), unitStats and unitStats:FindFirstChild("player")
-			if id and id.Value == "mahoraga" and owner and owner.Value == localPlayer and Config.WarlordMode ~= "Leave" and os.clock() - (Conductor.modeAt or 0) > 4 then
-				-- What he hunts (his button cycles 1 strongest "BOSS", 2 first "DEF", 3 range "ATK").
-				-- Measured over nine 26 s windows at waves 45-50: his own damage was ~1.1M/s on
-				-- BOSS against ~0.7M/s on both DEF and ATK. Auto = BOSS, and DEF for a minute after
-				-- the base loses health. (Not "an enemy is deep": with Elyssia's jellyfish walking
-				-- up from the base a few enemies are always past 80%, and he sat on DEF, passing
-				-- through ATK on every switch back.)
+			if id and id.Value == "mahoraga" and owner and owner.Value == localPlayer and Config.WarlordMode ~= "Leave" then
+				-- What he hunts (his button cycles 1 strongest "BOSS" -> 2 first "DEF" -> 3 range
+				-- "ATK" -> 1). Auto, the user's rule: DEF all the time; when the enemy furthest down
+				-- the road is a boss, BOSS until that boss is dead, then DEF again.
 				local want = Config.WarlordMode == "Boss" and 1 or Config.WarlordMode == "Front" and 2 or Config.WarlordMode == "Range" and 3 or nil
 				if not want then
-					want = (Match.bleedAt and os.clock() - Match.bleedAt < 60) and 2 or 1
+					local locked = Conductor.bossTarget
+					local lockedHumanoid = locked and locked.Parent and locked:FindFirstChildOfClass("Humanoid")
+					if not (lockedHumanoid and lockedHumanoid.Health > 0) then
+						Conductor.bossTarget = nil
+						local front, frontProgress = nil, -1
+						for _, enemy in ipairs(scanField().enemies) do
+							local humanoid = enemy:FindFirstChildOfClass("Humanoid")
+							if humanoid and humanoid.Health > 0 then
+								local progress = pathProgress(enemy:GetPivot().Position)
+								if progress > frontProgress then
+									front, frontProgress = enemy, progress
+								end
+							end
+						end
+						if front then
+							local enemyId = front._stats:FindFirstChild("id") and front._stats.id.Value or front.Name
+							local enemyData = Units[enemyId]
+							if (enemyData and enemyData.boss) or (tostring(enemyId):find("boss") and not tostring(enemyId):find("miniboss")) then
+								Conductor.bossTarget = front
+								note("warlordBoss", { id = enemyId })
+							end
+						end
+					end
+					want = Conductor.bossTarget and 1 or 2
 				end
-				if (unit:GetAttribute("_mahoragamode") or 1) ~= want then
-					Conductor.modeAt = os.clock()
-					note("warlordMode", { from = unit:GetAttribute("_mahoragamode") or 1, to = want })
+				-- One press per step of the cycle: the next only once the last one has shown up
+				-- on the unit (or after 4 s), so a slow update is never pressed twice.
+				local mode = unit:GetAttribute("_mahoragamode") or 1
+				local since = os.clock() - (Conductor.modeAt or 0)
+				if mode ~= want and (since > 4 or (mode ~= Conductor.modeSeen and since > 0.4)) then
+					Conductor.modeAt, Conductor.modeSeen = os.clock(), mode
+					note("warlordMode", { from = mode, to = want })
 					task.spawn(invoke, "use_active_attack", unit)
 				end
 			end
@@ -10166,7 +10210,7 @@ do
 	end, function(option)
 		Config.WarlordMode = option
 	end)
-	hint(page, "His own button in the game: Boss (BOSS) goes for the strongest enemy, Front (DEF) for the first one on the road, Range (ATK) is his third setting. Auto keeps him on Boss, where he dealt the most damage when measured, and switches to Front for a minute whenever your base loses health. Leave never touches it.")
+	hint(page, "His own button in the game: Boss (BOSS) goes for the strongest enemy, Front (DEF) for the first one on the road, Range (ATK) is his third setting. Auto keeps him on DEF; when the enemy furthest down the road is a boss he goes on BOSS until that boss is dead, then back to DEF. Leave never touches it.")
 	heading(page, "Targeting")
 	segmented(page, "", "Targeting", { "Smart", "First", "Last", "Closest" })
 	segmented(page, "", "Targeting", { "Farthest", "Strongest", "Weakest", "Off" })
