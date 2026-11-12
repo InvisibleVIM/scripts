@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v120", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v122", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 
 -- Unload a previous execution before touching anything.
 if shared.AnimeAdventures then
@@ -1957,22 +1957,31 @@ local function shapeScore(position, shape, nearby)
 	end
 	local range2 = shape.range * shape.range
 	local best, bestDirection = 0, nil
-	for i = 1, #nearby, 2 do
+	-- Every aim against every road sample is n squared per spot: on a big map with a dense road
+	-- (The Holy Warlord: 3,200 samples, 6,600 spots) one unit took 19 s to place and the game
+	-- crawled for the whole opening. At most 16 aims and 96 samples per spot, weights scaled up.
+	local count = #nearby
+	local aimStep = math.max(2, math.ceil(count / 16))
+	local pointStep = math.max(1, math.ceil(count / 96))
+	local isLine, halfWidth, cosHalf = shape.kind == "line", (shape.width or 0) / 2, math.cos(shape.half or 0)
+	for i = 1, count, aimStep do
 		local aim = nearby[i]
 		if aim.d2 <= range2 and aim.d2 > 0.25 then
 			local length = math.sqrt(aim.d2)
 			local ux, uz = aim.dx / length, aim.dz / length
 			local score = 0
-			for _, point in ipairs(nearby) do
+			for j = 1, count, pointStep do
+				local point = nearby[j]
 				local along = point.dx * ux + point.dz * uz
-				if shape.kind == "line" then
-					if along >= 0 and along <= shape.length and math.abs(point.dx * uz - point.dz * ux) <= shape.width / 2 then
+				if isLine then
+					if along >= 0 and along <= shape.length and math.abs(point.dx * uz - point.dz * ux) <= halfWidth then
 						score += point.weight
 					end
-				elseif along > 0 and point.d2 <= range2 and math.acos(math.clamp(along / math.sqrt(point.d2), -1, 1)) <= shape.half then
+				elseif along > 0 and point.d2 <= range2 and along >= cosHalf * math.sqrt(point.d2) then
 					score += point.weight
 				end
 			end
+			score *= pointStep
 			if score > best then
 				best, bestDirection = score, Vector3.new(ux, 0, uz)
 			end
@@ -2319,6 +2328,18 @@ local function bestSpot(data, focus)
 		end
 	end
 	local checked, sliceStart = 0, os.clock()
+	-- Big maps (thousands of spots): every third spot first, then every spot around the best
+	-- one. (The Holy Warlord has 6,600 ground spots; scoring all of them stalled the opening.)
+	local total = 0
+	for _, list in ipairs(pool) do
+		total += #list
+	end
+	local stride = total > 2400 and 3 or 1
+	for round = 1, 2 do
+	local center = round == 2 and best and best.position or nil
+	if round == 2 and (stride == 1 or not center) then
+		break
+	end
 	for pass = 1, 2 do
 	-- Pass 1 keeps the unit inside the buff group; pass 2 (nothing free there) takes any spot.
 	local hub, gapLimit = pass == 1 and circles or nil, pass == 1 and firstGap or nil
@@ -2326,14 +2347,21 @@ local function bestSpot(data, focus)
 		break
 	end
 	for _, list in ipairs(pool) do
-		for _, spot in ipairs(list) do
+		for index, spot in ipairs(list) do
 			local p = spot.position
 			checked += 1
 			if checked % 20 == 0 and os.clock() - sliceStart > 0.006 then
 				task.wait()
 				sliceStart = os.clock()
 			end
-			if spot.gap <= minReach and (not gapLimit or spot.gap <= gapLimit) and (not hub or insideHub(p, hub)) and not Match.badSpots[spotKey(p)] then
+			local take
+			if center then
+				local dx, dz = p.X - center.X, p.Z - center.Z
+				take = dx * dx + dz * dz <= 100 and index % stride ~= 0
+			else
+				take = index % stride == 0
+			end
+			if take and spot.gap <= minReach and (not gapLimit or spot.gap <= gapLimit) and (not hub or insideHub(p, hub)) and not Match.badSpots[spotKey(p)] then
 				local free = true
 				for _, other in ipairs(taken) do
 					local dx, dz = other.X - p.X, other.Z - p.Z
@@ -2407,6 +2435,7 @@ local function bestSpot(data, focus)
 				end
 			end
 		end
+	end
 	end
 	end
 	return best, bestDirection
