@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v89", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v92", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 
 -- Unload a previous execution before touching anything.
 if shared.AnimeAdventures then
@@ -2359,6 +2359,15 @@ local function planAction()
 	-- Leaks are fine as long as the base can afford them: only real danger changes the plan.
 	local fraction = maxHealth > 0 and health / maxHealth or 1
 	local danger = fraction < 0.5 or (bleeding and fraction < 0.75) or (Match.leakRisk or 0) >= 0.4
+	-- Enemies getting within a fifth of the road from the base, this wave or the last, is danger
+	-- too, full health or not: on hard stages one enemy through ends the match. (A Daily was lost
+	-- with 27000 banked for an upgrade 100 s away while waves 10-12 reached 86-93%.)
+	do
+		local depths = Match.depthByWave or {}
+		if math.max(depths[wave] or 0, depths[wave - 1] or 0) >= 0.8 then
+			danger = true
+		end
+	end
 	-- Farms never outrun the defence: money in farms stays at or below money in damage units, and
 	-- nothing goes to farms for a while after an enemy gets most of the way down the road.
 	-- (Logs showed a full-health base dying in 15 s at wave 8 with 2 un-upgraded units and 3 maxed farms.)
@@ -2406,7 +2415,9 @@ local function planAction()
 	local lostAt = AA.lostWave(Match.levelId)
 	-- Only for an early loss. A loss to the last waves / the boss needs more economy, not less:
 	-- the rush replay of a wave-15 boss loss played the whole act without its farm and lost again.
-	local rush = lostAt ~= nil and wave <= lostAt + 1 and lostAt <= math.max((Match.totalWaves or 15) * 0.6, 5)
+	-- Only around the wave it was lost at. (From wave 1 up to it, as before, meant a loss at wave
+	-- 13 put the whole next run in rush: nothing saved for, no farm, Elyssia level 0 at wave 10.)
+	local rush = lostAt ~= nil and wave >= lostAt - 2 and wave <= lostAt + 1 and lostAt <= math.max((Match.totalWaves or 15) * 0.6, 5)
 	if rush then
 		safe = false
 	end
@@ -2623,12 +2634,15 @@ local function planAction()
 			-- Under threat only the next half minute counts. (The old rule took the first
 			-- affordable thing on the list: 6000 went into Elfy upgrades worth a tenth of the
 			-- Water Goddess upgrade that was two seconds of income away.)
-			horizon = math.min(horizon, 30)
+			horizon = math.min(horizon, 60)
 		end
 		local best, bestValue
 		for _, option in ipairs(options) do
 			local wait = math.max(0, option.cost - money) / income
-			if option.score < 1e5 and wait < horizon * 0.8 and not (rush and wait > 0) then
+			-- (No "never save while rushing" any more: the waves before a remembered loss went
+			-- into three Shadow Sorcerers and Water Goddess upgrades at a third of the value of
+			-- the Elyssia upgrade that was next on the list.)
+			if option.score < 1e5 and wait < horizon * 0.8 then
 				local value = option.score * (1 - wait / horizon)
 				if not bestValue or value > bestValue then
 					best, bestValue = option, value
