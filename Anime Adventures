@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v92", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v98", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 
 -- Unload a previous execution before touching anything.
 if shared.AnimeAdventures then
@@ -751,7 +751,7 @@ function AA.lostWave(levelId)
 	local losses = type(AA.progress.losses) == "table" and AA.progress.losses or {}
 	local entry = levelId and losses[tostring(levelId) .. "_" .. tostring(localPlayer.UserId)]
 	if type(entry) == "table" and os.time() - (entry.at or 0) < 86400 then
-		return entry.wave, entry.n
+		return entry.wave, entry.n, tonumber(entry.low) or entry.wave
 	end
 	return nil
 end
@@ -773,7 +773,9 @@ function AA.noteResult(levelId, won, wave)
 		end
 		AA.progress.losses[key] = nil
 	else
-		AA.progress.losses[key] = { wave = wave, at = os.time(), n = (type(entry) == "table" and entry.n or 0) + 1 }
+		-- (low = the earliest wave it has been lost at lately: where the stage first bites.)
+		local low = type(entry) == "table" and os.time() - (entry.at or 0) < 86400 and tonumber(entry.low or entry.wave) or wave
+		AA.progress.losses[key] = { wave = wave, at = os.time(), n = (type(entry) == "table" and entry.n or 0) + 1, low = math.min(low, wave) }
 	end
 	AA.saveProgress()
 end
@@ -2362,11 +2364,40 @@ local function planAction()
 	-- Enemies getting within a fifth of the road from the base, this wave or the last, is danger
 	-- too, full health or not: on hard stages one enemy through ends the match. (A Daily was lost
 	-- with 27000 banked for an upgrade 100 s away while waves 10-12 reached 86-93%.)
+	-- Pressure: the health still walking in the last fifth of the road against what the team
+	-- deals in 5 s (its own recent peak, from the game's damage counter). How deep an enemy gets
+	-- says little by itself: one that arrives there nearly dead is no threat, one that arrives
+	-- full is. At 1 or more the line is about to break; that holds for 30 s.
+	local deep = false
 	do
-		local depths = Match.depthByWave or {}
-		if math.max(depths[wave] or 0, depths[wave - 1] or 0) >= 0.8 then
-			danger = true
+		local now = os.clock()
+		local dealt = stats:FindFirstChild("damage_dealt")
+		local sample = Match.dpsSample
+		if dealt and not sample then
+			Match.dpsSample = { at = now, value = dealt.Value }
+		elseif dealt and now - sample.at >= 4 then
+			local rate = math.max(dealt.Value - sample.value, 0) / (now - sample.at)
+			Match.peakDps = math.max(rate, (Match.peakDps or 0) * 0.9)
+			Match.dpsSample = { at = now, value = dealt.Value }
 		end
+		local remaining = 0
+		for _, enemy in ipairs(scanField().enemies) do
+			local humanoid = enemy:FindFirstChildOfClass("Humanoid")
+			if humanoid and humanoid.Health > 0 and pathProgress(enemy:GetPivot().Position) >= 0.8 then
+				remaining += humanoid.Health
+			end
+		end
+		local pressure = (Match.peakDps or 0) > 0 and remaining / (Match.peakDps * 5) or (remaining > 0 and 1 or 0)
+		Match.pressure = pressure
+		Match.pressByWave = Match.pressByWave or {}
+		Match.pressByWave[wave] = math.max(Match.pressByWave[wave] or 0, pressure)
+		if pressure >= 1 then
+			if not Match.pressAt or now - Match.pressAt > 30 then
+				note("press", { x = math.floor(pressure * 10) / 10, dps = math.floor(Match.peakDps or 0) })
+			end
+			Match.pressAt = now
+		end
+		deep = Match.pressAt ~= nil and now - Match.pressAt < 30
 	end
 	-- Farms never outrun the defence: money in farms stays at or below money in damage units, and
 	-- nothing goes to farms for a while after an enemy gets most of the way down the road.
@@ -2387,6 +2418,13 @@ local function planAction()
 		Match.threatAt = os.clock()
 	end
 	local pressed = Match.threatAt and os.clock() - Match.threatAt < 20
+	-- Farms wait while the line is strained: by pressure (health alive in the last fifth of the
+	-- road against the team's damage), not by how far enemies walk. On a short road everything
+	-- "gets deep", and a farm held back for that costs the whole match its income.
+	do
+		local byWave = Match.pressByWave or {}
+		pressed = math.max(byWave[wave] or 0, byWave[wave - 1] or 0) >= 0.6
+	end
 	local safe = damagePlaced >= 2 and not danger and not pressed and farmSpent < damageSpent
 	-- Only the three waves leading up to it: blocking farms from wave 1 starved the whole act
 	-- (Shibuya: farm never upgraded, Elyssia still level 1 at the boss).
@@ -2412,7 +2450,16 @@ local function planAction()
 	end
 	-- Lost here before: until that wave is behind us everything goes into damage (no farms, no
 	-- saving up), strongest units first.
-	local lostAt = AA.lostWave(Match.levelId)
+	local lostAt, _, lostLow = AA.lostWave(Match.levelId)
+	-- Getting ready for the wall: from three waves before the earliest wave this stage was lost at,
+	-- cash goes into what helps within the minute and farms wait. (Difficulty jumps: pressure was
+	-- 0 on waves 10-11 and 2.9 on wave 12, with 20000 just put into the farm.)
+	if lostLow and wave >= lostLow - 3 and wave <= (lostAt or lostLow) + 1 then
+		-- (Blocking only farms here and letting it save was tried in v97: it banked 30000 for
+		-- Elyssia, the wall hit 17 s before it could pay, and the run ended three waves earlier.)
+		deep = true
+		safe = false
+	end
 	-- Only for an early loss. A loss to the last waves / the boss needs more economy, not less:
 	-- the rush replay of a wave-15 boss loss played the whole act without its farm and lost again.
 	-- Only around the wave it was lost at. (From wave 1 up to it, as before, meant a loss at wave
@@ -2630,7 +2677,7 @@ local function planAction()
 		local elapsed = os.clock() - (Match.startedAt or os.clock())
 		local perWave = math.clamp(elapsed / math.max(wave, 1), 15, 60)
 		local horizon = math.clamp(math.max(left, 1) * perWave, 20, 600)
-		if danger then
+		if danger or deep then
 			-- Under threat only the next half minute counts. (The old rule took the first
 			-- affordable thing on the list: 6000 went into Elfy upgrades worth a tenth of the
 			-- Water Goddess upgrade that was two seconds of income away.)
@@ -3737,6 +3784,7 @@ local function resetMatch()
 	Match.voteNoted = nil
 	Match.shieldHits, Match.shieldAt = nil, nil
 	Match.enemyMedian, Match.tankNoted = nil, nil
+	Match.dpsSample, Match.peakDps, Match.pressure, Match.pressByWave, Match.pressAt = nil, nil, nil, nil, nil
 	Match.pendingAtStart, Match.pendingCheck = nil, nil
 	Match.killTime, Match.lastKillTime, Match.killWave, Match.everLong, Match.paceSeeded, Match.hubMoved = nil, nil, nil, nil, nil, nil
 	Match.earned, Match.lastCash, Match.teamIds, Match.spawnOwner, Match.summoners, Match.unreported = nil, nil, nil, nil, nil, nil
