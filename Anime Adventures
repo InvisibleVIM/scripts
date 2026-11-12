@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v113", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v114", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 
 -- Unload a previous execution before touching anything.
 if shared.AnimeAdventures then
@@ -229,6 +229,21 @@ do
 	end
 	if Config.KillsStage ~= "Summer" then
 		Config.KillsStage = "Walled City"
+	end
+	-- A saved choice that is no longer an option (an older version's) goes back to its default.
+	local choices = {
+		Mode = { "Story", "Level", "Infinite", "Legend", "Raid", "Artifact", "Challenge", "Daily", "Missions", "Summer", "Cursed Womb", "Tournament", "Castle", "Dungeon", "Portals", "Kills" },
+		AfterGame = { "Auto", "Next", "Replay", "Lobby" },
+		Difficulty = { "Normal", "Hard" },
+		PlaceStyle = { "Auto", "Front", "Normal" },
+		SnipeMode = { "Normal", "Middle" },
+		Targeting = { "Smart", "First", "Last", "Closest", "Farthest", "Strongest", "Weakest", "Off" },
+	}
+	local defaults = { Mode = "Story", AfterGame = "Auto", Difficulty = "Normal", PlaceStyle = "Auto", SnipeMode = "Normal", Targeting = "Smart" }
+	for key, list in pairs(choices) do
+		if not table.find(list, Config[key]) then
+			Config[key] = defaults[key]
+		end
 	end
 end
 
