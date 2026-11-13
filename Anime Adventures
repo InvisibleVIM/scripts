@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v173", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v175", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -5086,6 +5086,12 @@ do
 		return 0, 0
 	end
 
+	---When the buff a unit carries began (0 when it carries none).
+	function Conductor.since(unit, name)
+		local record = Conductor.active[unit] and Conductor.active[unit][name]
+		return record and record.ends > os.clock() and record.at or 0
+	end
+
 	function Conductor.onBuff(unit, buff, params)
 		if typeof(unit) ~= "Instance" or typeof(buff) ~= "Instance" or type(params) ~= "table" or type(params.damage_types) ~= "table" then
 			return
@@ -5304,6 +5310,21 @@ do
 		end
 		for name, group in pairs(groups) do
 			local buff = group.buff
+			Conductor.seeded = Conductor.seeded or {}
+			if not Conductor.seeded[name] then
+				-- Loaded in the middle of a match: what the units carry right now, from the
+				-- game's own numbers, so the first casts aren't thrown at units that would
+				-- ignore them. When each buff ends isn't known: the reconcile below drops it
+				-- the moment the game's number goes to zero.
+				Conductor.seeded[name] = true
+				for _, unit in ipairs(towers) do
+					local truth = unit._stats:GetAttribute("_dmg_buff_" .. tostring(buff.kind))
+					if type(truth) == "number" and truth > 0.01 and truth <= 1.01 and Conductor.rate(unit, name) <= 0 then
+						Conductor.active[unit] = Conductor.active[unit] or {}
+						Conductor.active[unit][name] = { rate = truth, ends = now + (buff.duration or 30), at = now - 10 }
+					end
+				end
+			end
 			for _, unit in ipairs(towers) do
 				Conductor.reconcile(unit, buff, now)
 			end
@@ -5335,7 +5356,7 @@ do
 			local function team(caster)
 				local position, radius = caster:GetPivot().Position, reach(caster)
 				local total, open, opensAt = 0, 0, 0
-				local members = {}
+				local members, opened = {}, {}
 				for _, unit in ipairs(towers) do
 					local unitId = unit._stats.id.Value
 					local data = Units[unitId]
@@ -5345,16 +5366,16 @@ do
 						local weight = math.max((damage and AA.rv(damage) or 1) / math.max(cooldown and AA.rv(cooldown) or 1, 0.1), 1)
 						total += weight
 						local _, ends = Conductor.rate(unit, name)
+						members[unit] = weight
 						if ends <= now then
 							open += weight
-							members[unit] = weight
+							opened[unit] = true
 						else
 							opensAt = math.max(opensAt, ends)
-							members[unit] = 0
 						end
 					end
 				end
-				return { total = total, open = open, opensAt = opensAt, members = members }
+				return { total = total, open = open, opensAt = opensAt, members = members, opened = opened }
 			end
 			-- A copy counts as standing in the damage when it reaches a real share of what the
 			-- best-placed copy reaches (a stray summon in a feeder's range doesn't make it a main).
@@ -5412,24 +5433,26 @@ do
 			-- feeder's range and in a main's too (it would take the feed and then ignore the main's
 			-- full cast). Damage only the feeder reaches loses nothing by it.
 			for _, feeder in ipairs(feeders) do
-				local harm = 0
+				local harm, shared = 0, 0
 				for unit, weight in pairs(info[feeder].members) do
-					if weight > 0 then
-						for _, main in ipairs(mains) do
-							if info[main].members[unit] then
+					for _, main in ipairs(mains) do
+						if info[main].members[unit] then
+							shared += weight
+							if info[feeder].opened[unit] then
 								harm += weight
-								break
 							end
+							break
 						end
 					end
 				end
-				info[feeder].harm = harm
+				info[feeder].harm, info[feeder].shared = harm, shared
 			end
-			-- (Two per cent, not eight: by weight a Shadow Sorcerer is a few per cent of an Elyssia,
-			-- and three of them and four Water Goddesses sat at +50% for half a match because the
-			-- feeds that hit them counted as harmless.)
+			-- (A feed at the opening may cost a minor share of the damage one cycle at +50%: it
+			-- happens once, the cast that follows waits four seconds, and from then on the feeds
+			-- come before the damage runs out. Three Shadow Sorcerers and four Water Goddesses
+			-- sat at +50% for half a match when it happened at every opening.)
 			local function clean(feeder, main)
-				return info[feeder].harm <= info[main].total * 0.02
+				return info[feeder].harm <= info[main].total * 0.35
 			end
 			---A feeder that carries a buff hands out the full one: that spoils nothing.
 			local function potent(feeder)
@@ -5440,7 +5463,7 @@ do
 				return (feeder:GetPivot().Position - main:GetPivot().Position).Magnitude <= reach(feeder)
 			end
 			local function opening(row)
-				return row.total > 0 and row.open >= row.total * 0.7
+				return row.total > 0 and row.open >= row.total * 0.5
 			end
 			local function feed(feeder)
 				Conductor.lastSupport[name] = now
@@ -5456,13 +5479,29 @@ do
 			local lastMain, lastFeed = Conductor.lastMain[name] or -math.huge, Conductor.lastSupport[name] or -math.huge
 			local acted = false
 			-- 1. The full buff: the damage is out of buff and a main that carries a buff is ready.
+			-- A main whose own buff is under four seconds old waits until it is: that keeps its
+			-- buff ending four seconds BEFORE the damage's, every cycle. In that gap the mains are
+			-- out of buff while the damage still carries one, which is the one moment a feed can
+			-- land on them and on nothing else, wherever the feeder stands. (Without the gap a feed
+			-- at the opening hit whatever damage stood near the feeder: fine while nothing did,
+			-- then +50% on everything for a minute when a few upgrades changed the picture.)
+			local hold = false
 			if now - lastMain >= 1.5 then
 				local best, bestRate, bestEnds = nil, 0, 0
 				for _, unit in ipairs(mains) do
 					local rate, ends = Conductor.rate(unit, name)
-					if rate >= 0.3 and ends - now > 0.25 and opening(info[unit]) and isReady(unit) and (rate > bestRate or rate == bestRate and ends > bestEnds) then
-						best, bestRate, bestEnds = unit, rate, ends
+					if rate >= 0.3 and ends - now > 0.25 and opening(info[unit]) and isReady(unit) then
+						-- (Not the very first cast of the match: the full buff a second after the
+						-- first pair is down is worth more than the gap, which the second cast sets.)
+						if Conductor.lastMain[name] and now - Conductor.since(unit, name) < 4 and ends - now > 1.5 then
+							hold = true
+						elseif rate > bestRate or rate == bestRate and ends > bestEnds then
+							best, bestRate, bestEnds = unit, rate, ends
+						end
 					end
+				end
+				if best then
+					hold = false
 				end
 				if not best then
 					-- No main can: any other copy standing in the damage that happens to carry a
@@ -5482,8 +5521,8 @@ do
 			-- 2. The damage is out of buff and the ready main carries none: a feed first, but only
 			-- one that can't spoil the damage (a feeder out of its reach, or one that is buffed
 			-- itself). This is what gives the full buff a second after the first pair is down.
-			local feedComing = false
-			if not acted and now - lastMain >= 1.5 then
+			local feedComing = hold
+			if not acted and not hold and now - lastMain >= 1.5 then
 				for _, main in ipairs(mains) do
 					if opening(info[main]) and Conductor.rate(main, name) <= 0 and not Conductor.pending[main] and isReady(main) then
 						for _, feeder in ipairs(feeders) do
@@ -5528,7 +5567,7 @@ do
 						nextOpening = math.min(nextOpening, row.opensAt)
 					end
 				end
-				if quiet and nextOpening < math.huge and nextOpening - now > 2 then
+				if quiet and nextOpening < math.huge and nextOpening - now > 1 then
 					local open, wait = {}, false
 					for _, main in ipairs(mains) do
 						local rate, ends = Conductor.rate(main, name)
@@ -5536,9 +5575,28 @@ do
 							wait = true
 						elseif rate <= 0 then
 							table.insert(open, main)
-						elseif ends < nextOpening - 2 then
+						elseif ends < nextOpening - 1 then
 							-- Runs out before the damage does: one feed then catches both.
 							wait = true
+						end
+					end
+					-- The main that casts next. When it still carries a buff that ends with the
+					-- damage's and a feeder standing clear of the damage can feed it at that
+					-- moment, the feeders are kept for that (rule 2). Otherwise the mains that are
+					-- out of buff are fed now, which is what gets a cluster onto its own clock.
+					local nextCaster, nextReady = nil, math.huge
+					for _, main in ipairs(mains) do
+						local readyAt = isReady(main) and now or (Conductor.readyAt[main] or now)
+						if readyAt < nextReady then
+							nextCaster, nextReady = main, readyAt
+						end
+					end
+					if #open > 0 and not wait and nextCaster and not table.find(open, nextCaster) then
+						for _, feeder in ipairs(feeders) do
+							if reaches(feeder, nextCaster) and info[feeder].shared <= info[nextCaster].total * 0.35 then
+								wait = true
+								break
+							end
 						end
 					end
 					if #open > 0 and not wait then
@@ -5574,7 +5632,10 @@ do
 			if not acted and not feedComing and now - lastFeed >= 1.2 and now - lastMain >= 1.5 then
 				local data = Units[group.units[1]._stats.id.Value]
 				local wanted = math.min(AA.buffCopies(buff, data), placeCap(data))
-				local building = #group.units == 1 and wanted >= 2 and now - newest < 4
+				-- (Twelve seconds: the second copy came 8 s after the first when cash was short,
+				-- the first had cast at 4 s, and the team sat at +50% for 30 s instead of waiting
+				-- 4 s more for the full buff.)
+				local building = #group.units == 1 and wanted >= 2 and now - newest < 12
 				if not building then
 					local pick, soon = nil, false
 					for _, unit in ipairs(mains) do
