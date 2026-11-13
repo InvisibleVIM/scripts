@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v181", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v182", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -5879,10 +5879,12 @@ local function matchKind()
 		return "Dungeon"
 	elseif data.infinite or data._gamemode == "infinite" then
 		return "Infinite"
+	elseif data._is_map_or_portal_level or data._portal_only_level or data.portal_group then
+		-- (Before the raid check: a Sky Portal is a raid by its game mode, was logged as one,
+		-- and got a plain replay vote at the end instead of the portal handling.)
+		return "Portal"
 	elseif data._gamemode == "raid" or data.is_raid then
 		return "Raid"
-	elseif data._is_map_or_portal_level or data._portal_only_level then
-		return "Portal"
 	elseif data._gamemode == "story" then
 		return "Story"
 	end
