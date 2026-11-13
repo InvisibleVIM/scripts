@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v152", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v153", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -6568,6 +6568,30 @@ local function claimRewards()
 			local have = quest.quest_progress and quest.quest_progress.amount or 0
 			if info and have >= need and not alreadyTried("quest:" .. tostring(uuid), day) then
 				invoke("redeem_quest", uuid)
+			end
+		end
+		-- Daily and 1-hour missions are a separate system from quest_handler (they never appear in
+		-- handler.quests). The endpoint lists the interval's mission ids; the server pays a claim
+		-- only when the mission is actually finished, so claiming a listed-but-unfinished one is a
+		-- safe no-op. claimed_missions resets when its interval rolls over. Re-checked every ~30 min
+		-- and after each finished match (when progress can have moved), not on every lobby tick.
+		local missionStamp = math.floor(os.time() / 1800) .. ":" .. tostring(Stats.wins + Stats.losses)
+		for _, kind in ipairs({
+			{ key = "dailymissions_data", list = "request_current_dailymissions", claim = "request_claim_dailymission" },
+			{ key = "missions_data", list = "request_current_missions", claim = "request_claim_mission" },
+		}) do
+			if not alreadyTried("missions:" .. kind.key, missionStamp) then
+				local ok, ids, interval = invoke(kind.list)
+				if ok and type(ids) == "table" then
+					local data = type(pd[kind.key]) == "table" and pd[kind.key] or {}
+					local fresh = (tonumber(data.highest_claimed_interval) or -1) < (tonumber(interval) or 0)
+					local claimed = type(data.claimed_missions) == "table" and data.claimed_missions or {}
+					for _, id in pairs(ids) do
+						if fresh or not claimed[id] then
+							invoke(kind.claim, id)
+						end
+					end
+				end
 			end
 		end
 	end
