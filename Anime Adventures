@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v158", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v159", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -1552,6 +1552,22 @@ function AA.frontForced()
 	return Match.frontForced == true
 end
 
+---How far down the road enemies get on a typical wave of this stage: the 80th percentile of the
+---per-wave depth, live once six waves are known, otherwise remembered from the last run here.
+---(Summer Hunt, hxhant map: enemies died at 10-30% of the road for 38 of 42 waves while the whole
+---team stood at 55-79%; a Water Goddess at 3% dealt 15M against 2-6M for the ones mid-road.)
+function AA.fightBand()
+	local list = {}
+	for _, depth in pairs(Match.depthByWave or {}) do
+		table.insert(list, depth)
+	end
+	if #list >= 6 then
+		table.sort(list)
+		return list[math.ceil(#list * 0.8)]
+	end
+	local saved = type(AA.progress.depths) == "table" and AA.progress.depths[AA.leakKey()]
+	return tonumber(saved)
+end
 ---The stretch of a road where enemies are meant to die in a fast match: from its spawn to where
 ---they have been dying, stretched to the first junction on maps with several roads.
 local function killZone(lane)
@@ -2556,7 +2572,9 @@ local function bestSpot(data, focus)
 						-- spots), off the kerb. Weak enemies: the very front, like everything else. A
 						-- summoner at 70% took the whole buff group with her, and Shadow Sorcerers at
 						-- the far end of the road did no damage at all while everything died at the spawn.
-						local aim = Match.pace == "speed" and (Match.laneJunction and Match.laneJunction[spot.lane] or 0.02) or 0.6
+						-- In long matches: just past where enemies usually die (never past 60%).
+						local band = Match.pace ~= "speed" and AA.fightBand() or nil
+						local aim = Match.pace == "speed" and (Match.laneJunction and Match.laneJunction[spot.lane] or 0.02) or (band and math.clamp(band + 0.1, 0.3, 0.6) or 0.6)
 						local score = -math.abs(progress - aim) * 10 + math.min(spot.gap, range) * (Match.pace == "speed" and -0.05 or 0.1)
 
 						if score > bestScore then
@@ -4849,6 +4867,11 @@ local function finishMatch()
 	if AA.leakKey() ~= "?" and Config.PlaceStyle == "Auto" then
 		AA.progress.paces = type(AA.progress.paces) == "table" and AA.progress.paces or {}
 		AA.progress.paces[AA.leakKey()] = (Match.everLong or not won) and "long" or "speed"
+		local band = AA.fightBand()
+		if band and Match.depthByWave and #Match.depthByWave >= 6 then
+			AA.progress.depths = type(AA.progress.depths) == "table" and AA.progress.depths or {}
+			AA.progress.depths[AA.leakKey()] = math.floor(band * 100) / 100
+		end
 	end
 	AA.saveProgress()
 	status = won and "Won" or "Lost"
