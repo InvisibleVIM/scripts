@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v166", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v168", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -124,6 +124,7 @@ local Config = {
 	Artifact = "artifact_usopp_ts",
 	CastleFloor = 0,
 	FriendsOnly = true,
+	PortalInstant = false,
 	AfterGame = "Auto",
 	-- In match
 	AutoStart = true,
@@ -1758,12 +1759,24 @@ local function buildSpots()
 		minZ, maxZ = math.min(minZ, p.Z), math.max(maxZ, p.Z)
 		topY = math.max(topY, p.Y)
 	end
-	local margin, step = 18, 1.62
+	-- Up to 36 studs from the road (was 18): long-ranged units cover far more from the inside of
+	-- a bend than from its kerb, and those spots were not even on the list. Beyond 18 studs only
+	-- every second row and column is kept, so big maps don't triple their spot count.
+	local margin, step = 36, 1.62
 	local spots = { ground = {}, hill = {} }
+	local column = 0
 	for x = minX - margin, maxX + margin, step do
+		column += 1
+		local row = 0
 		for z = minZ - margin, maxZ + margin, step do
+			row += 1
 			-- Near the path at all?
-			local onRoad, nearest = nearestPath(Vector3.new(x, 0, z), margin)
+			-- (The near band is looked up first with the short reach: the wide lookup is four
+			-- times the work and only every fourth cell needs it.)
+			local onRoad, nearest = nearestPath(Vector3.new(x, 0, z), 18)
+			if not onRoad and column % 2 == 0 and row % 2 == 0 then
+				onRoad, nearest = nearestPath(Vector3.new(x, 0, z), margin)
+			end
 			if onRoad and (nearest >= 1.4 or Config.RoadSpots) then
 				local hit = workspace:Raycast(Vector3.new(x, topY + 80, z), Vector3.new(0, -200, 0), params)
 				if hit and hit.Normal.Y > 0.6 and hit.Instance.Name ~= "_donotplace" then
@@ -2721,9 +2734,20 @@ local function bestSpot(data, focus)
 		local best, bestScore = nil, -math.huge
 		local band = Match.pace ~= "speed" and AA.fightBand() or nil
 		local summonLanes = (Match.laneCount or 1) > 1 and AA.laneWeights(myUnits()) or nil
+		-- How far her summons reach (eels: 71 studs, measured in the match and remembered); three
+		-- times her own range until one has been seen.
+		local knownReach = type(AA.progress.summonRange) == "table" and tonumber(AA.progress.summonRange[data.id]) or nil
+		local summonReach = math.clamp(knownReach or range * 3, range, 75)
+		local ownReach2 = (unitStatsAt(data, 0).range) ^ 2
+		local seenSpots, sliceAt = 0, os.clock()
 		for _, list in ipairs(pool) do
 			for _, spot in ipairs(list) do
 				local p = spot.position
+				seenSpots += 1
+				if seenSpots % 25 == 0 and os.clock() - sliceAt > 0.006 then
+					task.wait()
+					sliceAt = os.clock()
+				end
 				if spot.gap <= range and not Match.badSpots[spotKey(p)] then
 					local free = true
 					for _, other in ipairs(taken) do
@@ -2746,6 +2770,33 @@ local function bestSpot(data, focus)
 							-- Her summons work the road she stands on: the road that needs it most,
 							-- never one that is still closed.
 							score += ((summonLanes[spot.lane] or 1) - 1) * 3
+						end
+						if Match.pace ~= "speed" then
+							-- Strong enemies: where she and her summons reach the most road that
+							-- enemies actually walk. She is the first unit down and the buffers and
+							-- the rest of the damage follow her, so her spot decides what the whole
+							-- team can hit. (The old rule put her at a fixed share of the way down
+							-- the road: on Summer Hunt's city map that was an outside corner where
+							-- a 55-stud reach saw 110 of the road's 271 studs. The inside of the bend
+							-- 50 studs away, where the user was standing, sees 219.)
+							local sum = 0
+							local reach2 = summonReach * summonReach
+							pathWithin(p.X, p.Z, summonReach, function(point, _, _, d2)
+								if d2 <= reach2 then
+									local weight = 1 + (1 - point.progress) * 0.25
+									if band and point.progress > band + 0.05 then
+										weight *= math.max(0.15, math.exp(-(point.progress - band - 0.05) / 0.2))
+									end
+									if summonLanes then
+										weight *= summonLanes[point.lane] or 1
+									end
+									if d2 <= ownReach2 then
+										weight *= 1.5
+									end
+									sum += weight
+								end
+							end)
+							score = sum - spot.gap * 0.05
 						end
 
 						if score > bestScore then
@@ -3342,7 +3393,15 @@ local function planAction()
 				-- Income over the rest of the match against the price (first level only: upgrades compete separately).
 				local income = math.max(base.farm, 0) * math.max(left - 1, 0)
 				local path = farmTop * math.max(left - 3, 0)
-				if Config.FarmFirst and safe and not Match.farmsSold and (income > cost * 1.3 or path > cost * 4) then
+				-- The opening: a farm that can be paid for on the spot goes down before anything
+				-- else. It costs the first damage unit a few seconds at most (the first wave's
+				-- payout lands about ten seconds in, long before its enemies are anywhere), and
+				-- every step of a farm pays for itself in three to four waves (Bulby: 800 for
+				-- 250 a wave, 1500 for +500, 3000 for +750 ...), so a wave earlier is a wave of
+				-- income and every later step a wave sooner. It used to wait for two damage units
+				-- and came down at wave 2.
+				local opening = damagePlaced == 0 and wave <= 1 and threat < 0.25 and money >= cost and (placed[entry.id] or 0) == 0
+				if Config.FarmFirst and (safe or opening) and not Match.farmsSold and (income > cost * 1.3 or path > cost * 4) then
 					score = 1e6 + math.max(income, path) / cost
 				end
 			elseif copyPower(data, unit, maxLevel) > 0 then
@@ -3378,6 +3437,18 @@ local function planAction()
 						end
 					end
 					score = math.max(score, aura.pct * boosted * aura.coverage / cost)
+				end
+				-- A unit whose worth is what it adds to others' summons (Zombie (Risen)) is not the
+				-- first one down while the unit it feeds is still in the hand: alone she dealt
+				-- next to nothing in the first waves (0.0M at level 2 on Sky Island against 20-30M
+				-- for each Elyssia), and her blessing has nothing to bless.
+				if aura and aura.stacks and damagePlaced == 0 then
+					for _, other in ipairs(equipped) do
+						if other.id ~= entry.id and other.data.cost and aura.matches(other.id, other.data) and (placed[other.id] or 0) == 0 then
+							score *= 0.3
+							break
+						end
+					end
 				end
 				-- Opening: the strongest-per-cash unit goes down first (waiting a few seconds for it
 				-- beats wasting the cash on a cheap weak one). Only with enemies already half way
@@ -5570,7 +5641,7 @@ local function matchLoop()
 						pcall(function()
 							local root = localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart")
 							if root then
-								note("standAt", { progress = math.floor(pathProgress(root.Position) * 100) })
+								note("standAt", { progress = math.floor(pathProgress(root.Position) * 100), cash = math.floor(stats.resource.Value) })
 							end
 						end)
 						note("vote", { votes = votes and votes.Value, players = #playersService:GetPlayers() })
@@ -6620,10 +6691,81 @@ function AA.friendLobby()
 	return nil
 end
 
+-- Instant portal join: the moment another player opens a portal in this lobby, step into it.
+-- (Portal lobbies are the children of workspace._PORTALS.Lobbies; "Owner" is set to the player
+-- who opened one, and request_join_lobby with the lobby's name is the game's own join.)
+if IS_LOBBY then
+	task.spawn(function()
+		local portals = workspace:WaitForChild("_PORTALS", 30)
+		local folder = portals and portals:WaitForChild("Lobbies", 30)
+		if not folder then
+			return
+		end
+		local tries = {}
+		local function try(lobby)
+			if not (AA.alive and Config.PortalInstant) then
+				return
+			end
+			local owner = lobby:FindFirstChild("Owner")
+			local player = owner and owner.Value
+			local inLobby = localPlayer:FindFirstChild("AlreadyInLobby")
+			if not player or player == localPlayer or (inLobby and inLobby.Value) then
+				return
+			end
+			-- Up to three asks for one opening (full, friends only or already started: the
+			-- server says no and that is that).
+			local key = lobby.Name .. ":" .. tostring(player.UserId)
+			local entry = tries[key] or { n = 0, at = 0 }
+			if entry.n >= 3 or os.clock() - entry.at < 1 then
+				return
+			end
+			entry.n += 1
+			entry.at = os.clock()
+			tries[key] = entry
+			AA.portalJoinAt = os.clock()
+			status = "Joining " .. player.DisplayName .. "'s portal"
+			task.spawn(invoke, "request_join_lobby", lobby.Name)
+		end
+		local function watch(lobby)
+			local owner = lobby:FindFirstChild("Owner") or lobby:WaitForChild("Owner", 10)
+			if owner then
+				table.insert(AA.connections, owner:GetPropertyChangedSignal("Value"):Connect(function()
+					try(lobby)
+				end))
+				try(lobby)
+			end
+		end
+		for _, lobby in ipairs(folder:GetChildren()) do
+			task.spawn(watch, lobby)
+		end
+		table.insert(AA.connections, folder.ChildAdded:Connect(function(lobby)
+			task.spawn(watch, lobby)
+		end))
+		-- (Also looked at twice a second: covers the toggle being switched on with a portal
+		-- already open, and a lobby whose owner value was set before the signal was connected.)
+		while AA.alive do
+			if Config.PortalInstant then
+				for _, lobby in ipairs(folder:GetChildren()) do
+					try(lobby)
+				end
+			end
+			task.wait(0.5)
+		end
+	end)
+end
+
 local function joinGame()
 	if #equippedUnits() == 0 then
 		equipBest()
 		task.wait(1)
+	end
+	if Config.PortalInstant and AA.portalJoinAt and os.clock() - AA.portalJoinAt < 180 then
+		-- In someone's portal lobby: nothing of our own is opened while its owner gets ready.
+		local inLobby = localPlayer:FindFirstChild("AlreadyInLobby")
+		if inLobby and inLobby.Value then
+			status = "In a portal lobby, waiting for its owner to start"
+			return false
+		end
 	end
 	if tostring(Config.JoinFriend) ~= "" then
 		-- A friend to play with: step into the lobby they open and let them start it; nothing of
@@ -8236,6 +8378,16 @@ local function measureLoop()
 			local total = unit._stats:FindFirstChild("total_damage")
 			local owner = summonOwner(unit)
 			local ownerId = owner and owner:FindFirstChild("_stats") and owner._stats:FindFirstChild("id") and owner._stats.id.Value
+			local summonRange = unit._stats:FindFirstChild("range")
+			if ownerId and summonRange and AA.rv(summonRange) > 0 then
+				AA.progress.summonRange = type(AA.progress.summonRange) == "table" and AA.progress.summonRange or {}
+				local known = tonumber(AA.progress.summonRange[ownerId]) or 0
+				local seen = math.min(AA.rv(summonRange), 200)
+				if seen > known * 1.1 then
+					AA.progress.summonRange[ownerId] = math.floor(seen)
+					AA.progressDirty = true
+				end
+			end
 			if total and ownerId and Match.teamIds[ownerId] then
 				local entry = tracked[unit]
 				local gained = math.max(total.Value - (entry and entry.last or 0), 0)
@@ -11135,6 +11287,8 @@ do
 	toggle(page, "Infinity Mansion", "MatchCastle")
 	toggle(page, "Friends only lobby", "FriendsOnly")
 	hint(page, "Keeps strangers out of lobbies and portals the script opens itself. Matchmaking ignores it.")
+	toggle(page, "Instant join portals", "PortalInstant")
+	hint(page, "The moment anyone in the lobby opens a portal, you are put into it (the owner still starts it). Works with auto join off. A portal that is full or friends only says no, and the script leaves it at that.")
 	do
 		local friendBox = UI.textbox(page, "Join this player's lobby", "user or display name")
 		friendBox.Text = tostring(Config.JoinFriend or "")
