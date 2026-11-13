@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v157", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v158", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -132,6 +132,7 @@ local Config = {
 	AutoUpgrade = true,
 	AutoAbility = true,
 	SpellMode = "Safe",
+	CharmPick = "Auto",
 	PlaceStart = true,
 	RoadSpots = true,
 	Targeting = "Smart",
@@ -288,10 +289,11 @@ do
 		OrderPlacement = { "Smart", "Front" },
 		WarlordMode = { "Auto", "Boss", "Front", "Range", "Leave" },
 		SpellMode = { "Off", "Safe", "All" },
+		CharmPick = { "Off", "Auto", "Damage", "Rewards" },
 		OrderAddKind = { "Place", "Upgrade" },
 		Targeting = { "Smart", "First", "Last", "Closest", "Farthest", "Strongest", "Weakest", "Off" },
 	}
-	local defaults = { WarlordMode = "Auto", SpellMode = "Safe", OrderPlacement = "Smart", OrderAddKind = "Place", Mode = "Story", AfterGame = "Auto", Difficulty = "Normal", PlaceStyle = "Auto", SnipeMode = "Normal", Targeting = "Smart" }
+	local defaults = { WarlordMode = "Auto", SpellMode = "Safe", CharmPick = "Auto", OrderPlacement = "Smart", OrderAddKind = "Place", Mode = "Story", AfterGame = "Auto", Difficulty = "Normal", PlaceStyle = "Auto", SnipeMode = "Normal", Targeting = "Smart" }
 	for key, list in pairs(choices) do
 		if not table.find(list, Config[key]) then
 			Config[key] = defaults[key]
@@ -1217,6 +1219,57 @@ function AA.dailyKillQuest(forLevel)
 end
 
 ---Every portal item in the inventory: { uuid, id, name, tries, left, made }.
+---Charms: one can be worn at a time (GameplaySettings.MAX_EQUIPPED_CHARMS = 1) and each rolls its
+---own bonuses (_unique_charm_data._d = { { _t = "unit_damage", _d = 0.13 }, { _t = "reward_mul",
+---_d = 0.16 } }, _e set while worn). Returns the best one for the chosen goal and the worn one.
+function AA.charmBest()
+	local unique = (profile().inventory or {}).unique_items
+	local best, worn
+	for _, item in pairs(type(unique) == "table" and unique or {}) do
+		local charm = type(item) == "table" and type(item._unique_item_data) == "table" and item._unique_item_data._unique_charm_data
+		if type(charm) == "table" and type(item.uuid) == "string" then
+			local score = 0
+			for _, bonus in pairs(type(charm._d) == "table" and charm._d or {}) do
+				local kind, weight = tostring(type(bonus) == "table" and bonus._t or ""), 1
+				if Config.CharmPick == "Damage" then
+					weight = kind:find("damage", 1, true) and 1 or 0.01
+				elseif Config.CharmPick == "Rewards" then
+					weight = kind:find("reward", 1, true) and 1 or 0.01
+				end
+				score += (type(bonus) == "table" and tonumber(bonus._d) or 0) * weight
+			end
+			local entry = { uuid = item.uuid, id = tostring(item.item_id), score = score }
+			if charm._e ~= nil then
+				worn = entry
+			end
+			if not best or score > best.score then
+				best = entry
+			end
+		end
+	end
+	return best, worn
+end
+---Wear the best charm owned (lobby). A new drop that beats the worn one replaces it.
+function AA.charmStep()
+	if Config.CharmPick == "Off" then
+		return
+	end
+	local best, worn = AA.charmBest()
+	if not best or (worn and best.score <= worn.score + 1e-6) then
+		return
+	end
+	-- One try per charm every ten minutes, in case the server says no.
+	if AA.charmTried == best.uuid and os.clock() - (AA.charmTriedAt or 0) < 600 then
+		return
+	end
+	AA.charmTried, AA.charmTriedAt = best.uuid, os.clock()
+	if worn then
+		invoke("request_unequip_charm", worn.uuid)
+		task.wait(0.5)
+	end
+	invoke("use_unique_item", best.uuid)
+end
+
 function AA.portalItems()
 	local list = {}
 	local unique = (profile().inventory or {}).unique_items
@@ -6662,6 +6715,7 @@ local function claimRewards()
 				invoke("redeem_quest", uuid)
 			end
 		end
+		pcall(AA.charmStep)
 		-- Daily and 1-hour missions: the board lists the interval's missions, and
 		-- request_claim_dailymission / request_claim_mission is the board's ACCEPT button (not a
 		-- reward claim). An accepted mission becomes a quest in handler.quests ("Kill 3000 X, any
@@ -11019,6 +11073,8 @@ do
 	hint(page, "Buff units (Windsong, Commander): four copies in each other's range, cast in a timed chain that holds +100% damage on everything of their type nearby")
 	segmented(page, "Astral spells", "SpellMode", { "Off", "Safe", "All" })
 	hint(page, "The random spells that show up in your unit slots during a match, paid with match cash. Safe: Random Buff (+100% Attack or Range for good) on your best damage unit, Astral Summon and Clone when cash is spare. All: also Merge when your best unit has a copy in its range. Ritual, Gate and Refund are never cast. Nothing is cast before two units are down or when it would leave less than 1,000 cash.")
+	segmented(page, "Charm", "CharmPick", { "Off", "Auto", "Damage", "Rewards" })
+	hint(page, "Charms give bonuses in Summer Hunt and Sky portals and only one can be worn. In the lobby the script puts on the best one you own, so a better drop replaces the old one. Auto: highest total bonus. Damage / Rewards: highest unit damage or highest reward bonus. Charms are never sold.")
 	heading(page, "Event cards")
 	toggle(page, "Auto pick cards", "AutoCards")
 	segmented(page, "", "CardMode", { "Safe", "Balanced", "Pearls" })
