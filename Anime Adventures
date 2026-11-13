@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v143", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v144", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 AA.realValues = setmetatable({}, { __mode = "k" })
@@ -10699,6 +10699,24 @@ do
 	function Visual.percent(value)
 		return (value - 1) * 100
 	end
+	---What a shown number is multiplied by when a stat goes from its real value to the picked
+	---one. The game's own formulas (calculate_total_stat_multiplier): damage x potency,
+	---range x range stat, cooldown x (1 - (speed - 1)).
+	function Visual.ratio(key, real, want)
+		if key == "speed_stat" then
+			return math.max(2 - want, 0.01) / math.max(2 - real, 0.01)
+		end
+		return want / math.max(real, 0.01)
+	end
+	---The unit's lobby companion (the model that follows you; its hover card has the numbers).
+	function Visual.pet(uuid)
+		local character = workspace:FindFirstChild(localPlayer.Name)
+		local folder = character and character:FindFirstChild("_pets_folder")
+		return folder and folder:FindFirstChild(uuid) or nil
+	end
+	Visual.PET = { potency_stat = "_pet_damage", speed_stat = "_pet_cooldown", range_stat = "_pet_range" }
+	Visual.petReal = setmetatable({}, { __mode = "k" })
+	Visual.petSet = setmetatable({}, { __mode = "k" })
 	function Visual.load()
 		local ok, data = pcall(function()
 			return httpService:JSONDecode(readfile(Visual.FILE))
@@ -10786,6 +10804,33 @@ do
 				end
 			end
 		end
+		-- The companions in the lobby carry their own copy of the numbers (hover card).
+		for uuid, shown in pairs(Visual.saved) do
+			local pet = Visual.pet(uuid)
+			local orig = Visual.orig[uuid]
+			if pet and orig then
+				Visual.petReal[pet] = Visual.petReal[pet] or {}
+				Visual.petSet[pet] = Visual.petSet[pet] or {}
+				for _, stat in ipairs(Visual.STATS) do
+					local want, real = shown[stat.key], orig[stat.key]
+					local attribute = Visual.PET[stat.key]
+					local now = pet:GetAttribute(attribute)
+					if want and real and type(now) == "number" then
+						if now ~= Visual.petSet[pet][attribute] then
+							Visual.petReal[pet][attribute] = now -- the server's number
+						end
+						local value = Visual.petReal[pet][attribute] * Visual.ratio(stat.key, real, want)
+						Visual.petSet[pet][attribute] = value
+						if now ~= value then
+							pet:SetAttribute(attribute, value)
+						end
+						if pet:GetAttribute("_pet_" .. stat.key) ~= want then
+							pet:SetAttribute("_pet_" .. stat.key, want)
+						end
+					end
+				end
+			end
+		end
 		if IS_LOBBY then
 			return
 		end
@@ -10822,7 +10867,7 @@ do
 						if unit:GetAttribute(stat.key) ~= nil and unit:GetAttribute(stat.key) ~= want then
 							unit:SetAttribute(stat.key, want)
 						end
-						local ratio = want / real
+						local ratio = Visual.ratio(stat.key, real, want)
 						if stat.key == "potency_stat" then
 							show(stats:FindFirstChild("damage"), nil, ratio)
 							show(stats:FindFirstChild("base_damage"), nil, ratio)
@@ -10830,8 +10875,8 @@ do
 							show(stats:FindFirstChild("range"), nil, ratio)
 							show(stats:FindFirstChild("base_range"), nil, ratio)
 						else
-							show(stats:FindFirstChild("attack_cooldown"), nil, 1 / ratio)
-							show(stats:FindFirstChild("base_attack_cooldown"), nil, 1 / ratio)
+							show(stats:FindFirstChild("attack_cooldown"), nil, ratio)
+							show(stats:FindFirstChild("base_attack_cooldown"), nil, ratio)
 						end
 					end
 				end
@@ -10847,6 +10892,18 @@ do
 					unit.trait_stats[statKey] = value
 				end
 			end
+		end
+		local pet = Visual.pet(uuid)
+		if pet then
+			for attribute, value in pairs(Visual.petReal[pet] or {}) do
+				pet:SetAttribute(attribute, value)
+			end
+			for statKey, value in pairs(orig or {}) do
+				if pet:GetAttribute("_pet_" .. statKey) ~= nil then
+					pet:SetAttribute("_pet_" .. statKey, value)
+				end
+			end
+			Visual.petReal[pet], Visual.petSet[pet] = nil, nil
 		end
 		local folder = workspace:FindFirstChild("_UNITS")
 		for _, unit in ipairs(not IS_LOBBY and folder and folder:GetChildren() or {}) do
@@ -10909,12 +10966,24 @@ do
 				local extra = ""
 				local pick = draft[stat.key]
 				local value = pick and (1 + pick.percent / 100) or shown or real
-				if stat.key == "potency_stat" and (base.damage or 0) > 0 then
-					extra = ("\nLevel 0 damage %s -> %s"):format(tostring(math.floor(base.damage * real + 0.5)), tostring(math.floor(base.damage * value + 0.5)))
-				elseif stat.key == "range_stat" and (base.range or 0) > 0 then
-					extra = ("\nLevel 0 range %.1f -> %.1f"):format(base.range * real, base.range * value)
-				elseif stat.key == "speed_stat" and (base.cooldown or 0) > 0 then
-					extra = ("\nLevel 0 cooldown %.2fs -> %.2fs"):format(base.cooldown / real, base.cooldown / value)
+				-- The unit's own numbers when it is equipped (its companion carries them at its
+				-- real level and trait), else the level 0 numbers from the unit sheet.
+				local pet = Visual.pet(picked.uuid)
+				local attribute = Visual.PET[stat.key]
+				local actual = pet and ((Visual.petReal[pet] and Visual.petReal[pet][attribute]) or pet:GetAttribute(attribute))
+				local label = actual and "Now" or "Level 0"
+				if not actual then
+					actual = stat.key == "potency_stat" and (base.damage or 0) * real or stat.key == "range_stat" and (base.range or 0) * real or (base.cooldown or 0) * (2 - real)
+				end
+				local after = actual * Visual.ratio(stat.key, real, value)
+				if actual > 0 then
+					if stat.key == "potency_stat" then
+						extra = ("\n%s damage %s -> %s"):format(label, tostring(math.floor(actual + 0.5)), tostring(math.floor(after + 0.5)))
+					elseif stat.key == "range_stat" then
+						extra = ("\n%s range %.1f -> %.1f"):format(label, actual, after)
+					else
+						extra = ("\n%s cooldown %.2fs -> %.2fs"):format(label, actual, after)
+					end
 				end
 				line.Text = ("%s: really %s%s%s"):format(stat.name, describe(stat, real), shown and (", showing " .. describe(stat, shown)) or "", extra)
 			end
