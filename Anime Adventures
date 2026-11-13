@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v175", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v176", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -5136,6 +5136,12 @@ do
 			return
 		end
 		if truth <= 0.01 then
+			-- Gone before its time: logged with the stun flag (does a stun strip the buff?).
+			Conductor.losses = (Conductor.losses or 0) + 1
+			if record.ends - now > 1.5 and Conductor.losses <= 40 then
+				local flag = unit._stats:FindFirstChild("unit_stunned")
+				note("bufflost", { u = unit._stats.id.Value, left = math.floor(record.ends - now), stun = flag ~= nil and flag.Value == true or nil })
+			end
 			Conductor.active[unit][buff.name] = nil
 		elseif math.abs(record.rate - truth) > 0.05 and truth <= 1.01 then
 			record.rate = truth
@@ -5218,6 +5224,13 @@ do
 				-- went through, and a main that didn't cast must not hold the supports back.)
 				if (Conductor.readyAt[unit] or 0) < os.clock() + 0.3 then
 					Conductor.readyAt[unit] = os.clock() + 0.3
+				end
+				-- (Logged with the stun flag: the user's reading is that Explosive Deaths stuns
+				-- break the buff. A stunned caster that can't cast would show up here.)
+				Conductor.refusals = (Conductor.refusals or 0) + 1
+				if Conductor.refusals <= 40 and unit.Parent then
+					local flag = unit._stats:FindFirstChild("unit_stunned")
+					note("castfail", { u = unit._stats.id.Value, r = role, stun = flag ~= nil and flag.Value == true or nil })
 				end
 				if role == "main" and Conductor.lastMain[name] == stamp then
 					Conductor.lastMain[name] = lastMainBefore
