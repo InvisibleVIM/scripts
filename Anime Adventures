@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v169", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v170", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -1770,6 +1770,12 @@ local function buildSpots()
 		table.insert(filter, roadModel)
 	end
 	params.FilterDescendantsInstances = filter
+	-- Under a prop the server still wants headroom: under a building's upper floor 4.7 studs
+	-- up it placed the unit, under a rock mesh 0.9 studs up it refused. A covered spot counts
+	-- only with 4 clear studs above it (and not when it sits inside the prop).
+	local anything = RaycastParams.new()
+	anything.FilterType = Enum.RaycastFilterType.Include
+	anything.FilterDescendantsInstances = roadModel and { terrain, roadModel } or { terrain }
 
 	local minX, maxX, minZ, maxZ, topY = math.huge, -math.huge, math.huge, -math.huge, -math.huge
 	for _, point in ipairs(points) do
@@ -1798,6 +1804,15 @@ local function buildSpots()
 			end
 			if onRoad and (nearest >= 1.4 or Config.RoadSpots) then
 				local hit = workspace:Raycast(Vector3.new(x, topY + 80, z), Vector3.new(0, -200, 0), params)
+				if hit and hit.Normal.Y > 0.6 and hit.Instance.Name ~= "_donotplace" then
+					local top = workspace:Raycast(Vector3.new(x, topY + 80, z), Vector3.new(0, -200, 0), anything)
+					if top and top.Position.Y > hit.Position.Y + 0.5 then
+						local above = workspace:Raycast(hit.Position + Vector3.new(0, 0.2, 0), Vector3.new(0, 80, 0), anything)
+						if not above or above.Position.Y < hit.Position.Y + 4 then
+							hit = nil
+						end
+					end
+				end
 				if hit and hit.Normal.Y > 0.6 and hit.Instance.Name ~= "_donotplace" then
 					local spot = { position = hit.Position, gap = nearest, progress = onRoad.progress, lane = onRoad.lane }
 					if ground and hit.Instance:IsDescendantOf(ground) then
