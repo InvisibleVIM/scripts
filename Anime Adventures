@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v171", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v172", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -163,6 +163,10 @@ local Config = {
 	PinnedUnits = "",
 	AutoCards = true,
 	CardMode = "Balanced",
+	CardListOn = false,
+	CardList = "[]",
+	CardAddName = "",
+	OpeningCore = true,
 	ChallengeFallback = "Story",
 	Otherwise = "None",
 	QuestDaily = true,
@@ -4081,6 +4085,39 @@ local function planAction()
 			end
 		end
 	end
+	if Config.OpeningCore and Config.AutoPlace and not Match.openingDone and not danger and not deep and not AA.killsMode() then
+		-- The opening: the farm and two copies of the team's strongest damage unit before
+		-- anything else is placed or upgraded (user: "2 Elyssias and a Bulma first, after that
+		-- whatever is best"). Which unit that is comes from the same power number the line-up
+		-- is picked by, so another team opens with its own carry.
+		local core, corePower
+		for _, entry in ipairs(equipped) do
+			local data = entry.data
+			if data.cost and not AA.buffInfo(data) and unitStatsAt(data, data.upgrade and #data.upgrade or 0).farm <= 0 then
+				local power = unitPower(entry.id, entry.unit) or 0
+				if power > (corePower or 0) then
+					core, corePower = entry, power
+				end
+			end
+		end
+		local want = core and math.min(2, placeCap(core.data)) or 0
+		local set = {}
+		for _, option in ipairs(options) do
+			if option.kind == "place" then
+				local data = option.entry.data
+				local farm = unitStatsAt(data, data.upgrade and #data.upgrade or 0).farm > 0
+				if (farm and (placed[option.entry.id] or 0) == 0) or (core and option.entry.id == core.id and (placed[core.id] or 0) < want) then
+					table.insert(set, option)
+				end
+			end
+		end
+		if #set > 0 then
+			options = set
+		elseif not core or (placed[core.id] or 0) >= want then
+			Match.openingDone = true
+			note("openingDone", { core = core and core.id, cash = math.floor(money) })
+		end
+	end
 	table.sort(options, function(x, y)
 		return x.score > y.score
 	end)
@@ -6060,7 +6097,7 @@ local function resetMatch()
 	Match.voteNoted = nil
 	Match.shieldHits, Match.shieldAt, Match.shieldMode = nil, nil, nil
 	Match.enemyMedian, Match.tankNoted, Match.shieldOn, Match.blesserId = nil, nil, nil, nil
-	Match.soaring, Match.spotScore = nil, nil
+	Match.soaring, Match.spotScore, Match.openingDone = nil, nil, nil
 	Match.seenWave, Match.seenEnemies, Match.seenHealths = nil, nil, nil
 	Match.live, Match.liveAt, Match.laneDepth, Match.lanesNoted = nil, nil, nil, nil
 	AA.Macro.reset()
@@ -8718,6 +8755,78 @@ function CardBrain.score(option, state)
 	return power, reward, candy
 end
 
+-- The user's own order of cards. A card is known by its name without the tier ("+ Enemy
+-- Health III" -> "+ Enemy Health") and without the little picture some names start with.
+CardBrain.FAMILIES = {
+	{ "+ Attack", true }, { "+ Range", true }, { "- Cooldown", true }, { "- Active Cooldown", true }, { "+ Boss Damage", true },
+	{ "+ Double Attack, Double Cooldown", true }, { "+ Yen", true }, { "Leyline", true }, { "Mana Surge", true }, { "Dispel", true },
+	{ "Cinders", true }, { "Mud", true }, { "Rain Barrel", true },
+	{ "+ Enemy Health", false }, { "+ Enemy Speed", false }, { "+ Enemy Regen", false }, { "+ Enemy Shield", false },
+	{ "+ Explosive Deaths", false }, { "+ Plated Enemies", false }, { "+ Resistant Enemies", false }, { "+ Spellproof Enemies", false },
+	{ "Arcane Storm", false }, { "Arcane Ward", false }, { "Mana Shield", false }, { "Flash Flood", false }, { "Heatwave", false },
+	{ "Phoenix", false }, { "Scorch", false }, { "Torrent", false }, { "Washout", false },
+}
+function CardBrain.family(title)
+	local name = tostring(title):gsub("[\128-\255]+", ""):gsub("%s+I+$", ""):gsub("^%s+", ""):gsub("%s+$", "")
+	return name
+end
+---Every card name the script knows: the list above plus anything a vote has shown since.
+function CardBrain.families()
+	local names, seen, good = {}, {}, {}
+	for _, row in ipairs(CardBrain.FAMILIES) do
+		table.insert(names, row[1])
+		seen[row[1]], good[row[1]] = true, row[2]
+	end
+	for title, option in pairs(CardBrain.pool) do
+		local name = CardBrain.family(title)
+		if name ~= "" and not seen[name] then
+			table.insert(names, name)
+			seen[name], good[name] = true, option.option_type == "Good"
+		end
+	end
+	return names, good
+end
+function CardBrain.list()
+	if CardBrain.listText ~= Config.CardList then
+		local ok, list = pcall(function()
+			return httpService:JSONDecode(Config.CardList)
+		end)
+		local clean = {}
+		for _, name in ipairs(ok and type(list) == "table" and list or {}) do
+			if type(name) == "string" and not table.find(clean, name) then
+				table.insert(clean, name)
+			end
+		end
+		CardBrain.listText, CardBrain.listCache = Config.CardList, clean
+	end
+	return CardBrain.listCache
+end
+function CardBrain.setList(list)
+	Config.CardList = httpService:JSONEncode(list)
+end
+---The offered card that stands highest on the user's list (of two tiers of the same card, the
+---one the script itself rates higher), or nil when none of them is on it.
+function CardBrain.listed(options, values)
+	if not Config.CardListOn then
+		return nil
+	end
+	for rank, name in ipairs(CardBrain.list()) do
+		local best, bestValue
+		for key, option in pairs(options) do
+			if type(option) == "table" and CardBrain.family(option.title) == name then
+				local value = values and values[key] or 0
+				if not bestValue or value > bestValue then
+					best, bestValue = key, value
+				end
+			end
+		end
+		if best ~= nil then
+			return best, rank
+		end
+	end
+	return nil
+end
+
 function CardBrain.choose(options)
 	local state = CardBrain.state()
 	local health, maxHealth = baseHealth()
@@ -8765,6 +8874,7 @@ function CardBrain.choose(options)
 		Match.cardPower = stacked
 	end
 	local best, bestValue, report = nil, -math.huge, {}
+	local values = {}
 	for key, option in pairs(options) do
 		local power, reward, candy = CardBrain.score(option, state)
 		-- The multiplier only pays on the waves still to come: +1.5 at wave 47 of 50 is three
@@ -8776,9 +8886,16 @@ function CardBrain.choose(options)
 			value -= 10
 		end
 		table.insert(report, string.format("%s p%.2f r%.2f v%.2f", tostring(option.title), power, reward, value))
+		values[key] = value
 		if value > bestValue then
 			best, bestValue = key, value
 		end
+	end
+	-- The user's list decides when one of the offered cards is on it; otherwise the scores do.
+	local listed, rank = CardBrain.listed(options, values)
+	if listed ~= nil then
+		best = listed
+		table.insert(report, "my list #" .. rank)
 	end
 	return best, report, comfortable, danger, unproven
 end
@@ -12220,6 +12337,8 @@ do
 	toggle(page, "Daily with others: all units at the front", "DailyFront")
 	hint(page, "In a Daily Challenge with other players in the server, the whole team goes to the very start of the road, and units already standing further back are sold and placed again there (one at a time, when the cash covers rebuilding it: a sale only refunds 25%).")
 	toggle(page, "Farm units first", "FarmFirst")
+	toggle(page, "Open with the farm and two of my strongest unit", "OpeningCore")
+	hint(page, "The farm and two copies of the unit that deals the most on your team (Elyssia on the current one) go down before anything else is placed or upgraded. After that the script buys whatever is best. Skipped when enemies are already breaking through.")
 	toggle(page, "Auto use unit abilities", "AutoAbility")
 	hint(page, "Buff units (Windsong, Commander): four copies in each other's range, cast in a timed chain that holds +100% damage on everything of their type nearby")
 	segmented(page, "Astral spells", "SpellMode", { "Off", "Safe", "All" })
@@ -12230,6 +12349,73 @@ do
 	toggle(page, "Auto pick cards", "AutoCards")
 	segmented(page, "", "CardMode", { "Safe", "Balanced", "Pearls" })
 	hint(page, "Safe: always the card that keeps the team strongest. Balanced: the same until the stage has been cleared once, then challenge cards for more pearls while the run is comfortable. Pearls: challenge cards from the start.")
+	do
+		local CardBrain = AA.CardBrain
+		local listLine
+		local function showList()
+			if not listLine then
+				return
+			end
+			local _, good = CardBrain.families()
+			local lines = {}
+			for index, name in ipairs(CardBrain.list()) do
+				table.insert(lines, index .. ". " .. name .. (good[name] == false and "  (curse)" or ""))
+			end
+			listLine.Text = #lines == 0 and "Your list is empty." or table.concat(lines, "\n")
+		end
+		local function unlisted()
+			local names = {}
+			local list = CardBrain.list()
+			for _, name in ipairs((CardBrain.families())) do
+				if not table.find(list, name) then
+					table.insert(names, name)
+				end
+			end
+			return names
+		end
+		local function add(position)
+			local name = Config.CardAddName
+			local list = table.clone(CardBrain.list())
+			if name == "" or table.find(list, name) or not table.find((CardBrain.families()), name) then
+				return
+			end
+			table.insert(list, position and math.min(position, #list + 1) or #list + 1, name)
+			CardBrain.setList(list)
+			Config.CardAddName = unlisted()[1] or ""
+			for _, refresh in ipairs(UI.refreshers) do
+				pcall(refresh)
+			end
+			showList()
+		end
+		toggle(page, "Use my card order", "CardListOn")
+		hint(page, "At every vote the script takes the offered card that stands highest on your list, whatever the mode above says and however the run is going. When none of the offered cards is on it, the script decides as usual. Tiers count as the same card. Curses are marked: they are the ones that pay pearls.")
+		UI.dropdown(page, "Card", unlisted, function()
+			local names = unlisted()
+			if not table.find(names, Config.CardAddName) then
+				Config.CardAddName = names[1] or ""
+			end
+			return Config.CardAddName ~= "" and Config.CardAddName or "--"
+		end, function(option)
+			Config.CardAddName = option
+		end)
+		UI.buttonPair(page, "Add to the end", function()
+			add()
+		end, "Add to the top", function()
+			add(1)
+		end)
+		UI.buttonPair(page, "Remove last", function()
+			local list = table.clone(CardBrain.list())
+			table.remove(list)
+			CardBrain.setList(list)
+			showList()
+		end, "Clear list", function()
+			CardBrain.setList({})
+			showList()
+		end)
+		listLine = infoLine(page, 22)
+		listLine.TextYAlignment = Enum.TextYAlignment.Top
+		showList()
+	end
 	local cardLine = infoLine(page, 46)
 	task.spawn(function()
 		while AA.alive do
