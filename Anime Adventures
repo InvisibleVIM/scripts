@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v165", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v166", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -1098,8 +1098,22 @@ local function buildPath()
 	local bases = workspace:FindFirstChild("_BASES")
 	local lanes = bases and bases:FindFirstChild("pve") and bases.pve:FindFirstChild("LANES")
 	local laneCount = 0
-	for _, lane in ipairs(lanes and lanes:GetChildren() or {}) do
+	local laneList = lanes and lanes:GetChildren() or {}
+	table.sort(laneList, function(a, b)
+		return (tonumber(a.Name) or math.huge) < (tonumber(b.Name) or math.huge)
+	end)
+	Match.laneNames = {}
+	for _, lane in ipairs(laneList) do
+		-- The game's own path (PathService._setup_lane): "spawn", then the numbered bends, then
+		-- "final". Only the numbered bends used to be read, so every road was missing its first
+		-- and last stretch, and on maps whose roads share only that last stretch (Sky Island:
+		-- three roads, one base) an enemy at "99%" still had the walk to the base ahead of it.
+		-- "boss1" is a mock lane the game hides.
+		if lane.Name == "boss1" then
+			continue
+		end
 		laneCount += 1
+		Match.laneNames[laneCount] = lane.Name
 		local nodes = {}
 		for _, node in ipairs(lane:GetChildren()) do
 			if tonumber(node.Name) and node:IsA("BasePart") then
@@ -1109,6 +1123,13 @@ local function buildPath()
 		table.sort(nodes, function(a, b)
 			return tonumber(a.Name) < tonumber(b.Name)
 		end)
+		local first, last = lane:FindFirstChild("spawn"), lane:FindFirstChild("final")
+		if first and first:IsA("BasePart") then
+			table.insert(nodes, 1, first)
+		end
+		if last and last:IsA("BasePart") then
+			table.insert(nodes, last)
+		end
 		local total = 0
 		for i = 2, #nodes do
 			total += (nodes[i].Position - nodes[i - 1].Position).Magnitude
@@ -1573,6 +1594,73 @@ end
 ---Per stage AND map: Summer Hunt is played on a different map each run and the roads differ.
 function AA.depthKey()
 	return AA.leakKey() .. "@" .. tostring((Match.levelData or {}).map or "")
+end
+---Is this road in use right now? (Some maps open their extra roads during the match: the game
+---keeps the closed ones in workspace._DATA "closed_lanes" as a list of lane names.)
+function AA.laneOpen(lane)
+	local data = workspace:FindFirstChild("_DATA")
+	local closed = data and data:GetAttribute("closed_lanes")
+	if type(closed) ~= "string" or closed == "" then
+		return true
+	end
+	local name = tostring(Match.laneNames and Match.laneNames[lane] or lane)
+	for entry in closed:gmatch("[^,]+") do
+		if entry == name then
+			return false
+		end
+	end
+	return true
+end
+---How much a stretch of each road is worth to the next unit, on maps with two or three roads.
+---A road counts for more the deeper its enemies have been getting (that is where the team, other
+---players included, is short) and the fewer of my damage units already reach it; a closed road
+---counts for little until it opens. Returns weights by lane and the number of open roads.
+function AA.laneWeights(towers)
+	local count = Match.laneCount or 1
+	local weights, open = {}, 0
+	if count <= 1 then
+		return { 1 }, 1
+	end
+	local have, total = {}, 0
+	for lane = 1, count do
+		have[lane] = 0
+	end
+	for _, unit in ipairs(towers or {}) do
+		local unitStats = unit:FindFirstChild("_stats")
+		local range, damage = unitStats and unitStats:FindFirstChild("range"), unitStats and unitStats:FindFirstChild("damage")
+		if range and damage and (AA.rv(damage) > 0 or AA.isSummoner(unitStats.id.Value)) then
+			local position, reach = unit:GetPivot().Position, AA.rv(range)
+			local seen = {}
+			for _, point in ipairs(Match.pathPoints) do
+				if not seen[point.lane] then
+					local dx, dz = point.position.X - position.X, point.position.Z - position.Z
+					if dx * dx + dz * dz <= reach * reach then
+						seen[point.lane] = true
+						have[point.lane] += 1
+						total += 1
+					end
+				end
+			end
+		end
+	end
+	local wave = workspace:FindFirstChild("_wave_num") and workspace._wave_num.Value or 0
+	for lane = 1, count do
+		if AA.laneOpen(lane) then
+			open += 1
+			local depth = 0.4
+			local seen = Match.laneDepth and Match.laneDepth[lane]
+			if seen then
+				depth = 0
+				for w = wave - 2, wave do
+					depth = math.max(depth, seen[w] or 0)
+				end
+			end
+			weights[lane] = (0.5 + depth) * math.clamp((total / count + 1) / (have[lane] + 1), 0.5, 2.5)
+		else
+			weights[lane] = 0.15
+		end
+	end
+	return weights, math.max(open, 1)
 end
 ---The stretch of a road where enemies are meant to die in a fast match: from its spawn to where
 ---they have been dying, stretched to the first junction on maps with several roads.
@@ -2632,6 +2720,7 @@ local function bestSpot(data, focus)
 		local range = math.max(unitStatsAt(data, 0).range * 0.8, 6)
 		local best, bestScore = nil, -math.huge
 		local band = Match.pace ~= "speed" and AA.fightBand() or nil
+		local summonLanes = (Match.laneCount or 1) > 1 and AA.laneWeights(myUnits()) or nil
 		for _, list in ipairs(pool) do
 			for _, spot in ipairs(list) do
 				local p = spot.position
@@ -2653,6 +2742,11 @@ local function bestSpot(data, focus)
 						-- In long matches: just past where enemies usually die (never past 60%).
 						local aim = Match.pace == "speed" and (Match.laneJunction and Match.laneJunction[spot.lane] or 0.02) or (band and math.clamp(band + 0.1, 0.3, 0.6) or 0.6)
 						local score = -math.abs(progress - aim) * 10 + math.min(spot.gap, range) * (Match.pace == "speed" and -0.05 or 0.1)
+						if summonLanes then
+							-- Her summons work the road she stands on: the road that needs it most,
+							-- never one that is still closed.
+							score += ((summonLanes[spot.lane] or 1) - 1) * 3
+						end
 
 						if score > bestScore then
 							best, bestScore = spot, score
@@ -2690,6 +2784,10 @@ local function bestSpot(data, focus)
 	-- the road for its bends dealt nothing for eleven waves while everything died before 31%.
 	-- (Known after six waves, or from the last run on this stage and map; nil = no idea yet.)
 	local reachBand = not focus and Match.pace ~= "speed" and AA.fightBand() or nil
+	local laneWeight, openLanes = nil, Match.laneCount or 1
+	if (Match.laneCount or 1) > 1 then
+		laneWeight, openLanes = AA.laneWeights(myUnits())
+	end
 	local checked, sliceStart = 0, os.clock()
 	-- Big maps (thousands of spots): every third spot first, then every spot around the best
 	-- one. (The Holy Warlord has 6,600 ground spots; scoring all of them stalled the opening.)
@@ -2737,7 +2835,7 @@ local function bestSpot(data, focus)
 					local nearby = {}
 					local lanesSeen, lanesReached = {}, 0
 					pathWithin(p.X, p.Z, reach, function(point, dx, dz, d2)
-						if point.lane and not lanesSeen[point.lane] and d2 <= minReach * minReach then
+						if point.lane and not lanesSeen[point.lane] and d2 <= minReach * minReach and (not laneWeight or (laneWeight[point.lane] or 1) > 0.2) then
 							lanesSeen[point.lane] = true
 							lanesReached += 1
 						end
@@ -2758,6 +2856,9 @@ local function bestSpot(data, focus)
 								weight = 1 + (1 - point.progress) * 0.6
 							else
 								weight = 1 + point.progress * 0.6
+							end
+							if laneWeight and not focus then
+								weight *= laneWeight[point.lane] or 1
 							end
 							if reachBand and point.progress > reachBand + 0.05 then
 								-- Later waves do get deeper, so it fades instead of cutting off:
@@ -2781,10 +2882,10 @@ local function bestSpot(data, focus)
 						-- hundred free spots in the first 5%.)
 						score = 1000 * (1 - (spot.progress or 0)) - spot.gap
 					end
-					if (Match.laneCount or 1) > 1 and score > 0 and not focus then
+					if openLanes > 1 and score > 0 and not focus then
 						-- Several roads: a spot that reaches all of them is worth far more than one
 						-- that leaves a road's enemies to walk past untouched.
-						score *= 1 + 0.6 * (lanesReached - 1) / (Match.laneCount - 1)
+						score *= 1 + 0.6 * math.max(lanesReached - 1, 0) / (openLanes - 1)
 					end
 					if clusterAt and score > 0 then
 						-- Long modes: keep damage units together so one buffer / aura covers them all.
@@ -5302,7 +5403,7 @@ local function resetMatch()
 	Match.shieldHits, Match.shieldAt, Match.shieldMode = nil, nil, nil
 	Match.enemyMedian, Match.tankNoted, Match.shieldOn, Match.blesserId = nil, nil, nil, nil
 	Match.seenWave, Match.seenEnemies, Match.seenHealths = nil, nil, nil
-	Match.live, Match.liveAt = nil, nil
+	Match.live, Match.liveAt, Match.laneDepth, Match.lanesNoted = nil, nil, nil, nil
 	AA.Macro.reset()
 	Match.missionOpen, Match.leftLogged, Match.finishedSince, Match.frontForced = nil, nil, nil, nil
 	Match.orderSkip, Match.orderStep, Match.ritualAt, Match.skipHeld = nil, nil, nil, nil
@@ -5458,6 +5559,12 @@ local function matchLoop()
 					local votes = data and data:FindFirstChild("VoteStart") and data.VoteStart:FindFirstChild("Votes")
 					if not Match.voteNoted then
 						Match.voteNoted = true
+						pcall(function()
+							if (Match.laneCount or 1) > 1 then
+								local closed = workspace._DATA:GetAttribute("closed_lanes")
+								note("lanes", { n = Match.laneCount, names = table.concat(Match.laneNames or {}, ","), closed = tostring(closed or "") })
+							end
+						end)
 						-- Where the player stands on the road at the start (click macros place
 						-- around that point): logged to compare with where the units end up.
 						pcall(function()
@@ -8031,7 +8138,15 @@ local function measureLoop()
 		for _, enemy in ipairs(field.enemies) do
 			local position = enemy:GetPivot().Position
 			table.insert(enemies, position)
-			deepest = math.max(deepest, pathProgress(position))
+			local onRoad = nearestPath(position)
+			local reached = onRoad and onRoad.progress or 0
+			deepest = math.max(deepest, reached)
+			if onRoad and onRoad.lane and (Match.laneCount or 1) > 1 then
+				local wave = currentWave()
+				Match.laneDepth = Match.laneDepth or {}
+				Match.laneDepth[onRoad.lane] = Match.laneDepth[onRoad.lane] or {}
+				Match.laneDepth[onRoad.lane][wave] = math.max(Match.laneDepth[onRoad.lane][wave] or 0, reached)
+			end
 		end
 		-- How far down the road enemies get each wave: the kill margin the card picker reads.
 		local wave = currentWave()
