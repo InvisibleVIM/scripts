@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v182", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v183", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -5255,6 +5255,14 @@ do
 		if Conductor.pending[unit] and os.clock() - Conductor.pending[unit] < 1 then
 			return false
 		end
+		-- A stunned unit can't cast: the server refuses it. (Measured after Explosive Deaths III
+		-- was picked at wave 47: twelve refused casts in three waves, every one on a stunned
+		-- Elfy. The buffs units already carry are not touched by a stun.) Skipping it lets
+		-- another buffed copy in the damage take the cast instead of asking again and again.
+		local stunned = unit._stats:FindFirstChild("unit_stunned")
+		if stunned and (stunned.Value == true or (tonumber(stunned.Value) or 0) > 0) then
+			return false
+		end
 		local known = Conductor.readyAt[unit]
 		if known then
 			return os.clock() >= known
@@ -5743,7 +5751,11 @@ do
 				-- (Twelve seconds: the second copy came 8 s after the first when cash was short,
 				-- the first had cast at 4 s, and the team sat at +50% for 30 s instead of waiting
 				-- 4 s more for the full buff.)
-				local building = #group.units == 1 and wanted >= 2 and now - newest < 12
+				-- (And while the planner is saving for the second copy, up to 45 s: on a slow start
+				-- it came 25 s later and the first three casts of the match were half strength.)
+				local unitId = group.units[1]._stats.id.Value
+				local saving = type(Match.savingFor) == "string" and Match.savingFor:find(unitId, 1, true) ~= nil
+				local building = #group.units == 1 and wanted >= 2 and now - newest < (saving and 45 or 12)
 				if not building then
 					local pick, soon = nil, false
 					for _, unit in ipairs(mains) do
