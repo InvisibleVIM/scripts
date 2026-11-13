@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v142", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v143", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 AA.realValues = setmetatable({}, { __mode = "k" })
@@ -10645,9 +10645,14 @@ end
 ---that span (S- from 90% of it, S 92.5%, S+ 95%, SS 97.5%, SSS only at the very top).
 AA.Visual = {
 	STATS = {
-		{ key = "potency_stat", name = "Damage", min = 0.9, max = 1.2 },
-		{ key = "speed_stat", name = "Cooldown", min = 0.95, max = 1.1 },
-		{ key = "range_stat", name = "Range", min = 0.95, max = 1.1 },
+		-- max = the top of a normal roll (from the game's code). over = how far SSS may be typed
+		-- above it: units above the roll cap exist (a user screenshot shows SSS at +27.0% damage
+		-- and +10.9% cooldown, and the game calls anything at or over the cap SSS), but the
+		-- client holds no rule for how they get there or where it stops. 30% is the figure the
+		-- user had heard; 15% for the other two keeps the same 2:1 ratio. Not from game code.
+		{ key = "potency_stat", name = "Damage", min = 0.9, max = 1.2, over = 1.3 },
+		{ key = "speed_stat", name = "Cooldown", min = 0.95, max = 1.1, over = 1.15 },
+		{ key = "range_stat", name = "Range", min = 0.95, max = 1.1, over = 1.15 },
 	},
 	GRADES = { "C-", "C", "C+", "B-", "B", "B+", "A-", "A", "A+", "S-", "S", "S+", "SS", "SSS" },
 	FROM = { 0, 1 / 9, 2 / 9, 1 / 3, 4 / 9, 5 / 9, 2 / 3, 2 / 3 + 0.7 / 9, 2 / 3 + 1.4 / 9, 0.9, 0.925, 0.95, 0.975, 1 },
@@ -10684,7 +10689,7 @@ do
 	function Visual.gradeSpan(stat, grade)
 		local index = table.find(Visual.GRADES, grade) or #Visual.GRADES
 		if index == #Visual.GRADES then
-			return stat.max, stat.max
+			return stat.max, stat.over or stat.max
 		end
 		local span = stat.max - stat.min
 		local low = stat.min + span * Visual.FROM[index]
@@ -10945,8 +10950,10 @@ do
 			return draft[stat.key] and draft[stat.key].grade or "--"
 		end, function(option)
 			local low, high = Visual.gradeSpan(stat, option)
-			-- A letter starts at the top of its span; the box below takes any value inside it.
-			draft[stat.key] = { grade = option, percent = math.floor(Visual.percent(high) * 100 + 0.5) / 100 }
+			-- A letter starts at the top of its span (SSS at the normal roll cap); the box below
+			-- takes any value inside it.
+			local start = option == "SSS" and stat.max or high
+			draft[stat.key] = { grade = option, percent = math.floor(Visual.percent(start) * 100 + 0.5) / 100 }
 			boxes[stat.key].Text = ("%.2f"):format(draft[stat.key].percent)
 			boxes[stat.key].PlaceholderText = ("%+.2f to %+.2f"):format(Visual.percent(low), Visual.percent(high))
 			showUnit()
@@ -10963,7 +10970,7 @@ do
 				showUnit()
 			end
 		end)
-		hint(page, ("The game rolls %s between %+.0f%% and %+.0f%%. SSS is exactly %+.0f%%; every other letter is a slice below it, and the box only takes values inside the letter you picked."):format(stat.name, Visual.percent(stat.min), Visual.percent(stat.max), Visual.percent(stat.max)))
+		hint(page, ("A normal roll of %s is between %+.0f%% and %+.0f%%, and SSS starts at %+.0f%%. Units above that exist in the game and still read SSS, so SSS takes up to %+.0f%% here; every other letter is a slice below the cap, and the box only takes values inside the letter you picked."):format(stat.name, Visual.percent(stat.min), Visual.percent(stat.max), Visual.percent(stat.max), Visual.percent(stat.over)))
 	end
 	heading(page, "Apply", "right")
 	UI.buttonPair(page, "Apply", function()
