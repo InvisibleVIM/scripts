@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v159", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v163", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -434,6 +434,7 @@ do
 	end
 	if IS_LOBBY then
 		local RawUnits, RawAttacks, merged = Units, Attacks, {}
+		AA.RawUnits = RawUnits -- (the proxy below is empty to pairs)
 		Units = setmetatable({}, {
 			__index = function(_, id)
 				local raw = RawUnits[id]
@@ -1429,6 +1430,7 @@ function AA.ritualPayable(data, level, money, left)
 	for target = math.max(level, 0) + 1, data.upgrade and #data.upgrade or 0 do
 		cost += data.upgrade[target].cost or 0
 	end
+	cost *= AA.costScale and AA.costScale() or 1
 	local elapsed = os.clock() - (Match.startedAt or os.clock())
 	local perWave = math.clamp(elapsed / math.max(currentWave(), 1), 15, 60)
 	return (money or 0) + (Match.incomeRate or 0) * perWave * (left or 0) * 0.8 >= cost
@@ -1565,8 +1567,12 @@ function AA.fightBand()
 		table.sort(list)
 		return list[math.ceil(#list * 0.8)]
 	end
-	local saved = type(AA.progress.depths) == "table" and AA.progress.depths[AA.leakKey()]
+	local saved = type(AA.progress.depths) == "table" and AA.progress.depths[AA.depthKey()]
 	return tonumber(saved)
+end
+---Per stage AND map: Summer Hunt is played on a different map each run and the roads differ.
+function AA.depthKey()
+	return AA.leakKey() .. "@" .. tostring((Match.levelData or {}).map or "")
 end
 ---The stretch of a road where enemies are meant to die in a fast match: from its spawn to where
 ---they have been dying, stretched to the first junction on maps with several roads.
@@ -1859,6 +1865,7 @@ local function costScale()
 	local value = mods and mods:FindFirstChild("player_cost_scale")
 	return value and tonumber(value.Value) or 1
 end
+AA.costScale = costScale
 
 ---What placing this equipped copy costs right now.
 local function spawnCost(entry)
@@ -2020,8 +2027,69 @@ do
 		return data and (data._base_damage_type == "water" or (type(data._secondary_damage_types) == "table" and data._secondary_damage_types.water_damage == true))
 	end
 	---{ pct, matches(id, data), coverage } for units whose value is what they add to others.
+	---What the server says each equipped unit's passives and actives do (the same text the game
+	---shows on the unit card), kept per unit id. This is the only place a unit's passive exists
+	---on the client: the unit sheet has none of it. An unevolved unit whose passive is locked
+	---comes back with no description at all (Water Goddess: { locked = "evolve" }).
+	function AA.fetchPassives()
+		local function clean(list)
+			local out = {}
+			for _, entry in ipairs(type(list) == "table" and list or {}) do
+				if type(entry) == "table" and type(entry.description) == "string" then
+					table.insert(out, (entry.description:gsub("<[^>]+>", "")))
+				end
+			end
+			return out
+		end
+		AA.progress.passives = type(AA.progress.passives) == "table" and AA.progress.passives or {}
+		local changed = false
+		for _, entry in ipairs(equippedUnits()) do
+			if not (AA.passivesAt and AA.passivesAt[entry.id]) then
+				local ok, result = invoke("get_unit_passives", entry.uuid)
+				if ok and type(result) == "table" and type(result.passives) == "table" then
+					AA.passivesAt = AA.passivesAt or {}
+					AA.passivesAt[entry.id] = true
+					local fresh = { p = clean(result.passives), a = clean(result.actives) }
+					local old = AA.progress.passives[entry.id]
+					if type(old) ~= "table" or httpService:JSONEncode(old) ~= httpService:JSONEncode(fresh) then
+						AA.progress.passives[entry.id] = fresh
+						changed = true
+						note("passives", { u = entry.id, p = table.concat(fresh.p, " / "):sub(1, 300), a = table.concat(fresh.a, " / "):sub(1, 200) })
+					end
+				end
+			end
+		end
+		if changed then
+			AA.saveProgress()
+		end
+	end
 	function AA.synergyInfo(id)
-		local base = tostring(id):gsub("_evolved$", "")
+		-- From the unit's own passive text, whatever unit it is.
+		local known = type(AA.progress.passives) == "table" and AA.progress.passives[id]
+		if type(known) == "table" then
+			for _, text in ipairs(type(known.p) == "table" and known.p or {}) do
+				local lower = tostring(text):lower()
+				local pct = tonumber(lower:match("attack by (%d+)%%") or lower:match("damage by (%d+)%%"))
+				if pct and lower:find("minion", 1, true) and lower:find("summon", 1, true) then
+					-- "Whenever another minion is summoned, this unit buffs that minion's ... Attack by N%"
+					return { pct = pct / 100, stacks = lower:find("stack", 1, true) ~= nil, coverage = 1, matches = function(otherId, otherData)
+						return AA.isSummoner(otherId) or AA.ritualUnit(otherData or Units[otherId])
+					end }
+				end
+				local auraPct, auraType = lower:match("%+(%d+)%% {?([%a_]*)}? ?damage")
+				if tonumber(auraPct) and (lower:find("allies", 1, true) or lower:find("ally", 1, true)) and (lower:find("in range", 1, true) or lower:find("in its range", 1, true) or lower:find("nearby", 1, true)) and not lower:find(" for %d+ ?s") then
+					-- "Allies in range deal +N% {type} damage" with no duration: a standing aura.
+					local kind = auraType ~= "" and auraType or nil
+					return { pct = tonumber(auraPct) / 100, coverage = 0.6, matches = function(_, otherData)
+						if not kind or not otherData then
+							return otherData ~= nil
+						end
+						return otherData._base_damage_type == kind or (type(otherData._secondary_damage_types) == "table" and (otherData._secondary_damage_types[kind] == true or otherData._secondary_damage_types[kind .. "_damage"] == true))
+					end }
+				end
+			end
+			return nil
+		end
 		if id == "giselle_evolved" then
 			-- Undead Blessing (Zombie (Risen) only; plain Zombie has no passive): "Whenever another
 			-- minion is summoned, this unit buffs that minion's Health and Attack by 25%, and Range
@@ -2030,11 +2098,10 @@ do
 			return { pct = 0.25, stacks = true, coverage = 1, matches = function(otherId, otherData)
 				return AA.isSummoner(otherId) or AA.ritualUnit(otherData or Units[otherId])
 			end }
-		elseif base == "aqua" then
-			return { pct = 0.5, coverage = 0.6, matches = function(_, otherData)
-				return water(otherData)
-			end }
 		end
+		-- (Water Goddess used to be given a +50% Water aura here from a guide. The server says
+		-- the unevolved one has no passive at all, and Elyssia standing inside four of them never
+		-- carried a water buff: she is a plain damage unit until evolved.)
 		return nil
 	end
 end
@@ -2183,7 +2250,17 @@ function AA.shieldMode(towers)
 		-- Nothing measured yet: a shield challenge is treated as one until the numbers say otherwise.
 		return true
 	end
-	return count >= median / (total / n)
+	-- Latched: the reading sits right on the line in some matches (five shields against enemies
+	-- worth five hits) and the planner was switched between its two ways of scoring every second.
+	local ratio = count / math.max(median / (total / n), 1e-6)
+	if Match.shieldOn == nil then
+		Match.shieldOn = ratio >= 1
+	elseif Match.shieldOn and ratio < 0.7 then
+		Match.shieldOn = false
+	elseif not Match.shieldOn and ratio > 1.4 then
+		Match.shieldOn = true
+	end
+	return Match.shieldOn
 end
 local function unitPower(id, unit)
 	local data = Units[id]
@@ -2554,6 +2631,7 @@ local function bestSpot(data, focus)
 		-- they never take a front spot. Road still inside their range, as far down the path as it goes.
 		local range = math.max(unitStatsAt(data, 0).range * 0.8, 6)
 		local best, bestScore = nil, -math.huge
+		local band = Match.pace ~= "speed" and AA.fightBand() or nil
 		for _, list in ipairs(pool) do
 			for _, spot in ipairs(list) do
 				local p = spot.position
@@ -2573,7 +2651,6 @@ local function bestSpot(data, focus)
 						-- summoner at 70% took the whole buff group with her, and Shadow Sorcerers at
 						-- the far end of the road did no damage at all while everything died at the spawn.
 						-- In long matches: just past where enemies usually die (never past 60%).
-						local band = Match.pace ~= "speed" and AA.fightBand() or nil
 						local aim = Match.pace == "speed" and (Match.laneJunction and Match.laneJunction[spot.lane] or 0.02) or (band and math.clamp(band + 0.1, 0.3, 0.6) or 0.6)
 						local score = -math.abs(progress - aim) * 10 + math.min(spot.gap, range) * (Match.pace == "speed" and -0.05 or 0.1)
 
@@ -2609,6 +2686,10 @@ local function bestSpot(data, focus)
 			circles = nil
 		end
 	end
+	-- Road that enemies rarely reach is worth little, whatever the pace: a Zombie placed at 48% of
+	-- the road for its bends dealt nothing for eleven waves while everything died before 31%.
+	-- (Known after six waves, or from the last run on this stage and map; nil = no idea yet.)
+	local reachBand = not focus and Match.pace ~= "speed" and AA.fightBand() or nil
 	local checked, sliceStart = 0, os.clock()
 	-- Big maps (thousands of spots): every third spot first, then every spot around the best
 	-- one. (The Holy Warlord has 6,600 ground spots; scoring all of them stalled the opening.)
@@ -2677,6 +2758,11 @@ local function bestSpot(data, focus)
 								weight = 1 + (1 - point.progress) * 0.6
 							else
 								weight = 1 + point.progress * 0.6
+							end
+							if reachBand and point.progress > reachBand + 0.05 then
+								-- Later waves do get deeper, so it fades instead of cutting off:
+								-- half at 14% of the road past the usual depth, never under 0.15.
+								weight *= math.max(0.15, math.exp(-(point.progress - reachBand - 0.05) / 0.2))
 							end
 							table.insert(nearby, { dx = dx, dz = dz, d2 = d2, weight = weight })
 						end
@@ -2747,7 +2833,11 @@ end
 local function placeUnit(entry, focus)
 	local spot, direction = bestSpot(entry.data, focus)
 	if not spot then
-		Match.capped[entry.uuid] = currentWave()
+		-- (Not for a base-guard placement: no free spot near the base says nothing about the
+		-- rest of the map, and the unit was blocked everywhere for the wave.)
+		if not focus then
+			Match.capped[entry.uuid] = currentWave()
+		end
 		return false
 	end
 	local before = countPlaced(entry.id)
@@ -2770,6 +2860,15 @@ local function placeUnit(entry, focus)
 		return true
 	end
 	note("placefail", { u = entry.id, msg = AA.lastMessage })
+	if tostring(AA.lastMessage or ""):find("(Global)", 1, true) then
+		-- A cap shared by every player in the server ("Cannot place more than 6 of this unit!
+		-- (Global)"): the others hold the rest. Nothing wrong with the spot, and asking again
+		-- every wave cost three tries and three good spots each time. Look again in four waves
+		-- in case somebody sold theirs.
+		Match.capped[entry.uuid] = currentWave() + 3
+		Match.failStreak[entry.uuid] = 0
+		return false
+	end
 	if learnedCaps[entry.id] and before >= learnedCaps[entry.id] then
 		-- The server just told us this unit's real cap: nothing wrong with the spot.
 		return false
@@ -2873,9 +2972,30 @@ local function enemyState()
 			table.insert(list, { max = humanoid.MaxHealth, progress = pathProgress(enemy:GetPivot().Position) })
 		end
 	end
-	if #healths >= 3 then
-		table.sort(healths)
-		Match.enemyMedian = healths[math.ceil(#healths / 2)]
+	-- The usual enemy of this wave: the median over every enemy seen in it, not over whoever is
+	-- alive this instant (with two kinds on the road it jumped between them tick by tick, and
+	-- everything that reads it flipped with it).
+	do
+		local wave = currentWave()
+		if Match.seenWave ~= wave then
+			Match.seenWave, Match.seenEnemies, Match.seenHealths = wave, setmetatable({}, { __mode = "k" }), {}
+		end
+		local added = false
+		for _, enemy in ipairs(scanField().enemies) do
+			if not Match.seenEnemies[enemy] then
+				local humanoid = enemy:FindFirstChildOfClass("Humanoid")
+				if humanoid and humanoid.MaxHealth > 0 then
+					Match.seenEnemies[enemy] = true
+					table.insert(Match.seenHealths, humanoid.MaxHealth)
+					added = true
+				end
+			end
+		end
+		if added and #Match.seenHealths >= 3 then
+			local sorted = table.clone(Match.seenHealths)
+			table.sort(sorted)
+			Match.enemyMedian = sorted[math.ceil(#sorted / 2)]
+		end
 	end
 	local usual = Match.enemyMedian
 	if usual then
@@ -3007,7 +3127,16 @@ local function planAction()
 	end
 	-- (Letting the farm cost twice the damage units was tried in v99: same final wave, but the
 	-- second Elyssia came 13 s later and wave 6 nearly leaked. The cap stays.)
-	local safe = damagePlaced >= 2 and not danger and not pressed and farmSpent < damageSpent
+	-- "Two damage units down first", or as many as the team can field if that is fewer (a
+	-- Unique carry with a buffer and a farm never got past the carry).
+	local damageCap = 0
+	for _, entry in ipairs(equipped) do
+		if entry.data.cost and not AA.buffInfo(entry.data) and (unitStatsAt(entry.data, 0).dps > 0 or AA.isSummoner(entry.id)) then
+			damageCap += placeCap(entry.data)
+		end
+	end
+	local damageNeed = math.clamp(damageCap, 1, 2)
+	local safe = damagePlaced >= damageNeed and not danger and not pressed and farmSpent < damageSpent
 	-- Only the three waves leading up to it: blocking farms from wave 1 starved the whole act
 	-- (Shibuya: farm never upgraded, Elyssia still level 1 at the boss).
 	local leakWave = AA.leakWave()
@@ -3023,7 +3152,9 @@ local function planAction()
 		Match.pace = "speed"
 	elseif Match.infinite or (Match.totalWaves or 0) > 25 then
 		Match.longHaul = true
-		Match.pace = "long"
+		if Config.PlaceStyle ~= "Front" then
+			Match.pace = "long"
+		end
 	else
 		Match.longHaul = false
 	end
@@ -3081,7 +3212,7 @@ local function planAction()
 			local factor = AA.measureFactor(entry.id, 0)
 			local score = 0
 			local buff = AA.buffInfo(data)
-			if buff and damagePlaced >= 2 and (placed[entry.id] or 0) < AA.buffCopies(buff, data) then
+			if buff and damagePlaced >= damageNeed and (placed[entry.id] or 0) < AA.buffCopies(buff, data) then
 				-- Buffer: what the next copy adds to the damage it boosts, per cash (plus its own
 				-- hits). One copy holds the base buff half the time, two all the time, four chain
 				-- it to 100%; the third only pays off with the fourth, so those two are priced
@@ -3136,7 +3267,7 @@ local function planAction()
 					-- (Measured with the Unique trait: her one copy put 4 stacks on every
 					-- jellyfish and eel, the unit's normal cap, and a level 0 Elyssia's jellyfish
 					-- hit for 2.1x her damage. So a Unique copy counts as a full set.)
-					local copies = (placeCap(data) == 1 and (tonumber(data.spawn_cap) or 1) > 1) and data.spawn_cap or 1
+					local copies = (AA.uniqueIds and AA.uniqueIds[data.id] and (tonumber(data.spawn_cap) or 1) > 1) and data.spawn_cap or 1
 					score += boosted * aura.pct * copies / cost
 				elseif aura and not aura.stacks and (placed[entry.id] or 0) == 0 then
 					local boosted = 0
@@ -3288,17 +3419,33 @@ local function planAction()
 			-- upgrade, already maxed, or the server keeps refusing the placement: skip it.
 			-- Otherwise (waiting for a wave or a retry) hold the list here.
 			local entry = byId[step.unit]
-			local standing, open = 0, false
+			local standing, open, lowest = 0, false, nil
 			for _, unit in ipairs(units) do
 				if unit._stats.id.Value == step.unit then
 					standing += 1
 					local data = Units[step.unit]
 					if data and data.upgrade and unit._stats.upgrade.Value < #data.upgrade then
 						open = true
+						if not (Match.maxed[unit] and Match.maxed[unit] > os.clock()) and (not lowest or unit._stats.upgrade.Value < lowest._stats.upgrade.Value) then
+							lowest = unit
+						end
 					end
 				end
 			end
-			local stuck = not entry or (step.kind == "upgrade" and (standing == 0 or not open)) or (step.kind == "place" and (not Config.AutoPlace or Match.capped[entry.uuid] ~= nil))
+			-- The step is the user's call even where the planner itself wouldn't offer it (a farm
+			-- before any damage unit, a buffer before two are down, a farm upgrade that no longer
+			-- pays back): the list used to stop on such a step for the rest of the match.
+			local soldFarm = entry and Match.farmsSold and unitStatsAt(entry.data, entry.data.upgrade and #entry.data.upgrade or 0).farm > 0
+			if entry and step.kind == "place" and Config.AutoPlace and entry.data.cost and not soldFarm and standing < placeCap(entry.data) and not Match.capped[entry.uuid] then
+				Match.lastOptions = { string.format("build order %d: place %s", index, step.unit) }
+				Match.orderStep = index
+				return { kind = "place", entry = entry, cost = spawnCost(entry), score = 1 }, money
+			elseif entry and step.kind == "upgrade" and Config.AutoUpgrade and lowest then
+				Match.lastOptions = { string.format("build order %d: upgrade %s", index, step.unit) }
+				Match.orderStep = index
+				return { kind = "upgrade", unit = lowest, cost = upgradeCost(lowest, entry.data, lowest._stats.upgrade.Value), score = 1 }, money
+			end
+			local stuck = not entry or soldFarm or (step.kind == "upgrade" and (standing == 0 or not open or not Config.AutoUpgrade)) or (step.kind == "place" and (not Config.AutoPlace or Match.capped[entry.uuid] ~= nil or standing >= placeCap(entry.data)))
 			if not stuck then
 				Match.orderStep = index
 				Match.lastOptions = { string.format("build order %d: waiting for %s %s", index, step.kind, step.unit) }
@@ -3343,7 +3490,7 @@ local function planAction()
 			Match.killsPhase = 2
 			for _, entry in ipairs(equipped) do
 				local data = entry.data
-				if data.cost and isFarm(data) then
+				if data.cost and isFarm(data) and not Match.farmsSold then
 					local cappedWave = Match.capped[entry.uuid]
 					if (placed[entry.id] or 0) < 1 and not (cappedWave and cappedWave >= wave) then
 						table.insert(phase, existing[entry.uuid] or { kind = "place", entry = entry, cost = spawnCost(entry), score = 1 })
@@ -3419,7 +3566,9 @@ local function planAction()
 			-- (No "never save while rushing" any more: the waves before a remembered loss went
 			-- into three Shadow Sorcerers and Water Goddess upgrades at a third of the value of
 			-- the Elyssia upgrade that was next on the list.)
-			if option.score < 1e5 and wait < horizon * 0.8 then
+			-- (While the base guard is firing only what can be paid now counts: the wait is
+			-- worked out from the match's average income, which stops when the kills do.)
+			if option.score < 1e5 and wait < ((Match.leakRisk or 0) >= 0.4 and 2 or horizon * 0.8) then
 				local value = option.score * (1 - wait / horizon)
 				if not bestValue or value > bestValue then
 					best, bestValue = option, value
@@ -3477,6 +3626,9 @@ function AA.sellUnit(unit, why)
 	end
 	scanField(true)
 	if not unit.Parent then
+		-- (The refund is not income: it used to raise the income rate right when a sale meant
+		-- real income had dropped.)
+		Match.lastCash = stats.resource.Value
 		return true
 	end
 	if tostring(AA.lastMessage or ""):lower():find("cannot be sold", 1, true) then
@@ -3506,6 +3658,18 @@ local function leakGuard()
 		-- Only towers that actually hit things count as cover (farms and buffers stop nothing).
 		if range and damage and AA.rv(damage) > 0 then
 			table.insert(reach, { position = unit:GetPivot().Position, range = AA.rv(range) + 1.5 })
+		end
+	end
+	-- Summons (eels, the Warlord) and other players' towers stop enemies too: without them an
+	-- enemy being killed by an eel past the last tower counted as a leak, which blocks farms,
+	-- shortens the planner's horizon and makes the card picker play safe.
+	for _, group in ipairs({ field.summons, field.others }) do
+		for _, unit in ipairs(group) do
+			local unitStats = unit:FindFirstChild("_stats")
+			local range, damage = unitStats and unitStats:FindFirstChild("range"), unitStats and unitStats:FindFirstChild("damage")
+			if range and damage and AA.rv(damage) > 0 and AA.rv(range) > 0 then
+				table.insert(reach, { position = unit:GetPivot().Position, range = AA.rv(range) + 1.5 })
+			end
 		end
 	end
 	local leak, leakHealth = nil, 0
@@ -3573,7 +3737,10 @@ local function leakGuard()
 			local worth = unitData and copyPower(unitData, ownedOf(unit), unit._stats.upgrade.Value) * AA.measureFactor(unit._stats.id.Value) or 0
 			-- Buffers stay: selling a Windsong breaks the chain for a refund that buys nothing
 			-- (logs: one sold and re-placed five times in 40 s while the base died).
-			if worth < pickPower and not AA.unsellable(unit._stats.id.Value) and not (unitData and AA.buffInfo(unitData)) then
+			-- ... and only if the refund (a quarter of what went into it) pays for the guard.
+			local spent = unit._stats:FindFirstChild("total_spent")
+			local covers = stats.resource.Value + 0.25 * (spent and spent.Value or 0) >= cost
+			if covers and worth < pickPower and not AA.unsellable(unit._stats.id.Value) and not (unitData and AA.buffInfo(unitData)) then
 				local progress = pathProgress(unit:GetPivot().Position)
 				if progress < victimProgress and progress < LEAK_AT - 0.2 then
 					victim, victimProgress = unit, progress
@@ -4249,10 +4416,13 @@ local function useAbilities()
 				-- called once she stands, so he arrives with her blessing.
 				local risenOnTeam, risenPlaced = false, false
 				for _, entry in ipairs(equippedUnits()) do
-					risenOnTeam = risenOnTeam or entry.id == "giselle_evolved"
+					local synergy = AA.synergyInfo(entry.id)
+					if synergy and synergy.stacks then
+						risenOnTeam, Match.blesserId = true, entry.id
+					end
 				end
 				for _, tower in ipairs(field.towers) do
-					risenPlaced = risenPlaced or tower._stats.id.Value == "giselle_evolved"
+					risenPlaced = risenPlaced or tower._stats.id.Value == Match.blesserId
 				end
 				if risenOnTeam and not risenPlaced then
 					-- (At most 45 s: if she can't be placed the Ritual still happens.)
@@ -4868,9 +5038,9 @@ local function finishMatch()
 		AA.progress.paces = type(AA.progress.paces) == "table" and AA.progress.paces or {}
 		AA.progress.paces[AA.leakKey()] = (Match.everLong or not won) and "long" or "speed"
 		local band = AA.fightBand()
-		if band and Match.depthByWave and #Match.depthByWave >= 6 then
+		if band then
 			AA.progress.depths = type(AA.progress.depths) == "table" and AA.progress.depths or {}
-			AA.progress.depths[AA.leakKey()] = math.floor(band * 100) / 100
+			AA.progress.depths[AA.depthKey()] = math.floor(band * 100) / 100
 		end
 	end
 	AA.saveProgress()
@@ -5020,7 +5190,7 @@ local function finishMatch()
 	}
 	logMatch(summary)
 	saveDetail(summary)
-	if won then
+	if won and id then
 		AA.progress.cleared = type(AA.progress.cleared) == "table" and AA.progress.cleared or {}
 		AA.progress.cleared[id] = true
 	end
@@ -5067,7 +5237,8 @@ local function resetMatch()
 	Match.killsPhase = nil
 	Match.voteNoted = nil
 	Match.shieldHits, Match.shieldAt, Match.shieldMode = nil, nil, nil
-	Match.enemyMedian, Match.tankNoted = nil, nil
+	Match.enemyMedian, Match.tankNoted, Match.shieldOn, Match.blesserId = nil, nil, nil, nil
+	Match.seenWave, Match.seenEnemies, Match.seenHealths = nil, nil, nil
 	AA.Macro.reset()
 	Match.missionOpen, Match.leftLogged, Match.finishedSince, Match.frontForced = nil, nil, nil, nil
 	Match.orderSkip, Match.orderStep, Match.ritualAt, Match.skipHeld = nil, nil, nil, nil
@@ -5096,7 +5267,10 @@ end
 
 local function matchLoop()
 	if IS_LOBBY then
-		return task.wait(1e6)
+		while AA.alive do
+			task.wait(2)
+		end
+		return
 	end
 	workspace:WaitForChild("_MAP_CONFIG", 30)
 	do
@@ -5159,7 +5333,13 @@ local function matchLoop()
 			task.wait(0.5)
 		else
 			Match.finishedSince, Match.finishedAsked = nil, nil
-			if Match.ended then
+			if Match.ended and Match.leftLogged then
+				-- Still here after asking to leave (slow or refused teleport): ask again. This
+				-- used to be read as a replay and wiped the match, so the reason for leaving
+				-- was forgotten and the run was logged again on every retry.
+				invoke("teleport_back_to_lobby")
+				task.wait(5)
+			elseif Match.ended then
 				-- Replayed (or moved to the next act) in the same server: start fresh.
 				local want = Match.wantDifficulty
 				resetMatch()
@@ -5310,7 +5490,8 @@ local function matchLoop()
 							local id = unit._stats.id.Value
 							out[id] = (out[id] or "") .. unit._stats.upgrade.Value
 						end
-						table.insert(Detail.waves, { w = wave, t = math.floor(os.clock() - Match.startedAt), cash = math.floor(stats.resource.Value), hp = math.floor(health), units = out, pace = Match.pace, top = Match.lastOptions and Match.lastOptions[1] or nil })
+						local eventCash = stats:FindFirstChild("_resource" .. tostring((Match.levelData or {}).roguelike_multiplier_resource))
+						table.insert(Detail.waves, { w = wave, t = math.floor(os.clock() - Match.startedAt), cash = math.floor(stats.resource.Value), hp = math.floor(health), units = out, pace = Match.pace, top = Match.lastOptions and Match.lastOptions[1] or nil, res = eventCash and eventCash.Value or nil, mult = Match.roguelike and Match.roguelike.candy_multiplier or nil })
 					end
 				end
 			end
@@ -7146,7 +7327,7 @@ function AA.unitStep()
 			end
 		end
 		local unit = best and owned[best]
-		local has = false
+		local has = unit ~= nil and AA.hasTrait(unit, Config.TraitTarget) or false
 		for _, trait in pairs(unit and unit.traits or {}) do
 			if trait == Config.TraitTarget then
 				has = true
@@ -7264,7 +7445,10 @@ end
 
 local function lobbyLoop()
 	if not IS_LOBBY then
-		return task.wait(1e6)
+		while AA.alive do
+			task.wait(2)
+		end
+		return
 	end
 	local lastClaim, lastJoin = -math.huge, -math.huge
 	task.wait(1)
@@ -7496,7 +7680,11 @@ end
 CardBrain.pool = {}
 function CardBrain.learn(options)
 	for _, option in pairs(type(options) == "table" and options or {}) do
-		if type(option) == "table" and type(option.title) == "string" and type(option.effects) == "table" and not option.random_effects then
+		local random = type(option) == "table" and option.random_effects
+		for _, effect in pairs(type(option) == "table" and type(option.effects) == "table" and option.effects or {}) do
+			random = random or (type(effect) == "table" and effect.type == "random_effects")
+		end
+		if type(option) == "table" and type(option.title) == "string" and type(option.effects) == "table" and not random then
 			CardBrain.pool[option.title] = option
 		end
 	end
@@ -7544,12 +7732,13 @@ end
 
 ---Power factor (x my team's kill power) and extra reward of one card.
 function CardBrain.score(option, state)
-	local power, reward = 1, 0
+	local power, reward, candy = 1, 0, nil
 	for _, effect in ipairs(option.effects or {}) do
 		local kind, amount, stat = effect.type, tonumber(effect.amount) or 0, effect.stat
 		local share = effect.damage_type and (state.share[effect.damage_type] or 0) or 0
 		if kind == "candy_multiplier" then
 			reward += amount
+			candy = (candy or 0) + amount
 		elseif kind == "secret_drop" then
 			reward += amount * 3
 		elseif kind == "add_reward" then
@@ -7592,11 +7781,12 @@ function CardBrain.score(option, state)
 			-- health there, 2%/s is double. (Was x4: Regen I scored 0.98 and was taken freely.)
 			power /= 1 + amount * 50
 		elseif kind == "enemy_bomb" then
-			-- Explosive deaths (the number is the blast's reach in studs). What the blast does is
-			-- server-side and not measured yet; players name it one of the three curses to avoid,
-			-- and this team's damage walks the road (jellyfish, eels, the Warlord). Stunned
-			-- tower-seconds are logged per wave ("stun") to put a real number here.
-			power /= 1 + amount * 0.05
+			-- Explosive deaths (the number is the blast's reach in studs): the blast stuns towers
+			-- near the dying enemy. Measured over a 49-wave run with reach 6: 107 tower-seconds
+			-- of stun in total, 8-10 s in the waves it happened at all, with 17 towers on the
+			-- field (under 2% of their time), mostly the one tower standing in the kill zone.
+			-- (Was 0.05 a stud from hearsay: reach 6 scored as a 30% loss.)
+			power /= 1 + amount * 0.008
 		elseif kind == "enemy_resistance_specific" then
 			local current = state.resist[effect.damage_type] or 0
 			local before = math.max(1 - current / 100, 0.1)
@@ -7624,7 +7814,7 @@ function CardBrain.score(option, state)
 			power *= CardBrain.typical(effect._type, tonumber(effect.tier) or 1, state) ^ math.abs(amount)
 		end
 	end
-	return power, reward
+	return power, reward, candy
 end
 
 function CardBrain.choose(options)
@@ -7675,7 +7865,11 @@ function CardBrain.choose(options)
 	end
 	local best, bestValue, report = nil, -math.huge, {}
 	for key, option in pairs(options) do
-		local power, reward = CardBrain.score(option, state)
+		local power, reward, candy = CardBrain.score(option, state)
+		-- The multiplier only pays on the waves still to come: +1.5 at wave 47 of 50 is three
+		-- waves of pearls, bought with the clear. (A Pearls run took Enemy Health III there and
+		-- died at wave 49.)
+		reward -= (candy or 0) * progress
 		local value = reward * rewardWeight + math.log(math.max(power, 0.05)) * powerWeight
 		if stacked * power < floor and power < 1 then
 			value -= 10
@@ -7966,7 +8160,11 @@ local function measureLoop()
 				for id, entry in pairs(Match.meas) do
 					if entry.secs >= 20 and entry.sheet > 0 and entry.dmg > 0 then
 						factor[id] = entry.dmg / entry.sheet
-						table.insert(ratios, factor[id])
+						-- (A level 0-1 unit is in the list twice, as id and id#lo: counted once,
+						-- or a lone opener was measured against itself and stored as exactly 1.)
+						if not id:find("#lo", 1, true) then
+							table.insert(ratios, factor[id])
+						end
 					end
 				end
 				table.sort(ratios)
@@ -8027,7 +8225,10 @@ end
 supervise("match", matchLoop)
 supervise("buffs", function()
 	if IS_LOBBY then
-		return task.wait(1e6)
+		while AA.alive do
+			task.wait(2)
+		end
+		return
 	end
 	while AA.alive do
 		AA.Conductor.step()
@@ -8046,6 +8247,11 @@ if not IS_LOBBY then
 		pcall(AA.saveUnitCache)
 	end)
 end
+task.delay(8, function()
+	if AA.alive then
+		pcall(AA.fetchPassives)
+	end
+end)
 if IS_LOBBY then
 	task.spawn(function()
 		task.wait(2)
@@ -8892,7 +9098,7 @@ do
 		if x + 290 > view.X then
 			x = mouse.X - 296
 		end
-		tip.Position = UDim2.fromOffset(math.max(x, 4), math.clamp(mouse.Y + 18, 4, math.max(view.Y - 140, 4)))
+		tip.Position = UDim2.fromOffset(math.max(x, 4), math.clamp(mouse.Y + 18, 4, math.max(view.Y - math.max(tip.AbsoluteSize.Y, 140) - 4, 4)))
 		tip.Visible = true
 	end
 	---Put a "?" on a row. `spot` = { position (UDim2, anchored at its right edge), row }.
@@ -10869,6 +11075,7 @@ do
 		hint(page, "Which portal to open. The list keeps every kind of portal you have had since the script started tracking, so you can leave one picked while you have none: the script then waits for it, or plays your Otherwise mode. A portal already started is finished first, then the oldest. Any portal uses whatever you have.")
 		only({ "Portals" })
 	end
+	UI.lastRow[page] = nil
 	only({ "Missions" }, hint(page, "Plays the world whose daily kill mission is open (2500 kills for 500 gems and that world's evolution items): its infinite stage, or its acts in order until infinite unlocks. Normal play, not Farm kills. When the mission is done it claims it in the lobby and plays infinite on the world picked under Infinite."))
 	segmented(page, "Farm kills on", "KillsStage", { "Walled City", "Summer" })
 	only({ "Kills" })
@@ -11343,6 +11550,7 @@ do
 							Visual.wrote[uuid] = Visual.wrote[uuid] or {}
 							if now ~= nil and now ~= Visual.wrote[uuid][stat.key] then
 								Visual.orig[uuid][stat.key] = now
+								Visual.origDirty = true
 							end
 							record.trait_stats[stat.key] = want
 							Visual.wrote[uuid][stat.key] = want
@@ -11350,6 +11558,12 @@ do
 					end
 				end
 			end
+		end
+		if Visual.origDirty then
+			-- (A real reroll seen while a shown value was on: kept, or the next reload went
+			-- back to the old roll.)
+			Visual.origDirty = nil
+			pcall(Visual.save)
 		end
 		-- The companions in the lobby carry their own copy of the numbers (hover card).
 		for uuid, shown in pairs(Visual.saved) do
@@ -11631,6 +11845,14 @@ do
 		Visual.save()
 		pcall(Visual.apply)
 		draft = {}
+		for _, stat in ipairs(Visual.STATS) do
+			if boxes[stat.key] then
+				boxes[stat.key].Text = ""
+			end
+			if letterRefresh[stat.key] then
+				letterRefresh[stat.key]()
+			end
+		end
 		showUnit()
 		statusLine.Text = "Showing the new stats on " .. picked.label .. ". Reopen a game window to see it there."
 	end, "Reset unit", function()
@@ -11640,6 +11862,14 @@ do
 		end
 		Visual.reset(picked.uuid)
 		draft = {}
+		for _, stat in ipairs(Visual.STATS) do
+			if boxes[stat.key] then
+				boxes[stat.key].Text = ""
+			end
+			if letterRefresh[stat.key] then
+				letterRefresh[stat.key]()
+			end
+		end
 		showUnit()
 		statusLine.Text = picked.label .. " shows its real stats again."
 	end)
@@ -11895,7 +12125,8 @@ do
 		for id in tostring(Config.SnipeUnits):gmatch("[^,]+") do
 			picked[id] = true
 		end
-		for id, data in pairs(Units) do
+		for id in pairs(AA.RawUnits or Units) do
+			local data = Units[id]
 			if type(data) == "table" and data.cost and (data.rarity == "Mythic" or data.rarity == "Secret") and not data.hide_from_banner and not data.evolved then
 				table.insert(options, { id = id, name = (picked[id] and "[x] " or "[ ] ") .. tostring(data.name) .. (data.rarity == "Secret" and " (Secret)" or ""), current = picked[id] })
 			end
@@ -12378,7 +12609,7 @@ do
 					sound:Destroy()
 					sound = nil
 				end
-				if not Config.MusicOn and not Config.MyMusicOn then
+				if not Config.MusicOn then
 					Music.muteGame(false)
 				end
 			end
