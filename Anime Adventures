@@ -2507,7 +2507,9 @@ local function buffHub(data)
 		local allyId = unit._stats.id.Value
 		local allyData = Units[allyId]
 		if allyId == buffer.id then
-			table.insert(chain, { position = unit:GetPivot().Position, radius = reach })
+			-- (The range it has in this match can be wider than the sheet says: cards.)
+			local live = unit._stats:FindFirstChild("range")
+			table.insert(chain, { position = unit:GetPivot().Position, radius = reach, live = live and AA.rv(live) or 0 })
 		elseif placedIds[allyId] and allyData and AA.buffMatches(buff, allyData) and not AA.buffInfo(allyData) and (unitStatsAt(allyData, 0).damage > 0 or AA.isSummoner(allyId)) then
 			table.insert(friends, unit:GetPivot().Position)
 		end
@@ -2530,7 +2532,7 @@ local function buffHub(data)
 			if reaches then
 				table.insert(hub, circle)
 			else
-				table.insert(clear, { position = circle.position, radius = reach + 3.2, avoid = true })
+				table.insert(clear, { position = circle.position, radius = math.max(reach + 3.2, circle.live + 2.5), avoid = true })
 			end
 		end
 		if #hub == 0 then
@@ -2638,6 +2640,7 @@ local function bestSpot(data, focus)
 		end
 		local range = activeBuff and AA.buffRange(data, mine, activeBuff) - 0.7 or aura and math.max(unitStatsAt(data, 0).range * 0.9, 6) or math.max(unitStatsAt(data, maxLevel).range, 6)
 		local allies, partners, anchors = {}, {}, {}
+		local liveRange = 0
 		local placedIds = {}
 		for _, entry in ipairs(equippedUnits()) do
 			placedIds[entry.id] = true
@@ -2647,6 +2650,8 @@ local function bestSpot(data, focus)
 			local allyData = Units[allyId]
 			if activeBuff and allyId == data.id then
 				table.insert(partners, unit:GetPivot().Position)
+				local live = unit._stats:FindFirstChild("range")
+				liveRange = math.max(liveRange, live and AA.rv(live) or 0)
 			elseif allyData and (unitStatsAt(allyData, 0).damage > 0 or activeBuff and placedIds[allyId] and AA.isSummoner(allyId)) and (not activeBuff or AA.buffMatches(activeBuff, allyData))
 				and (not aura or (allyId ~= data.id and aura.matches(allyId, allyData))) then
 				local weight = activeBuff and math.max(copyPower(allyData, ownedOf(unit), unit._stats.upgrade.Value) * AA.measureFactor(allyId), 1) or 1
@@ -2661,7 +2666,8 @@ local function bestSpot(data, focus)
 			-- (see Conductor.step). Every second copy therefore goes where it reaches the casting
 			-- copies and none of the damage units: then the full buff starts a second after the
 			-- pair is down instead of 30 s later. No such ground: it joins the others inside.
-			local full = range + 0.7
+			-- (The copies already down show the range the buff really has in this match.)
+			local full = math.max(range + 0.7, liveRange)
 			local mains, feedersDown = {}, 0
 			for _, partner in ipairs(partners) do
 				local reaches = false
