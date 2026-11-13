@@ -38,13 +38,16 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v145", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v146", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
-AA.realValues = setmetatable({}, { __mode = "k" })
+-- (The real number is kept on the object itself as an attribute. A weak table keyed by the
+-- object forgets it at the next garbage collection even while the object is still in the game:
+-- measured 4090 entries -> 12 in 8 s. The shown number was then taken for a new server number
+-- and scaled again, over and over.)
 function AA.rv(object)
-	local real = AA.realValues[object]
-	if real ~= nil then
+	local real = object:GetAttribute("AAReal")
+	if real ~= nil and object.Value == object:GetAttribute("AAShown") then
 		return real
 	end
 	return object.Value
@@ -10667,7 +10670,6 @@ AA.Visual = {
 	FILE = SETTINGS_FOLDER .. "/visuals.json",
 	saved = {}, -- [uuid] = { potency_stat = 1.2, ... } what to show
 	orig = {}, -- [uuid] = the real trait stats
-	lastSet = setmetatable({}, { __mode = "k" }),
 	wrote = {}, -- [uuid][stat] = the last value this script put into the profile copy
 }
 do
@@ -10723,8 +10725,6 @@ do
 		return folder and folder:FindFirstChild(uuid) or nil
 	end
 	Visual.PET = { potency_stat = "_pet_damage", speed_stat = "_pet_cooldown", range_stat = "_pet_range" }
-	Visual.petReal = setmetatable({}, { __mode = "k" })
-	Visual.petSet = setmetatable({}, { __mode = "k" })
 	function Visual.load()
 		local ok, data = pcall(function()
 			return httpService:JSONDecode(readfile(Visual.FILE))
@@ -10817,20 +10817,22 @@ do
 			local pet = Visual.pet(uuid)
 			local orig = Visual.orig[uuid]
 			if pet and orig then
-				Visual.petReal[pet] = Visual.petReal[pet] or {}
-				Visual.petSet[pet] = Visual.petSet[pet] or {}
 				for _, stat in ipairs(Visual.STATS) do
 					local want, real = shown[stat.key], orig[stat.key]
 					local attribute = Visual.PET[stat.key]
 					local now = pet:GetAttribute(attribute)
 					if want and real and type(now) == "number" then
-						if now ~= Visual.petSet[pet][attribute] then
-							Visual.petReal[pet][attribute] = now -- the server's number
+						local actual = pet:GetAttribute("AAReal" .. attribute)
+						if actual == nil or now ~= pet:GetAttribute("AAShown" .. attribute) then
+							actual = now -- the server's number
+							pet:SetAttribute("AAReal" .. attribute, actual)
 						end
-						local value = Visual.petReal[pet][attribute] * Visual.ratio(stat.key, real, want)
-						Visual.petSet[pet][attribute] = value
+						local value = actual * Visual.ratio(stat.key, real, want)
 						if now ~= value then
 							pet:SetAttribute(attribute, value)
+						end
+						if pet:GetAttribute("AAShown" .. attribute) ~= value then
+							pet:SetAttribute("AAShown" .. attribute, value)
 						end
 						if pet:GetAttribute("_pet_" .. stat.key) ~= want then
 							pet:SetAttribute("_pet_" .. stat.key, want)
@@ -10849,20 +10851,20 @@ do
 			local shown = owner and owner.Value == localPlayer and uuidValue and Visual.saved[tostring(uuidValue.Value)]
 			if shown then
 				local orig = Visual.orig[tostring(uuidValue.Value)] or {}
-				local function show(object, real, factor)
+				local function show(object, factor)
 					if not object then
 						return
 					end
-					if object.Value ~= Visual.lastSet[object] then
+					local real = object:GetAttribute("AAReal")
+					if real == nil or object.Value ~= object:GetAttribute("AAShown") then
 						real = object.Value -- the server sent a new number
-						AA.realValues[object] = real
-					else
-						real = AA.realValues[object] or real
+						object:SetAttribute("AAReal", real)
 					end
-					local value = real * factor
-					Visual.lastSet[object] = value
-					if object.Value ~= value then
-						object.Value = value
+					if object.Value ~= real * factor then
+						object.Value = real * factor
+					end
+					if object:GetAttribute("AAShown") ~= object.Value then
+						object:SetAttribute("AAShown", object.Value)
 					end
 				end
 				for _, stat in ipairs(Visual.STATS) do
@@ -10877,14 +10879,14 @@ do
 						end
 						local ratio = Visual.ratio(stat.key, real, want)
 						if stat.key == "potency_stat" then
-							show(stats:FindFirstChild("damage"), nil, ratio)
-							show(stats:FindFirstChild("base_damage"), nil, ratio)
+							show(stats:FindFirstChild("damage"), ratio)
+							show(stats:FindFirstChild("base_damage"), ratio)
 						elseif stat.key == "range_stat" then
-							show(stats:FindFirstChild("range"), nil, ratio)
-							show(stats:FindFirstChild("base_range"), nil, ratio)
+							show(stats:FindFirstChild("range"), ratio)
+							show(stats:FindFirstChild("base_range"), ratio)
 						else
-							show(stats:FindFirstChild("attack_cooldown"), nil, ratio)
-							show(stats:FindFirstChild("base_attack_cooldown"), nil, ratio)
+							show(stats:FindFirstChild("attack_cooldown"), ratio)
+							show(stats:FindFirstChild("base_attack_cooldown"), ratio)
 						end
 					end
 				end
@@ -10903,15 +10905,19 @@ do
 		end
 		local pet = Visual.pet(uuid)
 		if pet then
-			for attribute, value in pairs(Visual.petReal[pet] or {}) do
-				pet:SetAttribute(attribute, value)
+			for _, attribute in pairs(Visual.PET) do
+				local actual = pet:GetAttribute("AAReal" .. attribute)
+				if actual ~= nil then
+					pet:SetAttribute(attribute, actual)
+				end
+				pet:SetAttribute("AAReal" .. attribute, nil)
+				pet:SetAttribute("AAShown" .. attribute, nil)
 			end
 			for statKey, value in pairs(orig or {}) do
 				if pet:GetAttribute("_pet_" .. statKey) ~= nil then
 					pet:SetAttribute("_pet_" .. statKey, value)
 				end
 			end
-			Visual.petReal[pet], Visual.petSet[pet] = nil, nil
 		end
 		local folder = workspace:FindFirstChild("_UNITS")
 		for _, unit in ipairs(not IS_LOBBY and folder and folder:GetChildren() or {}) do
@@ -10919,11 +10925,13 @@ do
 			local uuidValue = stats and stats:FindFirstChild("uuid")
 			if uuidValue and tostring(uuidValue.Value) == uuid then
 				for _, object in ipairs(stats:GetChildren()) do
-					local real = AA.realValues[object]
+					local real = object:GetAttribute("AAReal")
 					if real ~= nil then
-						object.Value = real
-						AA.realValues[object] = nil
-						Visual.lastSet[object] = nil
+						if object.Value == object:GetAttribute("AAShown") then
+							object.Value = real
+						end
+						object:SetAttribute("AAReal", nil)
+						object:SetAttribute("AAShown", nil)
 					end
 				end
 				for statKey, value in pairs(orig or {}) do
@@ -10978,7 +10986,7 @@ do
 				-- real level and trait), else the level 0 numbers from the unit sheet.
 				local pet = Visual.pet(picked.uuid)
 				local attribute = Visual.PET[stat.key]
-				local actual = pet and ((Visual.petReal[pet] and Visual.petReal[pet][attribute]) or pet:GetAttribute(attribute))
+				local actual = pet and (pet:GetAttribute("AAReal" .. attribute) or pet:GetAttribute(attribute))
 				local label = actual and "Now" or "Level 0"
 				if not actual then
 					actual = stat.key == "potency_stat" and (base.damage or 0) * real or stat.key == "range_stat" and (base.range or 0) * real or (base.cooldown or 0) * (2 - real)
