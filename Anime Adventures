@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v183", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v184", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -2556,7 +2556,7 @@ local function buffHub(data)
 			local reaches = false
 			for _, friend in ipairs(friends) do
 				local dx, dz = friend.X - circle.position.X, friend.Z - circle.position.Z
-				if dx * dx + dz * dz <= (reach + 1.7) ^ 2 then
+				if dx * dx + dz * dz + (friend.Y - circle.position.Y) ^ 2 <= (reach + 1.7) ^ 2 then
 					reaches = true
 					break
 				end
@@ -2628,7 +2628,8 @@ local function insideHub(p, circles, loose)
 			if not loose and dx * dx + dz * dz < circle.radius * circle.radius then
 				return false
 			end
-		elseif dx * dx + dz * dz > circle.radius * circle.radius then
+		elseif dx * dx + dz * dz + (circle.position.Y - p.Y - 1.3) ^ 2 > circle.radius * circle.radius then
+			-- (3D: a buffer up on a hill reaches less of the ground than its circle on the map.)
 			return false
 		end
 	end
@@ -2805,7 +2806,7 @@ local function bestSpot(data, focus, only)
 				local reaches = false
 				for _, anchor in ipairs(anchors) do
 					local dx, dz = anchor.X - partner.X, anchor.Z - partner.Z
-					if dx * dx + dz * dz <= (full + 1) ^ 2 then
+					if dx * dx + dz * dz + (anchor.Y - partner.Y) ^ 2 <= (full + 1) ^ 2 then
 						reaches = true
 						break
 					end
@@ -2835,7 +2836,7 @@ local function bestSpot(data, focus, only)
 							if free then
 								for _, main in ipairs(mains) do
 									local dx, dz = main.X - p.X, main.Z - p.Z
-									local d2 = dx * dx + dz * dz
+									local d2 = dx * dx + dz * dz + (main.Y - p.Y - 1.3) ^ 2
 									if d2 > near then
 										free = false
 										break
@@ -2914,7 +2915,7 @@ local function bestSpot(data, focus, only)
 					local spread = 0
 					for _, partner in ipairs(partners) do
 						local dx, dz = partner.X - p.X, partner.Z - p.Z
-						local d2 = dx * dx + dz * dz
+						local d2 = dx * dx + dz * dz + (partner.Y - p.Y - 1.3) ^ 2
 						if d2 > range * range then
 							free = false
 							break
@@ -2924,13 +2925,13 @@ local function bestSpot(data, focus, only)
 					if free then
 						for _, ally in ipairs(allies) do
 							local dx, dz = ally.position.X - p.X, ally.position.Z - p.Z
-							if dx * dx + dz * dz <= range * range then
+							if dx * dx + dz * dz + (ally.position.Y - p.Y - 1.3) ^ 2 <= range * range then
 								score += ally.weight / math.max(total, 1)
 							end
 						end
 						for _, guest in ipairs(guests) do
 							local dx, dz = guest.position.X - p.X, guest.position.Z - p.Z
-							if dx * dx + dz * dz <= range * range then
+							if dx * dx + dz * dz + (guest.position.Y - p.Y - 1.3) ^ 2 <= range * range then
 								score += 0.3 * guest.weight / math.max(guestTotal, 1)
 							end
 						end
@@ -3034,6 +3035,11 @@ local function bestSpot(data, focus, only)
 									local sum, early = 0, 0
 									local laneHits = {}
 									pathWithin(p.X, p.Z, own, function(point, _, _, d2)
+										-- (Range is measured in 3D: a unit on a tall hill reaches less road.)
+										d2 += (point.position.Y - p.Y) ^ 2
+										if d2 > own * own then
+											return
+										end
 										local weight
 										laneHits[point.lane] = (laneHits[point.lane] or 0) + 1
 										if Match.pace == "speed" and not hubLanes then
@@ -3140,6 +3146,7 @@ local function bestSpot(data, focus, only)
 							local reach2 = summonReach * summonReach
 							local laneHits = {}
 							pathWithin(p.X, p.Z, summonReach, function(point, _, _, d2)
+								d2 += (point.position.Y - p.Y) ^ 2
 								if d2 <= reach2 then
 									laneHits[point.lane] = (laneHits[point.lane] or 0) + 1
 									local weight = 1 + (1 - point.progress) * 0.25
@@ -3263,6 +3270,9 @@ local function bestSpot(data, focus, only)
 					local nearby = {}
 					local laneHits = {}
 					pathWithin(p.X, p.Z, reach, function(point, dx, dz, d2)
+						-- Range is measured in 3D (an Elfy on a hill 16 studs above the team reached
+						-- one unit of five that were inside her circle on the map).
+						d2 += (point.position.Y - p.Y) ^ 2
 						if point.lane and d2 <= minReach * minReach then
 							laneHits[point.lane] = (laneHits[point.lane] or 0) + 1
 						end
@@ -4803,6 +4813,43 @@ local function matchStep()
 	if Config.AutoPlace and leakGuard() then
 		return
 	end
+	-- A buffer standing alone where its cast reaches under a third of the damage it is there for
+	-- (placed before the team took shape, or on a hill too tall for its range): sold once, the
+	-- planner puts it back where the team is. No second copy is ever bought next to one like
+	-- that, so the whole chain depends on it.
+	if Config.AutoPlace and not Match.bufferMoved and currentWave() >= 2 and wavesLeft() >= 3 then
+		local towers = myUnits()
+		for _, unit in ipairs(towers) do
+			local id = unit._stats.id.Value
+			local data = Units[id]
+			local buff = AA.buffInfo(data)
+			if buff and countPlacedId(id) == 1 and not AA.unsellable(id) and os.clock() - (Match.startedAt or 0) > 45 then
+				local position = unit:GetPivot().Position
+				local range = unit._stats:FindFirstChild("range")
+				local reach = range and AA.rv(range) or AA.buffRange(data, nil, buff)
+				local inside, total, count = 0, 0, 0
+				for _, other in ipairs(towers) do
+					local otherId = other._stats.id.Value
+					local otherData = Units[otherId]
+					if otherData and not AA.buffInfo(otherData) and AA.buffMatches(buff, otherData) and (unitStatsAt(otherData, 0).damage > 0 or AA.isSummoner(otherId)) and unitStatsAt(otherData, 0).farm <= 0 then
+						local damage, cooldown = other._stats:FindFirstChild("damage"), other._stats:FindFirstChild("attack_cooldown")
+						local weight = math.max((damage and AA.rv(damage) or 1) / math.max(cooldown and AA.rv(cooldown) or 1, 0.1), 1)
+						total += weight
+						count += 1
+						if (other:GetPivot().Position - position).Magnitude <= reach then
+							inside += weight
+						end
+					end
+				end
+				if count >= 3 and inside < total * 0.34 then
+					Match.bufferMoved = true
+					note("bufferMove", { u = id, share = math.floor(inside / total * 100) })
+					AA.sellUnit(unit, "misplaced buffer")
+					return
+				end
+			end
+		end
+	end
 	-- Last wave: farms have nothing left to earn. Sell them once and put the refund into damage
 	-- (the planner already scores farms at 0 when there are no waves left to pay them back).
 	if Config.AutoUpgrade and not Match.farmsSold and wavesLeft() == 0 and currentWave() > 1 then
@@ -6299,7 +6346,7 @@ local function resetMatch()
 	Match.voteNoted = nil
 	Match.shieldHits, Match.shieldAt, Match.shieldMode = nil, nil, nil
 	Match.enemyMedian, Match.tankNoted, Match.shieldOn, Match.blesserId = nil, nil, nil, nil
-	Match.soaring, Match.spotScore, Match.openingDone, Match.flyShare = nil, nil, nil, nil
+	Match.soaring, Match.spotScore, Match.openingDone, Match.flyShare, Match.bufferMoved = nil, nil, nil, nil, nil
 	Match.seenWave, Match.seenEnemies, Match.seenHealths = nil, nil, nil
 	Match.live, Match.liveAt, Match.laneDepth, Match.lanesNoted = nil, nil, nil, nil
 	AA.Macro.reset()
