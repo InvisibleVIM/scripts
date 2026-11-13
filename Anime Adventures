@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v186", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v187", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -9020,9 +9020,14 @@ function CardBrain.score(option, state)
 			-- (Was 0.05 a stud from hearsay: reach 6 scored as a 30% loss.)
 			power /= 1 + amount * 0.008
 		elseif kind == "enemy_resistance_specific" then
-			local current = state.resist[effect.damage_type] or 0
-			local before = math.max(1 - current / 100, 0.1)
-			local after = math.max(1 - (current + amount) / 100, 0.1)
+			-- Resistance is in points, not per cent (enemy sheets carry 100 and 150): damage
+			-- taken is 100 / (100 + points). (It was read as "minus that many per cent, at
+			-- least 10% left": with Resistant I and II already taken, Resistant III, +200 to
+			-- physical and magic, scored as costing nothing and was picked as the cheapest
+			-- curse on offer. Two runs ended within a few waves of it.)
+			local current = math.max(state.resist[effect.damage_type] or 0, -90)
+			local before = 100 / (100 + current)
+			local after = 100 / (100 + math.max(current + amount, -90))
 			power *= 1 + share * (after / before - 1)
 		elseif kind == "enemy_amp_specific" then
 			power *= 1 + share * amount
@@ -9185,9 +9190,10 @@ function CardBrain.choose(options)
 		Match.cardPower = stacked
 	end
 	local best, bestValue, report = nil, -math.huge, {}
-	local values = {}
+	local values, powers, rewards = {}, {}, {}
 	for key, option in pairs(options) do
 		local power, reward, candy = CardBrain.score(option, state)
+		powers[key], rewards[key] = power, reward
 		-- The multiplier only pays on the waves still to come: +1.5 at wave 47 of 50 is three
 		-- waves of pearls, bought with the clear. (A Pearls run took Enemy Health III there and
 		-- died at wave 49.)
@@ -9202,8 +9208,25 @@ function CardBrain.choose(options)
 			best, bestValue = key, value
 		end
 	end
-	-- Cards on the user's never list lose to any card that isn't on it.
 	local banned = CardBrain.banned()
+	if mode == "Pearls" then
+		-- Pearls: curses only (they are what pays), and of the curses on offer the one that
+		-- costs the team the least; the pay only breaks a tie. A blessing is taken when no
+		-- curse is offered (or every curse on offer is on the never list).
+		local pick
+		for key, option in pairs(options) do
+			if type(option) == "table" and option.option_type == "Bad" and not table.find(banned, CardBrain.family(option.title)) then
+				if pick == nil or powers[key] > powers[pick] + 1e-6 or (math.abs(powers[key] - powers[pick]) <= 1e-6 and rewards[key] > rewards[pick]) then
+					pick = key
+				end
+			end
+		end
+		if pick ~= nil then
+			best = pick
+			table.insert(report, "pearls: the curse that costs least")
+		end
+	end
+	-- Cards on the user's never list lose to any card that isn't on it.
 	if #banned > 0 then
 		local free, freeValue
 		for key, option in pairs(options) do
@@ -12673,7 +12696,7 @@ do
 	heading(page, "Event cards")
 	toggle(page, "Auto pick cards", "AutoCards")
 	segmented(page, "", "CardMode", { "Safe", "Balanced", "Pearls" })
-	hint(page, "Safe: always the card that keeps the team strongest. Balanced: the same until the stage has been cleared once, then challenge cards for more pearls while the run is comfortable. Pearls: challenge cards from the start.")
+	hint(page, "Safe: always the card that keeps the team strongest. Balanced: the same until the stage has been cleared once, then challenge cards for more pearls while the run is comfortable. Pearls: only curses, always the one that costs your team the least; a blessing only when no curse is offered. Your own order and never list below still come first.")
 	do
 		local CardBrain = AA.CardBrain
 		local listLine
