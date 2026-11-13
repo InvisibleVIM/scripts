@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v138", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v141", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 
 -- Unload a previous execution before touching anything.
 if shared.AnimeAdventures then
@@ -149,6 +149,13 @@ local Config = {
 	CardMode = "Balanced",
 	ChallengeFallback = "Story",
 	Otherwise = "None",
+	QuestDaily = true,
+	QuestInfinite = true,
+	QuestStory = true,
+	QuestEvent = true,
+	QuestFirst = "",
+	QuestSecond = "",
+	QuestThird = "",
 	DailyGiveUp = true,
 	ChallengeLeave = false,
 	Matchmaking = false,
@@ -259,7 +266,7 @@ do
 	end
 	-- A saved choice that is no longer an option (an older version's) goes back to its default.
 	local choices = {
-		Mode = { "Story", "Level", "Infinite", "Legend", "Raid", "Artifact", "Challenge", "Daily", "Missions", "Summer", "Cursed Womb", "Tournament", "Castle", "Dungeon", "Portals", "Kills" },
+		Mode = { "Story", "Level", "Infinite", "Legend", "Raid", "Artifact", "Challenge", "Daily", "Missions", "Quests", "Summer", "Cursed Womb", "Tournament", "Castle", "Dungeon", "Portals", "Kills" },
 		AfterGame = { "Auto", "Next", "Replay", "Lobby" },
 		Difficulty = { "Normal", "Hard" },
 		PlaceStyle = { "Auto", "Front", "Normal" },
@@ -1204,12 +1211,13 @@ function AA.portalItems()
 					return gameRequire(replicatedStorage.src.Data.Items)[itemId]
 				end)
 				local static = ok and type(data) == "table" and data.static_portal_copy_to_level_params
-				AA.portalNames[itemId] = { name = ok and type(data) == "table" and data.name or itemId, group = type(static) == "table" and static.portal_group or nil }
+				AA.portalNames[itemId] = { name = ok and type(data) == "table" and data.name or itemId, group = type(static) == "table" and static.portal_group or nil, level = type(static) == "table" and static.level_id or nil }
 			end
 			local known = AA.portalNames[itemId]
 			local own = type(extra._unique_portal_data) == "table" and extra._unique_portal_data.level_id
 			local group = known.group or (own and Levels[own] and Levels[own].portal_group) or nil
-			table.insert(list, { uuid = item.uuid, id = itemId, name = known.name, group = group, tries = tries, left = max - tries, made = tonumber(item._creation_time) or 0 })
+			local depth = type(extra._unique_portal_data) == "table" and tonumber(extra._unique_portal_data.portal_depth) or nil
+			table.insert(list, { uuid = item.uuid, id = itemId, name = known.name, group = group, level = own or known.level, depth = depth, tries = tries, left = max - tries, made = tonumber(item._creation_time) or 0 })
 		end
 	end
 	return list
@@ -1318,22 +1326,6 @@ function AA.killsMode()
 	return id:find("^aot") ~= nil and id:find("infinite") ~= nil
 end
 
----How many of our Zombie (Risen) have this spot inside their range.
-function AA.blessedAt(position)
-	local count = 0
-	for _, unit in ipairs(AA.myTowers and AA.myTowers() or {}) do
-		if unit._stats.id.Value == "giselle_evolved" then
-			local range = unit._stats:FindFirstChild("range")
-			local at = unit:GetPivot().Position
-			local dx, dz = at.X - position.X, at.Z - position.Z
-			local reach = (range and range.Value or 21) * 0.95
-			if dx * dx + dz * dz <= reach * reach then
-				count += 1
-			end
-		end
-	end
-	return count
-end
 ---Our Holy Warlord, when one stands (Shadow Sorcerer (Ritual)'s summon; one at a time).
 function AA.ownWarlord()
 	local folder = workspace:FindFirstChild("_UNITS")
@@ -1918,10 +1910,10 @@ do
 	function AA.synergyInfo(id)
 		local base = tostring(id):gsub("_evolved$", "")
 		if id == "giselle_evolved" then
-			-- Undead Blessing comes with the evolution ("+25% Attack, +Bone Bomb Brigade, +Undead
-			-- Blessing"): plain Zombie has no passive and leaves no buff on units in her range
-			-- (checked live). Each Zombie (Risen) in range adds to summon damage, so summoners and
-			-- the Sorcerer whose Ritual becomes Holy Warlord stand inside her range.
+			-- Undead Blessing (Zombie (Risen) only; plain Zombie has no passive): "Whenever another
+			-- minion is summoned, this unit buffs that minion's Health and Attack by 25%, and Range
+			-- by 10%. This effect stacks globally on the same minion up to 8 times." Global: where
+			-- she stands doesn't matter, only that she is on the field when the minion appears.
 			return { pct = 0.25, stacks = true, coverage = 1, matches = function(otherId, otherData)
 				return AA.isSummoner(otherId) or AA.ritualUnit(otherData or Units[otherId])
 			end }
@@ -2447,7 +2439,6 @@ local function bestSpot(data, focus)
 		end
 		-- Summoners: their summons walk the road from the base no matter where the unit stands, so
 		-- they never take a front spot. Road still inside their range, as far down the path as it goes.
-		-- (Inside a Zombie (Risen)'s range when one is down: her blessing is on summon damage.)
 		local range = math.max(unitStatsAt(data, 0).range * 0.8, 6)
 		local best, bestScore = nil, -math.huge
 		for _, list in ipairs(pool) do
@@ -2470,7 +2461,7 @@ local function bestSpot(data, focus)
 						-- the far end of the road did no damage at all while everything died at the spawn.
 						local aim = Match.pace == "speed" and (Match.laneJunction and Match.laneJunction[spot.lane] or 0.02) or 0.6
 						local score = -math.abs(progress - aim) * 10 + math.min(spot.gap, range) * (Match.pace == "speed" and -0.05 or 0.1)
-						score += AA.blessedAt(p) * 1.5
+
 						if score > bestScore then
 							best, bestScore = spot, score
 						end
@@ -2501,26 +2492,6 @@ local function bestSpot(data, focus)
 		circles, firstGap = buffHub(data)
 		if circles and #circles == 0 then
 			circles = nil
-		end
-	end
-	-- Zombie (Risen)'s blessing: she goes where the units it boosts are inside her range, and
-	-- those units go inside hers.
-	local blessTargets, blessReach, blessedUnit
-	do
-		local own = data.id and AA.synergyInfo(data.id)
-		if own and own.stacks and not focus then
-			blessTargets, blessReach = {}, unitStatsAt(data, 0).range * 0.9
-			for _, unit in ipairs(myUnits()) do
-				local allyId = unit._stats.id.Value
-				if allyId ~= data.id and own.matches(allyId, Units[allyId]) then
-					table.insert(blessTargets, unit:GetPivot().Position)
-				end
-			end
-			if #blessTargets == 0 then
-				blessTargets = nil
-			end
-		elseif not focus and data.id and (AA.isSummoner(data.id) or AA.ritualUnit(data)) then
-			blessedUnit = true
 		end
 	end
 	local checked, sliceStart = 0, os.clock()
@@ -2624,18 +2595,6 @@ local function bestSpot(data, focus)
 							end
 						end
 						score *= 1 + 0.07 * math.min(close, 5)
-					end
-					if blessedUnit and score > 0 then
-						score *= 1 + 0.3 * math.min(AA.blessedAt(p), 2)
-					elseif blessTargets and score > 0 then
-						local inside = 0
-						for _, target in ipairs(blessTargets) do
-							local dx, dz = target.X - p.X, target.Z - p.Z
-							if dx * dx + dz * dz <= blessReach * blessReach then
-								inside += 1
-							end
-						end
-						score *= 1 + 1.5 * inside / #blessTargets
 					end
 					if score > bestScore then
 						best, bestScore, bestDirection = spot, score, direction
@@ -3049,7 +3008,22 @@ local function planAction()
 				score = best * factor
 				-- Aura units (Water Goddess: +50% to Water units in range): worth what they add.
 				local aura = AA.synergyInfo(entry.id)
-				if aura and not aura.stacks and (placed[entry.id] or 0) == 0 then
+				if aura and aura.stacks and (placed[entry.id] or 0) == 0 then
+					-- (Zombie (Risen): every minion summoned while she stands gets +25% attack,
+					-- wherever she is. Summoners' power counts through their summons; a Ritual
+					-- Sorcerer counts for the Warlord he becomes.)
+					local boosted = 0
+					for _, ally in ipairs(powerUnits) do
+						if aura.matches(ally.id, ally.data) then
+							boosted += ally.power * (AA.ritualUnit(ally.data) and 3 or 1)
+						end
+					end
+					-- (Measured with the Unique trait: her one copy put 4 stacks on every
+					-- jellyfish and eel, the unit's normal cap, and a level 0 Elyssia's jellyfish
+					-- hit for 2.1x her damage. So a Unique copy counts as a full set.)
+					local copies = (placeCap(data) == 1 and (tonumber(data.spawn_cap) or 1) > 1) and data.spawn_cap or 1
+					score += boosted * aura.pct * copies / cost
+				elseif aura and not aura.stacks and (placed[entry.id] or 0) == 0 then
 					local boosted = 0
 					for _, ally in ipairs(powerUnits) do
 						if ally.id ~= entry.id and aura.matches(ally.id, ally.data) then
@@ -4066,6 +4040,24 @@ local function useAbilities()
 		-- Warlord of ours stands or another ritual is on its way (that would only lose the unit).
 		if hasActive and live and tostring(live.Value):find(":mahoraga", 1, true) then
 			local warlord = AA.ownWarlord() ~= nil or not Config.RitualAuto
+			if not warlord then
+				-- The Warlord is a summoned minion: with Zombie (Risen) on the team he is only
+				-- called once she stands, so he arrives with her blessing.
+				local risenOnTeam, risenPlaced = false, false
+				for _, entry in ipairs(equippedUnits()) do
+					risenOnTeam = risenOnTeam or entry.id == "giselle_evolved"
+				end
+				for _, tower in ipairs(field.towers) do
+					risenPlaced = risenPlaced or tower._stats.id.Value == "giselle_evolved"
+				end
+				if risenOnTeam and not risenPlaced then
+					-- (At most 45 s: if she can't be placed the Ritual still happens.)
+					Match.ritualWait = Match.ritualWait or now
+					if now - Match.ritualWait < 45 then
+						warlord = true
+					end
+				end
+			end
 			if not warlord and now - (Match.ritualAt or 0) > 15 then
 				Match.ritualAt = now
 				Match.abilityAt[unit] = now
@@ -4742,6 +4734,10 @@ local function finishMatch()
 			after = "Replay"
 		end
 	end
+	if AA.playMode() == "Quests" and Config.AutoJoin then
+		-- The lobby claims the quest and picks the next one.
+		after = "Lobby"
+	end
 	local portalNext
 	if kind == "Portal" and after ~= "Lobby" and Config.AutoJoin and AA.playMode() == "Portals" then
 		-- The next portal straight from the result screen (the game's own "replay with another
@@ -4852,6 +4848,7 @@ local function resetMatch()
 	AA.Macro.reset()
 	Match.missionOpen, Match.leftLogged, Match.finishedSince, Match.frontForced = nil, nil, nil, nil
 	Match.orderSkip, Match.orderStep, Match.ritualAt, Match.skipHeld = nil, nil, nil, nil
+	Match.ritualWait = nil
 	Match.dpsSample, Match.peakDps, Match.pressure, Match.pressByWave, Match.pressAt = nil, nil, nil, nil, nil
 	Match.pendingAtStart, Match.pendingCheck = nil, nil
 	Match.killTime, Match.lastKillTime, Match.killWave, Match.everLong, Match.paceSeeded, Match.hubMoved = nil, nil, nil, nil, nil, nil
@@ -4883,7 +4880,7 @@ local function matchLoop()
 		local started = AA.progress.started
 		if type(started) == "table" then
 			if started.user == localPlayer.UserId and os.time() - (started.at or 0) < 300 then
-				AA.progress.session = { job = game.JobId, mode = started.mode }
+				AA.progress.session = { job = game.JobId, mode = started.mode, quest = started.quest }
 			end
 			AA.progress.started = nil
 			AA.saveProgress()
@@ -5019,6 +5016,12 @@ local function matchLoop()
 					-- The mission this run was for is complete: claim it and move on.
 					status = "Mission complete: leaving"
 					note("leave", { why = "mission" })
+					local summary = { level = Match.levelId, won = true, wave = wave, left = true, at = os.time(), mode = matchKind(), picked = Config.Mode, time = math.floor(os.clock() - Match.startedAt) }
+					AA.leaveMatch(summary)
+				elseif Config.AutoJoin and AA.playMode() == "Quests" and os.clock() - Match.startedAt > 20 and AA.Quests.goalDone() then
+					-- The quest this match was started for is done: claim it and take the next one.
+					status = "Quest done: leaving"
+					note("leave", { why = "quest" })
 					local summary = { level = Match.levelId, won = true, wave = wave, left = true, at = os.time(), mode = matchKind(), picked = Config.Mode, time = math.floor(os.clock() - Match.startedAt) }
 					AA.leaveMatch(summary)
 				elseif (Config.LeaveAfterMinutes or 0) > 0 and Config.AutoJoin and os.clock() - Match.startedAt >= Config.LeaveAfterMinutes * 60 then
@@ -5449,9 +5452,229 @@ local chooseTarget
 function AA.chooseTarget(...)
 	return chooseTarget(...)
 end
+---Quests mode. Every open quest of the profile as a record, sorted into the game's sets:
+---Daily (kills, multiplayer waves, the daily mission), Infinite (reach wave N on a world's
+---infinite), Story (clear a story act / legend stage / boss portal) and Event (the running
+---event's own quests).
+AA.Quests = {}
+function AA.Quests.list()
+	local list = {}
+	local handler = profile().quest_handler
+	for uuid, quest in pairs(type(handler) == "table" and type(handler.quests) == "table" and handler.quests or {}) do
+		local info = type(quest) == "table" and quest.quest_info
+		local class = type(info) == "table" and type(info.quest_class) == "table" and info.quest_class or nil
+		if class then
+			local need = tonumber(class.amount) or 1
+			local have = type(quest.quest_progress) == "table" and tonumber(quest.quest_progress.amount) or 0
+			local set
+			if info._infinite_quest_order then
+				set = "Infinite"
+			elseif class.class == "finish_level" and not info.expiry_time then
+				set = "Story"
+			elseif info.unique and info.expiry_time then
+				set = "Event"
+			elseif info.expiry_time then
+				set = "Daily"
+			else
+				set = "Story"
+			end
+			local key = info.id and tostring(info.id) or (tostring(class.class) .. ":" .. tostring(class.level_id or "") .. ":" .. tostring(class.wave or class.amount or ""))
+			table.insert(list, {
+				uuid = uuid, key = key, set = set, class = tostring(class.class), data = class, info = info,
+				name = tostring(info.quest_name or key), have = have, need = need,
+				done = quest.quest_completed == true or have >= need,
+			})
+		end
+	end
+	return list
+end
+---What to play for a quest: id, difficulty, kind, group (as chooseTarget returns them), or nil and
+---the reason it can't be played by the script right now.
+function AA.Quests.target(quest, done)
+	local class, data = quest.class, quest.data
+	if class == "reach_wave" or class == "finish_level" then
+		local id = data.level_id
+		local level = id and Levels[id]
+		if not level then
+			return nil, "unknown stage"
+		end
+		if level._portal_only_level or tostring(id):find("portal", 1, true) then
+			for _, item in ipairs(AA.portalItems()) do
+				if item.level == id and item.left > 0 then
+					return item.uuid, item.name, "portal"
+				end
+			end
+			return nil, "needs its portal"
+		end
+		if not levelUnlocked(id, done) then
+			return nil, "locked"
+		end
+		if class == "reach_wave" then
+			-- (An infinite stage always ends in a loss: only out when the last three runs today
+			-- fell short of this wave.)
+			local lastWave, count = AA.lostWave(id)
+			if (count or 0) >= 3 and (lastWave or 0) <= (tonumber(data.wave) or 0) then
+				return nil, "fell short 3 times today"
+			end
+		elseif AA.tooHard(id) then
+			return nil, "lost 3 times today"
+		end
+		local hard = class == "reach_wave" or tostring(id):find("_legend_", 1, true) or tostring(id):find("infinite", 1, true)
+		return id, hard and "Hard" or "Normal", "story"
+	elseif class == "kill_unit_multi" then
+		-- The daily mission ("Defeat 2500 Curses"): its world's infinite, or its furthest open act.
+		local worldId = tostring(quest.info.id or ""):match("^(.-)_daily$")
+		local world = worldId and Worlds[worldId]
+		local infinite = world and world.infinite and world.infinite.id
+		if infinite and Levels[infinite] and levelUnlocked(infinite, done) then
+			return infinite, "Hard", "story"
+		end
+		for act = 6, 1, -1 do
+			local entry = world and world.levels and (world.levels[tostring(act)] or world.levels[act])
+			if entry and levelUnlocked(entry.id, done) then
+				return entry.id, "Normal", "story"
+			end
+		end
+		return nil, "world locked"
+	elseif class == "finish_portal_level" then
+		for _, item in ipairs(AA.portalItems()) do
+			if item.level and type(data.level_ids) == "table" and data.level_ids[item.level] and item.left > 0 and (not data.min_depth or (item.depth or 0) >= data.min_depth) then
+				return item.uuid, item.name, "portal"
+			end
+		end
+		return nil, data.min_depth and ("needs a tier " .. tostring(data.min_depth) .. "+ portal") or "needs a portal"
+	elseif class == "summer2_hunt_weathers" or (class == "kill_unit" and tostring(data.unit_id):find("^summer")) then
+		local id, difficulty, kind, group = chooseTarget("Summer")
+		if id then
+			return id, difficulty, kind, group
+		end
+		return nil, "Summer Hunt not open"
+	elseif class == "kills" or class == "clear_waves_multiplayer" or class == "daily_complete" then
+		return nil, "fills up while playing anything"
+	end
+	return nil, "not something the script can do"
+end
+---How hard a quest is, for the automatic order (lower first).
+function AA.Quests.difficulty(quest)
+	local class, data = quest.class, quest.data
+	local left = 1 - math.clamp(quest.have / math.max(quest.need, 1), 0, 1)
+	if class == "kill_unit_multi" then
+		return 0.5 + left
+	elseif class == "reach_wave" then
+		return (tonumber(data.wave) or 10) / 10 + (tonumber(quest.info._infinite_quest_order) or 0) * 0.01
+	elseif class == "finish_level" then
+		local id = tostring(data.level_id)
+		local stage = tonumber(id:match("_(%d+)$")) or 1
+		if id:find("_legend_", 1, true) then
+			return 6 + stage * 0.3
+		elseif id:find("portal", 1, true) then
+			return 5
+		end
+		local index = table.find(Order.LEVEL_ORDER or {}, id) or 100
+		return 2.5 + index * 0.02
+	elseif class == "finish_portal_level" then
+		return 4 + (tonumber(data.min_depth) or 0) * 0.3 + math.log(math.max(quest.need - quest.have, 1), 10) * 2
+	elseif class == "kill_unit" then
+		return 7
+	elseif class == "summer2_hunt_weathers" then
+		return 9
+	end
+	return 50
+end
+---The quests of the picked sets in the order they will be done: the user's priority picks first,
+---the rest from easiest to hardest. Each entry gets .target (playable now) or .why.
+function AA.Quests.plan()
+	local sets = { Daily = Config.QuestDaily, Infinite = Config.QuestInfinite, Story = Config.QuestStory, Event = Config.QuestEvent }
+	local rank = {}
+	for index, key in ipairs({ Config.QuestFirst, Config.QuestSecond, Config.QuestThird }) do
+		if type(key) == "string" and key ~= "" and not rank[key] then
+			rank[key] = index
+		end
+	end
+	local done = completedLevels()
+	local plan = {}
+	for _, quest in ipairs(AA.Quests.list()) do
+		if not quest.done and (sets[quest.set] or rank[quest.key]) then
+			local id, second, kind, group = AA.Quests.target(quest, done)
+			if id then
+				quest.target = { id, second, kind, group }
+			else
+				quest.why = second
+			end
+			quest.rank = rank[quest.key] or 99
+			quest.hard = AA.Quests.difficulty(quest)
+			table.insert(plan, quest)
+		end
+	end
+	table.sort(plan, function(a, b)
+		if (a.target ~= nil) ~= (b.target ~= nil) then
+			return a.target ~= nil
+		end
+		if a.rank ~= b.rank then
+			return a.rank < b.rank
+		end
+		if a.hard ~= b.hard then
+			return a.hard < b.hard
+		end
+		return a.key < b.key
+	end)
+	return plan
+end
+---In a match started for a quest: is that quest finished (so the match can be left)?
+function AA.Quests.goalDone()
+	local session = AA.progress and AA.progress.session
+	local goal = type(session) == "table" and session.job == game.JobId and session.quest or nil
+	if type(goal) ~= "table" then
+		return false
+	end
+	if goal.class == "finish_level" or goal.class == "finish_portal_level" or goal.class == "kill_unit" or goal.class == "summer2_hunt_weathers" then
+		return false -- these end with the match itself
+	end
+	if goal.class == "reach_wave" then
+		-- Until the highest wave this run is for, or until no "reach wave" quest of this stage
+		-- is open any more.
+		local wave = workspace:FindFirstChild("_wave_num")
+		if goal.wave and (wave and wave.Value or 0) > goal.wave then
+			return true
+		end
+		for _, quest in ipairs(AA.Quests.list()) do
+			if quest.class == "reach_wave" and quest.data.level_id == goal.level and not quest.done then
+				return false
+			end
+		end
+		return true
+	end
+	local found
+	for _, quest in ipairs(AA.Quests.list()) do
+		if quest.key == goal.key then
+			found = quest
+		end
+	end
+	return not found or found.done
+end
+
 AA.chooseInner = function(modeOverride)
 	local mode = modeOverride or Config.Mode
 	local done = completedLevels()
+	if mode == "Quests" then
+		AA.questPick = nil
+		for _, quest in ipairs(AA.Quests.plan()) do
+			if quest.target then
+				AA.questPick = { key = quest.key, class = quest.class, wave = tonumber(quest.data.wave), name = quest.name, level = quest.data.level_id }
+				if quest.class == "reach_wave" then
+					-- One run does every "reach wave N" of the same stage: stay until the highest
+					-- one still open (10 and 20 fall on the way to 40).
+					for _, other in ipairs(AA.Quests.plan()) do
+						if other.class == "reach_wave" and other.target and other.data.level_id == quest.data.level_id then
+							AA.questPick.wave = math.max(AA.questPick.wave or 0, tonumber(other.data.wave) or 0)
+						end
+					end
+				end
+				return quest.target[1], quest.target[2], quest.target[3], quest.target[4]
+			end
+		end
+		return nil, nil, "quests"
+	end
 	-- An act lost three times in a day is too much for the team right now: farm the last act that
 	-- is cleared instead (unit XP, gems) and come back to it tomorrow or when the losses expire.
 	local function grind()
@@ -5823,11 +6046,11 @@ local function joinGame()
 	if id and (type(AA.progress.started) ~= "table" or AA.progress.started.mode ~= startedMode or os.time() - (AA.progress.started.at or 0) > 20) then
 		-- The match about to load was started by the script in this mode (mode rules such as
 		-- Farm kills only apply to those, never to a match opened by hand).
-		AA.progress.started = { mode = startedMode, at = os.time(), user = localPlayer.UserId }
+		AA.progress.started = { mode = startedMode, at = os.time(), user = localPlayer.UserId, quest = startedMode == "Quests" and AA.questPick or nil }
 		AA.saveProgress()
 	end
 	if not id then
-		status = kind == "wombkey" and "No Cursed Womb Key (drops in Haunted Academy infinite)" or kind == "portal" and "No portal items" or kind == "raid" and "Waiting for a raid" or (kind == "challenge" and "No challenge left" or ((kind == "artifact" or kind == "locked") and "Locked: clear the story first" or "Nothing to join"))
+		status = kind == "quests" and "No quest the script can play right now (see the list on the Mode tab)" or kind == "wombkey" and "No Cursed Womb Key (drops in Haunted Academy infinite)" or kind == "portal" and "No portal items" or kind == "raid" and "Waiting for a raid" or (kind == "challenge" and "No challenge left" or ((kind == "artifact" or kind == "locked") and "Locked: clear the story first" or "Nothing to join"))
 		return false
 	end
 	do
@@ -9968,7 +10191,7 @@ do
 	heading(page, "Mode", "left")
 	toggle(page, "Join and requeue on its own", "AutoJoin")
 	UI.dropdown(page, "Game mode", function()
-		return { "Story", "Level", "Infinite", "Legend", "Raid", "Artifact", "Challenge", "Daily", "Missions", "Summer", "Cursed Womb", "Tournament", "Castle", "Dungeon", "Portals", "Farm kills" }
+		return { "Story", "Level", "Infinite", "Legend", "Raid", "Artifact", "Challenge", "Daily", "Missions", "Quests", "Summer", "Cursed Womb", "Tournament", "Castle", "Dungeon", "Portals", "Farm kills" }
 	end, function()
 		return Config.Mode == "Kills" and "Farm kills" or Config.Mode
 	end, function(option)
@@ -10025,6 +10248,79 @@ do
 
 	heading(page, "Mode settings", "right")
 	only({ "Summer", "Cursed Womb", "Tournament", "Dungeon", "None" }, hint(page, "This mode has no settings of its own."))
+	do
+		-- Quests: which sets, what first, and the order the script will take them in.
+		local function gate(object)
+			only({ "Quests" }, object)
+		end
+		toggle(page, "Daily quests", "QuestDaily")
+		gate()
+		hint(page, "Quests mode plays whatever finishes your open quests, one at a time, and claims them in the lobby. These switches pick the sets. Kills, multiplayer waves and the like fill up on their own while it plays the others. Quests the script can't do (evolve a unit, summon a unit) are listed but skipped. When nothing is left to play it uses your Otherwise mode.")
+		toggle(page, "Infinite quests", "QuestInfinite")
+		gate()
+		toggle(page, "Story quests", "QuestStory")
+		gate()
+		toggle(page, "Event quests", "QuestEvent")
+		gate()
+		local function names()
+			local list = { "Auto" }
+			for _, quest in ipairs(AA.Quests.plan()) do
+				if quest.target and not table.find(list, quest.name) then
+					table.insert(list, quest.name)
+				end
+			end
+			return list
+		end
+		local function nameOf(key)
+			if key == "" then
+				return "Auto"
+			end
+			for _, quest in ipairs(AA.Quests.list()) do
+				if quest.key == key then
+					return quest.name
+				end
+			end
+			return "Auto"
+		end
+		local function keyOf(name)
+			for _, quest in ipairs(AA.Quests.list()) do
+				if quest.name == name then
+					return quest.key
+				end
+			end
+			return ""
+		end
+		for index, slot in ipairs({ "QuestFirst", "QuestSecond", "QuestThird" }) do
+			UI.dropdown(page, ({ "Do first", "Then", "Then" })[index], names, function()
+				return nameOf(Config[slot])
+			end, function(option)
+				Config[slot] = option == "Auto" and "" or keyOf(option)
+				AA.refreshPlay()
+			end)
+			gate()
+			if index == 1 then
+				hint(page, "Your own order for up to three quests. Everything you leave on Auto is taken from easiest to hardest: the daily mission, then infinite waves (10, 20, 40), story acts, portals, legend stages, event bosses. A stage lost three times in a day is skipped until tomorrow.")
+			end
+		end
+		local planLine = infoLine(page, 150)
+		planLine.TextYAlignment = Enum.TextYAlignment.Top
+		gate(planLine)
+		task.spawn(function()
+			while AA.alive do
+				if Config.Mode == "Quests" or Config.Otherwise == "Quests" then
+					local ok, plan = pcall(AA.Quests.plan)
+					local lines = {}
+					for index, quest in ipairs(ok and plan or {}) do
+						if #lines < 9 then
+							table.insert(lines, quest.target and (#lines + 1 .. ". " .. quest.name) or ("-- " .. quest.name .. " (" .. tostring(quest.why) .. ")"))
+						end
+					end
+					planLine.Text = #lines > 0 and table.concat(lines, "\n") or "No open quests in the picked sets."
+				end
+				task.wait(3)
+			end
+		end)
+	end
 	do
 		local function portalLabel(id)
 			local count, left, name = 0, 0, id
