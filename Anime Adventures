@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v153", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v154", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -6570,11 +6570,12 @@ local function claimRewards()
 				invoke("redeem_quest", uuid)
 			end
 		end
-		-- Daily and 1-hour missions are a separate system from quest_handler (they never appear in
-		-- handler.quests). The endpoint lists the interval's mission ids; the server pays a claim
-		-- only when the mission is actually finished, so claiming a listed-but-unfinished one is a
-		-- safe no-op. claimed_missions resets when its interval rolls over. Re-checked every ~30 min
-		-- and after each finished match (when progress can have moved), not on every lobby tick.
+		-- Daily and 1-hour missions: the board lists the interval's missions, and
+		-- request_claim_dailymission / request_claim_mission is the board's ACCEPT button (not a
+		-- reward claim). An accepted mission becomes a quest in handler.quests ("Kill 3000 X, any
+		-- mode") and only counts kills from then on; its reward is paid by redeem_quest above once
+		-- it's done. claimed_missions holds the accepted ids and resets when the interval rolls over.
+		-- Re-checked every ~30 min and after each finished match, not on every lobby tick.
 		local missionStamp = math.floor(os.time() / 1800) .. ":" .. tostring(Stats.wins + Stats.losses)
 		for _, kind in ipairs({
 			{ key = "dailymissions_data", list = "request_current_dailymissions", claim = "request_claim_dailymission" },
