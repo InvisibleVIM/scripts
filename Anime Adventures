@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v185", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v186", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -1795,6 +1795,7 @@ local function buildSpots()
 	-- every second row and column is kept, so big maps don't triple their spot count.
 	local margin, step = 36, 1.62
 	local spots = { ground = {}, hill = {} }
+	local cluttered = {}
 	local column = 0
 	for x = minX - margin, maxX + margin, step do
 		column += 1
@@ -1810,21 +1811,34 @@ local function buildSpots()
 			end
 			if onRoad and (nearest >= 1.4 or Config.RoadSpots) then
 				local hit = workspace:Raycast(Vector3.new(x, topY + 80, z), Vector3.new(0, -200, 0), params)
-				local roof
+				local roof, low
 				if hit and hit.Normal.Y > 0.6 and hit.Instance.Name ~= "_donotplace" then
-					local top = workspace:Raycast(Vector3.new(x, topY + 80, z), Vector3.new(0, -200, 0), anything)
-					if top and top.Position.Y > hit.Position.Y + 0.5 then
-						local above = workspace:Raycast(hit.Position + Vector3.new(0, 0.2, 0), Vector3.new(0, 80, 0), anything)
-						if not above or above.Position.Y < hit.Position.Y + 4 then
-							hit = nil
-						else
-							roof = above.Position.Y - hit.Position.Y
+					-- Everything above the spot, from the top down: the lowest surface decides.
+					-- (A building's foundation lies a tenth of a stud over the ground: the old
+					-- check looked up from 0.2 studs and saw only the roof six studs higher, and
+					-- nine placements in a row were refused there.)
+					local origin, lowest = Vector3.new(x, topY + 80, z), nil
+					for _ = 1, 6 do
+						local over = workspace:Raycast(origin, Vector3.new(0, -200, 0), anything)
+						if not over or over.Position.Y <= hit.Position.Y + 0.02 then
+							break
 						end
+						lowest = over.Position.Y
+						origin = over.Position - Vector3.new(0, 0.05, 0)
+					end
+					if lowest then
+						roof = lowest - hit.Position.Y
+						low = roof < 4
 					end
 				end
 				if hit and hit.Normal.Y > 0.6 and hit.Instance.Name ~= "_donotplace" then
 					local spot = { position = hit.Position, gap = nearest, progress = onRoad.progress, lane = onRoad.lane, roof = roof }
-					if ground and hit.Instance:IsDescendantOf(ground) then
+					if low then
+						-- Something lies right on top of this ground: kept aside (see below).
+						if (ground and hit.Instance:IsDescendantOf(ground)) or (hill and hit.Instance:IsDescendantOf(hill)) then
+							table.insert(cluttered, { spot = spot, hill = hill ~= nil and hit.Instance:IsDescendantOf(hill) })
+						end
+					elseif ground and hit.Instance:IsDescendantOf(ground) then
 						table.insert(spots.ground, spot)
 					elseif hill and hit.Instance:IsDescendantOf(hill) then
 						table.insert(spots.hill, spot)
@@ -1842,7 +1856,16 @@ local function buildSpots()
 			task.wait()
 		end
 	end
+	-- A map whose ground is covered nearly everywhere (a layer of grass or sand over the ground
+	-- parts) would be left with no spots at all: there the covered ones are placeable after all.
+	if #cluttered > (#spots.ground + #spots.hill) * 2 then
+		for _, row in ipairs(cluttered) do
+			table.insert(row.hill and spots.hill or spots.ground, row.spot)
+		end
+		cluttered = {}
+	end
 	Match.spots, Match.spotsRoad = spots, Config.RoadSpots
+	Match.spotsCluttered = #cluttered
 	return spots
 end
 
@@ -3429,6 +3452,18 @@ local function placeUnit(entry, focus)
 		return false
 	end
 	Match.badSpots[spotKey(spot.position)] = true
+	if Match.spots and tostring(AA.lastMessage or ""):find("Cannot place unit here", 1, true) then
+		-- Whatever is wrong with the ground here is wrong next to it too: the spots within six
+		-- studs go with it, so the next try is somewhere else.
+		for _, list in pairs(Match.spots) do
+			for _, other in ipairs(type(list) == "table" and list or {}) do
+				local dx, dz = other.position.X - spot.position.X, other.position.Z - spot.position.Z
+				if dx * dx + dz * dz <= 36 and math.abs(other.position.Y - spot.position.Y) < 3 then
+					Match.badSpots[spotKey(other.position)] = true
+				end
+			end
+		end
+	end
 	if spot.roof and Match.spots then
 		-- Refused under a roof: every covered spot with no more headroom than this one goes
 		-- with it. (Where the server draws that line is a guess between one spot it took, 4.7
