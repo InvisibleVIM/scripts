@@ -38,7 +38,17 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v141", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v142", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+-- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
+-- reading the real ones through this.
+AA.realValues = setmetatable({}, { __mode = "k" })
+function AA.rv(object)
+	local real = AA.realValues[object]
+	if real ~= nil then
+		return real
+	end
+	return object.Value
+end
 
 -- Unload a previous execution before touching anything.
 if shared.AnimeAdventures then
@@ -2061,8 +2071,8 @@ function AA.shieldMode(towers)
 	local total, n = 0, 0
 	for _, unit in ipairs(towers or {}) do
 		local damage = unit._stats:FindFirstChild("damage")
-		if damage and damage.Value > 0 then
-			total += damage.Value
+		if damage and AA.rv(damage) > 0 then
+			total += AA.rv(damage)
 			n += 1
 		end
 	end
@@ -2977,7 +2987,7 @@ local function planAction()
 				for _, tower in ipairs(units) do
 					if tower._stats.id.Value == entry.id and not anchor then
 						anchor = tower:GetPivot().Position
-						anchorRange = tower._stats:FindFirstChild("range") and tower._stats.range.Value or AA.buffRange(data, unit, buff)
+						anchorRange = tower._stats:FindFirstChild("range") and AA.rv(tower._stats.range) or AA.buffRange(data, unit, buff)
 					end
 				end
 				local boosted = 0
@@ -3389,8 +3399,8 @@ local function leakGuard()
 		local range = unit._stats:FindFirstChild("range")
 		local damage = unit._stats:FindFirstChild("damage")
 		-- Only towers that actually hit things count as cover (farms and buffers stop nothing).
-		if range and damage and damage.Value > 0 then
-			table.insert(reach, { position = unit:GetPivot().Position, range = range.Value + 1.5 })
+		if range and damage and AA.rv(damage) > 0 then
+			table.insert(reach, { position = unit:GetPivot().Position, range = AA.rv(range) + 1.5 })
 		end
 	end
 	local leak, leakHealth = nil, 0
@@ -3860,7 +3870,7 @@ local function matchStep()
 				local data = Units[id]
 				local range = unit._stats:FindFirstChild("range")
 				if data and (id == buffer.id or AA.buffMatches(buff, data)) and not AA.unsellable(id) and unitStatsAt(data, data.upgrade and #data.upgrade or 0).farm <= 0 then
-					local reach = id == buffer.id and (AA.buffRange(buffer.data, buffer.unit, buff) + 10) or ((range and range.Value or unitStatsAt(data, 0).range) + 1)
+					local reach = id == buffer.id and (AA.buffRange(buffer.data, buffer.unit, buff) + 10) or ((range and AA.rv(range) or unitStatsAt(data, 0).range) + 1)
 					if not AA.reachesKillZone(unit, reach) then
 						table.insert(move, unit)
 						if id ~= buffer.id and not AA.isSummoner(id) then
@@ -3907,7 +3917,7 @@ local function matchStep()
 				local level = unit._stats.upgrade.Value
 				local power = copyPower(data, entry.unit, level)
 				local range = unit._stats:FindFirstChild("range")
-				local reaches = AA.reachesKillZone(unit, (range and range.Value or unitStatsAt(data, level).range) + 1)
+				local reaches = AA.reachesKillZone(unit, (range and AA.rv(range) or unitStatsAt(data, level).range) + 1)
 				if frontAll then
 					-- Front for everyone: standing in the first stretch of the road, not just
 					-- reaching it. Each copy is moved once.
@@ -3953,7 +3963,7 @@ local function matchStep()
 			local idleData = Units[idle._stats.id.Value]
 			local spot = bestSpot(idleData)
 			local range = idle._stats:FindFirstChild("range")
-			if not spot or not idle.Parent or not AA.reachesKillZone(spot.position, (range and range.Value or unitStatsAt(idleData, idle._stats.upgrade.Value).range) + 1) then
+			if not spot or not idle.Parent or not AA.reachesKillZone(spot.position, (range and AA.rv(range) or unitStatsAt(idleData, idle._stats.upgrade.Value).range) + 1) then
 				Match.relocated[idle._stats.id.Value] = 2
 				if idle.Parent then
 					idle:SetAttribute("AAFront", true)
@@ -4077,7 +4087,7 @@ local function useAbilities()
 			-- into an empty lane is a full cooldown wasted), and always on a boss in range.
 			local position = unit:GetPivot().Position
 			local rangeValue = unit._stats:FindFirstChild("range")
-			local reach = (rangeValue and rangeValue.Value or data.range or 15) + 4
+			local reach = (rangeValue and AA.rv(rangeValue) or data.range or 15) + 4
 			for _, enemy in ipairs(enemies) do
 				if (enemy:GetPivot().Position - position).Magnitude <= reach then
 					Match.abilityAt[unit] = now
@@ -4292,7 +4302,7 @@ do
 			local chain, loners = {}, {}
 			for _, unit in ipairs(group.units) do
 				local range = unit._stats:FindFirstChild("range")
-				if (unit:GetPivot().Position - anchorPosition).Magnitude <= (range and range.Value or 15) then
+				if (unit:GetPivot().Position - anchorPosition).Magnitude <= (range and AA.rv(range) or 15) then
 					table.insert(chain, unit)
 				else
 					table.insert(loners, unit)
@@ -4317,7 +4327,7 @@ do
 			local function teamOpen(caster)
 				local position = caster:GetPivot().Position
 				local range = caster._stats:FindFirstChild("range")
-				local reach = range and range.Value or 15
+				local reach = range and AA.rv(range) or 15
 				local any, open, total = false, 0, 0
 				for _, unit in ipairs(towers) do
 					if unit ~= caster and not mains[unit] and (unit:GetPivot().Position - position).Magnitude <= reach then
@@ -4332,7 +4342,7 @@ do
 							elseif unitStatsAt(data, 0).damage > 0 then
 								any = true
 								local damage, cooldown = unit._stats:FindFirstChild("damage"), unit._stats:FindFirstChild("attack_cooldown")
-								local weight = math.max((damage and damage.Value or 1) / math.max(cooldown and cooldown.Value or 1, 0.1), 1)
+								local weight = math.max((damage and AA.rv(damage) or 1) / math.max(cooldown and AA.rv(cooldown) or 1, 0.1), 1)
 								total += weight
 								if ends <= now then
 									open += weight
@@ -10625,6 +10635,385 @@ do
 	button(page, "Back to lobby", function()
 		invoke("teleport_back_to_lobby")
 		return "Teleporting"
+	end)
+end
+
+---Visuals: show different stat grades on your own units. Display only: the server keeps the real
+---stats, nothing here changes how a unit fights, and no other player sees it.
+---The game's own rules (TraitServiceCore.calculate_stat_rank): every unit rolls Damage between
+----10% and +20%, Cooldown and Range between -5% and +10%; the letter is where the roll sits in
+---that span (S- from 90% of it, S 92.5%, S+ 95%, SS 97.5%, SSS only at the very top).
+AA.Visual = {
+	STATS = {
+		{ key = "potency_stat", name = "Damage", min = 0.9, max = 1.2 },
+		{ key = "speed_stat", name = "Cooldown", min = 0.95, max = 1.1 },
+		{ key = "range_stat", name = "Range", min = 0.95, max = 1.1 },
+	},
+	GRADES = { "C-", "C", "C+", "B-", "B", "B+", "A-", "A", "A+", "S-", "S", "S+", "SS", "SSS" },
+	FROM = { 0, 1 / 9, 2 / 9, 1 / 3, 4 / 9, 5 / 9, 2 / 3, 2 / 3 + 0.7 / 9, 2 / 3 + 1.4 / 9, 0.9, 0.925, 0.95, 0.975, 1 },
+	FILE = SETTINGS_FOLDER .. "/visuals.json",
+	saved = {}, -- [uuid] = { potency_stat = 1.2, ... } what to show
+	orig = {}, -- [uuid] = the real trait stats
+	lastSet = setmetatable({}, { __mode = "k" }),
+	wrote = {}, -- [uuid][stat] = the last value this script put into the profile copy
+}
+do
+	local Visual = AA.Visual
+	function Visual.stat(key)
+		for _, stat in ipairs(Visual.STATS) do
+			if stat.key == key then
+				return stat
+			end
+		end
+	end
+	---The letter for a value of a stat.
+	function Visual.grade(stat, value)
+		if value >= stat.max - 1e-9 then
+			return "SSS", #Visual.GRADES
+		end
+		local fraction = (value - stat.min) / (stat.max - stat.min)
+		local index = 1
+		for i = 1, #Visual.GRADES - 1 do
+			if fraction >= Visual.FROM[i] - 1e-9 then
+				index = i
+			end
+		end
+		return Visual.GRADES[index], index
+	end
+	---The lowest and highest value a letter covers (SSS is one exact value: the cap).
+	function Visual.gradeSpan(stat, grade)
+		local index = table.find(Visual.GRADES, grade) or #Visual.GRADES
+		if index == #Visual.GRADES then
+			return stat.max, stat.max
+		end
+		local span = stat.max - stat.min
+		local low = stat.min + span * Visual.FROM[index]
+		local high = stat.min + span * Visual.FROM[index + 1] - 0.0001
+		return low, math.max(high, low)
+	end
+	function Visual.percent(value)
+		return (value - 1) * 100
+	end
+	function Visual.load()
+		local ok, data = pcall(function()
+			return httpService:JSONDecode(readfile(Visual.FILE))
+		end)
+		if ok and type(data) == "table" then
+			Visual.saved = type(data.saved) == "table" and data.saved or {}
+			Visual.orig = type(data.orig) == "table" and data.orig or {}
+		end
+	end
+	function Visual.save()
+		pcall(function()
+			if not isfolder(SETTINGS_FOLDER) then
+				makefolder(SETTINGS_FOLDER)
+			end
+			writefile(Visual.FILE, httpService:JSONEncode({ saved = Visual.saved, orig = Visual.orig }))
+		end)
+	end
+	---Owned units for the picker: equipped first (by slot), then the rest by name.
+	function Visual.units()
+		local list = {}
+		for uuid, unit in pairs(collectionData().owned_units or {}) do
+			if type(unit) == "table" and type(unit.trait_stats) == "table" then
+				local data = Units[unit.unit_id]
+				table.insert(list, { uuid = tostring(unit.uuid or uuid), record = unit, id = unit.unit_id, name = tostring(data and data.name or unit.unit_id), slot = tonumber(unit.equipped_slot), shiny = unit.shiny == true })
+			end
+		end
+		table.sort(list, function(a, b)
+			if (a.slot ~= nil) ~= (b.slot ~= nil) then
+				return a.slot ~= nil
+			end
+			if a.slot and b.slot and a.slot ~= b.slot then
+				return a.slot < b.slot
+			end
+			if a.name ~= b.name then
+				return a.name < b.name
+			end
+			return a.uuid < b.uuid
+		end)
+		local seen = {}
+		for _, entry in ipairs(list) do
+			local label = (entry.slot and ("[" .. entry.slot .. "] ") or "") .. entry.name .. (entry.shiny and " (shiny)" or "")
+			seen[label] = (seen[label] or 0) + 1
+			entry.label = seen[label] > 1 and (label .. " #" .. seen[label]) or label
+		end
+		return list
+	end
+	---The real value of a unit's stat (what the server has), whatever is being shown.
+	function Visual.real(uuid, record, key)
+		local orig = Visual.orig[uuid]
+		if orig and orig[key] then
+			return orig[key]
+		end
+		return record.trait_stats[key]
+	end
+	---Shows the picked values: in the profile copy every menu reads (inventory, unit info, trade
+	---and reroll windows) and on the unit's copies standing in a match (letters, percent, and
+	---damage / range / cooldown scaled by the same ratio). Runs every half second, because the
+	---server keeps sending the real numbers.
+	function Visual.apply()
+		local owned = collectionData().owned_units or {}
+		for uuid, shown in pairs(Visual.saved) do
+			local record
+			for key, unit in pairs(owned) do
+				if type(unit) == "table" and tostring(unit.uuid or key) == uuid then
+					record = unit
+				end
+			end
+			if record and type(record.trait_stats) == "table" then
+				Visual.orig[uuid] = Visual.orig[uuid] or {}
+				for _, stat in ipairs(Visual.STATS) do
+					local want = shown[stat.key]
+					if want then
+						local now = record.trait_stats[stat.key]
+						if now ~= want then
+							-- (A value we didn't write ourselves is the real one: the first time,
+							-- or after the server sent the profile again, or after a reroll.)
+							Visual.wrote[uuid] = Visual.wrote[uuid] or {}
+							if now ~= nil and now ~= Visual.wrote[uuid][stat.key] then
+								Visual.orig[uuid][stat.key] = now
+							end
+							record.trait_stats[stat.key] = want
+							Visual.wrote[uuid][stat.key] = want
+						end
+					end
+				end
+			end
+		end
+		if IS_LOBBY then
+			return
+		end
+		local folder = workspace:FindFirstChild("_UNITS")
+		for _, unit in ipairs(folder and folder:GetChildren() or {}) do
+			local stats = unit:FindFirstChild("_stats")
+			local owner, uuidValue = stats and stats:FindFirstChild("player"), stats and stats:FindFirstChild("uuid")
+			local shown = owner and owner.Value == localPlayer and uuidValue and Visual.saved[tostring(uuidValue.Value)]
+			if shown then
+				local orig = Visual.orig[tostring(uuidValue.Value)] or {}
+				local function show(object, real, factor)
+					if not object then
+						return
+					end
+					if object.Value ~= Visual.lastSet[object] then
+						real = object.Value -- the server sent a new number
+						AA.realValues[object] = real
+					else
+						real = AA.realValues[object] or real
+					end
+					local value = real * factor
+					Visual.lastSet[object] = value
+					if object.Value ~= value then
+						object.Value = value
+					end
+				end
+				for _, stat in ipairs(Visual.STATS) do
+					local want, real = shown[stat.key], orig[stat.key]
+					local holder = stats:FindFirstChild(stat.key)
+					if want and real and real > 0 then
+						if holder and holder.Value ~= want then
+							holder.Value = want
+						end
+						if unit:GetAttribute(stat.key) ~= nil and unit:GetAttribute(stat.key) ~= want then
+							unit:SetAttribute(stat.key, want)
+						end
+						local ratio = want / real
+						if stat.key == "potency_stat" then
+							show(stats:FindFirstChild("damage"), nil, ratio)
+							show(stats:FindFirstChild("base_damage"), nil, ratio)
+						elseif stat.key == "range_stat" then
+							show(stats:FindFirstChild("range"), nil, ratio)
+							show(stats:FindFirstChild("base_range"), nil, ratio)
+						else
+							show(stats:FindFirstChild("attack_cooldown"), nil, 1 / ratio)
+							show(stats:FindFirstChild("base_attack_cooldown"), nil, 1 / ratio)
+						end
+					end
+				end
+			end
+		end
+	end
+	---Back to the real stats for one unit.
+	function Visual.reset(uuid)
+		local orig = Visual.orig[uuid]
+		for key, unit in pairs(collectionData().owned_units or {}) do
+			if type(unit) == "table" and tostring(unit.uuid or key) == uuid and orig and type(unit.trait_stats) == "table" then
+				for statKey, value in pairs(orig) do
+					unit.trait_stats[statKey] = value
+				end
+			end
+		end
+		local folder = workspace:FindFirstChild("_UNITS")
+		for _, unit in ipairs(not IS_LOBBY and folder and folder:GetChildren() or {}) do
+			local stats = unit:FindFirstChild("_stats")
+			local uuidValue = stats and stats:FindFirstChild("uuid")
+			if uuidValue and tostring(uuidValue.Value) == uuid then
+				for _, object in ipairs(stats:GetChildren()) do
+					local real = AA.realValues[object]
+					if real ~= nil then
+						object.Value = real
+						AA.realValues[object] = nil
+						Visual.lastSet[object] = nil
+					end
+				end
+				for statKey, value in pairs(orig or {}) do
+					local holder = stats:FindFirstChild(statKey)
+					if holder then
+						holder.Value = value
+					end
+					if unit:GetAttribute(statKey) ~= nil then
+						unit:SetAttribute(statKey, value)
+					end
+				end
+			end
+		end
+		Visual.saved[uuid], Visual.orig[uuid] = nil, nil
+		Visual.save()
+	end
+	Visual.load()
+end
+
+-- Visuals page.
+do
+	local Visual = AA.Visual
+	local page = makePage("Visuals")
+	local picked -- entry from Visual.units()
+	local draft = {} -- [statKey] = { grade = "SSS", percent = 20 }
+	local lines, boxes = {}, {}
+	local statusLine
+	local function entryFor(labelText)
+		for _, entry in ipairs(Visual.units()) do
+			if entry.label == labelText then
+				return entry
+			end
+		end
+	end
+	local function describe(stat, value)
+		return ("%s (%+.1f%%)"):format(Visual.grade(stat, value), Visual.percent(value))
+	end
+	local function showUnit()
+		for _, stat in ipairs(Visual.STATS) do
+			local line = lines[stat.key]
+			if not picked then
+				line.Text = stat.name .. ": pick a unit"
+			else
+				local real = Visual.real(picked.uuid, picked.record, stat.key) or 1
+				local shown = Visual.saved[picked.uuid] and Visual.saved[picked.uuid][stat.key]
+				local data = Units[picked.id]
+				local base = data and unitStatsAt(data, 0) or {}
+				local extra = ""
+				local pick = draft[stat.key]
+				local value = pick and (1 + pick.percent / 100) or shown or real
+				if stat.key == "potency_stat" and (base.damage or 0) > 0 then
+					extra = ("\nLevel 0 damage %s -> %s"):format(tostring(math.floor(base.damage * real + 0.5)), tostring(math.floor(base.damage * value + 0.5)))
+				elseif stat.key == "range_stat" and (base.range or 0) > 0 then
+					extra = ("\nLevel 0 range %.1f -> %.1f"):format(base.range * real, base.range * value)
+				elseif stat.key == "speed_stat" and (base.cooldown or 0) > 0 then
+					extra = ("\nLevel 0 cooldown %.2fs -> %.2fs"):format(base.cooldown / real, base.cooldown / value)
+				end
+				line.Text = ("%s: really %s%s%s"):format(stat.name, describe(stat, real), shown and (", showing " .. describe(stat, shown)) or "", extra)
+			end
+		end
+	end
+	heading(page, "Unit", "left")
+	UI.dropdown(page, "Unit", function()
+		local names = {}
+		for _, entry in ipairs(Visual.units()) do
+			table.insert(names, entry.label)
+		end
+		return names
+	end, function()
+		return picked and picked.label or "Pick a unit"
+	end, function(option)
+		picked = entryFor(option)
+		draft = {}
+		for _, stat in ipairs(Visual.STATS) do
+			if boxes[stat.key] then
+				boxes[stat.key].Text = ""
+			end
+		end
+		showUnit()
+	end)
+	hint(page, "Your equipped units come first, by slot. Display only: this changes the letters and numbers you see on your own screen (inventory, unit info, in a match). The server keeps the real stats, the unit fights exactly as before, and other players, trades included, still see the real ones.")
+	for _, stat in ipairs(Visual.STATS) do
+		heading(page, stat.name, stat.key == "potency_stat" and "left" or "right")
+		lines[stat.key] = infoLine(page, 44)
+		lines[stat.key].Text = stat.name .. ": pick a unit"
+		UI.dropdown(page, "Show as", function()
+			return Visual.GRADES
+		end, function()
+			return draft[stat.key] and draft[stat.key].grade or "--"
+		end, function(option)
+			local low, high = Visual.gradeSpan(stat, option)
+			-- A letter starts at the top of its span; the box below takes any value inside it.
+			draft[stat.key] = { grade = option, percent = math.floor(Visual.percent(high) * 100 + 0.5) / 100 }
+			boxes[stat.key].Text = ("%.2f"):format(draft[stat.key].percent)
+			boxes[stat.key].PlaceholderText = ("%+.2f to %+.2f"):format(Visual.percent(low), Visual.percent(high))
+			showUnit()
+		end)
+		boxes[stat.key] = UI.textbox(page, "Exact %", "pick a letter first")
+		boxes[stat.key].FocusLost:Connect(function()
+			local pick = draft[stat.key]
+			local typed = tonumber((boxes[stat.key].Text:gsub("[%%+%s]", "")))
+			if pick and typed then
+				-- Held inside what the game can roll for that letter.
+				local low, high = Visual.gradeSpan(stat, pick.grade)
+				pick.percent = math.clamp(typed, Visual.percent(low), Visual.percent(high))
+				boxes[stat.key].Text = ("%.2f"):format(pick.percent)
+				showUnit()
+			end
+		end)
+		hint(page, ("The game rolls %s between %+.0f%% and %+.0f%%. SSS is exactly %+.0f%%; every other letter is a slice below it, and the box only takes values inside the letter you picked."):format(stat.name, Visual.percent(stat.min), Visual.percent(stat.max), Visual.percent(stat.max)))
+	end
+	heading(page, "Apply", "right")
+	UI.buttonPair(page, "Apply", function()
+		if not picked then
+			statusLine.Text = "Pick a unit first"
+			return
+		end
+		local any = false
+		Visual.saved[picked.uuid] = Visual.saved[picked.uuid] or {}
+		Visual.orig[picked.uuid] = Visual.orig[picked.uuid] or {}
+		for _, stat in ipairs(Visual.STATS) do
+			local pick = draft[stat.key]
+			if pick then
+				local low, high = Visual.gradeSpan(stat, pick.grade)
+				local value = math.clamp(1 + pick.percent / 100, low, high)
+				if Visual.orig[picked.uuid][stat.key] == nil then
+					Visual.orig[picked.uuid][stat.key] = Visual.real(picked.uuid, picked.record, stat.key)
+				end
+				Visual.saved[picked.uuid][stat.key] = value
+				any = true
+			end
+		end
+		if not any then
+			statusLine.Text = "Pick a letter for at least one stat"
+			return
+		end
+		Visual.save()
+		pcall(Visual.apply)
+		draft = {}
+		showUnit()
+		statusLine.Text = "Showing the new stats on " .. picked.label .. ". Reopen a game window to see it there."
+	end, "Reset unit", function()
+		if not picked then
+			statusLine.Text = "Pick a unit first"
+			return
+		end
+		Visual.reset(picked.uuid)
+		draft = {}
+		showUnit()
+		statusLine.Text = picked.label .. " shows its real stats again."
+	end)
+	statusLine = infoLine(page, 40)
+	statusLine.Text = "Nothing changed yet."
+	task.spawn(function()
+		while AA.alive do
+			if next(Visual.saved) then
+				pcall(Visual.apply)
+			end
+			task.wait(0.5)
+		end
 	end)
 end
 
