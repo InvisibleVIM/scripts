@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v154", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v156", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -131,6 +131,7 @@ local Config = {
 	AutoPlace = true,
 	AutoUpgrade = true,
 	AutoAbility = true,
+	SpellMode = "Safe",
 	PlaceStart = true,
 	RoadSpots = true,
 	Targeting = "Smart",
@@ -286,10 +287,11 @@ do
 		SnipeMode = { "Normal", "Middle" },
 		OrderPlacement = { "Smart", "Front" },
 		WarlordMode = { "Auto", "Boss", "Front", "Range", "Leave" },
+		SpellMode = { "Off", "Safe", "All" },
 		OrderAddKind = { "Place", "Upgrade" },
 		Targeting = { "Smart", "First", "Last", "Closest", "Farthest", "Strongest", "Weakest", "Off" },
 	}
-	local defaults = { WarlordMode = "Auto", OrderPlacement = "Smart", OrderAddKind = "Place", Mode = "Story", AfterGame = "Auto", Difficulty = "Normal", PlaceStyle = "Auto", SnipeMode = "Normal", Targeting = "Smart" }
+	local defaults = { WarlordMode = "Auto", SpellMode = "Safe", OrderPlacement = "Smart", OrderAddKind = "Place", Mode = "Story", AfterGame = "Auto", Difficulty = "Normal", PlaceStyle = "Auto", SnipeMode = "Normal", Targeting = "Smart" }
 	for key, list in pairs(choices) do
 		if not table.find(list, Config[key]) then
 			Config[key] = defaults[key]
@@ -4054,6 +4056,94 @@ local function matchStep()
 end
 
 -- Units with an active ability: fire it whenever it's off cooldown (the server rejects early casts).
+local SpellData = gameRequire(replicatedStorage.src.Data.IngameSpells) or {}
+
+---Astral spells: during a match the game drops a random spell into one of the unit slots
+---(session.ingame_spells[slot] = id) and it is paid for in match cash, not real currency. Cast
+---the worthwhile ones on the best unit once the opening is set and the cash is there to spare,
+---so a spell never starves the build. Safe = buff / summon / clone (no unit lost); All adds
+---Merge. Ritual, Gate and Refund are left for the player.
+local function useSpells()
+	if Config.SpellMode == "Off" then
+		return
+	end
+	local sess = session()
+	local slots = type(sess) == "table" and sess.ingame_spells
+	if type(slots) ~= "table" or not next(slots) then
+		return
+	end
+	local field = scanField()
+	-- Don't touch spells until a couple of units are down: the opening matters more.
+	if #field.towers < 2 then
+		return
+	end
+	local cash = stats.resource.Value
+	local now = os.clock()
+	Match.spellAt = Match.spellAt or {}
+	-- Best non-farm damage unit (what has dealt the most so far), for buff / clone / merge.
+	local function bestUnit()
+		local best, score = nil, -1
+		for _, unit in ipairs(field.towers) do
+			local data = Units[unit._stats.id.Value]
+			local farm = data and unitStatsAt(data, unit._stats.upgrade.Value).farm > 0
+			if not farm then
+				local total = unit._stats:FindFirstChild("total_damage")
+				local extra = Match.extraDamage and Match.extraDamage[unit] or 0
+				local amount = (total and total.Value or 0) + extra
+				-- Nothing has scored yet: fall back to the most-upgraded one.
+				amount = amount + unit._stats.upgrade.Value
+				if amount > score then
+					best, score = unit, amount
+				end
+			end
+		end
+		return best
+	end
+	for slot, spellId in pairs(slots) do
+		local def = SpellData[spellId]
+		if def and now - (Match.spellAt[slot] or 0) > 5 then
+			local cost = tonumber(def.cost) or 0
+			local use, target
+			if cash >= cost + 1000 then
+				if spellId == "random_buff" then
+					target = bestUnit()
+					use = target ~= nil
+				elseif spellId == "summon" then
+					use = cash >= cost + 3000
+				elseif spellId == "clone" then
+					target = bestUnit()
+					use = target ~= nil and cash >= cost + 3000
+				elseif spellId == "sacrifice" and Config.SpellMode == "All" then
+					-- Merge only when the best unit has a same-id copy inside its range to fold in.
+					local pick = bestUnit()
+					if pick then
+						local pos = pick:GetPivot().Position
+						local rangeValue = pick._stats:FindFirstChild("range")
+						local reach = (rangeValue and AA.rv(rangeValue) or 15) + 2
+						local id = pick._stats.id.Value
+						for _, other in ipairs(field.towers) do
+							if other ~= pick and other._stats.id.Value == id and (other:GetPivot().Position - pos).Magnitude <= reach then
+								target, use = pick, true
+								break
+							end
+						end
+					end
+				end
+			end
+			if use then
+				Match.spellAt[slot] = now
+				note("spell", { id = spellId, slot = tostring(slot), cost = cost })
+				if target then
+					task.spawn(invoke, "use_ingame_spell", slot, target)
+				else
+					task.spawn(invoke, "use_ingame_spell", slot)
+				end
+				cash -= cost
+			end
+		end
+	end
+end
+
 local function useAbilities()
 	if not Config.AutoAbility then
 		return
@@ -5110,6 +5200,7 @@ local function matchLoop()
 					end
 					matchStep()
 					useAbilities()
+					useSpells()
 					targetingStep()
 					-- Log: one snapshot per wave, and every hit the base takes.
 					local health = baseHealth()
@@ -7523,6 +7614,23 @@ if not IS_LOBBY then
 	task.spawn(function()
 		local endpoints = replicatedStorage:WaitForChild("endpoints", 10)
 		local s2c = endpoints and endpoints:FindFirstChild("server_to_client")
+		-- Astral spells: which modes hand them out is decided by the server. Every delivery is
+		-- logged (stage, wave, spells) so the first real one shows where they come from.
+		local spellEvent = s2c and s2c:FindFirstChild("ingame_spells")
+		if spellEvent then
+			table.insert(AA.connections, spellEvent.OnClientEvent:Connect(function(list)
+				local ids = {}
+				for slot, id in pairs(type(list) == "table" and list or {}) do
+					table.insert(ids, tostring(slot) .. ":" .. tostring(id))
+				end
+				if #ids > 0 then
+					table.sort(ids)
+					note("spellOffer", { ids = table.concat(ids, ","), cash = math.floor(stats.resource.Value) })
+					AA.progress.spellSeen = { level = Match.levelId, wave = currentWave(), ids = table.concat(ids, ","), at = os.time() }
+					AA.saveProgress()
+				end
+			end))
+		end
 		local offer = s2c and s2c:FindFirstChild("show_roguelike_options")
 		local result = s2c and s2c:FindFirstChild("show_roguelike_vote_result")
 		if offer then
@@ -10908,6 +11016,8 @@ do
 	toggle(page, "Farm units first", "FarmFirst")
 	toggle(page, "Auto use unit abilities", "AutoAbility")
 	hint(page, "Buff units (Windsong, Commander): four copies in each other's range, cast in a timed chain that holds +100% damage on everything of their type nearby")
+	segmented(page, "Astral spells", "SpellMode", { "Off", "Safe", "All" })
+	hint(page, "The random spells that show up in your unit slots during a match, paid with match cash. Safe: Random Buff (+100% Attack or Range for good) on your best damage unit, Astral Summon and Clone when cash is spare. All: also Merge when your best unit has a copy in its range. Ritual, Gate and Refund are never cast. Nothing is cast before two units are down or when it would leave less than 1,000 cash.")
 	heading(page, "Event cards")
 	toggle(page, "Auto pick cards", "AutoCards")
 	segmented(page, "", "CardMode", { "Safe", "Balanced", "Pearls" })
