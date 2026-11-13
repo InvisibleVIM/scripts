@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v168", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v169", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -1745,7 +1745,26 @@ local function buildSpots()
 	end
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Include
-	local filter = { terrain }
+	-- Only what the server looks at: the ground, the hills, the road and the no-build parts.
+	-- Houses, trees and the other props don't count for it (tested: a unit sent to the ground
+	-- under a building's upper floor was placed), so they must not hide the ground under them
+	-- here either. Ground under a hill part is different: the server takes the hill, and a
+	-- ground unit sent there is refused at any height.
+	local filter = {}
+	if ground then
+		table.insert(filter, ground)
+	end
+	if hill then
+		table.insert(filter, hill)
+	end
+	for _, part in ipairs(terrain:GetDescendants()) do
+		if part.Name == "_donotplace" then
+			table.insert(filter, part)
+		end
+	end
+	if #filter == 0 then
+		filter = { terrain }
+	end
 	local roadModel = workspace:FindFirstChild("_road")
 	if roadModel then
 		table.insert(filter, roadModel)
@@ -2480,17 +2499,47 @@ local function buffHub(data)
 	end
 	local reach = AA.buffRange(buffer.data, buffer.unit, buff) - 0.7
 	local chain, friends = {}, {}
+	local placedIds = {}
+	for _, entry in ipairs(equippedUnits()) do
+		placedIds[entry.id] = true
+	end
 	for _, unit in ipairs(myUnits()) do
 		local allyId = unit._stats.id.Value
 		local allyData = Units[allyId]
 		if allyId == buffer.id then
 			table.insert(chain, { position = unit:GetPivot().Position, radius = reach })
-		elseif allyData and AA.buffMatches(buff, allyData) and not AA.buffInfo(allyData) and (unitStatsAt(allyData, 0).damage > 0 or AA.isSummoner(allyId)) then
+		elseif placedIds[allyId] and allyData and AA.buffMatches(buff, allyData) and not AA.buffInfo(allyData) and (unitStatsAt(allyData, 0).damage > 0 or AA.isSummoner(allyId)) then
 			table.insert(friends, unit:GetPivot().Position)
 		end
 	end
 	if #chain > 0 then
-		return chain
+		-- Copies that reach none of the damage are the feeders (they buff the casting copies,
+		-- see Conductor.step): a damage unit inside a feeder's range would take the feed and
+		-- then ignore the full cast, so it stands inside the casting copies' range and clear
+		-- of the feeders'.
+		local hub, clear = {}, {}
+		for _, circle in ipairs(chain) do
+			local reaches = false
+			for _, friend in ipairs(friends) do
+				local dx, dz = friend.X - circle.position.X, friend.Z - circle.position.Z
+				if dx * dx + dz * dz <= (reach + 1.7) ^ 2 then
+					reaches = true
+					break
+				end
+			end
+			if reaches then
+				table.insert(hub, circle)
+			else
+				table.insert(clear, { position = circle.position, radius = reach + 3.2, avoid = true })
+			end
+		end
+		if #hub == 0 then
+			return chain
+		end
+		for _, circle in ipairs(clear) do
+			table.insert(hub, circle)
+		end
+		return hub
 	end
 	local shortest = math.huge
 	for _, entry in ipairs(equippedUnits()) do
@@ -2520,10 +2569,15 @@ local function buffHub(data)
 	end
 	return { { position = anchor, radius = radius } }
 end
-local function insideHub(p, circles)
+---`loose`: the circles to keep clear of (feeders) don't count.
+local function insideHub(p, circles, loose)
 	for _, circle in ipairs(circles) do
 		local dx, dz = circle.position.X - p.X, circle.position.Z - p.Z
-		if dx * dx + dz * dz > circle.radius * circle.radius then
+		if circle.avoid then
+			if not loose and dx * dx + dz * dz < circle.radius * circle.radius then
+				return false
+			end
+		elseif dx * dx + dz * dz > circle.radius * circle.radius then
 			return false
 		end
 	end
@@ -2548,6 +2602,18 @@ local function bestSpot(data, focus)
 	end
 	local maxLevel = data.upgrade and #data.upgrade or 0
 	local taken = placedUnitPositions()
+	-- The range my copy really has: the sheet's range times its trait and stat bonuses. (The
+	-- sheet alone says 30 for a maxed Shadow Sorcerer that reaches 39, and every unit was
+	-- scored, and kept close to the road, as if it had the smaller circle.)
+	local rangeMul = 1
+	for _, entry in ipairs(equippedUnits()) do
+		if entry.id == data.id then
+			local mul = statMul(entry.unit, "range")
+			if type(mul) == "number" and mul == mul then
+				rangeMul = math.clamp(mul, 1, 2)
+			end
+		end
+	end
 	-- Units that never attack (farms like C.E.O.) go on the sidelines: as far from the road as the
 	-- map allows, packed together, so road-side spots stay free for damage units.
 	local attacks = false
@@ -2571,16 +2637,108 @@ local function bestSpot(data, focus)
 			end
 		end
 		local range = activeBuff and AA.buffRange(data, mine, activeBuff) - 0.7 or aura and math.max(unitStatsAt(data, 0).range * 0.9, 6) or math.max(unitStatsAt(data, maxLevel).range, 6)
-		local allies, partners = {}, {}
+		local allies, partners, anchors = {}, {}, {}
+		local placedIds = {}
+		for _, entry in ipairs(equippedUnits()) do
+			placedIds[entry.id] = true
+		end
 		for _, unit in ipairs(myUnits()) do
 			local allyId = unit._stats.id.Value
 			local allyData = Units[allyId]
 			if activeBuff and allyId == data.id then
 				table.insert(partners, unit:GetPivot().Position)
-			elseif allyData and unitStatsAt(allyData, 0).damage > 0 and (not activeBuff or AA.buffMatches(activeBuff, allyData))
+			elseif allyData and (unitStatsAt(allyData, 0).damage > 0 or activeBuff and placedIds[allyId] and AA.isSummoner(allyId)) and (not activeBuff or AA.buffMatches(activeBuff, allyData))
 				and (not aura or (allyId ~= data.id and aura.matches(allyId, allyData))) then
 				local weight = activeBuff and math.max(copyPower(allyData, ownedOf(unit), unit._stats.upgrade.Value) * AA.measureFactor(allyId), 1) or 1
 				table.insert(allies, { position = unit:GetPivot().Position, weight = weight })
+				if activeBuff and placedIds[allyId] and not AA.buffInfo(allyData) then
+					table.insert(anchors, unit:GetPivot().Position)
+				end
+			end
+		end
+		if activeBuff and #partners > 0 and #anchors > 0 and math.min(AA.buffCopies(activeBuff, data), placeCap(data)) >= 3 then
+			-- The full buff needs a copy that buffs the casting copy without touching the damage
+			-- (see Conductor.step). Every second copy therefore goes where it reaches the casting
+			-- copies and none of the damage units: then the full buff starts a second after the
+			-- pair is down instead of 30 s later. No such ground: it joins the others inside.
+			local full = range + 0.7
+			local mains, feedersDown = {}, 0
+			for _, partner in ipairs(partners) do
+				local reaches = false
+				for _, anchor in ipairs(anchors) do
+					local dx, dz = anchor.X - partner.X, anchor.Z - partner.Z
+					if dx * dx + dz * dz <= (full + 1) ^ 2 then
+						reaches = true
+						break
+					end
+				end
+				if reaches then
+					table.insert(mains, partner)
+				else
+					feedersDown += 1
+				end
+			end
+			if #mains > feedersDown then
+				local best, bestScore = nil, -math.huge
+				local near, far = (range - 1.5) ^ 2, (full + 2.5) ^ 2
+				for _, list in ipairs(pool) do
+					for _, spot in ipairs(list) do
+						local p = spot.position
+						if not Match.badSpots[spotKey(p)] then
+							local free = true
+							for _, other in ipairs(taken) do
+								local dx, dz = other.X - p.X, other.Z - p.Z
+								if dx * dx + dz * dz < 4.4 then
+									free = false
+									break
+								end
+							end
+							local spread = 0
+							if free then
+								for _, main in ipairs(mains) do
+									local dx, dz = main.X - p.X, main.Z - p.Z
+									local d2 = dx * dx + dz * dz
+									if d2 > near then
+										free = false
+										break
+									end
+									spread += math.sqrt(d2)
+								end
+							end
+							local nearest = math.huge
+							if free then
+								for _, anchor in ipairs(anchors) do
+									local dx, dz = anchor.X - p.X, anchor.Z - p.Z
+									local d2 = dx * dx + dz * dz
+									if d2 < far then
+										free = false
+										break
+									end
+									nearest = math.min(nearest, d2)
+								end
+							end
+							if free then
+								-- Well clear of the damage (room for the units still to come inside the
+								-- casting copies' range), off the kerb, close to the casting copies.
+								local score = math.min(math.sqrt(nearest) - full, 14) + math.min(spot.gap, 20) * 0.02 - spread / #mains * 0.03
+								for _, ally in ipairs(allies) do
+									local dx, dz = ally.position.X - p.X, ally.position.Z - p.Z
+									if dx * dx + dz * dz <= full * full then
+										-- A summon in reach (an eel, a Warlord) would take the feed too.
+										score -= 3
+									end
+								end
+								if score > bestScore then
+									best, bestScore = spot, score
+								end
+							end
+						end
+					end
+				end
+				if best then
+					Match.feederSpots = (Match.feederSpots or 0) + 1
+					return best
+				end
 			end
 		end
 		local total = 0
@@ -2695,50 +2853,99 @@ local function bestSpot(data, focus)
 		local circles = buffHub(data)
 		if circles then
 			if #circles > 0 then
-				local best, bestScore = nil, -math.huge
-				for _, list in ipairs(pool) do
-					for _, spot in ipairs(list) do
-						local p = spot.position
-						if not Match.badSpots[spotKey(p)] then
-							local free = true
-							for _, other in ipairs(taken) do
-								local dx, dz = other.X - p.X, other.Z - p.Z
-								if dx * dx + dz * dz < 4.4 then
-									free = false
-									break
+				-- Inside the buff, the spot that sees the most road: her own range is what her
+				-- explosions and attacks reach. (She used to go to the middle of the buffers, the
+				-- spot closest to all of them. On Summer Hunt's first map that was 109 of the
+				-- road's 303 points for the Zombie and 137 for the Shadow Sorcerers, with 120
+				-- and 159 on offer a few studs further back, still inside every buffer's range.)
+				-- Scored at the range she starts with and the range she ends with, like every other
+				-- unit (one in-between circle misses a road that lies right at its edge).
+				local own = math.max(unitStatsAt(data, 0).range, unitStatsAt(data, maxLevel).range, 6) * rangeMul
+				local early2 = (unitStatsAt(data, 0).range * rangeMul) ^ 2
+				local hubBand = Match.pace ~= "speed" and AA.fightBand() or nil
+				local hubLanes = (Match.laneCount or 1) > 1 and AA.laneWeights(myUnits()) or nil
+				for attempt = 1, 2 do
+					local best, bestScore = nil, -math.huge
+					local seen, sliceAt = 0, os.clock()
+					for _, list in ipairs(pool) do
+						for _, spot in ipairs(list) do
+							local p = spot.position
+							if not Match.badSpots[spotKey(p)] and insideHub(p, circles, attempt == 2) then
+								seen += 1
+								if seen % 25 == 0 and os.clock() - sliceAt > 0.006 then
+									task.wait()
+									sliceAt = os.clock()
 								end
-							end
-							local total = 0
-							if free and not insideHub(p, circles) then
-								free = false
-							end
-							if free then
-								for _, circle in ipairs(circles) do
-									total += (Vector3.new(circle.position.X, p.Y, circle.position.Z) - p).Magnitude
+								local free = true
+								for _, other in ipairs(taken) do
+									local dx, dz = other.X - p.X, other.Z - p.Z
+									if dx * dx + dz * dz < 4.4 then
+										free = false
+										break
+									end
 								end
-							end
-							if free and -total > bestScore then
-								best, bestScore = spot, -total
+								if free then
+									local total, count = 0, 0
+									for _, circle in ipairs(circles) do
+										if not circle.avoid then
+											total += (Vector3.new(circle.position.X, p.Y, circle.position.Z) - p).Magnitude
+											count += 1
+										end
+									end
+									local sum = 0
+									pathWithin(p.X, p.Z, own, function(point, _, _, d2)
+										local weight
+										if Match.pace == "speed" then
+											local zone = killZone(point.lane)
+											weight = point.progress <= zone and 4 * (1 - point.progress / zone * 0.8) or 0.1
+										else
+											weight = 1 + (1 - point.progress) * 0.25
+											if hubBand and point.progress > hubBand + 0.05 then
+												weight *= math.max(0.15, math.exp(-(point.progress - hubBand - 0.05) / 0.2))
+											end
+										end
+										if hubLanes then
+											weight *= hubLanes[point.lane] or 1
+										end
+										sum += weight * (d2 <= early2 and 1 or 0.65)
+									end)
+									local score = sum - total / math.max(count, 1) * 0.05 - spot.gap * 0.02
+									if score > bestScore then
+										best, bestScore = spot, score
+									end
+								end
 							end
 						end
 					end
-				end
-				if best then
-					return best
+					if best then
+						return best
+					end
+					local anyAvoid = false
+					for _, circle in ipairs(circles) do
+						anyAvoid = anyAvoid or circle.avoid
+					end
+					if not anyAvoid then
+						break
+					end
 				end
 			end
 		end
 		-- Summoners: their summons walk the road from the base no matter where the unit stands, so
 		-- they never take a front spot. Road still inside their range, as far down the path as it goes.
-		local range = math.max(unitStatsAt(data, 0).range * 0.8, 6)
+		local range = math.max(unitStatsAt(data, 0).range * rangeMul * 0.8, 6)
 		local best, bestScore = nil, -math.huge
 		local band = Match.pace ~= "speed" and AA.fightBand() or nil
 		local summonLanes = (Match.laneCount or 1) > 1 and AA.laneWeights(myUnits()) or nil
 		-- How far her summons reach (eels: 71 studs, measured in the match and remembered); three
 		-- times her own range until one has been seen.
+		-- Never seen one that stands still (the Zombie's walk the road from the base, wherever
+		-- she is): then only her own attack's reach counts, and she goes where that sees the
+		-- most road. (Guessing three times her range put her where a 60-stud circle saw the
+		-- most, with her own 32 studs on 109 of the road's 303 points and 126 free nearby.)
 		local knownReach = type(AA.progress.summonRange) == "table" and tonumber(AA.progress.summonRange[data.id]) or nil
-		local summonReach = math.clamp(knownReach or range * 3, range, 75)
-		local ownReach2 = (unitStatsAt(data, 0).range) ^ 2
+		local ownLater = math.max(unitStatsAt(data, 0).range, unitStatsAt(data, maxLevel).range) * rangeMul
+		local summonReach = math.max(knownReach and math.clamp(knownReach, range, 75) or 0, ownLater, range)
+		local ownReach2 = (unitStatsAt(data, 0).range * rangeMul) ^ 2
 		local seenSpots, sliceAt = 0, os.clock()
 		for _, list in ipairs(pool) do
 			for _, spot in ipairs(list) do
@@ -2790,8 +2997,13 @@ local function bestSpot(data, focus)
 									if summonLanes then
 										weight *= summonLanes[point.lane] or 1
 									end
-									if d2 <= ownReach2 then
-										weight *= 1.5
+									if knownReach then
+										if d2 <= ownReach2 then
+											weight *= 1.5
+										end
+									elseif d2 > ownReach2 then
+										-- Road only her upgraded range reaches.
+										weight *= 0.65
 									end
 									sum += weight
 								end
@@ -2811,6 +3023,13 @@ local function bestSpot(data, focus)
 		end
 	end
 	local now, later = attackShape(data, 0), attackShape(data, maxLevel)
+	if rangeMul > 1 then
+		for _, shape in ipairs(now == later and { now } or { now, later }) do
+			if shape.kind ~= "circle" then
+				shape.range *= rangeMul
+			end
+		end
+	end
 	local reach = math.max(now.range, later.range, later.length or 0, now.length or 0, 2.5)
 	local minReach = math.max(math.min(now.range, later.range) * 0.92, 2.5)
 	local best, bestScore, bestDirection = nil, 0, nil
@@ -2852,10 +3071,11 @@ local function bestSpot(data, focus)
 	if round == 2 and (stride == 1 or not center) then
 		break
 	end
-	for pass = 1, 2 do
-	-- Pass 1 keeps the unit inside the buff group; pass 2 (nothing free there) takes any spot.
-	local hub, gapLimit = pass == 1 and circles or nil, pass == 1 and firstGap or nil
-	if pass == 2 and (best or not (circles or firstGap)) then
+	for pass = 1, 3 do
+	-- Pass 1 keeps the unit inside the buff group and clear of the feeding copies; pass 2
+	-- (nothing free there) only inside the group; pass 3 takes any spot.
+	local hub, gapLimit = pass < 3 and circles or nil, pass < 3 and firstGap or nil
+	if pass > 1 and (best or not (circles or firstGap)) then
 		break
 	end
 	for _, list in ipairs(pool) do
@@ -2873,7 +3093,7 @@ local function bestSpot(data, focus)
 			else
 				take = index % stride == 0
 			end
-			if take and spot.gap <= minReach and (not gapLimit or spot.gap <= gapLimit) and (not hub or insideHub(p, hub)) and not Match.badSpots[spotKey(p)] then
+			if take and spot.gap <= minReach and (not gapLimit or spot.gap <= gapLimit) and (not hub or insideHub(p, hub, pass == 2)) and not Match.badSpots[spotKey(p)] then
 				local free = true
 				for _, other in ipairs(taken) do
 					local dx, dz = other.X - p.X, other.Z - p.Z
@@ -4895,102 +5115,212 @@ do
 			table.sort(group.units, function(x, y)
 				return (x:GetAttribute("_SPAWN_UNIT_UUID") or 0) < (y:GetAttribute("_SPAWN_UNIT_UUID") or 0)
 			end)
-			-- The chain: the first copy and every later one inside its range.
-			local anchor = group.units[1]
-			local anchorPosition = anchor:GetPivot().Position
-			local chain, loners = {}, {}
-			for _, unit in ipairs(group.units) do
-				local range = unit._stats:FindFirstChild("range")
-				if (unit:GetPivot().Position - anchorPosition).Magnitude <= (range and AA.rv(range) or 15) then
-					table.insert(chain, unit)
-				else
-					table.insert(loners, unit)
+			-- How the buff works (measured): a cast gives +50% to every ally in range that carries
+			-- no buff of this kind; a unit that already has one ignores the cast. A caster that is
+			-- buffed itself hands out more: (1 + 50%) x (1 + its own buff) - 1, so +50% on the
+			-- caster makes it the full +100%. The full buff therefore needs two casts in a row:
+			-- one copy buffs another (the feed), then that one casts on a team that is out of buff.
+			-- The feed must not land on the damage, or the damage sits at +50% for 30 s and
+			-- ignores the full cast. Two ways to keep it off: the feeding copy stands out of reach
+			-- of the damage (then the full buff comes within a second of the copies being placed),
+			-- or it feeds while the damage is still buffed from the cast before (full buff from
+			-- the next opening on).
+			local reachOf = {}
+			local function reach(unit)
+				local known = reachOf[unit]
+				if not known then
+					local range = unit._stats:FindFirstChild("range")
+					known = range and AA.rv(range) or 15
+					reachOf[unit] = known
 				end
+				return known
 			end
-			local mains, supports = {}, {}
-			for index, unit in ipairs(chain) do
-				if index <= 2 then
-					mains[unit] = true
-				elseif index <= 4 and #chain >= 4 then
-					supports[unit] = true
-				end
-			end
-			for _, unit in ipairs(loners) do
-				mains[unit] = true
-			end
-			---Is the team around this caster out of buff? Every support in its range must be (a
-			---main's cast is what buffs them), and at least half of the damage of the buff's
-			---type. Not all of it: a tower that only one main reaches ends up on the supports'
-			---clock, and waiting for it made that main cast late and unbuffed every time
-			---(seen live: the chain sat at 30% / 69% for a whole match).
-			local function teamOpen(caster)
-				local position = caster:GetPivot().Position
-				local range = caster._stats:FindFirstChild("range")
-				local reach = range and AA.rv(range) or 15
-				local any, open, total = false, 0, 0
+			---The damage a copy's cast lands on: its weight, how much of it is out of buff, and
+			---when the rest runs out.
+			local function team(caster)
+				local position, radius = caster:GetPivot().Position, reach(caster)
+				local total, open, opensAt = 0, 0, 0
+				local members = {}
 				for _, unit in ipairs(towers) do
-					if unit ~= caster and not mains[unit] and (unit:GetPivot().Position - position).Magnitude <= reach then
-						local data = Units[unit._stats.id.Value]
-						if data and AA.buffMatches(buff, data) then
-							local _, ends = Conductor.rate(unit, name)
-							if supports[unit] then
-								any = true
-								if ends > now then
-									return false
-								end
-							elseif unitStatsAt(data, 0).damage > 0 then
-								any = true
-								local damage, cooldown = unit._stats:FindFirstChild("damage"), unit._stats:FindFirstChild("attack_cooldown")
-								local weight = math.max((damage and AA.rv(damage) or 1) / math.max(cooldown and AA.rv(cooldown) or 1, 0.1), 1)
-								total += weight
-								if ends <= now then
-									open += weight
-								end
+					local unitId = unit._stats.id.Value
+					local data = Units[unitId]
+					if unit ~= caster and data and not AA.buffInfo(data) and AA.buffMatches(buff, data) and (unitStatsAt(data, 0).damage > 0 or AA.isSummoner(unitId))
+						and (unit:GetPivot().Position - position).Magnitude <= radius then
+						local damage, cooldown = unit._stats:FindFirstChild("damage"), unit._stats:FindFirstChild("attack_cooldown")
+						local weight = math.max((damage and AA.rv(damage) or 1) / math.max(cooldown and AA.rv(cooldown) or 1, 0.1), 1)
+						total += weight
+						local _, ends = Conductor.rate(unit, name)
+						if ends <= now then
+							open += weight
+							members[unit] = weight
+						else
+							opensAt = math.max(opensAt, ends)
+							members[unit] = 0
+						end
+					end
+				end
+				return { total = total, open = open, opensAt = opensAt, members = members }
+			end
+			-- A copy counts as standing in the damage when it reaches a real share of what the
+			-- best-placed copy reaches (a stray summon in a feeder's range doesn't make it a main).
+			local info, covering, most = {}, 0, 0
+			for _, unit in ipairs(group.units) do
+				info[unit] = team(unit)
+				most = math.max(most, info[unit].total)
+			end
+			for _, unit in ipairs(group.units) do
+				info[unit].inside = info[unit].total > 0 and info[unit].total >= most * 0.4
+				if info[unit].inside then
+					covering += 1
+				end
+			end
+			-- Mains cast on the damage; feeders buff the mains. A copy that reaches no damage is a
+			-- feeder. When every copy stands in the damage, every second one (by placement) feeds,
+			-- but only from four copies up: a main needs a feed every 30 s and a copy casts every
+			-- 60 s, so fewer than two feeders in the damage can't hold the full buff and would
+			-- only take casts away from the plain one.
+			local mains, feeders = {}, {}
+			local allInside = covering == #group.units
+			for index, unit in ipairs(group.units) do
+				if not info[unit].inside then
+					table.insert(feeders, unit)
+				elseif allInside and #group.units >= 4 and index % 2 == 0 then
+					table.insert(feeders, unit)
+				else
+					table.insert(mains, unit)
+				end
+			end
+			-- What a feed would spoil: damage that is out of buff, in the feeder's range and in a
+			-- main's too (it would take the feed and then ignore the main's full cast). Damage
+			-- only the feeder reaches loses nothing by it.
+			for _, feeder in ipairs(feeders) do
+				local harm = 0
+				for unit, weight in pairs(info[feeder].members) do
+					if weight > 0 then
+						for _, main in ipairs(mains) do
+							if info[main].members[unit] then
+								harm += weight
+								break
 							end
 						end
 					end
 				end
-				return any and (total <= 0 or open >= total * 0.5)
+				info[feeder].harm = harm
 			end
-			-- Mains.
-			local best, bestRate, soon = nil, -1, false
-			for unit in pairs(mains) do
-				local rate = Conductor.rate(unit, name)
-				if isReady(unit) then
-					if teamOpen(unit) and rate > bestRate then
+			local function clean(feeder, main)
+				return info[feeder].harm <= info[main].total * 0.08
+			end
+			Conductor.firstSeen = Conductor.firstSeen or setmetatable({}, { __mode = "k" })
+			local newest = 0
+			for _, unit in ipairs(group.units) do
+				Conductor.firstSeen[unit] = Conductor.firstSeen[unit] or now
+				newest = math.max(newest, Conductor.firstSeen[unit])
+			end
+			local lastMain, lastFeed = Conductor.lastMain[name] or -math.huge, Conductor.lastSupport[name] or -math.huge
+			local acted = false
+			-- 1. The full buff: a main that carries a buff itself, its damage out of buff.
+			if now - lastMain >= 1.5 then
+				local best, bestRate = nil, 0
+				for _, unit in ipairs(mains) do
+					local row = info[unit]
+					local rate, ends = Conductor.rate(unit, name)
+					if rate >= 0.3 and ends - now > 0.1 and rate > bestRate and row.open >= row.total * 0.7 and isReady(unit) then
 						best, bestRate = unit, rate
 					end
-				elseif rate > 0 and (Conductor.readyAt[unit] or math.huge) - now < 1.5 then
-					soon = true
+				end
+				if best then
+					cast(best, "main", name, math.min(1, (1 + buff.pct) * (1 + bestRate) - 1))
+					acted = true
 				end
 			end
-			-- (Two mains never fire on the same opening: the first one's buff takes a moment to arrive.)
-			if best and not (bestRate <= 0 and soon) and now - (Conductor.lastMain[name] or -math.huge) >= 1.5 then
-				cast(best, "main", name, math.min(1, (1 + buff.pct) * (1 + bestRate) - 1))
-			end
-			-- Supports.
-			if next(supports) and now - (Conductor.lastMain[name] or -math.huge) >= SUPPORT_DELAY and now - (Conductor.lastSupport[name] or -math.huge) >= 2 then
-				local open = false
-				-- (Chain mains only: a copy standing alone is out of the supports' reach, and
-				-- counting it kept this true forever.)
-				for index, unit in ipairs(chain) do
-					local _, ends = Conductor.rate(unit, name)
-					if index <= 2 and ends <= now and not Conductor.pending[unit] then
-						open = true
+			-- 2. The feed: for a main with no buff that will be able to cast when its damage
+			-- runs out of buff (or already has), from a copy whose cast can't touch open damage.
+			local feedComing = false
+			if not acted then
+				for _, main in ipairs(mains) do
+					local row = info[main]
+					local opensAt = row.open >= row.total * 0.7 and now or row.opensAt
+					local readyAt = isReady(main) and now or (Conductor.readyAt[main] or math.huge)
+					if Conductor.rate(main, name) <= 0 and not Conductor.pending[main] and readyAt <= opensAt + 0.5 and opensAt - now < buff.duration - 2 then
+						for _, feeder in ipairs(feeders) do
+							if clean(feeder, main) and (feeder:GetPivot().Position - main:GetPivot().Position).Magnitude <= reach(feeder) then
+								if isReady(feeder) then
+									if now - lastFeed >= 1.2 then
+										Conductor.lastSupport[name] = now
+										local own = Conductor.rate(feeder, name)
+										cast(feeder, "support", name, math.min(1, (1 + buff.pct) * (1 + own) - 1))
+										acted = true
+									end
+									feedComing = true
+									break
+								elseif (Conductor.readyAt[feeder] or math.huge) - now < 1.5 then
+									feedComing = true
+								end
+							end
+						end
+					end
+					if acted then
+						break
 					end
 				end
-				if open then
-					local pick, pickRate = nil, 0
-					for unit in pairs(supports) do
-						local rate = Conductor.rate(unit, name)
-						if rate > pickRate and isReady(unit) then
-							pick, pickRate = unit, rate
+			end
+			-- 2b. Out of step: every main due to cast is buffed on the same clock as the damage
+			-- (they all took the same cast), so the rule above finds nobody to feed and the
+			-- team would sit at +50% for good. A feed a few seconds after a main's cast lands on
+			-- that main alone, which moves its clock off the damage's; the next feed then catches
+			-- both mains and the full buff holds from the cast after that.
+			if not acted and not feedComing and allInside and #feeders >= 2 and now - lastMain >= 4 and now - lastFeed >= 1.2 then
+				for _, main in ipairs(mains) do
+					local row = info[main]
+					if Conductor.rate(main, name) <= 0 and not Conductor.pending[main] and row.open < row.total * 0.7 then
+						for _, feeder in ipairs(feeders) do
+							if clean(feeder, main) and isReady(feeder) and (feeder:GetPivot().Position - main:GetPivot().Position).Magnitude <= reach(feeder) then
+								Conductor.lastSupport[name] = now
+								local own = Conductor.rate(feeder, name)
+								cast(feeder, "support", name, math.min(1, (1 + buff.pct) * (1 + own) - 1))
+								acted = true
+								break
+							end
+						end
+					end
+					if acted then
+						break
+					end
+				end
+			end
+			-- 3. The plain buff, when nothing can feed: better +50% now than nothing. Not while a
+			-- feed is on its way, and a lone first copy waits a moment for the second (if that
+			-- one lands out of reach of the damage, the full buff follows within a second; a
+			-- first copy that has already cast would be on cooldown for it).
+			if not acted and not feedComing and now - lastFeed >= 1.2 and now - lastMain >= 1.5 then
+				local data = Units[group.units[1]._stats.id.Value]
+				local wanted = math.min(AA.buffCopies(buff, data), placeCap(data))
+				local building = #group.units == 1 and wanted >= 2 and now - newest < 4
+				if not building then
+					local pick, soon = nil, false
+					for _, unit in ipairs(mains) do
+						local row = info[unit]
+						if row.open >= row.total * 0.7 and Conductor.rate(unit, name) <= 0 then
+							if isReady(unit) then
+								pick = pick or unit
+							end
+						end
+						if (Conductor.readyAt[unit] or 0) - now < 5 then
+							soon = true
+						end
+					end
+					if not pick and not soon then
+						-- No main can cast for a while: a feeder that stands in open damage does it.
+						for _, unit in ipairs(feeders) do
+							local row = info[unit]
+							if row.total > 0 and row.open >= row.total * 0.7 and Conductor.rate(unit, name) <= 0 and isReady(unit) then
+								pick = unit
+								break
+							end
 						end
 					end
 					if pick then
-						-- (The stamp keeps the other support from firing on the same opening.)
-						Conductor.lastSupport[name] = now
-						cast(pick, "support", name, math.min(1, (1 + buff.pct) * (1 + pickRate) - 1))
+						cast(pick, "main", name, buff.pct)
 					end
 				end
 			end
