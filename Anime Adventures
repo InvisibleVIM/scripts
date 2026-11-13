@@ -2586,6 +2586,23 @@ local function buffHub(data)
 	end
 	return { { position = anchor, radius = radius } }
 end
+---The best-scoring spot among those that see, at the range the unit starts with, at least 80%
+---of what the best spot sees at that range. (Scored mostly on her final range, the Zombie went
+---17 studs back: 36 road points at level 0 against 70. She dealt 1.6M, the cash rule read that
+---as a weak unit and left her at level 1 for the whole run; the run before she dealt 149M.)
+function AA.pickCovered(found)
+	local most = 0
+	for _, row in ipairs(found) do
+		most = math.max(most, row.early)
+	end
+	local best, bestScore = nil, -math.huge
+	for _, row in ipairs(found) do
+		if row.early >= most * 0.8 and row.score > bestScore then
+			best, bestScore = row.spot, row.score
+		end
+	end
+	return best
+end
 ---`loose`: the circles to keep clear of (feeders) don't count.
 local function insideHub(p, circles, loose)
 	for _, circle in ipairs(circles) do
@@ -2886,7 +2903,7 @@ local function bestSpot(data, focus)
 				local hubBand = Match.pace ~= "speed" and AA.fightBand() or nil
 				local hubLanes = (Match.laneCount or 1) > 1 and AA.laneWeights(myUnits()) or nil
 				for attempt = 1, 2 do
-					local best, bestScore = nil, -math.huge
+					local found = {}
 					local seen, sliceAt = 0, os.clock()
 					for _, list in ipairs(pool) do
 						for _, spot in ipairs(list) do
@@ -2913,7 +2930,7 @@ local function bestSpot(data, focus)
 											count += 1
 										end
 									end
-									local sum = 0
+									local sum, early = 0, 0
 									pathWithin(p.X, p.Z, own, function(point, _, _, d2)
 										local weight
 										if Match.pace == "speed" then
@@ -2928,16 +2945,19 @@ local function bestSpot(data, focus)
 										if hubLanes then
 											weight *= hubLanes[point.lane] or 1
 										end
-										sum += weight * (d2 <= early2 and 1 or 0.65)
+										if d2 <= early2 then
+											early += weight
+											sum += weight
+										else
+											sum += weight * 0.65
+										end
 									end)
-									local score = sum - total / math.max(count, 1) * 0.05 - spot.gap * 0.02
-									if score > bestScore then
-										best, bestScore = spot, score
-									end
+									table.insert(found, { spot = spot, early = early, score = sum - total / math.max(count, 1) * 0.05 - spot.gap * 0.02 })
 								end
 							end
 						end
 					end
+					local best = AA.pickCovered(found)
 					if best then
 						return best
 					end
@@ -2968,6 +2988,7 @@ local function bestSpot(data, focus)
 		local summonReach = math.max(knownReach and math.clamp(knownReach, range, 75) or 0, ownLater, range)
 		local ownReach2 = (unitStatsAt(data, 0).range * rangeMul) ^ 2
 		local seenSpots, sliceAt = 0, os.clock()
+		local found = {}
 		for _, list in ipairs(pool) do
 			for _, spot in ipairs(list) do
 				local p = spot.position
@@ -2994,6 +3015,7 @@ local function bestSpot(data, focus)
 						-- In long matches: just past where enemies usually die (never past 60%).
 						local aim = Match.pace == "speed" and (Match.laneJunction and Match.laneJunction[spot.lane] or 0.02) or (band and math.clamp(band + 0.1, 0.3, 0.6) or 0.6)
 						local score = -math.abs(progress - aim) * 10 + math.min(spot.gap, range) * (Match.pace == "speed" and -0.05 or 0.1)
+						local early = 0
 						if summonLanes then
 							-- Her summons work the road she stands on: the road that needs it most,
 							-- never one that is still closed.
@@ -3025,20 +3047,20 @@ local function bestSpot(data, focus)
 									elseif d2 > ownReach2 then
 										-- Road only her upgraded range reaches.
 										weight *= 0.65
+									else
+										early += weight
 									end
 									sum += weight
 								end
 							end)
 							score = sum - spot.gap * 0.05
 						end
-
-						if score > bestScore then
-							best, bestScore = spot, score
-						end
+						table.insert(found, { spot = spot, early = early, score = score })
 					end
 				end
 			end
 		end
+		best = AA.pickCovered(found)
 		if best then
 			return best
 		end
