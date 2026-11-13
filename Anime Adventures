@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v172", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v173", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -1808,17 +1808,20 @@ local function buildSpots()
 			end
 			if onRoad and (nearest >= 1.4 or Config.RoadSpots) then
 				local hit = workspace:Raycast(Vector3.new(x, topY + 80, z), Vector3.new(0, -200, 0), params)
+				local roof
 				if hit and hit.Normal.Y > 0.6 and hit.Instance.Name ~= "_donotplace" then
 					local top = workspace:Raycast(Vector3.new(x, topY + 80, z), Vector3.new(0, -200, 0), anything)
 					if top and top.Position.Y > hit.Position.Y + 0.5 then
 						local above = workspace:Raycast(hit.Position + Vector3.new(0, 0.2, 0), Vector3.new(0, 80, 0), anything)
 						if not above or above.Position.Y < hit.Position.Y + 4 then
 							hit = nil
+						else
+							roof = above.Position.Y - hit.Position.Y
 						end
 					end
 				end
 				if hit and hit.Normal.Y > 0.6 and hit.Instance.Name ~= "_donotplace" then
-					local spot = { position = hit.Position, gap = nearest, progress = onRoad.progress, lane = onRoad.lane }
+					local spot = { position = hit.Position, gap = nearest, progress = onRoad.progress, lane = onRoad.lane, roof = roof }
 					if ground and hit.Instance:IsDescendantOf(ground) then
 						table.insert(spots.ground, spot)
 					elseif hill and hit.Instance:IsDescendantOf(hill) then
@@ -3322,7 +3325,7 @@ local function placeUnit(entry, focus)
 		note("place", { u = entry.id, cash = math.floor(stats.resource.Value), p = math.floor(pathProgress(spot.position) * 100), guard = focus and true or nil })
 		return true
 	end
-	note("placefail", { u = entry.id, msg = AA.lastMessage })
+	note("placefail", { u = entry.id, msg = AA.lastMessage, x = math.floor(spot.position.X), z = math.floor(spot.position.Z), roof = spot.roof and math.floor(spot.roof * 10) / 10 or nil })
 	if tostring(AA.lastMessage or ""):find("(Global)", 1, true) then
 		-- A cap shared by every player in the server ("Cannot place more than 6 of this unit!
 		-- (Global)"): the others hold the rest. Nothing wrong with the spot, and asking again
@@ -3342,6 +3345,18 @@ local function placeUnit(entry, focus)
 		return false
 	end
 	Match.badSpots[spotKey(spot.position)] = true
+	if spot.roof and Match.spots then
+		-- Refused under a roof: every covered spot with no more headroom than this one goes
+		-- with it. (Where the server draws that line is a guess between one spot it took, 4.7
+		-- studs of headroom, and one it refused, 0.9; one match logged 32 refusals in a row.)
+		for _, list in pairs(Match.spots) do
+			for _, other in ipairs(type(list) == "table" and list or {}) do
+				if other.roof and other.roof <= spot.roof + 0.25 then
+					Match.badSpots[spotKey(other.position)] = true
+				end
+			end
+		end
+	end
 	Match.failStreak[entry.uuid] = (Match.failStreak[entry.uuid] or 0) + 1
 	if Match.failStreak[entry.uuid] >= 3 then
 		-- Server keeps refusing: unit cap (or no room). Retry next wave.
