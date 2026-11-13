@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v150", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v152", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -593,6 +593,10 @@ if type(MatchLog) ~= "table" then
 end
 function AA.matchLog()
 	return MatchLog
+end
+---"SummerPearls" / "EventClover" / "Summer2026" as words.
+function AA.spaced(id)
+	return (tostring(id):gsub("(%l)(%u)", "%1 %2"):gsub("(%a)(%d)", "%1 %2"))
 end
 for _, entry in ipairs(MatchLog) do
 	if entry.won then
@@ -8749,6 +8753,70 @@ do
 		end
 		return values
 	end
+	---A stack of rows that is rebuilt whenever its content changes (banner odds, drop tables).
+	---Returns set(rows). A row is one of:
+	---  { title = "Summer 2026", right = "150 Summer Pearls a pull" }   group heading
+	---  { name = "Phoenix", value = "0.25%", extra = "1 in 400", accent = true, tick = true }
+	---  { note = "..." }                                               wrapped small print
+	---  { gap = true }
+	function UI.list(page)
+		local body = slot(page, 80)
+		local holder = create("Frame", {
+			Size = UDim2.new(1, 0, 0, 0),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			BackgroundTransparency = 1,
+			LayoutOrder = UI.nextOrder(),
+			Parent = body,
+		}, { create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 4) }) })
+		-- A hint() after the list becomes a "?" at the end of the card's title.
+		local cardTitle = body:FindFirstChildWhichIsA("TextLabel")
+		if cardTitle then
+			UI.markRow(page, cardTitle, UDim2.new(1, 0, 0, 2))
+		end
+		local signature
+		return function(rows)
+			local now = httpService:JSONEncode(rows)
+			if now == signature then
+				return
+			end
+			signature = now
+			for _, child in ipairs(holder:GetChildren()) do
+				if child:IsA("GuiObject") then
+					child:Destroy()
+				end
+			end
+			for index, row in ipairs(rows) do
+				if row.gap then
+					create("Frame", { Size = UDim2.new(1, 0, 0, 6), BackgroundTransparency = 1, LayoutOrder = index, Parent = holder })
+				elseif row.title then
+					local head = create("Frame", { Size = UDim2.new(1, 0, 0, 22), BackgroundTransparency = 1, LayoutOrder = index, Parent = holder }, {
+						create("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, VerticalAlignment = Enum.VerticalAlignment.Center, Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder }),
+					})
+					label({ Size = UDim2.new(0, 0, 1, 0), AutomaticSize = Enum.AutomaticSize.X, Text = row.title, FontFace = CODE_BOLD, TextSize = 15, LayoutOrder = 1, Parent = head })
+					create("UIFlexItem", { FlexMode = Enum.UIFlexMode.Fill, Parent = label({ Size = UDim2.new(0, 0, 1, 0), Text = row.right or "", TextSize = 13, TextColor3 = UI.roles.Muted, TextXAlignment = Enum.TextXAlignment.Right, LayoutOrder = 2, Parent = head }) })
+				elseif row.note then
+					label({ Size = UDim2.new(1, 0, 0, 16), AutomaticSize = Enum.AutomaticSize.Y, Text = row.note, TextSize = 13, LineHeight = 1.15, TextColor3 = UI.roles.Muted, TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Top, LayoutOrder = index, Parent = holder })
+				else
+					local line = create("Frame", { Size = UDim2.new(1, 0, 0, 26), BackgroundColor3 = UI.roles.Control, BorderSizePixel = 0, LayoutOrder = index, Parent = holder }, {
+						create("UICorner", { CornerRadius = UDim.new(0, 6) }),
+						create("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 9) }),
+						create("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, VerticalAlignment = Enum.VerticalAlignment.Center, Padding = UDim.new(0, 7), SortOrder = Enum.SortOrder.LayoutOrder }),
+					})
+					if row.accent then
+						create("Frame", { Size = UDim2.fromOffset(3, 14), BackgroundColor3 = UI.roles.Accent, BorderSizePixel = 0, LayoutOrder = 1, Parent = line }, { create("UICorner", { CornerRadius = UDim.new(0, 2) }) })
+					end
+					local name = label({ Size = UDim2.new(0, 0, 1, 0), Text = tostring(row.name) .. (row.tick and (' <font color="#%s">\u{2713}</font>'):format(WIN:ToHex()) or ""), RichText = true, TextSize = 14, FontFace = row.accent and CODE_MEDIUM or CODE, TextTruncate = Enum.TextTruncate.AtEnd, LayoutOrder = 2, Parent = line })
+					create("UIFlexItem", { FlexMode = Enum.UIFlexMode.Fill, Parent = name })
+					if row.extra then
+						label({ Size = UDim2.new(0, 0, 1, 0), AutomaticSize = Enum.AutomaticSize.X, Text = row.extra, TextSize = 13, TextColor3 = UI.roles.Muted, LayoutOrder = 3, Parent = line })
+					end
+					if row.value then
+						label({ Size = UDim2.new(0, 0, 1, 0), AutomaticSize = Enum.AutomaticSize.X, Text = row.value, TextSize = 14, FontFace = CODE_MEDIUM, TextXAlignment = Enum.TextXAlignment.Right, LayoutOrder = 4, Parent = line })
+					end
+				end
+			end
+		end
+	end
 	---Theme presets as small pictures of the window in that theme; click one to wear it.
 	function UI.themeGrid(page)
 		local rows = math.ceil(#UI.PRESETS / 2)
@@ -10319,30 +10387,71 @@ do
 	over.half = UI.kv(page, "Half-hour")
 	over.daily = UI.kv(page, "Daily")
 	heading(page, "Summon banners", "right")
-	over.banners = infoLine(page, 60)
+	-- One block per banner: what a pull costs, then each featured unit with its chance for a
+	-- single pull. (This was one paragraph of "Name 25%, Name 25%": the 25% is that unit's share
+	-- of Mythic pulls, and read like a 1 in 4 chance when the real one is 1 in 400.)
+	over.banners = UI.list(page)
 	task.spawn(function()
-		while AA.alive and over.banners.Parent do
+		while AA.alive and page.Parent do
 			local ok, list, at = pcall(AA.bannerFeatured)
-			local lines = {}
-			for _, entry in ipairs(ok and list or {}) do
-				local names = {}
-				for _, slot in ipairs(entry.slots) do
-					local chance = slot.chance > 0 and string.format(" %d%%", slot.chance * 100 + 0.5) or ""
-					table.insert(names, (slot.top and "[" .. slot.name .. chance .. "]" or slot.name .. chance) .. (slot.rarity == "Secret" and " (Secret)" or ""))
+			local rows = {}
+			local owned = {}
+			for _, unit in pairs(collectionData().owned_units or {}) do
+				if type(unit) == "table" and unit.unit_id then
+					owned[unit.unit_id] = true
+					local data = Units[unit.unit_id]
+					if data and type(data.evolved) == "table" and type(data.evolved.from) == "string" then
+						owned[data.evolved.from] = true
+					end
 				end
-				table.insert(lines, entry.banner .. ": " .. table.concat(names, ", "))
 			end
-			if #lines == 0 then
-				over.banners.Text = "Open the lobby once to read the banners."
-			else
-				local age = (not IS_LOBBY and at) and string.format("\nAs of %d min ago (banners are read in the lobby).", math.max(0, (os.time() - at) / 60)) or ""
-				over.banners.Text = table.concat(lines, "\n") .. "\n[ ] = middle slot" .. age
+			for _, entry in ipairs(ok and list or {}) do
+				local banner = type(Banners[entry.banner]) == "table" and Banners[entry.banner] or {}
+				local cost = nil
+				if type(banner.resource_cost) == "table" and banner.resource_cost.amount then
+					cost = ("%s %s"):format(tostring(banner.resource_cost.amount), AA.spaced(banner.resource_cost.id))
+				elseif tonumber(banner.gem_cost) then
+					cost = ("%d gems"):format(banner.gem_cost)
+				end
+				if #rows > 0 then
+					table.insert(rows, { gap = true })
+				end
+				table.insert(rows, { title = AA.spaced(entry.banner), right = cost })
+				local rates = {}
+				for _, rate in pairs(type(banner.rarity_rates) == "table" and banner.rarity_rates or {}) do
+					if type(rate) == "table" and rate.rarity then
+						rates[rate.rarity] = tonumber(rate.chance)
+					end
+				end
+				for _, slot in ipairs(entry.slots) do
+					local each = (rates[slot.rarity] or 0) * slot.chance
+					table.insert(rows, {
+						name = slot.name .. (slot.rarity ~= "Mythic" and (" (" .. slot.rarity .. ")") or ""),
+						-- One number a row, the one nobody misreads. (The font is wide: a row holds about
+						-- 27 characters, and with "0.25%" next to "1 in 400" the names were shrunk to fit.)
+						value = each > 0 and ("1 in %d"):format(1 / each + 0.5) or (slot.chance > 0 and ("%d%% share"):format(slot.chance * 100 + 0.5) or nil),
+						accent = slot.top or nil,
+						tick = owned[slot.id] or nil,
+					})
+				end
+				local pity = tonumber(banner._show_mythic_pity) and ("a Mythic is guaranteed within %d pulls"):format(banner._show_mythic_pity) or tonumber(banner._show_featured_pity) and ("featured pity at %d pulls"):format(banner._show_featured_pity) or nil
+				if rates.Mythic then
+					table.insert(rows, { note = ("%s%% of pulls are Mythic%s."):format(("%.2f"):format(rates.Mythic * 100):gsub("%.?0+$", ""), pity and (", " .. pity) or "") })
+				end
 			end
+			if #rows == 0 then
+				rows = { { note = "Open the lobby once to read the banners." } }
+			elseif not IS_LOBBY and at then
+				table.insert(rows, { gap = true })
+				table.insert(rows, { note = ("Read in the lobby %d min ago."):format(math.max(0, (os.time() - at) / 60)) })
+			end
+			over.banners(rows)
 			task.wait(IS_LOBBY and 20 or 60)
 		end
 	end)
+	hint(page, "Next to each banner: what one pull costs. Next to each unit: the chance on a single pull, which is the banner's Mythic rate times that unit's share of Mythic pulls (Phoenix: 1% x 25% = 1 in 400). The marked unit holds the banner's middle slot. A tick means you already own it.")
 	heading(page, "Drops", "right")
-	over.drops = infoLine(page, 44)
+	over.drops = UI.list(page)
 	heading(page, "Items this session", "right")
 	local names = {}
 	for _, entry in ipairs(AA.TRACKED) do
@@ -10643,11 +10752,22 @@ do
 			return tostring(entry and entry.name or id)
 		end
 		local lines, listed = {}, {}
+		-- A line that starts with "# " is a group title on the Overview (rows under it are short).
 		for resource, steps in pairs(type(level.infinite_resource_rewards) == "table" and level.infinite_resource_rewards or {}) do
+			local from, titled = 1, false
 			for _, step in ipairs(type(steps) == "table" and steps or {}) do
+				local upTo = tonumber(step.wave_up_to) or from
 				if (tonumber(step.reward) or 0) > 0 then
-					table.insert(lines, string.format("%s: %s a wave up to wave %s", tostring(resource), tostring(step.reward), tostring(step.wave_up_to)))
+					if not titled then
+						titled = true
+						table.insert(lines, "# " .. AA.spaced(resource) .. " a wave")
+					end
+					table.insert(lines, string.format("Waves %d to %d: %s", from, upTo, tostring(step.reward)))
 				end
+				from = upTo + 1
+			end
+			if titled then
+				table.insert(lines, "# Items")
 			end
 		end
 		if (tonumber(level._override_gem_reward) or 0) > 0 then
@@ -10675,12 +10795,13 @@ do
 					local key = "res" .. tostring(resource) .. tostring(amount)
 					if not listed[key] then
 						listed[key] = true
-						table.insert(lines, tostring(resource) .. ": x" .. tostring(amount))
+						table.insert(lines, AA.spaced(resource) .. ": x" .. tostring(amount))
 					end
 				end
 			end
 			for key, inner in pairs(value) do
-				if type(inner) == "table" and key ~= "requirements" and key ~= "_MATCHMAKING" then
+				-- (map_board_line_reward is the lobby's map board prize, not something the stage drops.)
+				if type(inner) == "table" and key ~= "requirements" and key ~= "_MATCHMAKING" and key ~= "map_board_line_reward" then
 					scan(inner, depth + 1)
 				end
 			end
@@ -10689,7 +10810,7 @@ do
 		local bonus, info = gameCall(Core.Level and Core.Level.calculate_level_drop_increase, level, session())
 		bonus = tonumber(bonus)
 		if bonus and bonus > 0 then
-			table.insert(lines, string.format("%s rate boost from your units and skins: +%d%%", type(info) == "table" and tostring(info._reward_type or "Drop") or "Drop", math.floor(bonus * 100 + 0.5)))
+			table.insert(lines, string.format("%s boost: +%d%%", type(info) == "table" and tostring(info._reward_type or "Drop") or "Drop", math.floor(bonus * 100 + 0.5)))
 		end
 		-- Measured: everything the logged clears of this stage gave that the game lists no chance for.
 		local id = level.id or levelId
@@ -10717,7 +10838,7 @@ do
 		for index, entry in ipairs(measured) do
 			if index <= 8 then
 				local percent = entry.count / clears * 100
-				table.insert(lines, string.format("%s: measured %s%% (%d of %d clears)", entry.name, percent >= 10 and tostring(math.floor(percent + 0.5)) or string.format("%.1f", percent), entry.count, clears))
+				table.insert(lines, string.format("%s: %d of %d clears", entry.name, entry.count, clears))
 			end
 		end
 		if bonus and bonus > 0 and type(info) == "table" and info._reward_type then
@@ -10728,6 +10849,9 @@ do
 			if not seenPortal then
 				table.insert(lines, string.format("%s: not listed by the game. None in %d clears logged%s.", tostring(info._reward_type), clears, clears < 20 and ", too few to give a chance yet" or (string.format(", so under about %d%%", math.ceil(300 / clears)))))
 			end
+		end
+		if lines[#lines] == "# Items" then
+			table.remove(lines)
 		end
 		return #lines > 0 and table.concat(lines, "\n") or "The game lists no item drops for this stage (gems and XP only)."
 	end
@@ -12413,8 +12537,24 @@ do
 				UI.dropKey = dropKey
 				local okDrops, text = pcall(AA.dropText, IS_LOBBY and id or Match.levelId, (not IS_LOBBY) and Match.levelData or nil)
 				text = okDrops and text or "Could not read the drops."
+				-- "Name: value" lines become rows, sentences stay small print.
+				local rows = {}
+				for line in tostring(text):gmatch("[^\n]+") do
+					local name, value = line:match("^(.-): (.+)$")
+					if line:sub(1, 2) == "# " then
+						if #rows > 0 then
+							table.insert(rows, { gap = true })
+						end
+						table.insert(rows, { title = line:sub(3) })
+					elseif name and #name + #value <= 27 then
+						table.insert(rows, { name = name, value = value })
+					else
+						table.insert(rows, { note = line })
+					end
+				end
+				over.drops(rows)
+				text = text:gsub("# ([^\n]+)", "%1:")
 				UI.playDrops.Text = text
-				over.drops.Text = text
 			end
 			local session = AA.session()
 			local level = Match.levelId and Levels[Match.levelId]
