@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v176", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v177", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -165,6 +165,7 @@ local Config = {
 	CardMode = "Balanced",
 	CardListOn = false,
 	CardList = "[]",
+	CardBan = "[]",
 	CardAddName = "",
 	OpeningCore = true,
 	ChallengeFallback = "Story",
@@ -8893,16 +8894,33 @@ end
 function CardBrain.setList(list)
 	Config.CardList = httpService:JSONEncode(list)
 end
+---Cards the user never wants voted for (unless every offered card is one of them).
+function CardBrain.banned()
+	if CardBrain.banText ~= Config.CardBan then
+		local ok, list = pcall(function()
+			return httpService:JSONDecode(Config.CardBan)
+		end)
+		local clean = {}
+		for _, name in ipairs(ok and type(list) == "table" and list or {}) do
+			if type(name) == "string" and not table.find(clean, name) then
+				table.insert(clean, name)
+			end
+		end
+		CardBrain.banText, CardBrain.banCache = Config.CardBan, clean
+	end
+	return CardBrain.banCache
+end
 ---The offered card that stands highest on the user's list (of two tiers of the same card, the
 ---one the script itself rates higher), or nil when none of them is on it.
 function CardBrain.listed(options, values)
 	if not Config.CardListOn then
 		return nil
 	end
+	local banned = CardBrain.banned()
 	for rank, name in ipairs(CardBrain.list()) do
 		local best, bestValue
 		for key, option in pairs(options) do
-			if type(option) == "table" and CardBrain.family(option.title) == name then
+			if type(option) == "table" and CardBrain.family(option.title) == name and not table.find(banned, name) then
 				local value = values and values[key] or 0
 				if not bestValue or value > bestValue then
 					best, bestValue = key, value
@@ -8978,6 +8996,20 @@ function CardBrain.choose(options)
 		values[key] = value
 		if value > bestValue then
 			best, bestValue = key, value
+		end
+	end
+	-- Cards on the user's never list lose to any card that isn't on it.
+	local banned = CardBrain.banned()
+	if #banned > 0 then
+		local free, freeValue
+		for key, option in pairs(options) do
+			if type(option) == "table" and not table.find(banned, CardBrain.family(option.title)) and (not freeValue or (values[key] or -math.huge) > freeValue) then
+				free, freeValue = key, values[key] or -math.huge
+			end
+		end
+		if free ~= nil and best ~= free and table.find(banned, CardBrain.family(options[best] and options[best].title)) then
+			best = free
+			table.insert(report, "never list")
 		end
 	end
 	-- The user's list decides when one of the offered cards is on it; otherwise the scores do.
@@ -12450,13 +12482,14 @@ do
 			for index, name in ipairs(CardBrain.list()) do
 				table.insert(lines, index .. ". " .. name .. (good[name] == false and "  (curse)" or ""))
 			end
-			listLine.Text = #lines == 0 and "Your list is empty." or table.concat(lines, "\n")
+			local never = CardBrain.banned()
+			listLine.Text = (#lines == 0 and "Your list is empty." or table.concat(lines, "\n")) .. (#never > 0 and ("\nNever: " .. table.concat(never, ", ")) or "")
 		end
 		local function unlisted()
 			local names = {}
-			local list = CardBrain.list()
+			local list, never = CardBrain.list(), CardBrain.banned()
 			for _, name in ipairs((CardBrain.families())) do
-				if not table.find(list, name) then
+				if not table.find(list, name) and not table.find(never, name) then
 					table.insert(names, name)
 				end
 			end
@@ -12501,6 +12534,24 @@ do
 			CardBrain.setList({})
 			showList()
 		end)
+		UI.buttonPair(page, "Never pick this card", function()
+			local name = Config.CardAddName
+			local never = table.clone(CardBrain.banned())
+			if name == "" or table.find(never, name) or not table.find((CardBrain.families()), name) then
+				return
+			end
+			table.insert(never, name)
+			Config.CardBan = httpService:JSONEncode(never)
+			Config.CardAddName = unlisted()[1] or ""
+			for _, refresh in ipairs(UI.refreshers) do
+				pcall(refresh)
+			end
+			showList()
+		end, "Clear never list", function()
+			Config.CardBan = "[]"
+			showList()
+		end)
+		hint(page, "Never: the script does not vote for that card while any other card is on offer, in every mode. It works with the order switched off too.")
 		listLine = infoLine(page, 22)
 		listLine.TextYAlignment = Enum.TextYAlignment.Top
 		showList()
