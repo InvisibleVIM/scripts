@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v187", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v188", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -6321,6 +6321,9 @@ local function finishMatch()
 		name = data.name,
 		won = won,
 		wave = wave,
+		-- Event currency earned in the match itself (the balance at the last logged wave minus
+		-- the one at the first): the clear bonus is paid after this and isn't in it.
+		eventCash = AA.runEventCash(),
 		waves = (type(result.stats) == "table" and tonumber(result.stats.num_waves)) or Match.totalWaves or nil,
 		time = math.floor(os.clock() - Match.startedAt),
 		at = os.time(),
@@ -6362,6 +6365,18 @@ local function finishMatch()
 	if AA.alive and gameFinished() then
 		invoke("teleport_back_to_lobby")
 	end
+end
+
+---Event currency (Summer Pearls) earned so far in this match, from the per-wave log.
+function AA.runEventCash()
+	local first, last
+	for _, row in ipairs(Detail.waves) do
+		if row.res then
+			first = first or row.res
+			last = row.res
+		end
+	end
+	return first and last and (last - first) or nil
 end
 
 function AA.startDetail()
@@ -12787,7 +12802,10 @@ do
 	task.spawn(function()
 		while AA.alive do
 			local offer = Match.cardOffer
-			cardLine.Text = offer and offer.pick and offer.options[offer.pick] and ("Last pick: " .. tostring(offer.options[offer.pick].title) .. string.format("\nCurses stacked: x%.2f power", Match.cardPower or 1)) or "No card vote yet"
+			local earned = AA.runEventCash()
+			local minutes = Match.startedAt and (os.clock() - Match.startedAt) / 60 or 0
+			local pay = earned and earned > 0 and string.format("\nEarned this run: %d (%.0f a minute)", earned, minutes > 1 and earned / minutes or 0) or ""
+			cardLine.Text = (offer and offer.pick and offer.options[offer.pick] and ("Last pick: " .. tostring(offer.options[offer.pick].title) .. string.format("\nCurses stacked: x%.2f power", Match.cardPower or 1)) or "No card vote yet") .. pay
 			task.wait(2)
 		end
 	end)
