@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v144", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v145", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 AA.realValues = setmetatable({}, { __mode = "k" })
@@ -5001,6 +5001,14 @@ local function matchLoop()
 					local votes = data and data:FindFirstChild("VoteStart") and data.VoteStart:FindFirstChild("Votes")
 					if not Match.voteNoted then
 						Match.voteNoted = true
+						-- Where the player stands on the road at the start (click macros place
+						-- around that point): logged to compare with where the units end up.
+						pcall(function()
+							local root = localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart")
+							if root then
+								note("standAt", { progress = math.floor(pathProgress(root.Position) * 100) })
+							end
+						end)
 						note("vote", { votes = votes and votes.Value, players = #playersService:GetPlayers() })
 					end
 					if #playersService:GetPlayers() > 1 then
