@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v163", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v165", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -3533,6 +3533,69 @@ local function planAction()
 	if #options == 0 then
 		return nil, money
 	end
+	-- What each unit is really doing in THIS match, whatever unit it is. A unit whose copies have
+	-- stood for two minutes and dealt less than half the share of the team's damage that their
+	-- numbers promised gets that much less of the next cash (down to a tenth). The numbers
+	-- remembered from other matches can't see a bad map for a unit: three Water Goddess on Sky
+	-- Island and four in a Summer Hunt dealt nothing at all (hill spots away from the fight)
+	-- and were still upgraded, 60,000 cash in the Summer run, while Elyssia waited for hers.
+	do
+		local now = os.clock()
+		if not Match.live or now - (Match.liveAt or 0) >= 5 then
+			local rows, expectTotal, dealtTotal = {}, 0, 0
+			for _, unit in ipairs(units) do
+				local id = unit._stats.id.Value
+				local data = Units[id]
+				local born = unit:GetAttribute("AABorn")
+				if data and not AA.buffInfo(data) and unitStatsAt(data, data.upgrade and #data.upgrade or 0).farm <= 0 then
+					local level = unit._stats.upgrade.Value
+					local total = unit._stats:FindFirstChild("total_damage")
+					local dealt = (total and total.Value or 0) + (Match.extraDamage and Match.extraDamage[unit] or 0)
+					-- Counted from the moment this script first saw the unit, for every unit
+					-- alike: after a reload the game's own counters go back to the start of the
+					-- match but the damage credited from summons does not, and Zombie (all of
+					-- hers comes through summons) read as dealing nothing.
+					AA.liveBoot = AA.liveBoot or now
+					if not born or born > now or born < AA.liveBoot then
+						born = now
+						unit:SetAttribute("AABorn", now)
+						unit:SetAttribute("AABase", dealt)
+					end
+					dealt = math.max(dealt - (unit:GetAttribute("AABase") or 0), 0)
+					local expect = copyPower(data, ownedOf(unit), level) * AA.measureFactor(id, level) * (now - born)
+					local row = rows[id] or { expect = 0, dealt = 0, age = 0 }
+					row.expect += expect
+					row.dealt += dealt
+					row.age = math.max(row.age, now - born)
+					rows[id] = row
+					expectTotal += expect
+					dealtTotal += dealt
+				end
+			end
+			local live = {}
+			if dealtTotal > 0 and expectTotal > 0 then
+				for id, row in pairs(rows) do
+					if row.age >= 120 and row.expect > 0 then
+						local ratio = (row.dealt / dealtTotal) / (row.expect / expectTotal)
+						if ratio < 0.5 then
+							live[id] = math.max(ratio * 2, 0.1)
+							local was = Match.live and Match.live[id]
+							if not was or math.abs(was - live[id]) >= 0.25 then
+								note("live", { u = id, x = math.floor(live[id] * 100) / 100, share = math.floor(row.dealt / dealtTotal * 1000) / 10 })
+							end
+						end
+					end
+				end
+			end
+			Match.live, Match.liveAt = live, now
+		end
+		for _, option in ipairs(options) do
+			local id = option.kind == "place" and option.entry.id or option.unit._stats.id.Value
+			if option.score < 1e5 and Match.live[id] then
+				option.score *= Match.live[id]
+			end
+		end
+	end
 	table.sort(options, function(x, y)
 		return x.score > y.score
 	end)
@@ -5239,6 +5302,7 @@ local function resetMatch()
 	Match.shieldHits, Match.shieldAt, Match.shieldMode = nil, nil, nil
 	Match.enemyMedian, Match.tankNoted, Match.shieldOn, Match.blesserId = nil, nil, nil, nil
 	Match.seenWave, Match.seenEnemies, Match.seenHealths = nil, nil, nil
+	Match.live, Match.liveAt = nil, nil
 	AA.Macro.reset()
 	Match.missionOpen, Match.leftLogged, Match.finishedSince, Match.frontForced = nil, nil, nil, nil
 	Match.orderSkip, Match.orderStep, Match.ritualAt, Match.skipHeld = nil, nil, nil, nil
