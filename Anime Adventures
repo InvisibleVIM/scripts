@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v156", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v157", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -4056,14 +4056,15 @@ local function matchStep()
 end
 
 -- Units with an active ability: fire it whenever it's off cooldown (the server rejects early casts).
-local SpellData = gameRequire(replicatedStorage.src.Data.IngameSpells) or {}
+-- (On AA, not as locals: the file sits at the 200-local limit of the game's compiler.)
+AA.SpellData = gameRequire(replicatedStorage.src.Data.IngameSpells) or {}
 
 ---Astral spells: during a match the game drops a random spell into one of the unit slots
 ---(session.ingame_spells[slot] = id) and it is paid for in match cash, not real currency. Cast
 ---the worthwhile ones on the best unit once the opening is set and the cash is there to spare,
 ---so a spell never starves the build. Safe = buff / summon / clone (no unit lost); All adds
 ---Merge. Ritual, Gate and Refund are left for the player.
-local function useSpells()
+function AA.useSpells()
 	if Config.SpellMode == "Off" then
 		return
 	end
@@ -4100,7 +4101,7 @@ local function useSpells()
 		return best
 	end
 	for slot, spellId in pairs(slots) do
-		local def = SpellData[spellId]
+		local def = AA.SpellData[spellId]
 		if def and now - (Match.spellAt[slot] or 0) > 5 then
 			local cost = tonumber(def.cost) or 0
 			local use, target
@@ -5200,7 +5201,7 @@ local function matchLoop()
 					end
 					matchStep()
 					useAbilities()
-					useSpells()
+					AA.useSpells()
 					targetingStep()
 					-- Log: one snapshot per wave, and every hit the base takes.
 					local health = baseHealth()
