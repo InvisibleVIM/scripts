@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v177", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v181", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -1663,7 +1663,8 @@ function AA.laneWeights(towers)
 			end
 			weights[lane] = (0.5 + depth) * math.clamp((total / count + 1) / (have[lane] + 1), 0.5, 2.5)
 		else
-			weights[lane] = 0.15
+			-- (Closed for now. It opens later in the match, so it counts like the others.)
+			weights[lane] = 1
 		end
 	end
 	return weights, math.max(open, 1)
@@ -2634,6 +2635,55 @@ local function insideHub(p, circles, loose)
 	return true
 end
 
+---Maps with two or three roads: a spot is worth the square of the share of the roads it reaches
+---(a road counts as reached with a dozen studs of it in range; a road that is still closed
+---counts too, it opens later). On Sky Island the three roads start a hundred studs apart and
+---only run together for the last stretch before the base: a team placed at the front of one
+---road, which is where the single-road rules put it, never touched what came down the others,
+---and the wave-20 boss walked to the base past units that had held their own road all match.
+function AA.laneShare(hits)
+	local count = Match.laneCount or 1
+	if count <= 1 then
+		return 1
+	end
+	local reached = 0
+	for lane = 1, count do
+		if (hits[lane] or 0) >= 12 then
+			reached += 1
+		end
+	end
+	return math.max(reached / count, 0.2) ^ 2
+end
+
+---What a unit's damage is worth against this match's enemies in the air. "Flying enemies take
+---50% less damage from ground attacks without Anti-Air": a unit on a hill, or one whose attack
+---has Anti-Air at that level, loses nothing; any other loses half of what it deals to the share
+---of the enemies that fly. `unit` is the placed tower (nil for a unit still in the hand).
+function AA.airFactor(data, unit, level)
+	local share = Match.flyShare or 0
+	if share < 0.1 or not data then
+		return 1
+	end
+	if data.hill_unit or data.hybrid_placement then
+		return 1
+	end
+	if unit then
+		if unit:GetAttribute("_on_hill") == true then
+			return 1
+		end
+		local unlocks = tostring(unit:GetAttribute("_anti_air_upgrades") or "")
+		for entry in unlocks:gmatch("%d+") do
+			if tonumber(entry) <= (level or 0) then
+				return 1
+			end
+		end
+		if unit:GetAttribute("_anti_air") == true and (level or 0) <= unit._stats.upgrade.Value then
+			return 1
+		end
+	end
+	return 1 - 0.5 * share
+end
+
 ---Are there Soaring enemies in this match? ("Soaring enemies only take damage from Hill
 ---units": Sky Portals, and weather cards that turn flyers into soaring ones.)
 function AA.soaringMatch()
@@ -2951,8 +3001,8 @@ local function bestSpot(data, focus, only)
 				-- unit (one in-between circle misses a road that lies right at its edge).
 				local own = math.max(unitStatsAt(data, 0).range, unitStatsAt(data, maxLevel).range, 6) * rangeMul
 				local early2 = (unitStatsAt(data, 0).range * rangeMul) ^ 2
-				local hubBand = Match.pace ~= "speed" and AA.fightBand() or nil
 				local hubLanes = (Match.laneCount or 1) > 1 and AA.laneWeights(myUnits()) or nil
+				local hubBand = Match.pace ~= "speed" and not hubLanes and AA.fightBand() or nil
 				for attempt = 1, 2 do
 					local found = {}
 					local seen, sliceAt = 0, os.clock()
@@ -2982,9 +3032,11 @@ local function bestSpot(data, focus, only)
 										end
 									end
 									local sum, early = 0, 0
+									local laneHits = {}
 									pathWithin(p.X, p.Z, own, function(point, _, _, d2)
 										local weight
-										if Match.pace == "speed" then
+										laneHits[point.lane] = (laneHits[point.lane] or 0) + 1
+										if Match.pace == "speed" and not hubLanes then
 											local zone = killZone(point.lane)
 											weight = point.progress <= zone and 4 * (1 - point.progress / zone * 0.8) or 0.1
 										else
@@ -3003,6 +3055,10 @@ local function bestSpot(data, focus, only)
 											sum += weight * 0.65
 										end
 									end)
+									if hubLanes then
+										local share = AA.laneShare(laneHits)
+										sum, early = sum * share, early * share
+									end
 									table.insert(found, { spot = spot, early = early, score = sum - total / math.max(count, 1) * 0.05 - spot.gap * 0.02 })
 								end
 							end
@@ -3026,8 +3082,8 @@ local function bestSpot(data, focus, only)
 		-- they never take a front spot. Road still inside their range, as far down the path as it goes.
 		local range = math.max(unitStatsAt(data, 0).range * rangeMul * 0.8, 6)
 		local best, bestScore = nil, -math.huge
-		local band = Match.pace ~= "speed" and AA.fightBand() or nil
 		local summonLanes = (Match.laneCount or 1) > 1 and AA.laneWeights(myUnits()) or nil
+		local band = Match.pace ~= "speed" and not summonLanes and AA.fightBand() or nil
 		-- How far her summons reach (eels: 71 studs, measured in the match and remembered); three
 		-- times her own range until one has been seen.
 		-- Never seen one that stands still (the Zombie's walk the road from the base, wherever
@@ -3072,7 +3128,7 @@ local function bestSpot(data, focus, only)
 							-- never one that is still closed.
 							score += ((summonLanes[spot.lane] or 1) - 1) * 3
 						end
-						if Match.pace ~= "speed" then
+						if Match.pace ~= "speed" or summonLanes then
 							-- Strong enemies: where she and her summons reach the most road that
 							-- enemies actually walk. She is the first unit down and the buffers and
 							-- the rest of the damage follow her, so her spot decides what the whole
@@ -3082,8 +3138,10 @@ local function bestSpot(data, focus, only)
 							-- 50 studs away, where the user was standing, sees 219.)
 							local sum = 0
 							local reach2 = summonReach * summonReach
+							local laneHits = {}
 							pathWithin(p.X, p.Z, summonReach, function(point, _, _, d2)
 								if d2 <= reach2 then
+									laneHits[point.lane] = (laneHits[point.lane] or 0) + 1
 									local weight = 1 + (1 - point.progress) * 0.25
 									if band and point.progress > band + 0.05 then
 										weight *= math.max(0.15, math.exp(-(point.progress - band - 0.05) / 0.2))
@@ -3104,6 +3162,10 @@ local function bestSpot(data, focus, only)
 									sum += weight
 								end
 							end)
+							if summonLanes then
+								local share = AA.laneShare(laneHits)
+								sum, early = sum * share, early * share
+							end
 							score = sum - spot.gap * 0.05
 						end
 						table.insert(found, { spot = spot, early = early, score = score })
@@ -3147,7 +3209,8 @@ local function bestSpot(data, focus, only)
 	-- Road that enemies rarely reach is worth little, whatever the pace: a Zombie placed at 48% of
 	-- the road for its bends dealt nothing for eleven waves while everything died before 31%.
 	-- (Known after six waves, or from the last run on this stage and map; nil = no idea yet.)
-	local reachBand = not focus and Match.pace ~= "speed" and AA.fightBand() or nil
+	local multi = (Match.laneCount or 1) > 1
+	local reachBand = not focus and Match.pace ~= "speed" and not multi and AA.fightBand() or nil
 	local laneWeight, openLanes = nil, Match.laneCount or 1
 	if (Match.laneCount or 1) > 1 then
 		laneWeight, openLanes = AA.laneWeights(myUnits())
@@ -3198,16 +3261,19 @@ local function bestSpot(data, focus, only)
 				end
 				if free then
 					local nearby = {}
-					local lanesSeen, lanesReached = {}, 0
+					local laneHits = {}
 					pathWithin(p.X, p.Z, reach, function(point, dx, dz, d2)
-						if point.lane and not lanesSeen[point.lane] and d2 <= minReach * minReach and (not laneWeight or (laneWeight[point.lane] or 1) > 0.2) then
-							lanesSeen[point.lane] = true
-							lanesReached += 1
+						if point.lane and d2 <= minReach * minReach then
+							laneHits[point.lane] = (laneHits[point.lane] or 0) + 1
 						end
 						do
 							local weight
 							if focus then
 								weight = point.progress >= focus and 1 or 0
+							elseif multi then
+								-- Several roads: plain coverage. Where enemies died in earlier
+								-- runs says where the team stood then, not where it should stand.
+								weight = 1 + (1 - point.progress) * 0.25
 							elseif Match.pace == "speed" then
 								-- Weak waves die right at the spawn: put the damage there so each one
 								-- dies the moment it appears. Road past the kill zone is nearly worthless.
@@ -3247,10 +3313,10 @@ local function bestSpot(data, focus, only)
 						-- hundred free spots in the first 5%.)
 						score = 1000 * (1 - (spot.progress or 0)) - spot.gap
 					end
-					if openLanes > 1 and score > 0 and not focus then
+					if multi and score > 0 and not focus then
 						-- Several roads: a spot that reaches all of them is worth far more than one
 						-- that leaves a road's enemies to walk past untouched.
-						score *= 1 + 0.6 * math.max(lanesReached - 1, 0) / (openLanes - 1)
+						score *= AA.laneShare(laneHits)
 					end
 					if clusterAt and score > 0 then
 						-- Long modes: keep damage units together so one buffer / aura covers them all.
@@ -3443,6 +3509,17 @@ local function enemyState()
 	if state.soaring and not Match.soaring then
 		Match.soaring = true
 		note("soaring", {})
+	end
+	-- Share of the enemies that fly, smoothed over the match (Sky Island: half of them).
+	if state.count >= 5 then
+		local flying = 0
+		for _, enemy in ipairs(scanField().enemies) do
+			local flag = enemy._stats:FindFirstChild("Flying")
+			if flag and flag.Value > 0 then
+				flying += 1
+			end
+		end
+		Match.flyShare = (Match.flyShare or flying / state.count) * 0.9 + flying / state.count * 0.1
 	end
 	-- A tank: one enemy with at least five times the health of the usual one on this wave
 	-- (Mineral Elemental: 4.2M among 600k bandits, walked to the base at full health behind them
@@ -3742,7 +3819,7 @@ local function planAction()
 					spend += math.ceil((data.upgrade[level].cost or 0) * scale)
 					best = math.max(best, copyPower(data, unit, level) / spend * 0.9)
 				end
-				score = best * factor
+				score = best * factor * AA.airFactor(data, nil, 0)
 				-- Aura units (Water Goddess: +50% to Water units in range): worth what they add.
 				local aura = AA.synergyInfo(entry.id)
 				if aura and aura.stacks and (placed[entry.id] or 0) == 0 then
@@ -3870,6 +3947,14 @@ local function planAction()
 					end
 					-- Units sitting where the fight is are worth more than ones enemies already passed.
 					score = best * AA.measureFactor(id, level + 1)
+					-- Enemies in the air: an upgrade that brings Anti-Air is worth the damage it
+					-- stops losing as well; one on a unit that never gets it is worth less.
+					local airNow, airNext = AA.airFactor(data, unit, level), AA.airFactor(data, unit, level + 1)
+					if airNext > airNow then
+						score = score * airNext + copyPower(data, record, level) * (airNext - airNow) / math.max(cost, 1) * AA.measureFactor(id, level + 1)
+					else
+						score *= airNext
+					end
 					if Match.pace == "speed" and not AA.buffInfo(data) and not AA.isSummoner(id) and not AA.reachesKillZone(unit, unitStatsAt(data, level + 1).range * statMul(record, "range") + 1) then
 						score *= 0.25
 					end
@@ -4705,6 +4790,10 @@ local function matchStep()
 	if not (Config.AutoPlace or Config.AutoUpgrade) or not gameStarted() then
 		return
 	end
+	if AA.loadedMid == nil then
+		-- Loaded into a match that is already running (a reload, or a late join)?
+		AA.loadedMid = (currentWave() > 2 and #myUnits() > 0) and os.clock() or false
+	end
 	local macro = AA.Macro.active()
 	if macro then
 		-- A macro plays this match: its steps in its order, the planner stays out.
@@ -4728,7 +4817,12 @@ local function matchStep()
 	-- Weak enemies and the buff group stands where nothing reaches the fight: move the whole group
 	-- once. Its Windsongs, the units they buff and the summoners among them are sold; the planner
 	-- then rebuilds the group at the front (the first one back picks the spot by the spawn).
-	if Config.AutoPlace and Match.pace == "speed" and not Match.hubMoved and currentWave() >= 3 and wavesLeft() >= 3 and not (Match.bleedAt and os.clock() - Match.bleedAt < 60) and (Match.fightDepth or 1) < 0.3 then
+	-- (Never on a map with several roads: there the team stands where the roads run together,
+	-- on purpose. And not in the first two minutes after the script was loaded into a running
+	-- match: the pace starts out as "speed" until it has been measured again, and a reload at
+	-- wave 12 of a Sky Portal sold ten placed and upgraded units "to move them to the front".)
+	local settled = (Match.laneCount or 1) <= 1 and not (AA.loadedMid and os.clock() - AA.loadedMid < 120)
+	if settled and Config.AutoPlace and Match.pace == "speed" and not Match.hubMoved and currentWave() >= 3 and wavesLeft() >= 3 and not (Match.bleedAt and os.clock() - Match.bleedAt < 60) and (Match.fightDepth or 1) < 0.3 then
 		local buffer, buff
 		for _, entry in ipairs(equippedUnits()) do
 			local info = AA.buffInfo(entry.data)
@@ -4766,7 +4860,7 @@ local function matchStep()
 	-- Speed pace: damage units that can't reach the kill zone (enemies die near the spawn) are idle.
 	-- When cash covers rebuilding one at its current level, sell it and re-place it at the front.
 	local frontAll = AA.frontForced()
-	if Config.AutoPlace and Match.pace == "speed" and os.clock() - (Match.relocateAt or 0) > (frontAll and 3 or 15) and (frontAll or not (Match.bleedAt and os.clock() - Match.bleedAt < 60)) and wavesLeft() > 1 then
+	if (settled or frontAll) and Config.AutoPlace and Match.pace == "speed" and os.clock() - (Match.relocateAt or 0) > (frontAll and 3 or 15) and (frontAll or not (Match.bleedAt and os.clock() - Match.bleedAt < 60)) and wavesLeft() > 1 then
 		local byId = {}
 		for _, entry in ipairs(equippedUnits()) do
 			byId[entry.id] = entry
@@ -5141,7 +5235,7 @@ do
 			Conductor.losses = (Conductor.losses or 0) + 1
 			if record.ends - now > 1.5 and Conductor.losses <= 40 then
 				local flag = unit._stats:FindFirstChild("unit_stunned")
-				note("bufflost", { u = unit._stats.id.Value, left = math.floor(record.ends - now), stun = flag ~= nil and flag.Value == true or nil })
+				note("bufflost", { u = unit._stats.id.Value, left = math.floor(record.ends - now), stun = flag ~= nil and (flag.Value == true or (tonumber(flag.Value) or 0) > 0) or nil })
 			end
 			Conductor.active[unit][buff.name] = nil
 		elseif math.abs(record.rate - truth) > 0.05 and truth <= 1.01 then
@@ -5231,7 +5325,7 @@ do
 				Conductor.refusals = (Conductor.refusals or 0) + 1
 				if Conductor.refusals <= 40 and unit.Parent then
 					local flag = unit._stats:FindFirstChild("unit_stunned")
-					note("castfail", { u = unit._stats.id.Value, r = role, stun = flag ~= nil and flag.Value == true or nil })
+					note("castfail", { u = unit._stats.id.Value, r = role, stun = flag ~= nil and (flag.Value == true or (tonumber(flag.Value) or 0) > 0) or nil })
 				end
 				if role == "main" and Conductor.lastMain[name] == stamp then
 					Conductor.lastMain[name] = lastMainBefore
@@ -6079,6 +6173,10 @@ local function finishMatch()
 		task.wait(1.5)
 		portalNext = AA.portalChoose(data.portal_group)
 		after = portalNext and "Replay" or "Lobby"
+	elseif kind == "Portal" and after == "Replay" then
+		-- A portal match is never replayed by a plain vote: that would spend another use of
+		-- the portal without it having been picked (the mode was changed during the match).
+		after = "Lobby"
 	end
 	note("end", { won = won, after = after, portal = portalNext and portalNext.id or nil })
 	if after == "Castle" then
@@ -6187,7 +6285,7 @@ local function resetMatch()
 	Match.voteNoted = nil
 	Match.shieldHits, Match.shieldAt, Match.shieldMode = nil, nil, nil
 	Match.enemyMedian, Match.tankNoted, Match.shieldOn, Match.blesserId = nil, nil, nil, nil
-	Match.soaring, Match.spotScore, Match.openingDone = nil, nil, nil
+	Match.soaring, Match.spotScore, Match.openingDone, Match.flyShare = nil, nil, nil, nil
 	Match.seenWave, Match.seenEnemies, Match.seenHealths = nil, nil, nil
 	Match.live, Match.liveAt, Match.laneDepth, Match.lanesNoted = nil, nil, nil, nil
 	AA.Macro.reset()
