@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v184", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v185", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -2711,13 +2711,19 @@ local function bestSpot(data, focus, only)
 		-- wins; without them it wins unless it sees less than half the road the best ground
 		-- spot does (a buffer: unless it covers noticeably less of the team).
 		local hillSpot, hillDirection = bestSpot(data, focus, "hill")
-		local hillScore = Match.spotScore
+		local hillScore, hillKind = Match.spotScore, Match.spotKind
 		if hillSpot then
 			if AA.soaringMatch() and not AA.buffInfo(data) then
 				return hillSpot, hillDirection
 			end
 			local groundSpot, groundDirection = bestSpot(data, focus, "ground")
 			local groundScore = Match.spotScore
+			if groundSpot and Match.spotKind == "feeder" and hillKind ~= "feeder" then
+				-- A feeding spot (in reach of the casting copies, clear of the damage) exists
+				-- on the ground and not on the hill: that is worth more than the hill. (All
+				-- four Elfys went up one hill together and the full buff took 150 s to start.)
+				return groundSpot, groundDirection
+			end
 			local need = (AA.buffInfo(data) or (data.id and AA.synergyInfo(data.id))) and 0.9 or 0.5
 			if not groundSpot or not hillScore or not groundScore or hillScore >= groundScore * need then
 				return hillSpot, hillDirection
@@ -2726,7 +2732,7 @@ local function bestSpot(data, focus, only)
 		end
 		only = "ground"
 	end
-	Match.spotScore = nil
+	Match.spotScore, Match.spotKind = nil, nil
 	local pool
 	if data.hill_unit or only == "hill" then
 		pool = { spots.hill }
@@ -2876,6 +2882,7 @@ local function bestSpot(data, focus, only)
 				end
 				if best then
 					Match.feederSpots = (Match.feederSpots or 0) + 1
+					Match.spotKind = "feeder"
 					return best
 				end
 			end
@@ -5803,6 +5810,9 @@ do
 				local unitId = group.units[1]._stats.id.Value
 				local saving = type(Match.savingFor) == "string" and Match.savingFor:find(unitId, 1, true) ~= nil
 				local building = #group.units == 1 and wanted >= 2 and now - newest < (saving and 45 or 12)
+				-- (Copies often land in a burst once the cash is there: three seconds for the
+				-- next one, so the first cast is made with the feeders already standing.)
+				building = building or (#group.units < wanted and now - newest < 3)
 				if not building then
 					local pick, soon = nil, false
 					for _, unit in ipairs(mains) do
