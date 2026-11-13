@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v149", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v150", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -10960,6 +10960,29 @@ do
 	---and reroll windows) and on the unit's copies standing in a match (letters, percent, and
 	---damage / range / cooldown scaled by the same ratio). Runs every half second, because the
 	---server keeps sending the real numbers.
+	---The card over a placed unit: the game writes the letters once, when the unit spawns (with the
+	---real rolls), and only keeps the numbers current. Has the game write them again.
+	function Visual.restyle(unit, stats)
+		local goal = stats:FindFirstChild("formation_goal")
+		local over = goal and typeof(goal.Value) == "Instance" and goal.Value:FindFirstChild("_overhead")
+		local frames = over and over:FindFirstChild("OverFrame") and over.OverFrame:FindFirstChild("Stats")
+		if not (frames and frames:FindFirstChild("Attack") and frames:FindFirstChild("Range") and frames:FindFirstChild("Cooldown")) then
+			return false
+		end
+		if not Visual.styler and os.clock() >= (Visual.stylerRetry or 0) then
+			Visual.stylerRetry = os.clock() + 20
+			local ok, found = pcall(function()
+				return filtergc("function", { Name = "apply_trait_stat_ranking_color" }, false)
+			end)
+			Visual.styler = ok and type(found) == "table" and found[1] or nil
+		end
+		local potency, speed, range = unit:GetAttribute("potency_stat"), unit:GetAttribute("speed_stat"), unit:GetAttribute("range_stat")
+		if not (Visual.styler and potency and speed and range) then
+			return false
+		end
+		gameCall(Visual.styler, frames, stats.id.Value, potency, speed, range)
+		return true
+	end
 	function Visual.apply()
 		local owned = collectionData().owned_units or {}
 		for uuid, shown in pairs(Visual.saved) do
@@ -11067,6 +11090,10 @@ do
 						end
 					end
 				end
+				local styled = ("%s|%s|%s"):format(tostring(unit:GetAttribute("potency_stat")), tostring(unit:GetAttribute("speed_stat")), tostring(unit:GetAttribute("range_stat")))
+				if unit:GetAttribute("AAStyled") ~= styled and Visual.restyle(unit, stats) then
+					unit:SetAttribute("AAStyled", styled)
+				end
 			end
 		end
 	end
@@ -11119,6 +11146,10 @@ do
 					if unit:GetAttribute(statKey) ~= nil then
 						unit:SetAttribute(statKey, value)
 					end
+				end
+				if unit:GetAttribute("AAStyled") ~= nil then
+					Visual.restyle(unit, stats)
+					unit:SetAttribute("AAStyled", nil)
 				end
 			end
 		end
