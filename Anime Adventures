@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v202", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v203", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -1934,6 +1934,17 @@ function AA.laneOpen(lane)
 	end
 	return true
 end
+---A road that is closed and will stay closed all match. A portal's level data carries the number
+---of roads it uses (_portal_lanes; the game shows it as "Tier: 8 (2 Lanes)"), and the roads
+---closed at the start of such a match never open. (I had read "closed" as "opens later" and
+---planned the whole team around all three roads of a two-road Sky Portal. User: "if there's only
+---2 paths that enemies follow the units should be in the best spot for those 2 paths".)
+function AA.laneDead(lane)
+	if AA.laneOpen(lane) then
+		return false
+	end
+	return type(Match.levelData) == "table" and type(Match.levelData._portal_lanes) == "number"
+end
 ---How much a stretch of each road is worth to the next unit, on maps with two or three roads.
 ---A road counts for more the deeper its enemies have been getting (that is where the team, other
 ---players included, is short) and the fewer of my damage units already reach it; a closed road
@@ -1979,6 +1990,8 @@ function AA.laneWeights(towers)
 				end
 			end
 			weights[lane] = (0.5 + depth) * math.clamp((total / count + 1) / (have[lane] + 1), 0.5, 2.5)
+		elseif AA.laneDead(lane) then
+			weights[lane] = 0
 		end
 	end
 	-- A road that is closed for now opens later in the match, so it counts like the open ones:
@@ -3329,13 +3342,29 @@ function AA.laneShare(hits)
 	if count <= 1 then
 		return 1
 	end
-	local reached = 0
+	-- Roads that never open (AA.laneDead) are left out altogether.
+	local live, reached, least, sum = 0, 0, math.huge, 0
 	for lane = 1, count do
-		if (hits[lane] or 0) >= 12 then
-			reached += 1
+		if not AA.laneDead(lane) then
+			live += 1
+			local seen = hits[lane] or 0
+			if seen >= 12 then
+				reached += 1
+			end
+			least = math.min(least, seen)
+			sum += seen
 		end
 	end
-	return math.max(reached / count, 0.2) ^ 2
+	if live <= 1 then
+		return 1
+	end
+	-- The weaker road decides: a match is lost on the road with the least fire on it, however
+	-- much the other one gets. A spot that sees 131 studs of one road and 48 of the other is
+	-- worth less than one that sees 84 and 68 (Sky Island, range 34: the first was what plain
+	-- "most road" picked, the second sits by the junction where the user was standing).
+	-- Six tenths of a spot's worth goes by its weakest road, four tenths by the total.
+	local balance = sum > 0 and 0.4 + 0.6 * math.min(live * least / sum, 1) or 1
+	return math.max(reached / live, 0.2) ^ 2 * balance
 end
 
 ---What a spot sees, in one figure that means the same for every unit: studs of road within
