@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v189", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v190", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -2803,7 +2803,7 @@ local function bestSpot(data, focus, only)
 		end
 		local range = activeBuff and AA.buffRange(data, mine, activeBuff) - 0.7 or aura and math.max(unitStatsAt(data, 0).range * 0.9, 6) or math.max(unitStatsAt(data, maxLevel).range, 6)
 		local allies, partners, anchors = {}, {}, {}
-		local liveRange = 0
+		local liveRange, liveLow = 0, math.huge
 		local placedIds = {}
 		for _, entry in ipairs(equippedUnits()) do
 			placedIds[entry.id] = true
@@ -2815,6 +2815,7 @@ local function bestSpot(data, focus, only)
 				table.insert(partners, unit:GetPivot().Position)
 				local live = unit._stats:FindFirstChild("range")
 				liveRange = math.max(liveRange, live and AA.rv(live) or 0)
+				liveLow = math.min(liveLow, live and AA.rv(live) or math.huge)
 			elseif allyData and (unitStatsAt(allyData, 0).damage > 0 or activeBuff and placedIds[allyId] and AA.isSummoner(allyId)) and (not activeBuff or AA.buffMatches(activeBuff, allyData))
 				and (not aura or (allyId ~= data.id and aura.matches(allyId, allyData))) then
 				local weight = activeBuff and math.max(copyPower(allyData, ownedOf(unit), unit._stats.upgrade.Value) * AA.measureFactor(allyId), 1) or 1
@@ -2824,7 +2825,38 @@ local function bestSpot(data, focus, only)
 				end
 			end
 		end
-		if activeBuff and #partners > 0 and #anchors > 0 and math.min(AA.buffCopies(activeBuff, data), placeCap(data)) >= 3 then
+		if activeBuff and liveLow < math.huge then
+			-- The copies already down show the range the buff has in THIS match (cards move
+			-- it both ways): never plan with more than the shortest of them.
+			range = math.min(range, liveLow - 0.7)
+		end
+		if activeBuff and #partners > 0 then
+			for _, ally in ipairs(allies) do
+				local reachedBy = 0
+				for _, partner in ipairs(partners) do
+					if (ally.position - partner).Magnitude <= range + 0.7 then
+						reachedBy += 1
+					end
+				end
+				ally.need = reachedBy == 0 and 1 or reachedBy == 1 and 0.6 or 0.15
+			end
+		end
+		-- (Not while a damage unit stands outside every copy's reach: covering it comes first.)
+		local uncovered = false
+		for _, anchor in ipairs(anchors) do
+			local reached = false
+			for _, partner in ipairs(partners) do
+				if (anchor - partner).Magnitude <= math.max(range + 0.7, liveRange) then
+					reached = true
+					break
+				end
+			end
+			if not reached then
+				uncovered = true
+				break
+			end
+		end
+		if activeBuff and #partners > 0 and #anchors > 0 and not uncovered and math.min(AA.buffCopies(activeBuff, data), placeCap(data)) >= 3 then
 			-- The full buff needs a copy that buffs the casting copy without touching the damage
 			-- (see Conductor.step). Every second copy therefore goes where it reaches the casting
 			-- copies and none of the damage units: then the full buff starts a second after the
@@ -2943,21 +2975,33 @@ local function bestSpot(data, focus, only)
 							break
 						end
 					end
-					local spread = 0
+					-- In reach of at least one other copy (they feed each other), the closer to all
+					-- of them the better. (It had to be in reach of EVERY copy: after a card
+					-- shrank the range, two copies stood out of everyone's reach and nothing
+					-- could be placed any more, because no spot reached them and the rest.)
+					local spread, linked = 0, #partners == 0
 					for _, partner in ipairs(partners) do
 						local dx, dz = partner.X - p.X, partner.Z - p.Z
 						local d2 = dx * dx + dz * dz + (partner.Y - p.Y - 1.3) ^ 2
-						if d2 > range * range then
-							free = false
-							break
+						if d2 <= range * range then
+							linked = true
 						end
-						spread += math.sqrt(d2)
+						spread += math.min(math.sqrt(d2), range * 2)
+					end
+					if not linked then
+						free = false
 					end
 					if free then
 						for _, ally in ipairs(allies) do
 							local dx, dz = ally.position.X - p.X, ally.position.Z - p.Z
-							if dx * dx + dz * dz + (ally.position.Y - p.Y - 1.3) ^ 2 <= range * range then
-								score += ally.weight / math.max(total, 1)
+							local d2 = dx * dx + dz * dz + (ally.position.Y - p.Y - 1.3) ^ 2
+							if d2 <= range * range then
+								-- (A unit at the very edge of the range drops out with the first
+								-- card that costs range: comfortably inside counts for more. And a
+								-- unit no copy reaches yet counts in full, one a single copy reaches
+								-- for most, since it only gets every second cast, one that two
+								-- reach already for little.)
+								score += ally.weight / math.max(total, 1) * (d2 <= (range * 0.85) ^ 2 and 1 or 0.6) * (ally.need or 1)
 							end
 						end
 						for _, guest in ipairs(guests) do
@@ -2969,7 +3013,7 @@ local function bestSpot(data, focus, only)
 						if #partners > 0 then
 							-- Copies of the chain only need each other: tight together, so the
 							-- same allies stay inside every copy's range.
-							score += 0.5 + 0.3 * (1 - spread / #partners / range)
+							score += 0.5 + 0.12 * math.max(1 - spread / #partners / range, -1)
 						end
 						score += spot.gap * 0.0001
 						if score > bestScore then
@@ -3848,6 +3892,36 @@ local function planAction()
 				local nextCount = (have == 2 and want >= 4) and 4 or have + 1
 				local gain = (AA.buffValue(buff, nextCount) - AA.buffValue(buff, have)) * boosted
 				score = (gain / (nextCount - have) + copyPower(data, unit, 0)) / cost
+			elseif buff and damagePlaced >= damageNeed then
+				-- The chain is complete, but damage it should boost stands outside every copy's
+				-- reach (a unit placed before the buffers, a card that cost range): one more
+				-- copy next to it is worth most of the buff on that unit.
+				local copies = {}
+				for _, tower in ipairs(units) do
+					if tower._stats.id.Value == entry.id then
+						local range = tower._stats:FindFirstChild("range")
+						table.insert(copies, { position = tower:GetPivot().Position, reach = range and AA.rv(range) or AA.buffRange(data, unit, buff) })
+					end
+				end
+				local inside, outside = 0, 0
+				for _, ally in ipairs(powerUnits) do
+					if ally.data ~= data and AA.buffMatches(buff, ally.data) and not AA.buffInfo(ally.data) then
+						-- (Reached by one copy only: it gets every second cast, half the buff.)
+						local reachedBy = 0
+						local position = ally.unit:GetPivot().Position
+						for _, copy in ipairs(copies) do
+							if (position - copy.position).Magnitude <= copy.reach then
+								reachedBy += 1
+							end
+						end
+						local missing = reachedBy == 0 and 1 or reachedBy == 1 and 0.5 or 0
+						inside += ally.power * (1 - missing)
+						outside += ally.power * missing
+					end
+				end
+				if outside > (inside + outside) * 0.1 then
+					score = (0.6 * outside + copyPower(data, unit, 0)) / cost
+				end
 			elseif buff then
 				score = 0
 			elseif farmTop > 0 then
@@ -4856,40 +4930,80 @@ local function matchStep()
 	if Config.AutoPlace and leakGuard() then
 		return
 	end
-	-- A buffer standing alone where its cast reaches under a third of the damage it is there for
-	-- (placed before the team took shape, or on a hill too tall for its range): sold once, the
-	-- planner puts it back where the team is. No second copy is ever bought next to one like
-	-- that, so the whole chain depends on it.
-	if Config.AutoPlace and not Match.bufferMoved and currentWave() >= 2 and wavesLeft() >= 3 then
+	-- Buffers that have stopped doing their job are sold, a few times a match at most, and the
+	-- planner puts them back where the team is:
+	--  * a copy that reaches no unit it could buff and no other copy (after a card that costs
+	--    range, feeders 22 studs from the casters stood there for the rest of the run);
+	--  * a copy standing alone that reaches under a third of the damage it is there for
+	--    (placed before the team took shape, or on a hill too tall for its range).
+	-- No copy is ever bought next to one like that, so the whole chain depends on it.
+	if Config.AutoPlace and (Match.bufferMoves or 0) < 4 and os.clock() - (Match.bufferMoveAt or 0) > 20 and currentWave() >= 2 and wavesLeft() >= 3
+		and os.clock() - (Match.startedAt or 0) > 45 and not (AA.loadedMid and os.clock() - AA.loadedMid < 30) then
 		local towers = myUnits()
+		local groups = {}
 		for _, unit in ipairs(towers) do
 			local id = unit._stats.id.Value
-			local data = Units[id]
-			local buff = AA.buffInfo(data)
-			if buff and countPlacedId(id) == 1 and not AA.unsellable(id) and os.clock() - (Match.startedAt or 0) > 45 then
-				local position = unit:GetPivot().Position
+			local buff = AA.buffInfo(Units[id])
+			if buff and not AA.unsellable(id) then
+				groups[id] = groups[id] or { buff = buff, copies = {} }
 				local range = unit._stats:FindFirstChild("range")
-				local reach = range and AA.rv(range) or AA.buffRange(data, nil, buff)
-				local inside, total, count = 0, 0, 0
-				for _, other in ipairs(towers) do
-					local otherId = other._stats.id.Value
-					local otherData = Units[otherId]
-					if otherData and not AA.buffInfo(otherData) and AA.buffMatches(buff, otherData) and (unitStatsAt(otherData, 0).damage > 0 or AA.isSummoner(otherId)) and unitStatsAt(otherData, 0).farm <= 0 then
-						local damage, cooldown = other._stats:FindFirstChild("damage"), other._stats:FindFirstChild("attack_cooldown")
-						local weight = math.max((damage and AA.rv(damage) or 1) / math.max(cooldown and AA.rv(cooldown) or 1, 0.1), 1)
-						total += weight
-						count += 1
-						if (other:GetPivot().Position - position).Magnitude <= reach then
-							inside += weight
+				table.insert(groups[id].copies, { unit = unit, position = unit:GetPivot().Position, reach = range and AA.rv(range) or AA.buffRange(Units[id], nil, buff) })
+			end
+		end
+		for id, group in pairs(groups) do
+			local total, count, outside = 0, 0, 0
+			for _, copy in ipairs(group.copies) do
+				copy.inside = 0
+			end
+			for _, other in ipairs(towers) do
+				local otherId = other._stats.id.Value
+				local otherData = Units[otherId]
+				if otherData and not AA.buffInfo(otherData) and AA.buffMatches(group.buff, otherData) and (unitStatsAt(otherData, 0).damage > 0 or AA.isSummoner(otherId)) and unitStatsAt(otherData, 0).farm <= 0 then
+					local damage, cooldown = other._stats:FindFirstChild("damage"), other._stats:FindFirstChild("attack_cooldown")
+					local weight = math.max((damage and AA.rv(damage) or 1) / math.max(cooldown and AA.rv(cooldown) or 1, 0.1), 1)
+					total += weight
+					count += 1
+					local reached = false
+					local position = other:GetPivot().Position
+					for _, copy in ipairs(group.copies) do
+						if (position - copy.position).Magnitude <= copy.reach then
+							copy.inside += weight
+							reached = true
+						end
+					end
+					if not reached then
+						outside += weight
+					end
+				end
+			end
+			local victim, why
+			if count >= 3 and #group.copies == 1 and group.copies[1].inside < total * 0.34 then
+				victim, why = group.copies[1], "alone"
+			elseif count >= 1 and #group.copies >= 2 then
+				for _, copy in ipairs(group.copies) do
+					if copy.inside <= 0 then
+						-- Reaches no damage. Does it reach a copy that does (a feeder at work)?
+						local linked = false
+						for _, other in ipairs(group.copies) do
+							if other ~= copy and other.inside > 0 and (other.position - copy.position).Magnitude <= copy.reach then
+								linked = true
+								break
+							end
+						end
+						if not linked then
+							victim, why = copy, "idle"
+							break
 						end
 					end
 				end
-				if count >= 3 and inside < total * 0.34 then
-					Match.bufferMoved = true
-					note("bufferMove", { u = id, share = math.floor(inside / total * 100) })
-					AA.sellUnit(unit, "misplaced buffer")
-					return
-				end
+			end
+			if victim then
+				Match.bufferMoves = (Match.bufferMoves or 0) + 1
+				Match.bufferMoveAt = os.clock()
+				Match.bufferMoved = true
+				note("bufferMove", { u = id, why = why, share = math.floor(victim.inside / math.max(total, 1) * 100), out = math.floor(outside / math.max(total, 1) * 100) })
+				AA.sellUnit(victim.unit, "misplaced buffer")
+				return
 			end
 		end
 	end
@@ -6408,6 +6522,7 @@ local function resetMatch()
 	Match.shieldHits, Match.shieldAt, Match.shieldMode = nil, nil, nil
 	Match.enemyMedian, Match.tankNoted, Match.shieldOn, Match.blesserId = nil, nil, nil, nil
 	Match.soaring, Match.spotScore, Match.openingDone, Match.flyShare, Match.bufferMoved = nil, nil, nil, nil, nil
+	Match.bufferMoves, Match.bufferMoveAt = nil, nil
 	Match.seenWave, Match.seenEnemies, Match.seenHealths = nil, nil, nil
 	Match.live, Match.liveAt, Match.laneDepth, Match.lanesNoted = nil, nil, nil, nil
 	AA.Macro.reset()
@@ -8896,6 +9011,7 @@ function CardBrain.state()
 		state.spent += spent and spent.Value or 0
 		local id = unit._stats.id.Value
 		local data = Units[id]
+		state.buffer = state.buffer or (data ~= nil and AA.buffInfo(data) ~= nil)
 		if data and (data.damage or 0) > 0 then
 			-- Weight by what the tower is worth right now (damage counters miss summoners).
 			local amount = math.max(copyPower(data, ownedOf(unit), unit._stats.upgrade.Value) * AA.measureFactor(id), 1)
@@ -8998,7 +9114,16 @@ function CardBrain.score(option, state)
 			if stat == "damage" then
 				power *= 1 + amount
 			elseif stat == "range" then
-				power *= 1 + amount * 0.6
+				if amount < 0 then
+					-- Less range costs road in reach one for one, and it pulls the buff group
+					-- apart: buffers stop reaching the units and each other. ("Double Attack,
+					-- Half Range" scored as +40%: Elfy's reach went from 27 to 13 studs, the
+					-- feeders lost the casters, and an Elyssia stood unbuffed for the rest of
+					-- the run.)
+					power *= math.max(1 + amount, 0.2) * (state.buffer and 0.8 or 1)
+				else
+					power *= 1 + amount * 0.6
+				end
 			elseif stat == "attack_cooldown" then
 				power /= math.max(1 + amount, 0.2)
 			elseif stat == "active_attack_cooldown" then
