@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v194", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v195", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -207,7 +207,7 @@ local Config = {
 	MatchCastle = false,
 	KillsStage = "Walled City",
 	DailyWithChallenges = true,
-	TestUnproven = true,
+	MeasureHidden = false,
 	AutoSummon = false,
 	Banner = "EventClover",
 	PortalPick = "",
@@ -216,8 +216,9 @@ local Config = {
 	CompassPick = "",
 	AutoFeed = false,
 	AutoEvolve = false,
-	AutoTrait = false,
-	TraitTarget = "",
+	TraitUnit = "",
+	TraitUse = "Tokens",
+	TraitStopMythic = true,
 	BuyGoldShop = false,
 	KeepGold = 0,
 	BuyEvolveFruit = true,
@@ -322,8 +323,9 @@ do
 		Targeting = { "Smart", "First", "Last", "Closest", "Farthest", "Strongest", "Weakest", "Off" },
 		CardStrategy = { "Win", "Balanced", "Pearls" },
 		MenuFont = { "Own", "Roblox" },
+		TraitUse = { "Tokens", "Remnants", "Both" },
 	}
-	local defaults = { CardStrategy = "Balanced", MenuFont = "Own", WarlordMode = "Auto", SpellMode = "Safe", CharmPick = "Auto", OrderPlacement = "Smart", OrderAddKind = "Place", Mode = "Story", AfterGame = "Auto", Difficulty = "Normal", PlaceStyle = "Auto", SnipeMode = "Normal", Targeting = "Smart" }
+	local defaults = { CardStrategy = "Balanced", MenuFont = "Own", TraitUse = "Tokens", WarlordMode = "Auto", SpellMode = "Safe", CharmPick = "Auto", OrderPlacement = "Smart", OrderAddKind = "Place", Mode = "Story", AfterGame = "Auto", Difficulty = "Normal", PlaceStyle = "Auto", SnipeMode = "Normal", Targeting = "Smart" }
 	for key, list in pairs(choices) do
 		if not table.find(list, Config[key]) then
 			Config[key] = defaults[key]
@@ -417,17 +419,17 @@ do
 	end)
 	AA.unitCache = cache
 	local NEW_STYLE = { "_rateup_banner_only", "shared_setup_script", "show_custom_unique_info" }
-	local FIELDS = { "upgrade", "primary_attack", "primary_attack_no_upgrades", "spawn_cap", "damage", "attack_cooldown", "range", "hill_unit", "hybrid_placement", "_attacks" }
+	local FIELDS = { "upgrade", "primary_attack", "primary_attack_no_upgrades", "spawn_cap", "damage", "attack_cooldown", "range", "hill_unit", "hybrid_placement", "_attacks", "death_attack", "active_attack", "on_attack_script", "upgrade_script", "spawn_script", "physical_crit_chance", "physical_crit_damage", "magic_crit_chance", "magic_crit_damage" }
 	local function plain(value, depth)
 		if type(value) ~= "table" then
 			return (type(value) == "number" or type(value) == "string" or type(value) == "boolean") and value or nil
 		end
-		if depth > 4 then
+		if depth > 8 then
 			return nil
 		end
 		local out = {}
 		for key, item in pairs(value) do
-			if key ~= "fx" and key ~= "sfx" and key ~= "effects" and key ~= "ASSETS" then
+			if key ~= "fx" and key ~= "sfx" and key ~= "effects" and key ~= "ASSETS" and key ~= "initial_fx" and key ~= "particle" and key ~= "projectile" then
 				out[key] = plain(item, depth + 1)
 			end
 		end
@@ -449,7 +451,14 @@ do
 					end
 					cache.units[id] = entry
 					count += 1
-					for _, attackId in ipairs({ data.primary_attack, data.primary_attack_no_upgrades }) do
+					local attackIds = { data.primary_attack or false, data.primary_attack_no_upgrades or false, data.death_attack or false, data.active_attack or false }
+					for _, attackId in pairs(type(data._attacks) == "table" and data._attacks or {}) do
+						table.insert(attackIds, attackId)
+					end
+					for _, up in ipairs(data.upgrade) do
+						table.insert(attackIds, type(up) == "table" and up.primary_attack or false)
+					end
+					for _, attackId in ipairs(attackIds) do
 						if type(attackId) == "string" and Attacks[attackId] then
 							cache.attacks[attackId] = plain(Attacks[attackId], 0)
 						end
@@ -1994,6 +2003,61 @@ function AA.hasTrait(unit, trait)
 	return false
 end
 
+---What one use of an attack deals to one enemy, in multiples of the unit's damage:
+---  aoe        every hit of the attack (hit.damage is its share of the damage);
+---  aoe_dot    an area that lingers: time / interval ticks of hit.damage each (the game's own
+---             tables add up to a whole hit this way: 3 s at 1 s x 0.333, 3 s at 0.6 s x 0.2);
+---  spawn_unit a summon that blows up (death_attack) deals that attack once, at damage_ratio of
+---             its owner's damage, times the amount summoned. A summon that keeps attacking
+---             counts for one attack: how long it lives is the server's business.
+function AA.attackHits(attack, depth)
+	if type(attack) ~= "table" then
+		return 1
+	end
+	local total = 0
+	for _, entry in pairs(type(attack.aoe) == "table" and attack.aoe or {}) do
+		local hit = type(entry) == "table" and entry.hit
+		if type(hit) == "table" then
+			total += tonumber(hit.damage) or 1
+		end
+	end
+	for _, entry in pairs(type(attack.aoe_dot) == "table" and attack.aoe_dot or {}) do
+		local inner = type(entry) == "table" and type(entry.aoe) == "table" and entry.aoe.hit
+		local time, interval = type(entry) == "table" and tonumber(entry.time), type(entry) == "table" and tonumber(entry.interval)
+		if type(inner) == "table" and time and interval and interval > 0 then
+			total += (tonumber(inner.damage) or 1) * math.max(math.floor(time / interval + 0.5), 1)
+		end
+	end
+	if (depth or 0) < 2 then
+		for _, group in pairs(type(attack.spawn_unit) == "table" and attack.spawn_unit or {}) do
+			for _, summon in pairs(type(group) == "table" and type(group.units_nonrandom) == "table" and group.units_nonrandom or {}) do
+				local summonData = type(summon) == "table" and Units[summon.unit]
+				if type(summonData) == "table" then
+					local attackId = summonData.death_attack or summonData.primary_attack or summonData.primary_attack_no_upgrades or (type(summonData._attacks) == "table" and (summonData._attacks[1] or summonData._attacks["1"]))
+					total += (tonumber(summon.amount) or 1) * (tonumber(summon.damage_ratio) or 1) * AA.attackHits(type(attackId) == "string" and Attacks[attackId] or nil, (depth or 0) + 1)
+				end
+			end
+		end
+	end
+	return total > 0 and total or 1
+end
+
+---Crit chance of a copy from the game's own formula (unit, relic and artifact), and the size of
+---its crits when the unit's table gives one (nil otherwise: the default lives on the server).
+function AA.critOf(data, unit)
+	local kind = data._base_damage_type == "magic" and "magic" or "physical"
+	local chance = tonumber(data[kind .. "_crit_chance"]) or 0
+	if type(unit) == "table" then
+		statMul(unit, "damage")
+		local entry = statCache[unit]
+		if entry.crit == nil then
+			entry.crit = tonumber(gameCall(Core.Unit and Core.Unit.calculate_static_crit_chance, AA.realRecord(unit), nil, kind, session())) or false
+		end
+		chance = entry.crit or chance
+	end
+	return math.clamp(chance, 0, 1), tonumber(data[kind .. "_crit_damage"])
+end
+
 local function hitsPerAttack(data, level)
 	local attackId = data.primary_attack or data.primary_attack_no_upgrades
 	for i = 1, level do
@@ -2002,15 +2066,7 @@ local function hitsPerAttack(data, level)
 			attackId = up.primary_attack
 		end
 	end
-	local attack = attackId and Attacks[attackId]
-	local total = 0
-	for _, entry in pairs(attack and type(attack.aoe) == "table" and attack.aoe or {}) do
-		local hit = type(entry) == "table" and entry.hit
-		if type(hit) == "table" then
-			total += tonumber(hit.damage) or 1
-		end
-	end
-	return total > 0 and total or 1
+	return AA.attackHits(attackId and Attacks[attackId], 0)
 end
 
 local function copyPower(data, unit, level)
@@ -2021,9 +2077,8 @@ local function copyPower(data, unit, level)
 	local damage = base.damage * hitsPerAttack(data, level) * statMul(unit, "damage")
 	local cooldown = math.max(base.cooldown * statMul(unit, "attack_cooldown"), 0.1)
 	local range = base.range * statMul(unit, "range")
-	local kind = data._base_damage_type == "magic" and "magic" or "physical"
-	local chance = math.clamp(data[kind .. "_crit_chance"] or 0, 0, 1)
-	local crit = 1 + chance * (data[kind .. "_crit_damage"] or 0.5)
+	local chance, size = AA.critOf(data, unit)
+	local crit = 1 + chance * (size or 0.5)
 	local shape = attackShape(data, level)
 	local targets = 1
 	if shape.kind == "circle" then
@@ -2309,9 +2364,10 @@ do
 	pcall(function()
 		if isfile(file) then
 			local data = httpService:JSONDecode(readfile(file))
-			if type(data) == "table" and (data.v == 3 or data.v == 4 or data.v == 5) and type(data.units) == "table" then
+			if type(data) == "table" and (data.v == 3 or data.v == 4 or data.v == 5 or data.v == 6) and type(data.units) == "table" then
 				AA.Measured = data.units
-				if data.v ~= 5 then
+				AA.measuredVersion = data.v
+				if data.v < 5 then
 					-- Older numbers used the in-range clock for everything but summoners: only the
 					-- summoners' are on today's scale. The rest measure again.
 					local summoners = type(AA.progress.summoners) == "table" and AA.progress.summoners or {}
@@ -2331,8 +2387,9 @@ do
 		end
 	end)
 	function AA.saveMeasured()
+		AA.measureStamp = (AA.measureStamp or 0) + 1
 		pcall(function()
-			writefile(file, httpService:JSONEncode({ v = 5, units = AA.Measured }))
+			writefile(file, httpService:JSONEncode({ v = AA.measuredVersion == 6 and 6 or 5, units = AA.Measured }))
 		end)
 	end
 	function AA.scriptedUnit(data)
@@ -2492,6 +2549,291 @@ local function unitPower(id, unit)
 	-- Units the level favours (event bonuses, matching skins) hit harder there.
 	local favoured = (1 + (tonumber(AA.levelBonus and AA.levelBonus(unit)) or 0)) * (AA.typeFactor and AA.typeFactor(data) or 1)
 	return perCopy * copies * affordability * antiAir * favoured, measured
+end
+
+-- Unit ratings. What a copy is worth is worked out from the game's own tables, in two steps:
+--   on paper:  damage x hits per attack x the game's stat multipliers / attack cooldown, with
+--              crits where the data gives their size. One copy against one enemy that never
+--              leaves its range. (The game's own measure of a unit is the same damage /
+--              attack_cooldown: UnitServiceCore.get_static_dps_ratio.)
+--   in play:   the paper number x how many enemies the attack shape catches x time in range x
+--              copies you can place x what a full set costs. This is the number teams are
+--              picked by (unitPower).
+-- Some damage never reaches the client's tables: passives are text plus a server script, burn
+-- and bleed tick on the server's clock, some attacks are scripted outright. Those parts are
+-- named, not guessed: such a unit is rated on what can be calculated ("at least") until a
+-- match has measured it, and then on the measured number.
+do
+	local Eval = { cache = {}, stamp = 0 }
+	AA.Eval = Eval
+	local STATUS = { fire = "Burn", black_fire = "Black fire", bleed = "Bleed", power_bleed = "Bleed", decay = "Decay", aki_curse = "Curse", cursed = "Curse", merlin_cursed = "Curse" }
+
+	---Every attack a unit uses between level 0 and its last upgrade.
+	local function attacksOf(data)
+		local ids, seen = {}, {}
+		local function add(id)
+			if type(id) == "string" and not seen[id] then
+				seen[id] = true
+				table.insert(ids, id)
+			end
+		end
+		add(data.primary_attack)
+		add(data.primary_attack_no_upgrades)
+		for _, up in ipairs(type(data.upgrade) == "table" and data.upgrade or {}) do
+			add(type(up) == "table" and up.primary_attack)
+		end
+		return ids
+	end
+	---Parts of a unit's damage the client has no numbers for, as short phrases.
+	function Eval.gaps(data)
+		local list, seen = {}, {}
+		local function add(text)
+			if not seen[text] then
+				seen[text] = true
+				table.insert(list, text)
+			end
+		end
+		for _, passive in pairs(type(data.passives) == "table" and data.passives or {}) do
+			if type(passive) == "table" then
+				add('passive "' .. tostring(passive.name or passive.id or "?") .. '"')
+			end
+		end
+		if data.active_attack then
+			add("its ability")
+		end
+		if data.on_attack_script then
+			add("a server script on each attack")
+		end
+		if data.upgrade_script then
+			add("a server script on upgrades")
+		end
+		if data.spawn_script then
+			add("a server script on placing")
+		end
+		for _, attackId in ipairs(attacksOf(data)) do
+			local attack = Attacks[attackId]
+			for _, group in ipairs({ type(attack) == "table" and attack.aoe or false, type(attack) == "table" and attack.aoe_dot or false }) do
+				for _, entry in pairs(type(group) == "table" and group or {}) do
+					local hit = type(entry) == "table" and (entry.hit or (type(entry.aoe) == "table" and entry.aoe.hit))
+					for _, buff in pairs(type(hit) == "table" and type(hit.buffs) == "table" and hit.buffs or {}) do
+						local rate = type(buff) == "table" and type(buff.params) == "table" and tonumber(buff.params.damage_rate)
+						if rate then
+							add(string.format("%s (%s%% of a hit for %ss, ticks on the server's clock)", STATUS[buff.name] or tostring(buff.name), tostring(math.floor(rate * 1000 + 0.5) / 10), tostring(buff.time or "?")))
+						elseif type(buff) == "table" and STATUS[buff.name] then
+							add(STATUS[buff.name] .. " on hit")
+						end
+					end
+				end
+			end
+			for _, group in pairs(type(attack) == "table" and type(attack.spawn_unit) == "table" and attack.spawn_unit or {}) do
+				for _, summon in pairs(type(group) == "table" and type(group.units_nonrandom) == "table" and group.units_nonrandom or {}) do
+					local summonData = type(summon) == "table" and Units[summon.unit]
+					if not summonData then
+						add("its summons (no numbers here)")
+					elseif not summonData.death_attack then
+						add("how long its summons stay alive")
+					end
+				end
+			end
+		end
+		local kind = data._base_damage_type == "magic" and "magic" or "physical"
+		if (tonumber(data[kind .. "_crit_chance"]) or 0) > 0 and not data[kind .. "_crit_damage"] then
+			add("the size of its critical hits")
+		end
+		return list
+	end
+
+	local function traitSig(unit)
+		local parts = {}
+		for slot, entry in pairs(type(unit.traits) == "table" and unit.traits or {}) do
+			table.insert(parts, tostring(slot) .. (type(entry) == "table" and (tostring(entry.trait) .. tostring(entry.tier)) or tostring(entry)))
+		end
+		table.sort(parts)
+		return table.concat(parts, ",")
+	end
+	---Everything a rating depends on. A rating is kept until this string changes.
+	local function signature(unit)
+		local real = AA.realRecord(unit)
+		local stats = type(real.trait_stats) == "table" and real.trait_stats or {}
+		local level = AA.targetLevel
+		return table.concat({
+			tostring(unit.unit_id),
+			tostring(unit.xp or 0),
+			traitSig(unit),
+			tostring(stats.potency_stat), tostring(stats.speed_stat), tostring(stats.range_stat),
+			tostring(unit._equipped_relic),
+			tostring(unit.shiny),
+			tostring(AA.measureStamp or 0),
+			tostring(Eval.stamp),
+			tostring(type(level) == "table" and level.id or Match.levelId or ""),
+			tostring(Config.MaxPerUnit),
+			tostring(Match.pace or ""),
+			tostring(math.floor(os.clock() / 120)),
+		}, "|")
+	end
+	---Drop what is kept for one copy (its traits or stats changed), or for every copy.
+	function Eval.forget(uuid)
+		if uuid == nil then
+			Eval.stamp += 1
+			Eval.cache = {}
+			return
+		end
+		Eval.cache[tostring(uuid)] = nil
+		local owned = collectionData().owned_units
+		local unit = type(owned) == "table" and owned[tostring(uuid)]
+		if unit then
+			statCache[unit] = nil
+		end
+	end
+
+	---The rating of one owned copy:
+	---  kind      "calculated" | "measured" | "partial" | "unknown" | "support" | "farm"
+	---  paper     damage a second on paper (one copy, one enemy)
+	---  play      the ranking number (unitPower)
+	---  hit, cooldown, range, hits, crit   what the paper number is made of
+	---  factor    measured damage / paper damage, when a match has measured it
+	---  gaps      what could not be calculated
+	function Eval.of(unit)
+		if type(unit) ~= "table" then
+			return { kind = "unknown", paper = 0, play = 0, gaps = {}, name = "?" }
+		end
+		local uuid = tostring(unit.uuid)
+		local sig = signature(unit)
+		local kept = Eval.cache[uuid]
+		if kept and kept.sig == sig then
+			return kept.value
+		end
+		local data = Units[unit.unit_id]
+		local value = { id = unit.unit_id, name = tostring(data and data.name or unit.unit_id), kind = "unknown", paper = 0, play = 0, factor = 1, gaps = {} }
+		if data then
+			local level = data.upgrade and #data.upgrade or 0
+			local base = unitStatsAt(data, level)
+			value.level = level
+			if base.farm > 0 then
+				value.kind = "farm"
+				value.income = base.farm * statMul(unit, "farm_amount")
+			elseif base.damage <= 0 then
+				if AA.buffInfo(data) or data._NO_ATTACKS_UNIT or AA.synergyInfo(unit.unit_id) then
+					value.kind = "support"
+				else
+					value.why = IS_LOBBY and "The lobby does not carry this unit's numbers. They are saved the next time you are in a match." or "The game data has no damage for this unit."
+				end
+			else
+				local hits = hitsPerAttack(data, level)
+				local chance, size = AA.critOf(data, unit)
+				value.hits = hits
+				value.hit = base.damage * hits * statMul(unit, "damage")
+				value.cooldown = math.max(base.cooldown * statMul(unit, "attack_cooldown"), 0.1)
+				value.range = base.range * statMul(unit, "range")
+				value.crit = chance
+				value.paper = value.hit / value.cooldown * (1 + chance * (size or 0))
+				local play, measured = unitPower(unit.unit_id, unit)
+				value.play = play
+				value.gaps = Eval.gaps(data)
+				if measured then
+					value.kind = "measured"
+					value.factor = AA.measureFactor(unit.unit_id)
+					if not (AA.scriptedUnit(data) or data._fromCache or AA.isSummoner(unit.unit_id)) then
+						-- (The same limits unitPower puts on a unit with plain attack data.)
+						value.factor = math.clamp(value.factor, 0.6, 1.6)
+					end
+				else
+					value.kind = #value.gaps > 0 and "partial" or "calculated"
+				end
+			end
+		end
+		Eval.cache[uuid] = { sig = sig, value = value }
+		return value
+	end
+
+	function Eval.short(number)
+		number = tonumber(number) or 0
+		if number >= 1e9 then
+			return string.format("%.2fB", number / 1e9)
+		elseif number >= 1e6 then
+			return string.format("%.2fM", number / 1e6)
+		elseif number >= 1e4 then
+			return (string.format("%.1fk", number / 1e3):gsub("%.0k$", "k"))
+		end
+		return tostring(math.floor(number + 0.5))
+	end
+	---How the number was arrived at, in a few words.
+	function Eval.basis(value)
+		if value.kind == "measured" then
+			return string.format("measured, %sx the calculation", tostring(math.floor(value.factor * 10 + 0.5) / 10))
+		elseif value.kind == "calculated" then
+			return "calculated"
+		elseif value.kind == "partial" then
+			return "at least"
+		elseif value.kind == "farm" then
+			return "income"
+		elseif value.kind == "support" then
+			return "support"
+		end
+		return "no numbers yet"
+	end
+	---The equipped team and the strongest copies left out, rated: { team = {...}, bench = {...} }.
+	---Each row: { uuid, value, slot }.
+	function Eval.report(benchSize)
+		local data = collectionData()
+		local owned = data.owned_units or {}
+		local team, on = {}, {}
+		for slot, uuid in pairs(data.equipped_units or {}) do
+			local unit = owned[uuid]
+			if unit then
+				on[uuid] = true
+				table.insert(team, { uuid = uuid, slot = tonumber(slot) or 99, value = Eval.of(unit) })
+			end
+		end
+		table.sort(team, function(a, b)
+			return a.slot < b.slot
+		end)
+		local best = {}
+		for uuid, unit in pairs(owned) do
+			if not on[uuid] then
+				local value = Eval.of(unit)
+				local shown = best[unit.unit_id]
+				if value.play > 0 and (not shown or value.play > shown.value.play) then
+					best[unit.unit_id] = { uuid = uuid, value = value }
+				end
+			end
+		end
+		local bench = {}
+		for id, row in pairs(best) do
+			local equippedTwin = false
+			for _, member in ipairs(team) do
+				equippedTwin = equippedTwin or member.value.id == id
+			end
+			if not equippedTwin then
+				table.insert(bench, row)
+			end
+		end
+		table.sort(bench, function(a, b)
+			return a.value.play > b.value.play
+		end)
+		for index = #bench, (benchSize or 3) + 1, -1 do
+			bench[index] = nil
+		end
+		return { team = team, bench = bench }
+	end
+
+	-- Measured numbers from before the sheet counted lingering areas (aoe_dot): the factor of a
+	-- unit with one was measured against a smaller paper number and would now count it twice.
+	if AA.measuredVersion ~= 6 then
+		for key in pairs(AA.Measured) do
+			local data = Units[(key:gsub("[#@].*$", ""))]
+			local lingering = false
+			for _, attackId in ipairs(data and attacksOf(data) or {}) do
+				local attack = Attacks[attackId]
+				lingering = lingering or (type(attack) == "table" and type(attack.aoe_dot) == "table" and next(attack.aoe_dot) ~= nil)
+			end
+			if lingering then
+				AA.Measured[key] = nil
+			end
+		end
+		AA.measuredVersion = 6
+		AA.saveMeasured()
+	end
 end
 
 ---How much of the path one attack from this spot hits, and the best way to face.
@@ -7084,20 +7426,24 @@ local function equipBest()
 			table.insert(picks, entry)
 		end
 	end
-	-- Trial: a scripted unit with no real numbers yet gets the last slot until it has been measured,
-	-- if its sheet guess is at least a third of the weakest pick's (scripted attacks usually hit more than the sheet shows).
-	if Config.TestUnproven and #picks == slots then
+	-- Every unit is ranked on what the game data gives (AA.Eval). A unit with parts the data
+	-- hides is ranked on the rest, which is the least it can do. Optional: such a unit that has
+	-- never been measured takes the last slot for a match, so its real damage gets logged, if
+	-- what can be calculated is within reach of the team (a third of the weakest pick).
+	if Config.MeasureHidden and #picks == slots then
+		local function untested(entry)
+			return AA.Eval.of(owned[entry.uuid]).kind == "partial"
+		end
 		local weakest = picks[#picks]
 		for _, entry in ipairs(list) do
-			local unitData = Units[entry.id]
 			local chosen = false
 			for _, pick in ipairs(picks) do
 				chosen = chosen or pick.id == entry.id
 			end
-			if not chosen and AA.scriptedUnit(unitData) and not AA.isMeasured(entry.id) and entry.power >= weakest.power * 0.33 then
+			if not chosen and untested(entry) and entry.power >= weakest.power * 0.33 then
 				for j = #picks, 1, -1 do
 					local pick = picks[j]
-					if not pick.pinned and not (AA.scriptedUnit(Units[pick.id]) and not AA.isMeasured(pick.id)) then
+					if not pick.pinned and not untested(pick) then
 						entry.trial = true
 						picks[j] = entry
 						break
@@ -8721,27 +9067,6 @@ function AA.unitStep()
 			end
 		end
 	end
-	if Config.AutoTrait and Config.TraitTarget ~= "" then
-		-- Reroll the strongest equipped unit with trait tokens until it has the target trait.
-		local best, bestPower = nil, 0
-		for _, entry in ipairs(equippedUnits()) do
-			local power = unitPower(entry.id, owned[entry.uuid])
-			if power > bestPower then
-				best, bestPower = entry.uuid, power
-			end
-		end
-		local unit = best and owned[best]
-		local has = unit ~= nil and AA.hasTrait(unit, Config.TraitTarget) or false
-		for _, trait in pairs(unit and unit.traits or {}) do
-			if trait == Config.TraitTarget then
-				has = true
-			end
-		end
-		if unit and not has and (profile().trait_reroll_tokens or 0) > 0 then
-			status = "Rerolling traits"
-			invoke("request_token_trait_reroll", best)
-		end
-	end
 end
 
 -- Shops: gold shop (XP food / Star Fruit for gold), Summer capsules with pearls, travelling merchant.
@@ -10229,6 +10554,556 @@ end
 supervise("lobby", lobbyLoop)
 
 -- ============================================================
+--  Trait rolls
+-- ============================================================
+-- One unit, a list of traits worth keeping, and a loop that rolls until one of them lands.
+-- A roll is one request. The server answers it twice: the request returns, and a
+-- unit_traits_changed event carries the new traits. Nothing is sent while an answer is still
+-- owed, and nothing is rolled on a reading older than the last roll: a roll that was paid for
+-- but never reported stops the run instead of being followed by another.
+do
+	local Traits = { state = "idle", text = "", serial = 0, recent = {} }
+	AA.Traits = Traits
+	local store = type(AA.progress.traits) == "table" and AA.progress.traits or {}
+	AA.progress.traits = store
+	store.want = type(store.want) == "table" and store.want or {}
+	store.rolls = type(store.rolls) == "table" and store.rolls or {}
+	Traits.store = store
+	-- Seconds: how long a request may stay unanswered, how long its event may trail the answer,
+	-- and the pause between two rolls (the game's own window refuses a second roll while the
+	-- first is in flight; the lobby server drops requests sent faster than one per 0.75 s).
+	Traits.TIMEOUT, Traits.SETTLE, Traits.GAP = 45, 6, 1.2
+	Traits.MAX_REFUSALS = 3
+	local ROMAN = { "I", "II", "III", "IV", "V", "VI" }
+	local RANK = { Rare = 1, Epic = 2, Legendary = 3, Mythic = 4, Secret = 5 }
+	-- Percent a roll, as the game's own rate panel lists them (they add up to 100). Read again
+	-- from the panel whenever it is loaded.
+	local ODDS = {
+		["superior:1"] = 14.98, ["superior:2"] = 10.48, ["superior:3"] = 4.5,
+		["range:1"] = 12.48, ["range:2"] = 8.74, ["range:3"] = 3.75,
+		["nimble:1"] = 12.48, ["nimble:2"] = 8.74, ["nimble:3"] = 3.75,
+		neuroplasticity = 9.99, culling = 5, sniper = 2.5, godspeed = 1, reaper = 0.8,
+		ethereal = 0.36, divine = 0.2, golden = 0.15, unique = 0.1,
+	}
+	local ITEMS = { limited = "star_remnant_limited", remnants = "star_remnant", legacy = "trait_reroll_legacy" }
+	Traits.ITEMS = ITEMS
+
+	local options, byKey
+	---Every trait a roll can land, one entry per tier: { key, id, tier, name, rarity, odds }.
+	---key is "superior:3" for a tiered trait and the plain id otherwise.
+	function Traits.options()
+		if options then
+			return options, byKey
+		end
+		local data = gameRequire(replicatedStorage.src.Data.Traits)
+		local list, map = {}, {}
+		for id, info in pairs(type(data) == "table" and type(data.info) == "table" and data.info or {}) do
+			if type(info) == "table" then
+				local tiers = math.clamp(tonumber(gameCall(Core.Trait and Core.Trait.get_tier_count, id)) or 1, 1, 6)
+				for tier = 1, tiers do
+					local key = tiers > 1 and (id .. ":" .. tier) or id
+					local entry = {
+						key = key,
+						id = id,
+						tier = tier,
+						tiers = tiers,
+						name = tostring(info.name or id) .. (tiers > 1 and (" " .. ROMAN[tier]) or ""),
+						rarity = type(info.tier_rarity) == "table" and info.tier_rarity[tostring(tier)] or info.rarity or "Rare",
+						odds = ODDS[key],
+					}
+					table.insert(list, entry)
+					map[key] = entry
+				end
+			end
+		end
+		-- The panel's own numbers, when the game has built it.
+		pcall(function()
+			local panel = localPlayer.PlayerGui:FindFirstChild("TraitReroll")
+			local byName = {}
+			for _, object in ipairs(panel and panel:GetDescendants() or {}) do
+				if object.Name == "TraitName" and object:IsA("TextLabel") then
+					local chance = object.Parent:FindFirstChild("Chance")
+					local value = chance and tonumber((tostring(chance.Text):gsub("[^%d%.]", "")))
+					if value then
+						byName[object.Text:lower()] = value
+					end
+				end
+			end
+			local found = 0
+			for _, entry in ipairs(list) do
+				local value = byName[entry.name:lower()]
+				if value then
+					entry.odds = value
+					found += 1
+				end
+			end
+			Traits.oddsLive = found > 0
+		end)
+		table.sort(list, function(a, b)
+			if (a.odds or 1000) ~= (b.odds or 1000) then
+				return (a.odds or 1000) < (b.odds or 1000)
+			end
+			return a.key < b.key
+		end)
+		if #list > 0 then
+			options, byKey = list, map
+		end
+		return list, map
+	end
+
+	---The traits on an owned copy, in the game's order: { { key, id, tier, name, rarity } }.
+	function Traits.of(unit)
+		local list = {}
+		local _, map = Traits.options()
+		local slots = {}
+		for slot in pairs(type(unit) == "table" and type(unit.traits) == "table" and unit.traits or {}) do
+			table.insert(slots, slot)
+		end
+		table.sort(slots, function(a, b)
+			return tostring(a) < tostring(b)
+		end)
+		for _, slot in ipairs(slots) do
+			local entry = unit.traits[slot]
+			local id = type(entry) == "table" and entry.trait or entry
+			if type(id) == "string" and id ~= "" then
+				local tier = tonumber(type(entry) == "table" and entry.tier) or 1
+				local known = map[id .. ":" .. tier] or map[id]
+				table.insert(list, known or { key = id, id = id, tier = tier, name = id, rarity = "Rare", unknown = true })
+			end
+		end
+		return list
+	end
+	function Traits.label(unit)
+		local names = {}
+		for _, trait in ipairs(Traits.of(unit)) do
+			table.insert(names, trait.name)
+		end
+		return #names == 0 and "No trait" or table.concat(names, " and ")
+	end
+	---One string per reading: two readings with the same string carry the same traits.
+	function Traits.sig(unit)
+		local keys = {}
+		for _, trait in ipairs(Traits.of(unit)) do
+			table.insert(keys, trait.id .. ":" .. trait.tier)
+		end
+		return table.concat(keys, "|")
+	end
+
+	function Traits.wanted(uuid)
+		local list = store.want[tostring(uuid)]
+		return type(list) == "table" and list or {}
+	end
+	function Traits.wants(uuid, key)
+		return table.find(Traits.wanted(uuid), key) ~= nil
+	end
+	---Tick or untick a trait for one unit. Takes effect on the very next reading, mid-run too.
+	function Traits.toggleWant(uuid, key)
+		uuid = tostring(uuid)
+		local list = table.clone(Traits.wanted(uuid))
+		local found = table.find(list, key)
+		if found then
+			table.remove(list, found)
+		else
+			table.insert(list, key)
+		end
+		store.want[uuid] = #list > 0 and list or nil
+		AA.saveProgress()
+	end
+	---The first trait on the copy that is on its list (its name), or nil.
+	function Traits.match(unit, uuid)
+		local want = Traits.wanted(uuid)
+		for _, trait in ipairs(Traits.of(unit)) do
+			if table.find(want, trait.key) then
+				return trait.name
+			end
+		end
+		return nil
+	end
+	---A Mythic trait on the copy that is not on its list: rolling again would throw it away.
+	function Traits.rareOffList(unit, uuid)
+		local want = Traits.wanted(uuid)
+		for _, trait in ipairs(Traits.of(unit)) do
+			if (RANK[trait.rarity] or 0) >= RANK.Mythic and not table.find(want, trait.key) then
+				return trait.name
+			end
+		end
+		return nil
+	end
+	---Percent a roll that one roll lands something on the list.
+	function Traits.chance(uuid)
+		local _, map = Traits.options()
+		local total = 0
+		for _, key in ipairs(Traits.wanted(uuid)) do
+			total += map[key] and map[key].odds or 0
+		end
+		return total
+	end
+
+	---What can pay for a roll on this copy. Star Remnants: the game takes 5 a roll on a Mythic
+	---or Secret unit and 1 on anything else (TraitServiceCore.get_reroll_requirements).
+	function Traits.resources(unit)
+		local unitData = type(unit) == "table" and Units[unit.unit_id] or nil
+		local rarity = unitData and unitData.rarity
+		local per = tonumber(gameCall(Core.Trait and Core.Trait.get_reroll_requirements, rarity, "reroll_trait", ITEMS.remnants))
+		if not per or per < 1 then
+			per = (rarity == "Mythic" or rarity == "Secret") and 5 or 1
+		end
+		local legacyUnits = Core.Unit and Core.Unit.LEGACY_UNITS
+		local isLegacy = type(legacyUnits) == "table" and unit ~= nil and legacyUnits[unit.unit_id] ~= nil
+		return {
+			tokens = tonumber(profile().trait_reroll_tokens) or 0,
+			limited = itemCount(ITEMS.limited),
+			remnants = itemCount(ITEMS.remnants),
+			legacy = isLegacy and itemCount(ITEMS.legacy) or 0,
+			per = per,
+		}
+	end
+	---The order things are spent in. Limited remnants go first (they expire), legacy rerolls
+	---before tokens (they only work on old units).
+	local function spendOrder(use)
+		if use == "Remnants" then
+			return { "limited", "remnants" }
+		elseif use == "Both" then
+			return { "limited", "remnants", "legacy", "tokens" }
+		end
+		return { "legacy", "tokens" }
+	end
+	local function costOf(res, kind)
+		return (kind == "limited" or kind == "remnants") and res.per or 1
+	end
+	---Rolls the chosen resources still pay for.
+	function Traits.rollsLeft(res, use)
+		local total = 0
+		for _, kind in ipairs(spendOrder(use)) do
+			total += math.floor((res[kind] or 0) / costOf(res, kind))
+		end
+		return total
+	end
+	---What the next roll is paid with: { kind, cost, item } or nil when nothing is left.
+	function Traits.nextPayment(res, use)
+		for _, kind in ipairs(spendOrder(use)) do
+			local cost = costOf(res, kind)
+			if (res[kind] or 0) >= cost then
+				return { kind = kind, cost = cost, item = ITEMS[kind] }
+			end
+		end
+		return nil
+	end
+	---Everything spendable, as one number that only ever goes down when a roll is paid.
+	local function purse(res)
+		return res.tokens + res.limited + res.remnants + res.legacy
+	end
+	function Traits.emptyText(use)
+		if use == "Remnants" then
+			return "Out of Star Remnants."
+		elseif use == "Both" then
+			return "Out of Star Remnants and reroll tokens."
+		end
+		return "Out of reroll tokens."
+	end
+
+	---The request itself. Trait rerolls bought with Robux are never sent.
+	function Traits.send(uuid, payment)
+		if payment.kind == "tokens" then
+			return invoke("request_token_trait_reroll", uuid)
+		end
+		return invoke("use_item", payment.item, { unit_uuid = uuid })
+	end
+	function Traits.unit(uuid)
+		local owned = collectionData().owned_units
+		return type(owned) == "table" and owned[tostring(uuid)] or nil
+	end
+	function Traits.unitName(unit)
+		local unitData = type(unit) == "table" and Units[unit.unit_id]
+		return tostring(unitData and unitData.name or (unit and unit.unit_id) or "The unit")
+	end
+
+	-- The server's own word on a roll: the new traits of the unit.
+	do
+		local events = replicatedStorage.endpoints:FindFirstChild("server_to_client")
+		local changed = events and events:FindFirstChild("unit_traits_changed")
+		if changed then
+			table.insert(AA.connections, changed.OnClientEvent:Connect(function(uuid, traits)
+				Traits.serial += 1
+				Traits.lastEvent = { uuid = tostring(uuid), traits = traits, serial = Traits.serial, at = os.clock() }
+				if AA.Eval then
+					AA.Eval.forget(tostring(uuid))
+				end
+			end))
+		end
+	end
+
+	local function persist()
+		local run = Traits.run
+		store.run = run and { uuid = run.uuid, rolls = run.rolls, at = os.time() } or nil
+		AA.saveProgress()
+	end
+	local function finish(state, text, title)
+		local run = Traits.run
+		Traits.run = nil
+		Traits.state, Traits.text = state, text
+		Traits.ended = { state = state, text = text, uuid = run and run.uuid, rolls = run and run.rolls or 0, at = os.clock() }
+		persist()
+		if title and AA.traitNotice then
+			pcall(AA.traitNotice, title, text, 12)
+		end
+	end
+	Traits.finish = finish
+
+	---May a run start for this unit? Returns ok, reason. `confirmed`: the user has seen that the
+	---copy carries a Mythic trait (or two traits) the roll would replace.
+	function Traits.check(uuid, confirmed)
+		uuid = tostring(uuid or "")
+		if Traits.run then
+			return false, "Already rolling for " .. Traits.unitName(Traits.unit(Traits.run.uuid)) .. ". Stop that run first."
+		end
+		local unit = Traits.unit(uuid)
+		if uuid == "" or not unit then
+			return false, "Pick a unit first."
+		end
+		if #Traits.wanted(uuid) == 0 then
+			return false, "Tick at least one trait to stop on."
+		end
+		local hit = Traits.match(unit, uuid)
+		if hit then
+			return false, Traits.unitName(unit) .. " already has " .. hit .. ". Nothing to roll."
+		end
+		local res = Traits.resources(unit)
+		if not Traits.nextPayment(res, Config.TraitUse) then
+			return false, Traits.emptyText(Config.TraitUse)
+		end
+		if not confirmed then
+			local rare = Traits.rareOffList(unit, uuid)
+			if rare then
+				return false, Traits.unitName(unit) .. " has " .. rare .. ", a Mythic trait that is not on your list. Press Start again to roll it away.", true
+			end
+			if #Traits.of(unit) > 1 then
+				return false, Traits.unitName(unit) .. " carries two traits. A roll replaces both. Press Start again to go ahead.", true
+			end
+		end
+		return true
+	end
+	function Traits.start(uuid)
+		uuid = tostring(uuid or "")
+		local confirm = Traits.confirm
+		local confirmed = confirm ~= nil and confirm.uuid == uuid and os.clock() - confirm.at < 20
+		local ok, reason, needsConfirm = Traits.check(uuid, confirmed)
+		if not ok then
+			Traits.confirm = needsConfirm and { uuid = uuid, at = os.clock() } or nil
+			if not Traits.run then
+				Traits.state, Traits.text = needsConfirm and "confirm" or "idle", reason
+			end
+			return false, reason
+		end
+		Traits.confirm = nil
+		Traits.run = { uuid = uuid, rolls = 0, refusals = 0, startedAt = os.clock(), confirmed = confirmed }
+		Traits.recent = {}
+		Traits.state, Traits.text = "rolling", "Starting."
+		persist()
+		return true
+	end
+	---Ends the run after the request that is in flight (a sent roll cannot be taken back).
+	function Traits.stop()
+		local run = Traits.run
+		if run then
+			run.stop = true
+			if not run.waiting then
+				finish("stopped", "Stopped after " .. run.rolls .. (run.rolls == 1 and " roll." or " rolls."))
+			else
+				Traits.text = "Stopping once the roll in flight is answered."
+			end
+		end
+	end
+
+	---One pass of the run: read, decide, and at most one request. Returns false when the run ended.
+	function Traits.step()
+		local run = Traits.run
+		if not run then
+			return false
+		end
+		local uuid = run.uuid
+		-- 1. The unit, as the collection has it now.
+		local unit = Traits.unit(uuid)
+		if not unit then
+			if next(collectionData().owned_units or {}) == nil then
+				-- The collection itself is not loaded (teleport, loading screen): wait, don't judge.
+				Traits.state, Traits.text = "waiting", "Waiting for your collection to load."
+				task.wait(1)
+				return true
+			end
+			finish("stopped", "The unit is no longer in your collection. Stopped after " .. run.rolls .. " rolls.", "Trait rolls stopped")
+			return false
+		end
+		local name = Traits.unitName(unit)
+		-- 2. What it carries. A trait on the list ends the run before anything is sent.
+		local hit = Traits.match(unit, uuid)
+		if hit then
+			finish("done", name .. " has " .. hit .. (run.rolls > 0 and (" after " .. run.rolls .. (run.rolls == 1 and " roll." or " rolls.")) or "."), "Trait landed")
+			return false
+		end
+		if run.stop then
+			finish("stopped", "Stopped after " .. run.rolls .. (run.rolls == 1 and " roll." or " rolls."))
+			return false
+		end
+		-- A Mythic trait that is not on the list is not rolled away without a second look. (The
+		-- first roll of a run is the one the user confirmed.)
+		local rare = Config.TraitStopMythic and run.rolls > 0 and Traits.rareOffList(unit, uuid)
+		if rare then
+			finish("stopped", name .. " landed " .. rare .. ", a Mythic trait that is not on your list. Stopped so you can decide.", "Mythic trait landed")
+			return false
+		end
+		-- 3. What pays for the roll.
+		local res = Traits.resources(unit)
+		local payment = Traits.nextPayment(res, Config.TraitUse)
+		if not payment then
+			finish("stopped", Traits.emptyText(Config.TraitUse) .. " " .. name .. " still has " .. Traits.label(unit) .. " after " .. run.rolls .. " rolls.", "Trait rolls stopped")
+			return false
+		end
+		-- 4. One request. Nothing else leaves until it is answered.
+		local before = { sig = Traits.sig(unit), serial = Traits.serial, purse = purse(res) }
+		local reply = { done = false, sentAt = os.clock() }
+		Traits.pending = reply
+		run.waiting = true
+		Traits.state, Traits.text = "rolling", "Roll " .. (run.rolls + 1) .. " sent. Waiting for the result."
+		task.spawn(function()
+			local ok, first = Traits.send(uuid, payment)
+			setthreadidentity(8)
+			reply.ok, reply.first, reply.at, reply.done = ok, first, os.clock(), true
+		end)
+		local outcome, event
+		while AA.alive do
+			task.wait(0.1)
+			local seen = Traits.lastEvent
+			if seen and seen.serial > before.serial and seen.uuid == uuid then
+				outcome, event = "rolled", seen
+				break
+			end
+			local now = Traits.unit(uuid)
+			if now and Traits.sig(now) ~= before.sig then
+				outcome = "rolled"
+				break
+			end
+			local paid = now ~= nil and purse(Traits.resources(now)) < before.purse
+			if reply.done then
+				if os.clock() - reply.at >= (paid and Traits.SETTLE or 2.5) then
+					outcome = paid and "blind" or "refused"
+					break
+				end
+			elseif os.clock() - reply.sentAt >= Traits.TIMEOUT then
+				outcome = paid and "blind" or "silent"
+				break
+			end
+		end
+		run.waiting = false
+		if not AA.alive then
+			return false
+		end
+		if outcome == "rolled" then
+			run.rolls += 1
+			run.refusals = 0
+			store.rolls[uuid] = (tonumber(store.rolls[uuid]) or 0) + 1
+			-- The reading that decides. The event carries the server's own word; the game writes
+			-- it into the collection in the same moment, and the next pass reads it from there.
+			-- Both have to agree before anything else is sent.
+			task.wait(0.15)
+			local landed = Traits.unit(uuid) or {}
+			local synced = true
+			local fromEvent = event and type(event.traits) == "table" and { traits = event.traits } or nil
+			local understood = fromEvent ~= nil and #Traits.of(fromEvent) > 0
+			for _, trait in ipairs(fromEvent and Traits.of(fromEvent) or {}) do
+				understood = understood and trait.unknown ~= true
+			end
+			if understood then
+				local target = Traits.sig(fromEvent)
+				local waited = 0
+				synced = Traits.sig(landed) == target
+				while not synced and waited < 3 do
+					waited += task.wait(0.1)
+					local now = Traits.unit(uuid)
+					synced = now ~= nil and Traits.sig(now) == target
+				end
+				landed = fromEvent
+			end
+			local label = Traits.label(landed)
+			table.insert(Traits.recent, 1, label)
+			Traits.recent[9] = nil
+			local count = run.rolls .. (run.rolls == 1 and " roll." or " rolls.")
+			local hitNow = Traits.match(landed, uuid)
+			if hitNow then
+				finish("done", name .. " has " .. hitNow .. " after " .. count, "Trait landed")
+				return false
+			end
+			if not synced then
+				finish("stopped", "The game did not show the result of roll " .. run.rolls .. " (" .. label .. "). Stopped so nothing is rolled on an old reading.", "Trait rolls stopped")
+				return false
+			end
+			Traits.text = "Roll " .. run.rolls .. " landed " .. label .. "."
+			persist()
+			task.wait(Traits.GAP)
+			return true
+		elseif outcome == "blind" then
+			run.rolls += 1
+			store.rolls[uuid] = (tonumber(store.rolls[uuid]) or 0) + 1
+			finish("stopped", "The server took roll " .. run.rolls .. " but never sent its result. Stopped so nothing is rolled on an old reading. Check " .. name .. " and start again.", "Trait rolls stopped")
+			return false
+		elseif outcome == "silent" then
+			finish("stopped", "The server did not answer roll " .. (run.rolls + 1) .. " within " .. Traits.TIMEOUT .. " seconds. Stopped. Nothing was sent twice.", "Trait rolls stopped")
+			return false
+		end
+		-- Refused: answered, nothing paid, nothing changed.
+		run.refusals += 1
+		local why = ""
+		for index = #(AA.messages or {}), 1, -1 do
+			local message = AA.messages[index]
+			if os.clock() - message.at < 8 then
+				why = ' The game said: "' .. message.text .. '".'
+				break
+			end
+		end
+		if reply.ok == false and tostring(reply.first) == "missing remote" then
+			finish("stopped", "Trait rolls cannot be reached from this place. Stopped after " .. run.rolls .. " rolls.", "Trait rolls stopped")
+			return false
+		end
+		if reply.ok == false and why == "" then
+			why = " (" .. tostring(reply.first) .. ")"
+		end
+		if run.refusals >= Traits.MAX_REFUSALS then
+			finish("stopped", "The game refused the roll " .. run.refusals .. " times in a row." .. why .. " Stopped after " .. run.rolls .. " rolls.", "Trait rolls stopped")
+			return false
+		end
+		Traits.state, Traits.text = "waiting", "The game refused the roll." .. why .. " Trying again shortly (" .. run.refusals .. " of " .. Traits.MAX_REFUSALS .. ")."
+		task.wait(2 * run.refusals)
+		return true
+	end
+
+	-- A run that was going when the game teleported picks up where it stopped.
+	if type(store.run) == "table" and type(store.run.uuid) == "string" and os.time() - (tonumber(store.run.at) or 0) < 6 * 3600 then
+		Traits.run = { uuid = store.run.uuid, rolls = tonumber(store.run.rolls) or 0, refusals = 0, startedAt = os.clock(), resumed = true, confirmed = true }
+		Traits.state, Traits.text = "waiting", "Picking the run back up."
+	else
+		store.run = nil
+	end
+
+	supervise("traits", function()
+		while AA.alive do
+			if Traits.run then
+				-- A request from before a restart of this loop is still owed an answer.
+				local pending = Traits.pending
+				if pending and not pending.done and os.clock() - pending.sentAt < Traits.TIMEOUT + 15 then
+					task.wait(0.5)
+				elseif session() == nil then
+					task.wait(1)
+				else
+					Traits.step()
+				end
+			else
+				task.wait(0.3)
+			end
+		end
+	end)
+end
+
+-- ============================================================
 --  Music
 -- ============================================================
 
@@ -10965,11 +11840,11 @@ AA.ui = UI
 		end
 	end
 
-	---A card. side: "left", "right" or "full" (above the columns). note: one muted line under
-	---the title.
+	---A card. side: "left", "right", "full" (above the columns) or "bottom" (under them).
+	---note: one muted line under the title.
 	local function newBox(page, title, side, note)
 		local columns = UI.columns[page]
-		if side ~= "left" and side ~= "right" and side ~= "full" then
+		if side ~= "left" and side ~= "right" and side ~= "full" and side ~= "bottom" then
 			side = columns.height.left <= columns.height.right and "left" or "right"
 		end
 		local box = create("Frame", {
@@ -10991,7 +11866,7 @@ AA.ui = UI
 			create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 12) }),
 			create("UIPadding", { PaddingTop = UDim.new(0, 16), PaddingBottom = UDim.new(0, 16), PaddingLeft = UDim.new(0, 16), PaddingRight = UDim.new(0, 16) }),
 		})
-		if side ~= "full" then
+		if columns.height[side] then
 			columns.height[side] += 44
 		end
 		UI.current[page] = { body = body, side = side, box = box }
@@ -11002,7 +11877,7 @@ AA.ui = UI
 			if note and note ~= "" then
 				wrapped({ Position = UDim2.fromOffset(0, 23), Size = UDim2.new(1, 0, 0, 16), Text = note, TextSize = px(13), TextColor3 = UI.roles.Muted, Parent = head })
 			end
-			if side ~= "full" then
+			if columns.height[side] then
 				columns.height[side] += 30
 			end
 		end
@@ -11013,7 +11888,7 @@ AA.ui = UI
 	local function slot(page, height)
 		local current = UI.current[page] or { body = newBox(page) }
 		current = UI.current[page]
-		if current.side ~= "full" then
+		if UI.columns[page].height[current.side] then
 			UI.columns[page].height[current.side] += (height or 24) + 12
 		end
 		return current.body
@@ -11065,10 +11940,16 @@ AA.ui = UI
 			})
 		end
 		local left, right = column(0), column(0.5)
-		UI.columns[page] = { left = left, right = right, full = full, intro = intro, height = { left = 0, right = 0 } }
+		local bottom = create("Frame", { Name = "Bottom", Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, LayoutOrder = 4, Visible = false, Parent = page }, {
+			create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 14) }),
+		})
+		bottom.ChildAdded:Connect(function()
+			bottom.Visible = true
+		end)
+		UI.columns[page] = { left = left, right = right, full = full, bottom = bottom, intro = intro, height = { left = 0, right = 0 } }
 		-- Custom rows that a script parents straight to the page land in the open card.
 		page.ChildAdded:Connect(function(child)
-			if child ~= intro and child ~= full and child ~= holder and child:IsA("GuiObject") then
+			if child ~= intro and child ~= full and child ~= holder and child ~= bottom and child:IsA("GuiObject") then
 				task.defer(function()
 					if child.Parent == page then
 						child.Parent = slot(page, child.AbsoluteSize.Y > 0 and child.AbsoluteSize.Y or 24)
@@ -12223,6 +13104,240 @@ AA.ui = UI
 		if UI.activeTab then
 			UI.selectTab(UI.activeTab)
 		end
+	end
+
+	-- Controls of the trait roller: a card with two panes, a list to pick one rich row from,
+	-- chips to tick any number of options, and a button whose label follows a state.
+
+	---Two panes side by side inside the open card. Returns left, right and into(pane): controls
+	---built after into(pane) land in that pane, into(nil) goes back to the card itself.
+	function UI.split(page, share)
+		share = share or 0.5
+		local body = slot(page, 0)
+		local row = create("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, LayoutOrder = UI.nextOrder(), Parent = body })
+		local function pane(x, width, offset)
+			return create("Frame", { Position = UDim2.new(x, offset, 0, 0), Size = UDim2.new(width, -10, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, Parent = row }, {
+				create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 12) }),
+			})
+		end
+		local left, right = pane(0, share, 0), pane(share, 1 - share, 10)
+		local current = UI.current[page]
+		return left, right, function(target)
+			current.body = target or body
+			UI.lastRow[page] = nil
+		end
+	end
+
+	---A small heading inside a card or pane.
+	function UI.subhead(page, text, note)
+		local holder = create("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, LayoutOrder = UI.nextOrder(), Parent = slot(page, 20) }, {
+			create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 2) }),
+		})
+		label({ Size = UDim2.new(1, 0, 0, 20), Text = text, FontFace = CODE_BOLD, TextSize = px(15), TextTruncate = Enum.TextTruncate.AtEnd, LayoutOrder = 1, Parent = holder })
+		local noteLabel
+		if note and note ~= "" then
+			noteLabel = wrapped({ Size = UDim2.new(1, 0, 0, 16), Text = note, TextSize = px(13), TextColor3 = UI.roles.Muted, LayoutOrder = 2, Parent = holder })
+		end
+		UI.lastRow[page] = nil
+		return noteLabel
+	end
+
+	---A list to pick one row from. options: get() -> rows { id, title, sub, tag, section },
+	---selected() -> id, pick(id), height, empty. Rows of one section sit under its name. The
+	---picked row is filled, ringed in the accent and ticked. Returns refresh().
+	function UI.pickList(page, options)
+		local frame = create("ScrollingFrame", {
+			Size = UDim2.new(1, 0, 0, options.height or 280),
+			BackgroundColor3 = UI.roles.Control,
+			BorderSizePixel = 0,
+			ScrollBarThickness = 4,
+			ScrollBarImageColor3 = UI.roles.Outline,
+			CanvasSize = UDim2.new(),
+			AutomaticCanvasSize = Enum.AutomaticSize.Y,
+			ScrollingDirection = Enum.ScrollingDirection.Y,
+			LayoutOrder = UI.nextOrder(),
+			Parent = slot(page, options.height or 280),
+		}, {
+			create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 3) }),
+			create("UIPadding", { PaddingTop = UDim.new(0, 6), PaddingBottom = UDim.new(0, 6), PaddingLeft = UDim.new(0, 6), PaddingRight = UDim.new(0, 10) }),
+		})
+		round(frame, 8)
+		stroke(frame, "Outline")
+		UI.lastRow[page] = nil
+		local signature
+		local function refresh()
+			local rows = options.get()
+			local picked = options.selected()
+			local parts = { tostring(picked), UI.roles.Accent:ToHex(), UI.roles.Raised:ToHex() }
+			for _, row in ipairs(rows) do
+				table.insert(parts, table.concat({ tostring(row.id), tostring(row.title), tostring(row.sub), tostring(row.tag), tostring(row.section), tostring(row.note) }, "~"))
+			end
+			local now = table.concat(parts, "|")
+			if now == signature then
+				return
+			end
+			signature = now
+			for _, child in ipairs(frame:GetChildren()) do
+				if child:IsA("GuiObject") then
+					child:Destroy()
+				end
+			end
+			if #rows == 0 then
+				wrapped({ Size = UDim2.new(1, -8, 0, 16), Text = options.empty or "Nothing to show.", TextSize = px(13), TextColor3 = UI.roles.Muted, LayoutOrder = 1, Parent = frame })
+				return
+			end
+			local section
+			local order = 0
+			for _, row in ipairs(rows) do
+				if row.note then
+					order += 1
+					wrapped({ Size = UDim2.new(1, -8, 0, 16), Text = row.note, TextSize = px(13), TextColor3 = UI.roles.Muted, LayoutOrder = order, Parent = frame })
+				else
+					if row.section and row.section ~= section then
+						section = row.section
+						order += 1
+						local head = create("Frame", { Size = UDim2.new(1, 0, 0, order == 1 and 22 or 30), BackgroundTransparency = 1, LayoutOrder = order, Parent = frame })
+						label({ AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 6, 1, -2), Size = UDim2.new(1, -12, 0, 16), Text = section, FontFace = CODE_BOLD, TextSize = px(12), TextColor3 = UI.roles.Muted, TextTruncate = Enum.TextTruncate.AtEnd, Parent = head })
+					end
+					order += 1
+					local isPicked = row.id == picked
+					local item = create("TextButton", { Size = UDim2.new(1, 0, 0, 46), BackgroundColor3 = UI.roles.Raised, BackgroundTransparency = isPicked and 0 or 1, BorderSizePixel = 0, Text = "", AutoButtonColor = false, LayoutOrder = order, Parent = frame })
+					item:SetAttribute("NoTheme", true)
+					round(item, 7)
+					local ring = create("UIStroke", { Color = UI.roles.Accent, Thickness = 1.5, Transparency = isPicked and 0 or 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Parent = item })
+					ring:SetAttribute("NoTheme", true)
+					local reserve = isPicked and 34 or 12
+					local hasTag = row.tag ~= nil and row.tag ~= ""
+					if hasTag then
+						label({ AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -reserve, 0, 7), Size = UDim2.fromOffset(52, 16), Text = row.tag, FontFace = CODE_BOLD, TextSize = px(12), TextColor3 = UI.roles.Accent, TextXAlignment = Enum.TextXAlignment.Right, Parent = item })
+					end
+					label({ Position = UDim2.fromOffset(12, 6), Size = UDim2.new(1, -(reserve + 12 + (hasTag and 58 or 0)), 0, 18), Text = tostring(row.title), FontFace = isPicked and CODE_BOLD or CODE_MEDIUM, TextSize = px(15), TextTruncate = Enum.TextTruncate.AtEnd, Parent = item })
+					label({ Position = UDim2.fromOffset(12, 25), Size = UDim2.new(1, -24, 0, 16), Text = tostring(row.sub or ""), TextSize = px(13), TextColor3 = UI.roles.Muted, TextTruncate = Enum.TextTruncate.AtEnd, Parent = item })
+					if isPicked then
+						icon(item, "check", 13, UI.roles.Accent, { AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -12, 0, 8) })
+					end
+					item.MouseEnter:Connect(function()
+						if not isPicked then
+							item.BackgroundTransparency = 0.45
+						end
+					end)
+					item.MouseLeave:Connect(function()
+						if not isPicked then
+							item.BackgroundTransparency = 1
+						end
+					end)
+					item.MouseButton1Click:Connect(function()
+						options.pick(row.id)
+						UI.refreshAll()
+					end)
+				end
+			end
+		end
+		table.insert(UI.refreshers, refresh)
+		table.insert(UI.colorRefreshers, function()
+			signature = nil
+			refresh()
+		end)
+		refresh()
+		return refresh
+	end
+
+	---Chips to tick any number of options. options: get() -> { { id, name, note } } (read once),
+	---isOn(id), toggle(id), perRow. A ticked chip is ringed and its box filled.
+	function UI.chips(page, options)
+		local entries = options.get()
+		local perRow = options.perRow or 2
+		local rows = math.max(math.ceil(#entries / perRow), 1)
+		local grid = UI.rowBase(page, rows * 34 + (rows - 1) * 6, false)
+		grid.AutomaticSize = Enum.AutomaticSize.None
+		UI.lastRow[page] = nil
+		create("UIGridLayout", { CellSize = UDim2.new(1 / perRow, -6 * (perRow - 1) / perRow, 0, 34), CellPadding = UDim2.fromOffset(6, 6), SortOrder = Enum.SortOrder.LayoutOrder, Parent = grid })
+		local chips = {}
+		local function refresh()
+			for id, chip in pairs(chips) do
+				local on = options.isOn(id) == true
+				chip.frame.BackgroundColor3 = on and UI.roles.Raised or UI.roles.Control
+				chip.ring.Color = on and UI.roles.Accent or UI.roles.Outline
+				chip.ring.Thickness = on and 1.5 or 1
+				chip.box.BackgroundColor3 = UI.roles.Accent
+				chip.box.BackgroundTransparency = on and 0 or 1
+				chip.boxRing.Color = on and UI.roles.Accent or UI.roles.Muted
+				chip.mark.Visible = on
+				UI.tint(chip.mark, UI.onAccent())
+				chip.name.TextColor3 = UI.roles.Font
+				chip.name.FontFace = on and CODE_BOLD or CODE
+				chip.note.TextColor3 = UI.roles.Muted
+			end
+		end
+		for index, entry in ipairs(entries) do
+			local frame = create("TextButton", { BackgroundColor3 = UI.roles.Control, BorderSizePixel = 0, Text = "", AutoButtonColor = false, LayoutOrder = index, Parent = grid })
+			frame:SetAttribute("NoTheme", true)
+			round(frame, 7)
+			local ring = create("UIStroke", { Color = UI.roles.Outline, Thickness = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Parent = frame })
+			ring:SetAttribute("NoTheme", true)
+			local box = create("Frame", { AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 10, 0.5, 0), Size = UDim2.fromOffset(16, 16), BackgroundColor3 = UI.roles.Accent, BackgroundTransparency = 1, BorderSizePixel = 0, Parent = frame })
+			box:SetAttribute("NoTheme", true)
+			round(box, 4)
+			local boxRing = create("UIStroke", { Color = UI.roles.Muted, Thickness = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Parent = box })
+			local mark = icon(box, "check", 10, UI.onAccent(), { AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5) })
+			mark:SetAttribute("NoTheme", true)
+			local hasNote = entry.note ~= nil and entry.note ~= ""
+			local name = label({ Position = UDim2.fromOffset(34, 0), Size = UDim2.new(1, hasNote and -96 or -42, 1, 0), Text = tostring(entry.name), TextSize = px(14), TextTruncate = Enum.TextTruncate.AtEnd, Parent = frame })
+			local note = label({ AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -10, 0, 0), Size = UDim2.new(0, 52, 1, 0), Text = tostring(entry.note or ""), TextSize = px(12), TextColor3 = UI.roles.Muted, TextXAlignment = Enum.TextXAlignment.Right, Parent = frame })
+			chips[entry.id] = { frame = frame, ring = ring, box = box, boxRing = boxRing, mark = mark, name = name, note = note }
+			frame.MouseEnter:Connect(function()
+				if not options.isOn(entry.id) then
+					ring.Color = UI.roles.Muted
+				end
+			end)
+			frame.MouseLeave:Connect(refresh)
+			frame.MouseButton1Click:Connect(function()
+				options.toggle(entry.id)
+				UI.refreshAll()
+			end)
+		end
+		table.insert(UI.refreshers, refresh)
+		table.insert(UI.colorRefreshers, refresh)
+		refresh()
+		return refresh
+	end
+
+	---A button whose label and look follow a state: state() -> text, primary. Returns refresh().
+	function UI.liveButton(page, state, action)
+		local button = create("TextButton", { Size = UDim2.new(1, 0, 0, 38), BackgroundColor3 = UI.roles.Control, BorderSizePixel = 0, AutoButtonColor = false, FontFace = CODE_BOLD, Text = "", TextSize = px(15), TextTruncate = Enum.TextTruncate.AtEnd, LayoutOrder = UI.nextOrder(), Parent = slot(page, 38) })
+		button:SetAttribute("NoTheme", true)
+		round(button, 7)
+		local outline = create("UIStroke", { Color = UI.roles.Outline, Thickness = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Parent = button })
+		UI.lastRow[page] = nil
+		local function refresh()
+			local text, primary = state()
+			button.Text = tostring(text)
+			button.BackgroundColor3 = primary and UI.roles.Accent or UI.roles.Control
+			button.TextColor3 = primary and UI.onAccent() or UI.roles.Font
+			outline.Color = primary and UI.roles.Accent or UI.roles.Outline
+		end
+		button.MouseEnter:Connect(function()
+			button.BackgroundTransparency = 0.14
+		end)
+		button.MouseLeave:Connect(function()
+			button.BackgroundTransparency = 0
+		end)
+		local busy = false
+		button.MouseButton1Click:Connect(function()
+			if busy then
+				return
+			end
+			busy = true
+			task.spawn(function()
+				pcall(action)
+				busy = false
+				UI.refreshAll()
+			end)
+		end)
+		table.insert(UI.refreshers, refresh)
+		table.insert(UI.colorRefreshers, refresh)
+		refresh()
+		return refresh
 	end
 
 	-- Color picker: a saturation / brightness square with the hue bar on its right.
@@ -14243,9 +15358,9 @@ do
 			end, note)
 		end
 
-		-- Team: who is equipped and how they grow.
+		-- Team: who is equipped, how the units are rated, how they grow, and trait rolls.
 		do
-			local page = makePage("Team", "Which units are equipped and how they level up.", "Account")
+			local page = makePage("Team", "Which units are equipped, how they grow, and which traits they roll for.", "Account")
 			heading(page, "Equipped team", "left")
 			-- The game's own saved teams (profile.loadouts_v2, loaded with load_team_loadout), by the
 			-- names given to them in the game.
@@ -14291,8 +15406,9 @@ do
 					UI.refreshAll()
 				end)
 			end, "Teams from the game's own Teams menu. Loading one turns Equip the best team off.")
-			toggle(page, "Equip the best team", "AutoEquipBest", "Picks the strongest units you own before each match.")
-			toggle(page, "Try unproven units", "TestUnproven", "A unit whose damage the game hides gets a trial slot until it has been measured.")
+			toggle(page, "Equip the best team", "AutoEquipBest", "Before each match, by the ratings at the bottom of this page.")
+			toggle(page, "Trial slot for hidden damage", "MeasureHidden", "A unit with damage the game data hides plays one match in the last slot, so it gets measured.")
+			hint(page, "Every unit is rated from the game's own numbers, so nothing has to be tried out first. Some units deal part of their damage through server scripts the data does not show. Off: such a unit is rated on the part that can be calculated. On: the strongest one that has never been measured takes the last slot for a match, and its real damage is logged from then on.")
 			pickMany(page, "Always equip", "PinnedUnits", function()
 				local options, seen = {}, {}
 				for _, unit in pairs(collectionData().owned_units or {}) do
@@ -14307,7 +15423,6 @@ do
 			button(page, "Equip the best team now", function()
 				return equipBest() .. " changes"
 			end)
-			view.team = infoLine(page, 92)
 
 			heading(page, "Levels and evolutions", "right")
 			toggle(page, "Feed XP food", "AutoFeed", "To your lowest-level damage unit.")
@@ -14325,25 +15440,258 @@ do
 			end
 			toggle(page, "Buy missing Star Fruits", "BuyEvolveFruit", "From the merchant, with gems, only what the equipped team still needs. Keeps your gem reserve.")
 
-			heading(page, "Traits", "right")
-			toggle(page, "Reroll with tokens", "AutoTrait", "Rerolls your strongest equipped unit until the trait below lands.")
-			cycler(page, "Trait to land", function()
-				local traits = gameRequire(replicatedStorage.src.Data.Traits)
-				local options = {}
-				for id, info in pairs(traits and traits.info or {}) do
-					table.insert(options, { id = id, name = info.name, current = id == Config.TraitTarget })
+			-- Trait rolls: one unit, the traits worth keeping, and a roller that checks every result.
+			local Traits = AA.Traits
+			AA.traitNotice = UI.toast
+			heading(page, "Trait rolls", "bottom", "Pick a unit, tick every trait you would keep, and press Start. Each roll is checked before the next one is sent.")
+			local left, right, into = UI.split(page, 0.45)
+			local filter = ""
+			---Owned copies for the list: the equipped ones first, by slot.
+			local function unitRows()
+				local data = collectionData()
+				local owned = data.owned_units or {}
+				local slotOf, copies = {}, {}
+				for slot, uuid in pairs(data.equipped_units or {}) do
+					slotOf[uuid] = tonumber(slot) or 9
 				end
-				table.sort(options, function(a, b)
+				for _, unit in pairs(owned) do
+					copies[unit.unit_id] = (copies[unit.unit_id] or 0) + 1
+				end
+				local rows, hidden = {}, 0
+				local needle = filter:lower()
+				for uuid, unit in pairs(owned) do
+					local unitData = Units[unit.unit_id]
+					if unitData then
+						local name = tostring(unitData.name or unit.unit_id)
+						local trait = Traits.label(unit)
+						local level = tonumber(gameCall(Core.Unit and Core.Unit.calculate_level, unit.unit_id, unit.xp or 0)) or math.floor(math.log((unit.xp or 0) / 1000 + 1) / 0.0769610411361284) + 1
+						local tail = tostring(uuid):gsub("[^%w]", ""):sub(-4)
+						local sub = trait .. ", level " .. level .. (slotOf[uuid] and (", slot " .. slotOf[uuid]) or "") .. (copies[unit.unit_id] > 1 and (", copy " .. tail) or "")
+						if needle == "" or (name .. " " .. sub):lower():find(needle, 1, true) then
+							local rolling = Traits.run ~= nil and Traits.run.uuid == uuid
+							table.insert(rows, {
+								id = uuid,
+								title = name,
+								sub = sub,
+								tag = rolling and "Rolling" or "",
+								section = slotOf[uuid] and "Equipped" or "Not equipped",
+								slot = slotOf[uuid] or 99,
+							})
+						end
+					end
+				end
+				table.sort(rows, function(a, b)
+					if a.slot ~= b.slot then
+						return a.slot < b.slot
+					elseif a.title ~= b.title then
+						return a.title < b.title
+					end
 					return a.id < b.id
 				end)
-				return options
-			end, function()
-				local traits = gameRequire(replicatedStorage.src.Data.Traits)
-				local info = traits and traits.info and traits.info[Config.TraitTarget]
-				return info and info.name or "None"
-			end, function(option)
-				Config.TraitTarget = option.id
+				for index = #rows, 81, -1 do
+					rows[index] = nil
+					hidden += 1
+				end
+				if hidden > 0 then
+					table.insert(rows, { note = hidden .. " more. Type a name to narrow the list." })
+				end
+				return rows
+			end
+			into(left)
+			local search = UI.textbox(page, "Unit", "Search by name or trait")
+			local refreshUnits = UI.pickList(page, {
+				height = 322,
+				empty = "No unit matches. Your collection is read once the game has loaded it.",
+				get = unitRows,
+				selected = function()
+					return Config.TraitUnit
+				end,
+				pick = function(uuid)
+					Config.TraitUnit = uuid
+					Traits.confirm = nil
+					if not Traits.run then
+						Traits.state, Traits.text = "idle", ""
+					end
+				end,
+			})
+			search:GetPropertyChangedSignal("Text"):Connect(function()
+				filter = search.Text
+				refreshUnits()
 			end)
+
+			into(right)
+			local wantNote = UI.subhead(page, "Stop when one of these lands", "Pick a unit to choose its traits.")
+			UI.chips(page, {
+				perRow = 2,
+				get = function()
+					local entries = {}
+					for _, option in ipairs((Traits.options())) do
+						table.insert(entries, { id = option.key, name = option.name, note = option.odds and (tostring(option.odds) .. "%") or "" })
+					end
+					return entries
+				end,
+				isOn = function(key)
+					return Config.TraitUnit ~= "" and Traits.wants(Config.TraitUnit, key)
+				end,
+				toggle = function(key)
+					if Config.TraitUnit == "" or not Traits.unit(Config.TraitUnit) then
+						UI.toast("Trait rolls", "Pick a unit first: the list of traits is kept per unit.", 5)
+						return
+					end
+					Traits.toggleWant(Config.TraitUnit, key)
+					Traits.confirm = nil
+					if not Traits.run then
+						Traits.state, Traits.text = "idle", ""
+					end
+				end,
+			})
+
+			into(nil)
+			segmented(page, "Pay with", "TraitUse", { "Tokens", "Remnants", "Both" }, "Limited Star Remnants are spent before regular ones. Rerolls bought with Robux are never used.", { Tokens = "Reroll tokens", Remnants = "Star Remnants", Both = "Remnants, then tokens" })
+			local ownLine = UI.note(page, "")
+			toggle(page, "Stop on any Mythic trait", "TraitStopMythic", "Also stops when a Mythic trait lands that is not on the unit's list, so it is never rolled away unseen.")
+			local unitValue = UI.kv(page, "Unit")
+			local nowValue = UI.kv(page, "Trait now")
+			local wantValue = UI.kv(page, "Stops on")
+			local tiles = UI.tiles(page, { "Rolls this run", "Chance a roll", "Rolls you can pay for", "Chance with those" }, 4)
+			local statusText = UI.callout(page, "")
+			UI.liveButton(page, function()
+				local run = Traits.run
+				if run then
+					return run.stop and "Stopping" or ("Stop rolling for " .. Traits.unitName(Traits.unit(run.uuid))), false
+				end
+				return Traits.state == "confirm" and "Start anyway" or "Start rolling", true
+			end, function()
+				if Traits.run then
+					Traits.stop()
+				else
+					local ok, reason = Traits.start(Config.TraitUnit)
+					if not ok and Traits.state ~= "confirm" then
+						UI.toast("Trait rolls", reason, 6)
+					end
+				end
+			end)
+
+			heading(page, "Unit ratings", "bottom", "Damage a second on paper: one copy at its last upgrade against one enemy, from the game's own numbers and formulas.")
+			local setRatings = UI.list(page)
+			hint(page, "Paper damage is damage x hits per attack x the game's stat multipliers (level, traits, stat rolls, relics) divided by the attack cooldown. Teams are picked by the team score, a second number built on it: how many enemies the attack shape catches, time in range, copies you can place, what a full set costs, and the measured figure when there is one.\n\nCalculated: every part of the damage is in the game data.\nAt least: part of it runs on the server (listed under the table) and is left out, not guessed.\nMeasured: logged from your own matches, which covers the hidden parts too. The figure beside it is how the real damage compares with the calculation.")
+
+			local function percent(value)
+				if value <= 0 then
+					return "0%"
+				elseif value < 1 then
+					return (string.format("%.2f", value):gsub("0+$", ""):gsub("%.$", "")) .. "%"
+				elseif value < 10 then
+					return string.format("%.1f%%", value)
+				end
+				return string.format("%d%%", math.floor(value + 0.5))
+			end
+			local ratingsAt, unitsAt = 0, 0
+			function view.teamTick(force)
+				if not page.Visible and force ~= true then
+					return
+				end
+				-- The unit list follows the collection (a new unit, a sold one, a new trait).
+				if os.clock() - unitsAt >= 2 then
+					unitsAt = os.clock()
+					refreshUnits()
+				end
+				-- Trait rolls.
+				local uuid = Config.TraitUnit
+				local unit = uuid ~= "" and Traits.unit(uuid) or nil
+				local run = Traits.run
+				local res = Traits.resources(unit)
+				local remnants = res.limited + res.remnants
+				ownLine.Text = string.format("You have %d reroll %s and %d Star %s%s.%s", res.tokens, res.tokens == 1 and "token" or "tokens", remnants, remnants == 1 and "Remnant" or "Remnants", res.limited > 0 and (" (" .. res.limited .. " limited)") or "", unit and (" A roll on " .. Traits.unitName(unit) .. " takes " .. res.per .. (res.per == 1 and " Remnant" or " Remnants") .. " or 1 token.") or "")
+				if unit then
+					local names = {}
+					local _, map = Traits.options()
+					for _, key in ipairs(Traits.wanted(uuid)) do
+						table.insert(names, map[key] and map[key].name or key)
+					end
+					unitValue.Text = Traits.unitName(unit)
+					nowValue.Text = Traits.label(unit)
+					wantValue.Text = #names > 0 and table.concat(names, ", ") or "Nothing ticked yet"
+					wantNote.Text = "Kept for " .. Traits.unitName(unit) .. " only. You can change the list while it rolls."
+				else
+					unitValue.Text, nowValue.Text, wantValue.Text = "None picked", "", ""
+					wantNote.Text = "Pick a unit to choose its traits."
+				end
+				local chance = unit and Traits.chance(uuid) or 0
+				local affordable = unit and Traits.rollsLeft(res, Config.TraitUse) or 0
+				local shownRun = run or (Traits.ended and Traits.ended.uuid == uuid and Traits.ended) or nil
+				tiles["Rolls this run"].Text = tostring(shownRun and shownRun.rolls or 0)
+				tiles["Chance a roll"].Text = chance > 0 and percent(chance) or "n/a"
+				tiles["Rolls you can pay for"].Text = unit and tostring(affordable) or "n/a"
+				tiles["Chance with those"].Text = (chance > 0 and affordable > 0) and percent((1 - (1 - chance / 100) ^ affordable) * 100) or "n/a"
+				local text = Traits.text
+				if run and run.uuid ~= uuid then
+					text = "Rolling for " .. Traits.unitName(Traits.unit(run.uuid)) .. ". " .. text
+				elseif not run then
+					if Traits.state == "idle" or text == "" or (Traits.ended and Traits.ended.uuid ~= uuid and Traits.state ~= "confirm") then
+						local ok, reason = Traits.check(uuid, true)
+						text = ok and (chance > 0 and string.format("Ready. One roll in %d lands a trait on the list.", math.max(math.floor(100 / chance + 0.5), 1)) or "Ready.") or reason
+					end
+				end
+				if #Traits.recent > 0 and (run or Traits.state ~= "idle") then
+					text = text .. "\nLast rolls: " .. table.concat(Traits.recent, ", ") .. "."
+				end
+				statusText.Text = text
+				-- Ratings: every 3 seconds (they are kept between changes).
+				if os.clock() - ratingsAt >= 3 then
+					ratingsAt = os.clock()
+					local ok, report = pcall(AA.Eval.report, 3)
+					local rows, notes = {}, {}
+					local function add(row)
+						local value = row.value
+						local figure = value.kind == "farm" and (AA.Eval.short(value.income) .. " a wave") or (value.paper > 0 and AA.Eval.short(value.paper) or "")
+						local basis = AA.Eval.basis(value)
+						if value.play > 0 then
+							basis = basis .. ", team score " .. AA.Eval.short(value.play)
+						end
+						table.insert(rows, { name = value.name, value = figure, extra = basis, accent = row.slot ~= nil })
+						if value.kind == "partial" and #value.gaps > 0 then
+							table.insert(notes, value.name .. " is rated without " .. table.concat(value.gaps, ", ") .. ".")
+						elseif value.kind == "unknown" and value.why then
+							table.insert(notes, value.name .. ": " .. value.why)
+						end
+					end
+					if ok and #report.team > 0 then
+						table.insert(rows, { title = "Equipped", right = "damage a second on paper" })
+						for _, row in ipairs(report.team) do
+							add(row)
+						end
+						if #report.bench > 0 then
+							table.insert(rows, { gap = true })
+							table.insert(rows, { title = "Strongest not equipped" })
+							for _, row in ipairs(report.bench) do
+								add(row)
+							end
+						end
+						local seen = {}
+						for _, note in ipairs(notes) do
+							if not seen[note] then
+								seen[note] = true
+								table.insert(rows, { note = note })
+							end
+						end
+					else
+						table.insert(rows, { note = "Your units are read once the game has loaded your collection." })
+					end
+					setRatings(rows)
+				end
+			end
+			-- Fresh the moment the page opens or a control on it changes, not half a second later.
+			table.insert(UI.refreshers, function()
+				pcall(view.teamTick, true)
+			end)
+			page:GetPropertyChangedSignal("Visible"):Connect(function()
+				if page.Visible then
+					unitsAt, ratingsAt = 0, 0
+					pcall(view.teamTick)
+				end
+			end)
+			pcall(view.teamTick, true)
 		end
 
 		-- Summon: banners, the sniper, what to sell.
@@ -15400,7 +16748,12 @@ do
 				account["Upgrades"].Text = tostring(Stats.upgrades)
 				account["Summons"].Text = tostring(Stats.summons)
 				account["Codes redeemed"].Text = tostring(Stats.codes)
-				view.team.Text = table.concat(AA.teamReport or { "The team is read in the lobby." }, "\n")
+				do
+					local okTeam, problem = pcall(view.teamTick)
+					if not okTeam then
+						AA.errors.team = tostring(problem)
+					end
+				end
 				do
 					local okSnipe, _, target = pcall(AA.snipeFind)
 					view.snipe.Text = okSnipe and target and (tostring(Units[target] and Units[target].name or target) .. " is featured right now.") or "None of them is featured right now."
