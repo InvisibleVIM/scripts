@@ -1870,13 +1870,32 @@ function AA.fightBand()
 	end
 	local deep = usual
 	local marks = type(AA.progress.deeps) == "table" and AA.progress.deeps[AA.depthKey()]
-	if type(marks) == "table" and #marks > 0 then
-		for _, mark in ipairs(marks) do
-			deep = math.max(deep, tonumber(mark) or 0)
+	local kept = 0
+	for _, mark in ipairs(type(marks) == "table" and marks or {}) do
+		deep = math.max(deep, tonumber(mark) or 0)
+		kept += 1
+	end
+	if kept < 3 and Match.levelId then
+		-- Fewer than three runs kept for this map: the match log stands in for the missing
+		-- ones (the runs before the kept ones, on any map of this stage; a lost run counts as
+		-- the whole road). One easy win after four losses is not a reason to plan shallow.
+		local skip, need = kept, 3 - kept
+		for index = #MatchLog, 1, -1 do
+			local entry = MatchLog[index]
+			if type(entry) == "table" and entry.level == Match.levelId and (entry.user == nil or entry.user == localPlayer.UserId) then
+				if skip > 0 then
+					skip -= 1
+				else
+					need -= 1
+					if entry.won == false then
+						deep = 1
+					end
+					if need <= 0 or deep >= 1 then
+						break
+					end
+				end
+			end
 		end
-	elseif AA.lostWave(Match.levelId) then
-		-- Nothing kept for this map yet, and the stage was lost in the last day.
-		deep = 1
 	end
 	for _, depth in pairs(Match.depthByWave or {}) do
 		deep = math.max(deep, depth)
