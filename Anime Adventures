@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v191", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v192", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -3876,17 +3876,32 @@ local function planAction()
 				-- as a pair.
 				local have = placed[entry.id] or 0
 				local want = math.min(AA.buffCopies(buff, data), placeCap(data))
-				local anchor, anchorRange
+				-- What the chain boosts: every matching unit that some copy already reaches. (It
+				-- was measured from the first copy found alone. When that one was the feeder,
+				-- which stands clear of the damage on purpose, the chain "boosted nothing", the
+				-- fourth copy was never worth its price, and with three copies every second
+				-- cast is half strength: 100, 50, 100, 50 for five minutes.)
+				local copies = {}
 				for _, tower in ipairs(units) do
-					if tower._stats.id.Value == entry.id and not anchor then
-						anchor = tower:GetPivot().Position
-						anchorRange = tower._stats:FindFirstChild("range") and AA.rv(tower._stats.range) or AA.buffRange(data, unit, buff)
+					if tower._stats.id.Value == entry.id then
+						local range = tower._stats:FindFirstChild("range")
+						table.insert(copies, { position = tower:GetPivot().Position, reach = range and AA.rv(range) or AA.buffRange(data, unit, buff) })
 					end
 				end
 				local boosted = 0
 				for _, ally in ipairs(powerUnits) do
-					if ally.data ~= data and AA.buffMatches(buff, ally.data) and (not anchor or (ally.unit:GetPivot().Position - anchor).Magnitude <= anchorRange) then
-						boosted += ally.power
+					if ally.data ~= data and AA.buffMatches(buff, ally.data) then
+						local reached = #copies == 0
+						local position = ally.unit:GetPivot().Position
+						for _, copy in ipairs(copies) do
+							if (position - copy.position).Magnitude <= copy.reach then
+								reached = true
+								break
+							end
+						end
+						if reached then
+							boosted += ally.power
+						end
 					end
 				end
 				local nextCount = (have == 2 and want >= 4) and 4 or have + 1
