@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v198", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v199", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -892,7 +892,7 @@ function AA.holdSkip()
 	local _, _, lostLow = AA.lostWave(AA.Match and AA.Match.levelId)
 	if lostLow and lostLow <= 8 then
 		local wave = workspace:FindFirstChild("_wave_num")
-		return (wave and wave.Value or 0) <= lostLow + 2
+		return (wave and wave.Value or 0) <= lostLow + 2, lostLow
 	end
 	return false
 end
@@ -6490,6 +6490,16 @@ local function matchKind()
 	return Config.Mode
 end
 AA.matchKindName = matchKind
+do
+	local events = replicatedStorage.endpoints:FindFirstChild("server_to_client")
+	local loseVote = events and events:FindFirstChild("lose_vote_changed")
+	if loseVote then
+		table.insert(AA.connections, loseVote.OnClientEvent:Connect(function(first)
+			Match.loseVoteAt = os.clock()
+			note("loseVote", { votes = tonumber(first) })
+		end))
+	end
+end
 ---Is the game's matchmaking switched on (Mode tab) for a match of this kind on this level?
 ---kind: "Daily", "Challenge", "Castle", or anything else for a level with its own queue
 ---(infinite, legend stages, raids, the Summer Hunt: levels whose data has _MATCHMAKING).
@@ -6664,15 +6674,30 @@ local function finishMatch()
 	if type(Match.result) == "table" and Match.result.victory ~= nil then
 		won = Match.result.victory == true
 	end
-	if won then
-		Stats.wins += 1
-	else
-		Stats.losses += 1
-	end
 	local data = Match.levelData or {}
 	local id = Match.levelId
 	local kind = matchKind()
 	local wave = currentWave()
+	-- A defeat the stage did not cause: a lose vote in the last two minutes, or a match with
+	-- other players that ended with the base at half health or better and no enemy past the
+	-- middle of the road. It says
+	-- nothing about the stage, so nothing below learns from it.
+	local gaveUp = false
+	if not won then
+		local voted = Match.loseVoteAt ~= nil and os.clock() - Match.loseVoteAt < 120
+		local depths = Match.depthByWave or {}
+		local depth = math.max(depths[wave] or 0, depths[wave - 1] or 0)
+		local standing = Detail.lastHealth ~= nil and (maxHealth or 0) > 0 and Detail.lastHealth >= maxHealth * 0.5 and depth < 0.6
+		-- (Without a vote this is only believed with other players in the match: alone, nobody
+		-- else can end it, and a stage that runs out of time has to count as lost.)
+		gaveUp = voted or (standing and (Match.sawOthers == true or #playersService:GetPlayers() > 1))
+	end
+	Match.loseVoteAt, Match.sawOthers = nil, nil
+	if won then
+		Stats.wins += 1
+	elseif not gaveUp then
+		Stats.losses += 1
+	end
 	local castle = data._gamemode == "infinite_tower"
 	local floor = tonumber(data.floor_num or data._infinite_tower_floor)
 	if castle and won and floor then
@@ -6702,8 +6727,10 @@ local function finishMatch()
 		cleared[id] = type(cleared[id]) == "table" and cleared[id] or {}
 		cleared[id][data._difficulty] = true
 	end
-	AA.noteResult(id, won, wave)
-	if AA.leakKey() ~= "?" and Config.PlaceStyle == "Auto" then
+	if not gaveUp then
+		AA.noteResult(id, won, wave)
+	end
+	if not gaveUp and AA.leakKey() ~= "?" and Config.PlaceStyle == "Auto" then
 		AA.progress.paces = type(AA.progress.paces) == "table" and AA.progress.paces or {}
 		AA.progress.paces[AA.leakKey()] = (Match.everLong or not won) and "long" or "speed"
 		local band = AA.fightBand()
@@ -6713,7 +6740,7 @@ local function finishMatch()
 		end
 	end
 	AA.saveProgress()
-	status = won and "Won" or "Lost"
+	status = won and "Won" or (gaveUp and "Ended by a vote" or "Lost")
 
 	-- What next: decided and voted right away, so a rematch / next act loads while the server is
 	-- still sending the rewards.
@@ -6809,7 +6836,7 @@ local function finishMatch()
 		-- the portal without it having been picked (the mode was changed during the match).
 		after = "Lobby"
 	end
-	note("end", { won = won, after = after, portal = portalNext and portalNext.id or nil })
+	note("end", { won = won, gaveUp = gaveUp or nil, after = after, portal = portalNext and portalNext.id or nil })
 	if after == "Castle" then
 		task.spawn(invoke, "request_start_infinite_tower_from_game", (won and floor) and floor + 1 or floor or 1)
 	elseif after == "Next" then
@@ -6845,6 +6872,7 @@ local function finishMatch()
 		level = id,
 		name = data.name,
 		won = won,
+		gaveUp = gaveUp or nil,
 		wave = wave,
 		-- Event currency earned in the match itself (the balance at the last logged wave minus
 		-- the one at the first): the clear bonus is paid after this and isn't in it.
@@ -6871,7 +6899,9 @@ local function finishMatch()
 	}
 	logMatch(summary)
 	saveDetail(summary)
-	pcall(AA.CardBrain.learnRun, id, won, wave)
+	if not gaveUp then
+		pcall(AA.CardBrain.learnRun, id, won, wave)
+	end
 	if won and id then
 		AA.progress.cleared = type(AA.progress.cleared) == "table" and AA.progress.cleared or {}
 		AA.progress.cleared[id] = true
@@ -7053,13 +7083,19 @@ local function matchLoop()
 				buildPath()
 				AA.startDetail()
 			end
-			if Config.AutoSkip then
-				local hold = AA.holdSkip()
-				if hold ~= Match.skipHeld then
-					Match.skipHeld = hold
-					note("skip", { on = not hold })
+			do
+				-- The game's own Auto-Skip Waves follows the menu switch both ways (it used to be
+				-- switched on and never off again, so turning Skip waves off changed nothing).
+				if #playersService:GetPlayers() > 1 then
+					Match.sawOthers = true
 				end
-				setGameSetting("autoskip_waves", not hold)
+				local hold = Config.AutoSkip and AA.holdSkip() or false
+				local on = Config.AutoSkip == true and not hold
+				if on ~= Match.skipOn then
+					Match.skipOn = on
+					note("skip", { on = on })
+				end
+				setGameSetting("autoskip_waves", on)
 			end
 			-- (This only ever switched the game's setting on: turning the switch off in the menu
 			-- left it on in the game, and with other players in the match the game then ignores
@@ -15604,7 +15640,10 @@ do
 			heading(page, "Start and pace", "left")
 			toggle(page, "Start the match", "AutoStart")
 			slider(page, "Wait before starting", "StartDelay", 0, 60, 1, offOr(" s"), "Holds the start vote, for example while friends join.")
-			toggle(page, "Skip waves", "AutoSkip", "Votes to skip as soon as the game allows it.")
+			toggle(page, "Skip waves", "AutoSkip", "Casts your skip vote the moment the game opens one. With other players a wave is skipped once everyone has voted.")
+			hint(page, "This switches the game's own Auto-Skip Waves setting on and off.\n\nOne exception: a stage you lost within its first 8 waves in the last day is played without skipping until two waves past that point, because skipping puts the next wave on the road while the last one is still there. A match ended by a vote to lose does not count as such a loss.")
+			view.skipHold = UI.note(page, "")
+			view.skipHold.Visible = false
 
 			heading(page, "Placing", "left")
 			toggle(page, "Place units", "AutoPlace", "Each unit goes where it covers the most road.")
@@ -17138,6 +17177,17 @@ do
 				account["Upgrades"].Text = tostring(Stats.upgrades)
 				account["Summons"].Text = tostring(Stats.summons)
 				account["Codes redeemed"].Text = tostring(Stats.codes)
+				do
+					-- Why waves are not being skipped right now, when that is the script's own doing.
+					local hold, lostAt = false, nil
+					if not IS_LOBBY and Config.AutoSkip then
+						hold, lostAt = AA.holdSkip()
+					end
+					view.skipHold.Visible = hold == true and lostAt ~= nil
+					if hold and lostAt then
+						view.skipHold.Text = string.format("Playing every wave until wave %d: this stage was lost at wave %d in the last day.", lostAt + 3, lostAt)
+					end
+				end
 				do
 					local okTeam, problem = pcall(view.teamTick)
 					if not okTeam then
