@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v195", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v196", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -10179,6 +10179,241 @@ if not IS_LOBBY then
 		end
 	end)
 end
+
+-- What each card does, in the game's own words. The game sends a card's effects with the vote
+-- and its card window builds the text from them (the format strings below are that window's),
+-- so a card can be described once a vote has shown it: this session's votes plus the ones
+-- logged in cards.json. Nothing is known about a card the game has not offered yet.
+CardBrain.shown = {}
+do
+	local learn = CardBrain.learn
+	function CardBrain.learn(options)
+		for _, option in pairs(type(options) == "table" and options or {}) do
+			if type(option) == "table" and type(option.title) == "string" and type(option.effects) == "table" then
+				CardBrain.shown[option.title] = option
+				CardBrain.catalogCache = nil
+			end
+		end
+		return learn(options)
+	end
+end
+local STAT_NAMES = { damage = "Attack", health = "Health", range = "Range", attack_cooldown = "Cooldown", active_attack_cooldown = "Active Cooldown", physical_crit_chance = "Phys Crit Chance", magic_crit_chance = "Magic Crit Chance" }
+local ROMAN = { "I", "II", "III", "IV" }
+local function signed(amount, percent, decimals)
+	local value = math.abs(amount) * (percent and 100 or 1)
+	local text = decimals and string.format("%.1f", value) or tostring(math.floor(value + 0.5))
+	return (amount < 0 and "-" or "+") .. text .. (percent and "%" or "")
+end
+local function damageName(id)
+	local service = CardBrain.damageNames
+	if service == nil then
+		service = findData("DamageTypeServiceCore", "get_damage_type_name") or false
+		CardBrain.damageNames = service
+	end
+	local name = service and gameCall(service.get_damage_type_name, id)
+	if type(name) == "string" and name ~= "" then
+		return name
+	end
+	local plain = tostring(id):gsub("_damage$", "")
+	return plain:sub(1, 1):upper() .. plain:sub(2)
+end
+---One effect as the card window words it: the changing part and what it applies to.
+function CardBrain.effectText(effect)
+	local kind, amount = effect.type, tonumber(effect.amount) or 0
+	local stat = STAT_NAMES[effect.stat] or tostring(effect.stat or "")
+	if kind == "stat_mul" or kind == "stat_add" or kind == "stat_attr_add" then
+		return signed(amount, true), stat
+	elseif kind == "stat_mul_real" then
+		return tostring(effect.text or ("x" .. amount)), stat
+	elseif kind == "resource_gain" then
+		return "+" .. math.floor(math.abs(amount) + 0.5), "yen"
+	elseif kind == "boss_damage" then
+		return signed(amount, true), "Boss Damage"
+	elseif kind == "enemy_speedup" then
+		return signed(amount, true), "Enemy Speed"
+	elseif kind == "enemy_regen" then
+		return signed(amount, true, true), "Enemy Regen"
+	elseif kind == "enemy_bomb" then
+		return signed(amount, false), "Explosive Deaths Range"
+	elseif kind == "enemy_resistance_specific" then
+		return signed(amount, false), "Enemy " .. damageName(effect.damage_type) .. " Resist"
+	elseif kind == "enemy_amp_specific" then
+		return signed(amount, true), damageName(effect.damage_type) .. " Damage Taken"
+	elseif kind == "weather_flying_chance" then
+		return signed(amount, true), "Enemy Flying Chance"
+	elseif kind == "weather_soaring_share" then
+		return signed(amount, true), "Flyers Soaring"
+	elseif kind == "flying_damage" then
+		return signed(amount, true), "Damage vs Flying"
+	elseif kind == "burst_speed" then
+		return signed(amount, true), "Burst Enemy Speed"
+	elseif kind == "lightning_strikes" then
+		return signed(amount, true), "Lightning Strikes"
+	elseif kind == "golem_chance" then
+		return signed(amount, true), "Star Golem Chance"
+	elseif kind == "enemy_passive_chance" then
+		return signed(amount, true), "Enemy " .. tostring(effect.passive) .. " Chance"
+	elseif kind == "enemy_stat_mul" then
+		return signed(amount, true), "Enemy " .. stat
+	elseif kind == "enemy_shield" then
+		return signed(amount, false), "Enemy Shield"
+	elseif kind == "candy_multiplier" then
+		return signed(amount, true), "Pearls"
+	elseif kind == "secret_drop" then
+		return signed(amount, true), "Secret Drop Rate"
+	elseif kind == "unit_cost" then
+		return signed(amount, true), "Placement/Upgrade Cost"
+	elseif kind == "random_effects" then
+		return "Gain " .. math.floor(math.abs(amount) + 0.5) .. " Tier " .. tostring(effect.tier or "?"), effect._type == "Good" and "Random Blessings" or "Random Curses"
+	elseif kind == "new_path" then
+		return "+" .. (type(effect.new_lanes) == "table" and #effect.new_lanes or 1), "New Paths"
+	elseif kind == "add_reward" then
+		return "Adds", "a bonus reward"
+	end
+	return signed(amount, false), tostring(kind)
+end
+---Every card seen so far, by name: { [family] = { tiers = { [tier] = option }, order = { tier, ... } } }.
+---Tier 0 is a card that has no tiers.
+function CardBrain.catalog()
+	if CardBrain.catalogCache then
+		return CardBrain.catalogCache
+	end
+	if not CardBrain.logged then
+		local logged = {}
+		pcall(function()
+			local file = SETTINGS_FOLDER .. "/cards.json"
+			if isfile(file) then
+				for _, vote in ipairs(httpService:JSONDecode(readfile(file))) do
+					for _, option in pairs(type(vote) == "table" and type(vote.options) == "table" and vote.options or {}) do
+						if type(option) == "table" and type(option.title) == "string" and type(option.effects) == "table" then
+							logged[option.title] = option
+						end
+					end
+				end
+			end
+		end)
+		CardBrain.logged = logged
+	end
+	local catalog = {}
+	for _, source in ipairs({ CardBrain.logged, CardBrain.shown }) do
+		for title, option in pairs(source) do
+			local family = CardBrain.family(title)
+			local entry = catalog[family] or { tiers = {}, order = {} }
+			catalog[family] = entry
+			local tier = CardBrain.tier(option) or 0
+			if not entry.tiers[tier] then
+				table.insert(entry.order, tier)
+			end
+			entry.tiers[tier] = option
+		end
+	end
+	for _, entry in pairs(catalog) do
+		table.sort(entry.order)
+	end
+	CardBrain.catalogCache = catalog
+	return catalog
+end
+---A card by name: kind ("Curse" | "Blessing"), text (what it does), known (a vote has shown it).
+---A card with tiers lists each figure tier by tier: "+50 / +100 / +200 Enemy Magic Resist".
+function CardBrain.describe(name)
+	local _, good = CardBrain.families()
+	local entry = CardBrain.catalog()[name]
+	local kind = good[name] == false and "Curse" or "Blessing"
+	if not entry or #entry.order == 0 then
+		return { kind = kind, known = false, text = "No vote has offered this card yet, so what it does is not known here." }
+	end
+	for _, tier in ipairs(entry.order) do
+		local option = entry.tiers[tier]
+		if option.option_type == "Bad" then
+			kind = "Curse"
+		elseif option.option_type == "Good" then
+			kind = "Blessing"
+		end
+	end
+	-- One phrase per thing the card changes, with its figure on every tier that has it.
+	local phrases, byLabel = {}, {}
+	for _, tier in ipairs(entry.order) do
+		local effects = entry.tiers[tier].effects
+		local keys = {}
+		for key in pairs(effects) do
+			table.insert(keys, key)
+		end
+		table.sort(keys, function(a, b)
+			return (tonumber(a) or 0) < (tonumber(b) or 0)
+		end)
+		for _, key in ipairs(keys) do
+			local effect = effects[key]
+			if type(effect) == "table" then
+				local value, label = CardBrain.effectText(effect)
+				local phrase = byLabel[label]
+				if not phrase then
+					phrase = { label = label, values = {} }
+					byLabel[label] = phrase
+					table.insert(phrases, phrase)
+				end
+				phrase.values[tier] = value
+			end
+		end
+	end
+	-- What the card does to the fight first, what it pays after.
+	local LAST = { ["Pearls"] = 1, ["Secret Drop Rate"] = 2, ["a bonus reward"] = 3 }
+	for index, phrase in ipairs(phrases) do
+		phrase.rank = (LAST[phrase.label] or 0) * 100 + index
+	end
+	table.sort(phrases, function(a, b)
+		return a.rank < b.rank
+	end)
+	local parts = {}
+	for _, phrase in ipairs(phrases) do
+		local values, tiers, same = {}, {}, true
+		for _, tier in ipairs(entry.order) do
+			local value = phrase.values[tier]
+			if value then
+				table.insert(values, value)
+				table.insert(tiers, ROMAN[tier] or "")
+				same = same and value == values[1]
+			end
+		end
+		local text = (same and values[1] or table.concat(values, " / ")) .. " " .. phrase.label
+		if #tiers < #entry.order then
+			text = text .. " (" .. table.concat(tiers, ", ") .. " only)"
+		end
+		table.insert(parts, text)
+	end
+	local text = table.concat(parts, ", ") .. "."
+	if #entry.order > 1 or entry.order[1] ~= 0 then
+		local tiers = {}
+		for _, tier in ipairs(entry.order) do
+			table.insert(tiers, ROMAN[tier] or "?")
+		end
+		text = (#tiers > 1 and ("Tiers " .. table.concat(tiers, " / ") .. ": ") or ("Tier " .. tiers[1] .. ": ")) .. text
+	end
+	return { kind = kind, known = true, text = text }
+end
+-- The names the menus offer: the built-in list, this session's votes, and every card the log
+-- has seen (weather cards come and go with the map, random-effect cards are not in the pool).
+do
+	local families = CardBrain.families
+	function CardBrain.families()
+		local names, good = families()
+		local seen, extra = {}, {}
+		for _, name in ipairs(names) do
+			seen[name] = true
+		end
+		for family, entry in pairs(CardBrain.catalog()) do
+			if family ~= "" and not seen[family] then
+				seen[family] = true
+				table.insert(extra, family)
+				good[family] = entry.tiers[entry.order[1]].option_type == "Good"
+			end
+		end
+		table.sort(extra)
+		for _, family in ipairs(extra) do
+			table.insert(names, family)
+		end
+		return names, good
+	end
+end
 end
 
 ---Logs the real damage of my towers while an enemy is within their range, and keeps the pace
@@ -12644,8 +12879,13 @@ AA.ui = UI
 			list.Visible = not list.Visible
 			if list.Visible then
 				local entries = {}
+				-- An option is a string, or { text = what the row shows, value = what is picked }.
 				for _, option in ipairs(getOptions()) do
-					table.insert(entries, { text = option, value = option, current = option == getValue() })
+					if type(option) == "table" then
+						table.insert(entries, { text = option.text, value = option.value, current = option.value == getValue() })
+					else
+						table.insert(entries, { text = option, value = option, current = option == getValue() })
+					end
 				end
 				fill(entries)
 			end
@@ -12893,13 +13133,32 @@ AA.ui = UI
 		return row
 	end
 
-	---A list the user edits: one line per item with a cross to take it off, and for an ordered
-	---list its place and an arrow to move it up. get() -> names; marks(name) -> small text on
-	---the right of the name (optional).
+	---A list the user edits: one row per entry with a remove button, and an up arrow when the
+	---order matters. options:
+	---  get() -> names           remove(index, name)        moveUp(index)      ordered, empty
+	---  marks(name, index) -> a muted word at the right; a second result of true paints it in the accent
+	---  tag(name, index) -> text, tone ("bad" | "good" | "accent"): a small label before the buttons
+	---  detail(name, index) -> a wrapped line under the name
+	---  maxHeight -> past this height the list scrolls inside its own frame
 	function UI.editList(page, options)
-		local holder = create("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, LayoutOrder = UI.nextOrder(), Parent = slot(page, 60) }, {
-			create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 4) }),
-		})
+		local scrolls = options.maxHeight ~= nil
+		local holder = create(scrolls and "ScrollingFrame" or "Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = scrolls and Enum.AutomaticSize.None or Enum.AutomaticSize.Y, BackgroundTransparency = 1, BorderSizePixel = 0, LayoutOrder = UI.nextOrder(), Parent = slot(page, 60) })
+		local layout = create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 4), Parent = holder })
+		if scrolls then
+			holder.ScrollBarThickness = 4
+			holder.ScrollBarImageColor3 = UI.roles.Outline
+			holder.ScrollingDirection = Enum.ScrollingDirection.Y
+			holder.CanvasSize = UDim2.new()
+			local pad = create("UIPadding", { Parent = holder })
+			local function fit()
+				local content = layout.AbsoluteContentSize.Y
+				holder.Size = UDim2.new(1, 0, 0, math.min(content, options.maxHeight))
+				holder.CanvasSize = UDim2.fromOffset(0, content)
+				pad.PaddingRight = UDim.new(0, content > options.maxHeight and 8 or 0)
+			end
+			layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(fit)
+			fit()
+		end
 		UI.lastRow[page] = nil
 		local signature
 		local function smallButton(parent, kind, order, action)
@@ -12919,7 +13178,22 @@ AA.ui = UI
 		end
 		local function refresh()
 			local names = options.get()
-			local now = table.concat(names, "|") .. "#" .. UI.roles.Accent:ToHex()
+			local rows, parts = {}, { UI.roles.Accent:ToHex(), UI.roles.Font:ToHex() }
+			for index, name in ipairs(names) do
+				local row = { name = name }
+				if options.marks then
+					row.mark, row.markAccent = options.marks(name, index)
+				end
+				if options.tag then
+					row.tag, row.tone = options.tag(name, index)
+				end
+				if options.detail then
+					row.detail = options.detail(name, index)
+				end
+				rows[index] = row
+				table.insert(parts, table.concat({ name, tostring(row.mark), tostring(row.markAccent), tostring(row.tag), tostring(row.detail) }, "~"))
+			end
+			local now = table.concat(parts, "|")
 			if now == signature then
 				return
 			end
@@ -12933,31 +13207,53 @@ AA.ui = UI
 				wrapped({ Size = UDim2.new(1, 0, 0, 16), Text = options.empty or "Nothing here yet.", TextSize = px(13), TextColor3 = UI.roles.Muted, LayoutOrder = 1, Parent = holder })
 				return
 			end
-			for index, name in ipairs(names) do
-				local line = create("Frame", { Size = UDim2.new(1, 0, 0, 30), BackgroundColor3 = UI.roles.Control, BorderSizePixel = 0, LayoutOrder = index, Parent = holder }, {
+			for index, row in ipairs(rows) do
+				local line = create("Frame", { Size = UDim2.new(1, 0, 0, 30), AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = UI.roles.Control, BorderSizePixel = 0, LayoutOrder = index, Parent = holder }, {
 					create("UICorner", { CornerRadius = UDim.new(0, 6) }),
+					create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder }),
+				})
+				local top = create("Frame", { Size = UDim2.new(1, 0, 0, 30), BackgroundTransparency = 1, LayoutOrder = 1, Parent = line }, {
 					create("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 3) }),
 					create("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, VerticalAlignment = Enum.VerticalAlignment.Center, Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }),
 				})
 				if options.ordered then
-					label({ Size = UDim2.fromOffset(16, 30), Text = tostring(index), FontFace = CODE_BOLD, TextSize = px(13), TextColor3 = UI.roles.Accent, LayoutOrder = 1, Parent = line })
+					label({ Size = UDim2.fromOffset(18, 30), Text = tostring(index), FontFace = CODE_BOLD, TextSize = px(13), TextColor3 = UI.roles.Accent, LayoutOrder = 1, Parent = top })
 				end
-				local nameLabel = label({ Size = UDim2.new(0, 0, 1, 0), Text = name, TextSize = px(14), TextTruncate = Enum.TextTruncate.AtEnd, LayoutOrder = 2, Parent = line })
+				local nameLabel = label({ Size = UDim2.new(0, 0, 1, 0), Text = row.name, TextSize = px(14), TextTruncate = Enum.TextTruncate.AtEnd, LayoutOrder = 2, Parent = top })
 				create("UIFlexItem", { FlexMode = Enum.UIFlexMode.Fill, Parent = nameLabel })
-				local mark = options.marks and options.marks(name)
-				if mark and mark ~= "" then
-					label({ Size = UDim2.new(0, 0, 1, 0), AutomaticSize = Enum.AutomaticSize.X, Text = mark, TextSize = px(12), TextColor3 = UI.roles.Muted, LayoutOrder = 3, Parent = line })
+				if row.tag and row.tag ~= "" then
+					-- Red for a curse, green for a blessing, pulled toward the text color so it
+					-- reads on any theme. The word says it too.
+					local tone = row.tone == "bad" and Color3.fromRGB(235, 87, 87) or row.tone == "good" and Color3.fromRGB(72, 199, 142) or row.tone == "accent" and UI.roles.Accent or UI.roles.Muted
+					local pill = create("Frame", { Size = UDim2.fromOffset(0, 18), AutomaticSize = Enum.AutomaticSize.X, BackgroundColor3 = UI.roles.Raised, BorderSizePixel = 0, LayoutOrder = 3, Parent = top }, {
+						create("UICorner", { CornerRadius = UDim.new(0, 5) }),
+						create("UIPadding", { PaddingLeft = UDim.new(0, 7), PaddingRight = UDim.new(0, 7) }),
+					})
+					pill:SetAttribute("NoTheme", true)
+					label({ Size = UDim2.new(0, 0, 1, 0), AutomaticSize = Enum.AutomaticSize.X, Text = row.tag, FontFace = CODE_BOLD, TextSize = px(12), TextColor3 = (row.tone == "bad" or row.tone == "good") and tone:Lerp(UI.roles.Font, 0.2) or tone, Parent = pill })
+				end
+				if row.mark and row.mark ~= "" then
+					local markLabel = label({ Size = UDim2.new(0, 0, 1, 0), AutomaticSize = Enum.AutomaticSize.X, Text = row.mark, FontFace = row.markAccent and CODE_BOLD or CODE, TextSize = px(12), TextColor3 = row.markAccent and UI.roles.Accent or UI.roles.Muted, LayoutOrder = 4, Parent = top })
+					if row.markAccent then
+						markLabel:SetAttribute("NoTheme", true)
+					end
 				end
 				if options.ordered and index > 1 then
-					smallButton(line, "up", 4, function()
+					smallButton(top, "up", 5, function()
 						options.moveUp(index)
 						UI.refreshAll()
 					end)
 				end
-				smallButton(line, "cross", 5, function()
-					options.remove(index, name)
+				smallButton(top, "cross", 6, function()
+					options.remove(index, row.name)
 					UI.refreshAll()
 				end)
+				if row.detail and row.detail ~= "" then
+					local under = create("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, LayoutOrder = 2, Parent = line }, {
+						create("UIPadding", { PaddingLeft = UDim.new(0, options.ordered and 34 or 10), PaddingRight = UDim.new(0, 10), PaddingBottom = UDim.new(0, 8) }),
+					})
+					wrapped({ Size = UDim2.new(1, 0, 0, 16), Text = row.detail, TextSize = px(13), TextColor3 = UI.roles.Muted, Parent = under })
+				end
 			end
 		end
 		table.insert(UI.refreshers, refresh)
@@ -12966,7 +13262,7 @@ AA.ui = UI
 			refresh()
 		end)
 		refresh()
-		return refresh
+		return refresh, holder
 	end
 
 	-- The script's own notices, in the menu's typeface (Roblox's notification box uses the
@@ -14851,9 +15147,9 @@ do
 			end)
 		end
 
-		-- Play: which mode, what happens between matches, who you play with.
+		-- Mode: which mode, what happens between matches, who you play with.
 		do
-			local page = makePage("Play", "What the script queues for. The card on the right changes with the mode.", "Farm")
+			local page = makePage("Mode", "What the script queues for. The card on the right changes with the mode.", "Farm")
 			-- Only what the picked mode uses is shown.
 			local gated = {}
 			local function only(modes, object)
@@ -15175,25 +15471,38 @@ do
 			toggle(page, "Open Sunny Stars", "OpenCapsules")
 			slider(page, "Pearls to keep", "KeepPearls", 0, 20000, 150, number, "Never spent below this.")
 
+			---Cards on neither list, for the two "Add a card" menus: blessings first, each row says which it is.
 			local function unlisted()
-				local names = {}
+				local options = {}
 				local list, never = CardBrain.list(), CardBrain.banned()
 				for _, name in ipairs((CardBrain.families())) do
 					if not table.find(list, name) and not table.find(never, name) then
-						table.insert(names, name)
+						local kind = CardBrain.describe(name).kind
+						table.insert(options, { text = name .. ", " .. kind:lower(), value = name, curse = kind == "Curse" })
 					end
 				end
-				table.sort(names)
-				return names
+				table.sort(options, function(a, b)
+					if a.curse ~= b.curse then
+						return b.curse
+					end
+					return a.value < b.value
+				end)
+				return options
 			end
-			local function kind(name)
-				local _, good = CardBrain.families()
-				return good[name] == false and "curse" or "blessing"
+			-- Each row of the two lists: curse or blessing, and what the card does in the game's own
+			-- words (read from the votes that have offered it).
+			local function cardTag(name)
+				local kind = CardBrain.describe(name).kind
+				return kind, kind == "Curse" and "bad" or "good"
+			end
+			local function cardDetail(name)
+				return CardBrain.describe(name).text
 			end
 			heading(page, "Never list", "right", "Cards the script must not vote for, in any strategy. If a vote offers only cards from this list, no vote is cast and the game decides.")
 			UI.editList(page, {
 				get = CardBrain.banned,
-				marks = kind,
+				tag = cardTag,
+				detail = cardDetail,
 				empty = "Empty. Every card may be voted for.",
 				remove = function(index)
 					local never = table.clone(CardBrain.banned())
@@ -15212,11 +15521,12 @@ do
 			end, "All tiers of a card count as the same card.")
 			hint(page, "Keep this list short. Every card on it is one fewer way out of a vote that offers nothing but curses, and the script then has to take a worse one.")
 
-			heading(page, "Take first", "right", "Optional. A card on this list is taken whenever it is offered, top of the list first, whatever the strategy says. The never list still wins.")
+			heading(page, "Take first", "right", "Optional. A card on this list is taken whenever it is offered, top of the list first, whatever the strategy says. The never list still wins. Each row says what the card does, tier by tier.")
 			toggle(page, "Use this list", "CardListOn")
 			UI.editList(page, {
 				get = CardBrain.list,
-				marks = kind,
+				tag = cardTag,
+				detail = cardDetail,
 				ordered = true,
 				empty = "Empty. The strategy decides every vote.",
 				remove = function(index)
@@ -15845,24 +16155,40 @@ do
 					end
 					return ids
 				end
-				local listLine, setupLine
-				local function showList()
-					if not listLine then
-						return
+				local setupLine
+				local showList = function() end
+				---The steps as the list shows them.
+				local function stepNames()
+					local names = {}
+					for _, step in ipairs(AA.Order.steps()) do
+						table.insert(names, (step.kind == "place" and "Place " or "Upgrade ") .. nameOf(step.unit))
 					end
-					local steps = AA.Order.steps()
-					local lines = {}
-					local current = not IS_LOBBY and Config.OrderOn and Match.orderStep or nil
+					return names
+				end
+				---Why a list of steps cannot be followed, or nil: the first step places a unit, and a
+				---unit is placed before it is upgraded.
+				local function orderProblem(steps)
+					local placed = {}
 					for index, step in ipairs(steps) do
-						if index > #steps - 14 then
-							local text = step.kind == "place" and ("Place " .. nameOf(step.unit)) or ("Upgrade " .. nameOf(step.unit) .. " x" .. step.times)
-							table.insert(lines, index .. ". " .. text .. (index == current and "   (now)" or ""))
+						if step.kind == "place" then
+							placed[step.unit] = true
+						elseif index == 1 then
+							return "The first step has to place a unit."
+						elseif not placed[step.unit] then
+							return nameOf(step.unit) .. " has to be placed before it is upgraded."
 						end
 					end
-					if #steps > 14 then
-						table.insert(lines, 1, "(" .. (#steps - 14) .. " earlier steps)")
+					return nil
+				end
+				---Save an edited list, unless it could not be followed.
+				local function applySteps(steps)
+					local problem = orderProblem(steps)
+					if problem then
+						UI.toast("Build order", problem, 6)
+						return false
 					end
-					listLine.Text = #steps == 0 and "No steps yet. The first step is always a placement." or table.concat(lines, "\n")
+					AA.Order.set(steps)
+					return true
 				end
 				heading(page, "Build order", "left", "The script does exactly the next step, saving up for it when it has to. After the last step it plays on by its own judgement.")
 				toggle(page, "Follow my build order", "OrderOn", "Farm kills mode and a playing macro keep their own order.")
@@ -15909,16 +16235,41 @@ do
 					showList()
 					return "Added"
 				end, true)
-				UI.buttonPair(page, "Remove the last step", function()
-					local steps = table.clone(AA.Order.steps())
-					table.remove(steps)
-					AA.Order.set(steps)
-					showList()
-				end, "Clear all steps", function()
+				-- The steps, top first: the cross takes a step out, the arrow moves it one place up.
+				showList = UI.editList(page, {
+					get = stepNames,
+					ordered = true,
+					maxHeight = 370,
+					empty = "No steps yet. The first step is always a placement.",
+					-- How many upgrades the step buys (kept out of the name, which may be cut short).
+					marks = function(_, index)
+						local step = AA.Order.steps()[index]
+						return (step and step.kind == "upgrade") and ("x" .. step.times) or ""
+					end,
+					-- Where the match is in the list.
+					tag = function(_, index)
+						local current = not IS_LOBBY and Config.OrderOn and Match.orderStep or nil
+						if current and index == current then
+							return "Now", "accent"
+						end
+						return (current and index < current) and "Done" or ""
+					end,
+					remove = function(index)
+						local steps = table.clone(AA.Order.steps())
+						table.remove(steps, index)
+						applySteps(steps)
+					end,
+					moveUp = function(index)
+						local steps = table.clone(AA.Order.steps())
+						steps[index - 1], steps[index] = steps[index], steps[index - 1]
+						applySteps(steps)
+					end,
+				})
+				button(page, "Clear all steps", function()
 					AA.Order.set({})
 					showList()
+					return "Cleared"
 				end)
-				listLine = infoLine(page, 230)
 				heading(page, "Saved setups", "right", "A setup is the whole build order plus its spots setting. Loading one replaces the list.")
 				local setupBox = UI.textbox(page, "Name", "For example: daily front")
 				setupBox.Text = tostring(Config.OrderName or "")
