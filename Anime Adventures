@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v203", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v204", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -4165,6 +4165,35 @@ local function bestSpot(data, focus, only, free)
 	return best, bestDirection
 end
 
+---Does any copy of this buffer reach a unit it boosts? Then the chain stands with the team, and
+---no copy of it is "in the wrong place": the copies that reach nothing are the feeders, put
+---there on purpose. (The front-for-everyone rule asked bestSpot where a buffer should be and
+---sold the copy when the answer was more than ten studs away. For a buffer bestSpot answers
+---where the NEXT copy goes, which is always somewhere else. Daily Challenge with six players:
+---an Elfy sold and re-placed six times in 30 s, then the last re-place was refused and the
+---chain ran on three copies, full buff only every other cast, for the rest of the match.)
+function AA.chainReaches(id, data)
+	local info = AA.buffInfo(data)
+	if not info then
+		return false
+	end
+	local towers = myUnits()
+	for _, copy in ipairs(towers) do
+		if copy._stats.id.Value == id then
+			local range = copy._stats:FindFirstChild("range")
+			local reach = (range and AA.rv(range) or 0) + 0.7
+			local position = copy:GetPivot().Position
+			for _, other in ipairs(towers) do
+				local otherData = Units[other._stats.id.Value]
+				if other ~= copy and otherData and not AA.buffInfo(otherData) and AA.buffMatches(info, otherData) and (other:GetPivot().Position - position).Magnitude <= reach then
+					return true
+				end
+			end
+		end
+	end
+	return false
+end
+
 ---Maps with two or three roads: the buff group is worth staying in only while it sees the roads.
 ---A spot inside the group is compared with the best spot anywhere, both measured the same way
 ---(AA.roadSeen at the unit's full range), and the unit leaves the group when the open spot sees
@@ -4244,6 +4273,13 @@ local function placeUnit(entry, focus)
 		return true
 	end
 	note("placefail", { u = entry.id, msg = AA.lastMessage, x = math.floor(spot.position.X), z = math.floor(spot.position.Z), roof = spot.roof and math.floor(spot.roof * 10) / 10 or nil })
+	if tostring(AA.lastMessage or ""):find("Unique units may not be placed", 1, true) and before > 0 then
+		-- Refused with copies of it already down: something passing (another player's unit),
+		-- not a cap and not the spot. Look again in four waves.
+		Match.capped[entry.uuid] = currentWave() + 3
+		Match.failStreak[entry.uuid] = 0
+		return false
+	end
 	if tostring(AA.lastMessage or ""):find("(Global)", 1, true) then
 		-- A cap shared by every player in the server ("Cannot place more than 6 of this unit!
 		-- (Global)"): the others hold the rest. Nothing wrong with the spot, and asking again
@@ -5865,7 +5901,8 @@ local function matchStep()
 			-- (Front for everyone: buffers, auras and summoners move too, each copy once, after
 			-- the damage units they stand with.)
 			local special = AA.buffInfo(data) or AA.isSummoner(id) or AA.synergyInfo(id)
-			if frontAll and special and entry and data and spent and spent.Value * (frontAll and 0.75 or 1) <= stats.resource.Value and not AA.unsellable(id) and (Match.relocated[id] or 0) < 8 and not idle and not unit:GetAttribute("AAFront") and unitStatsAt(data, data.upgrade and #data.upgrade or 0).farm <= 0 then
+			if frontAll and special and entry and data and spent and spent.Value * (frontAll and 0.75 or 1) <= stats.resource.Value and not AA.unsellable(id) and (Match.relocated[id] or 0) < 8 and not idle and not unit:GetAttribute("AAFront") and unitStatsAt(data, data.upgrade and #data.upgrade or 0).farm <= 0
+				and not AA.chainReaches(id, data) then
 				frontSpecial = frontSpecial or unit
 			elseif entry and data and spent and spent.Value * (frontAll and 0.75 or 1) <= stats.resource.Value and not special and not AA.unsellable(id) and (Match.relocated[id] or 0) < (frontAll and 8 or 2) then
 				local level = unit._stats.upgrade.Value
@@ -9894,7 +9931,7 @@ do
 			local last = Match.lastSpawn
 			if cap and last and os.clock() - last.at < 3 then
 				learnedCaps[last.id] = cap
-			elseif last and os.clock() - last.at < 3 and text:find("Unique units may not be placed") then
+			elseif last and os.clock() - last.at < 3 and text:find("Unique units may not be placed") and countPlaced(last.id) == 0 then
 				learnedCaps[last.id] = 1
 			end
 		end))
