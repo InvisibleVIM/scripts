@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v199", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v200", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -6490,6 +6490,93 @@ local function matchKind()
 	return Config.Mode
 end
 AA.matchKindName = matchKind
+---Should vote_start be sent now? It is sent once and then watched: the count in
+---workspace._DATA.VoteStart.Votes has to rise. It is sent again when the count did not move
+---(sent too early, ignored) or when the votes were wiped (a rematch, a player joining). If the
+---count went DOWN right after sending, the server took the second send as taking the vote
+---back: it is put in again at once. Once the vote has landed nothing more is sent; what is
+---left of the wait belongs to the other players or to the game's own countdown.
+function AA.startVoteDue(votes)
+	local count = votes and votes.Value or 0
+	local vote = Match.startVote
+	if not vote then
+		return true
+	end
+	local age = os.clock() - vote.at
+	if not vote.judged and age >= 1.2 then
+		vote.judged = true
+		if count > vote.before then
+			vote.landed = true
+		elseif count < vote.before then
+			note("voteToggle", { before = vote.before, after = count })
+			return true
+		end
+		note("voteSeen", { before = vote.before, after = count, landed = vote.landed or nil, players = #playersService:GetPlayers(), n = vote.sent })
+	end
+	if vote.landed then
+		return count == 0 and age > 3
+	end
+	return vote.judged == true and age >= 2.5
+end
+---What the wait at the start vote is for, when other players are in the match.
+function AA.startVoteStatus(data)
+	local voteData = data and data:FindFirstChild("VoteStart")
+	local votes = voteData and voteData:FindFirstChild("Votes")
+	local players = #playersService:GetPlayers()
+	if not votes then
+		return nil
+	end
+	if votes.Value ~= Match.startVotesSeen then
+		Match.startVotesSeen = votes.Value
+		note("votes", { votes = votes.Value, players = players })
+	end
+	if players <= 1 then
+		return nil
+	end
+	local text = string.format("Voted to start: %d of %d players have voted", math.min(votes.Value, players), players)
+	-- (StartTime counts down once the game has decided to start on its own.)
+	local startTime = voteData:FindFirstChild("StartTime")
+	local left = startTime and tonumber(startTime.Value)
+	if left then
+		if Match.startTimeFirst == nil then
+			Match.startTimeFirst = left
+		elseif left < Match.startTimeFirst - 0.5 and left > 0 then
+			text = text .. string.format(", the game starts on its own in %d s", math.floor(left + 1))
+		end
+	end
+	return text
+end
+if not IS_LOBBY then
+	-- Skip votes, for the log: when the server opens one and how the count moves. The game's own
+	-- client casts my vote when its Auto-Skip Waves setting is on; if a vote opens while the
+	-- setting is still off (it is switched a moment after the match loads), it is cast here.
+	local events = replicatedStorage.endpoints:FindFirstChild("server_to_client")
+	local opened = events and events:FindFirstChild("start_vote_wave_skip")
+	local counted = events and events:FindFirstChild("player_voted_wave_skip")
+	if opened then
+		table.insert(AA.connections, opened.OnClientEvent:Connect(function()
+			Match.skipVotes = (Match.skipVotes or 0) + 1
+			local own = settingsFolder:FindFirstChild("autoskip_waves")
+			local byGame = own ~= nil and own.Value == true
+			local wanted = Config.AutoSkip == true and not (AA.holdSkip())
+			if Match.skipVotes <= 40 then
+				note("skipVote", { players = #playersService:GetPlayers(), byGame = byGame or nil, wanted = wanted or nil })
+			end
+			if wanted and not byGame then
+				task.spawn(invoke, "vote_wave_skip")
+			end
+		end))
+	end
+	if counted then
+		table.insert(AA.connections, counted.OnClientEvent:Connect(function(voted, needed)
+			Match.skipCount = { voted = tonumber(voted), needed = tonumber(needed), at = os.clock() }
+			if (Match.skipCounts or 0) < 60 then
+				Match.skipCounts = (Match.skipCounts or 0) + 1
+				note("skipCount", { voted = tonumber(voted), needed = tonumber(needed) })
+			end
+		end))
+	end
+end
 do
 	local events = replicatedStorage.endpoints:FindFirstChild("server_to_client")
 	local loseVote = events and events:FindFirstChild("lose_vote_changed")
@@ -6961,6 +7048,7 @@ local function resetMatch()
 	Match.dropLog = nil
 	Match.killsPhase = nil
 	Match.voteNoted = nil
+	Match.startVote, Match.startVotesSeen, Match.startTimeFirst = nil, nil, nil
 	Match.shieldHits, Match.shieldAt, Match.shieldMode = nil, nil, nil
 	Match.enemyMedian, Match.tankNoted, Match.shieldOn, Match.blesserId = nil, nil, nil, nil
 	Match.soaring, Match.spotScore, Match.openingDone, Match.flyShare, Match.bufferMoved = nil, nil, nil, nil, nil
@@ -7121,12 +7209,15 @@ local function matchLoop()
 						note("difficulty", { d = want })
 						invoke("select_difficulty", want)
 					end
-				elseif Config.AutoStart and os.clock() - lastStart > 3 and os.clock() - (Match.startedAt or 0) >= (Config.StartDelay or 0) then
-					lastStart = os.clock()
-					readLevelData()
-					-- (Spawned: nothing may hold the loop while the server answers.)
-					task.spawn(invoke, "vote_start")
+				elseif Config.AutoStart and os.clock() - (Match.startedAt or 0) >= (Config.StartDelay or 0) then
 					local votes = data and data:FindFirstChild("VoteStart") and data.VoteStart:FindFirstChild("Votes")
+					if AA.startVoteDue(votes) then
+						lastStart = os.clock()
+						readLevelData()
+						Match.startVote = { at = os.clock(), before = votes and votes.Value or 0, sent = (Match.startVote and Match.startVote.sent or 0) + 1 }
+						-- (Spawned: nothing may hold the loop while the server answers.)
+						task.spawn(invoke, "vote_start")
+					end
 					if not Match.voteNoted then
 						Match.voteNoted = true
 						pcall(function()
@@ -7145,9 +7236,7 @@ local function matchLoop()
 						end)
 						note("vote", { votes = votes and votes.Value, players = #playersService:GetPlayers() })
 					end
-					if #playersService:GetPlayers() > 1 then
-						status = "Voted to start: waiting for the other players"
-					end
+					status = AA.startVoteStatus(data) or status
 				end
 			else
 				Match.idleSince = nil
