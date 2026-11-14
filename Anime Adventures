@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v196", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v197", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -6490,6 +6490,31 @@ local function matchKind()
 	return Config.Mode
 end
 AA.matchKindName = matchKind
+---Is the game's matchmaking switched on (Mode tab) for a match of this kind on this level?
+---kind: "Daily", "Challenge", "Castle", or anything else for a level with its own queue
+---(infinite, legend stages, raids, the Summer Hunt: levels whose data has _MATCHMAKING).
+function AA.matchmakingOn(kind, id)
+	if kind == "Daily" then
+		return Config.MatchDaily == true
+	elseif kind == "Challenge" then
+		return Config.MatchChallenge == true
+	elseif kind == "Castle" then
+		return Config.MatchCastle == true
+	end
+	local level = type(id) == "string" and Levels[id] or nil
+	if not (level and level._MATCHMAKING) then
+		return false
+	end
+	local lower = id:lower()
+	if lower:find("summer") then
+		return Config.MatchSummer == true
+	elseif level.is_raid or kind == "Raid" or kind == "raid" then
+		return Config.MatchRaid == true
+	elseif lower:find("infinite") then
+		return Config.MatchInfinite == true
+	end
+	return Config.MatchLegend == true
+end
 
 local function saveCastle(floor, difficulty)
 	local key = "Castle" .. (difficulty or "Normal")
@@ -6762,6 +6787,11 @@ local function finishMatch()
 		else
 			after = "Replay"
 		end
+	end
+	if Config.AutoJoin and Config.AfterGame == "Auto" and (after == "Replay" or after == "Castle") and AA.matchmakingOn(kind, id) then
+		-- Matchmaking is on for this kind of match: a rematch here would run with whoever is
+		-- left in this server (usually nobody). The lobby queues for the next one.
+		after = "Lobby"
 	end
 	if AA.playMode() == "Quests" and Config.AutoJoin then
 		-- The lobby claims the quest and picks the next one.
@@ -8240,22 +8270,13 @@ local function joinGame()
 		local queueId, wanted
 		if kind == "challenge" then
 			queueId = group == "DailyChallenge" and "__DAILY_CHALLENGE" or "__NORMAL_CHALLENGE"
-			wanted = group == "DailyChallenge" and Config.MatchDaily or group ~= "DailyChallenge" and Config.MatchChallenge
+			wanted = AA.matchmakingOn(group == "DailyChallenge" and "Daily" or "Challenge")
 		elseif kind == "castle" then
 			queueId = string.format("__INFINITE_TOWER:%d:%s", id, difficulty or "Normal")
-			wanted = Config.MatchCastle
+			wanted = AA.matchmakingOn("Castle")
 		elseif type(id) == "string" and Levels[id] and Levels[id]._MATCHMAKING then
 			queueId = id
-			local lower = id:lower()
-			if lower:find("summer") then
-				wanted = Config.MatchSummer
-			elseif Levels[id].is_raid or kind == "raid" then
-				wanted = Config.MatchRaid
-			elseif lower:find("infinite") then
-				wanted = Config.MatchInfinite
-			else
-				wanted = Config.MatchLegend
-			end
+			wanted = AA.matchmakingOn(kind, id)
 		end
 		if queueId and wanted and os.clock() - ((AA.queueFailed or {})[queueId] or -1e9) > 600 then
 			status = "Finding a match"
@@ -15208,7 +15229,7 @@ do
 			end, true)
 
 			heading(page, "After a match", "left")
-			segmented(page, "Then", "AfterGame", { "Auto", "Next", "Replay", "Lobby" }, "Auto: next act after a win, same act after a loss, next room in the mansion.")
+			segmented(page, "Then", "AfterGame", { "Auto", "Next", "Replay", "Lobby" }, "Auto: next act after a win, same act after a loss, next room in the mansion. A mode with matchmaking on goes back to the lobby instead and queues again there.")
 
 			heading(page, "Other players", "right", "Story acts and portals have no matchmaking.")
 			toggle(page, "Friends only", "FriendsOnly", "Keeps strangers out of lobbies and portals the script opens.")
@@ -15222,7 +15243,7 @@ do
 			toggle(page, "Jump into any portal that opens", "PortalInstant", "The moment someone in the lobby opens a portal you are put in it. Works with Join matches off.")
 			UI.note(page, "Use the game's matchmaking for:")
 			toggle(page, "Daily Challenge", "MatchDaily")
-			hint(page, "Each switch queues that kind of match with other players; off means you start it alone. If nobody is found in 45 seconds the stage starts alone anyway.")
+			hint(page, "Each switch queues that kind of match with other players; off means you start it alone. If nobody is found in 45 seconds the stage starts alone anyway.\n\nOther players can only be found from the lobby: a rematch inside the match keeps whoever is still there. So with a switch on, the script goes back to the lobby after every match of that kind and queues again (when After a match is on Auto). With it off, the rematch starts right where you are.")
 			toggle(page, "Half-hour challenges", "MatchChallenge")
 			toggle(page, "Infinite", "MatchInfinite")
 			toggle(page, "Legend stages", "MatchLegend")
