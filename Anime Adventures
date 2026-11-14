@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v192", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v193", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -9050,6 +9050,8 @@ function CardBrain.state()
 	for _, effect in pairs((Match.roguelike and Match.roguelike.persistent_effects) or {}) do
 		if type(effect) == "table" and effect.type == "enemy_resistance_specific" and effect.damage_type then
 			state.resist[effect.damage_type] = (state.resist[effect.damage_type] or 0) + (tonumber(effect.amount) or 0)
+		elseif type(effect) == "table" and effect.type == "enemy_bomb" then
+			state.bomb = (state.bomb or 0) + (tonumber(effect.amount) or 0)
 		end
 	end
 	return state
@@ -9119,7 +9121,10 @@ function CardBrain.score(option, state)
 			reward += amount
 			candy = (candy or 0) + amount
 		elseif kind == "secret_drop" then
-			reward += amount * 3
+			-- A better chance at a secret drop, which only exists if the run is cleared. (It was
+			-- counted three times as heavily as pearls: Doomsday, enemy health doubled, was taken
+			-- twice in one run for its +1 here.)
+			reward += amount * 0.3
 		elseif kind == "add_reward" then
 			reward += 0.25
 		elseif kind == "resource_gain" then
@@ -9174,7 +9179,15 @@ function CardBrain.score(option, state)
 			-- of stun in total, 8-10 s in the waves it happened at all, with 17 towers on the
 			-- field (under 2% of their time), mostly the one tower standing in the kill zone.
 			-- (Was 0.05 a stud from hearsay: reach 6 scored as a 30% loss.)
-			power /= 1 + amount * 0.008
+			-- (Measured again with reach 12 from wave 29 of a run that reached 49: 130-270 stunned
+			-- tower-seconds a wave with 17 towers, a fifth to a third of their time, and a
+			-- stunned Elfy can't cast. Reach 6 had cost under 2%. The cost grows faster than the
+			-- reach, so it is rated on the total in play: about 8% at 6, 25% at 12, 57% at 24.)
+			local function left(reach)
+				return 1 / (1 + (math.max(reach, 0) / 12) ^ 2 * 0.33)
+			end
+			local current = state.bomb or 0
+			power *= left(current + amount) / left(current)
 		elseif kind == "enemy_resistance_specific" then
 			-- Resistance is in points, not per cent (enemy sheets carry 100 and 150): damage
 			-- taken is 100 / (100 + points). (It was read as "minus that many per cent, at
