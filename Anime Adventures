@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v190", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v191", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -14173,9 +14173,12 @@ do
 	heading(page, "Classic theme")
 	toggle(page, "Play the classic theme", "ClassicTheme")
 	hint(page, "Loops the original theme song on its own. Switches off Custom music and My songs while it plays.")
-	slider(page, "Classic theme volume", "ClassicVolume", 0, 100, 5, function(v)
+	-- (Up to 500%: a Sound's Volume goes to 10, and at 100% the song was too quiet next to the
+	-- game with Roblox's own volume turned down.)
+	slider(page, "Classic theme volume", "ClassicVolume", 0, 500, 10, function(v)
 		return v .. "%"
 	end)
+	hint(page, "Over 100% is a boost. If it starts to crackle, come down a step.")
 	task.spawn(function()
 		local path, sound, was = "Potent/classic_theme_2.mp3", nil, false
 		while AA.alive do
@@ -14218,7 +14221,7 @@ do
 					end
 				end
 				if sound then
-					sound.Volume = Config.ClassicVolume / 100
+					sound.Volume = math.clamp(Config.ClassicVolume / 100, 0, 10)
 					if not sound.IsPlaying then
 						sound:Play()
 					end
