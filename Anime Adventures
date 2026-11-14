@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v200", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v201", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -151,6 +151,8 @@ local Config = {
 	AutoAbility = true,
 	SpellMode = "Safe",
 	CharmPick = "Auto",
+	CharmSell = false,
+	CharmKeep = 3,
 	PlaceStart = true,
 	RoadSpots = true,
 	Targeting = "Smart",
@@ -700,10 +702,120 @@ function AA.itemCounts()
 	end)
 	return counts
 end
+---The game's own record of an item (name, rarity, item_group, tier), or nil.
+function AA.itemInfo(id)
+	if AA.itemData == nil then
+		AA.itemData = gameRequire(replicatedStorage.src.Data.Items) or false
+	end
+	local info = AA.itemData and AA.itemData[id]
+	return type(info) == "table" and info or nil
+end
+---Everything owned, counted: normal items by id, unique items (portals, charms, skins) by item
+---id, units by unit id. ok is false while the profile has not loaded (an empty count taken
+---then would make the whole inventory look like a gain later).
+function AA.ownedCounts()
+	local counts = { items = {}, unique = {}, units = {}, ok = false }
+	pcall(function()
+		local data = profile()
+		local inventory = type(data.inventory) == "table" and data.inventory or {}
+		for id, amount in pairs(type(inventory.normal_items) == "table" and inventory.normal_items or {}) do
+			if type(amount) == "number" then
+				counts.items[tostring(id)] = amount
+			end
+		end
+		for _, item in pairs(type(inventory.unique_items) == "table" and inventory.unique_items or {}) do
+			local id = type(item) == "table" and item.item_id
+			if id then
+				counts.unique[tostring(id)] = (counts.unique[tostring(id)] or 0) + 1
+			end
+		end
+		for _, unit in pairs(collectionData().owned_units or {}) do
+			if type(unit) == "table" and unit.unit_id then
+				counts.units[tostring(unit.unit_id)] = (counts.units[tostring(unit.unit_id)] or 0) + 1
+			end
+		end
+		counts.ok = next(counts.units) ~= nil
+	end)
+	return counts
+end
 function AA.resetSession()
 	AA.progress.sessionAt = os.time()
 	AA.progress.sessionItems = AA.itemCounts()
+	local owned = AA.ownedCounts()
+	AA.progress.sessionOwned = owned.ok and owned or nil
 	AA.saveProgress()
+end
+---Every unit and item gained this session, most valuable first:
+---{ { group = "Units" | "Charms" | "Portals" | "Items", id, name, amount, rarity } }.
+---Two sources, and the larger figure of the two counts: what the match results listed (drops of
+---every run since the session began, also right while the match server's copy of the
+---inventory is behind), and the inventory now against the inventory when the session began
+---(which also sees what did not come from a match result).
+function AA.sessionGains()
+	local since = tonumber(AA.progress.sessionAt) or 0
+	local gained = {}
+	local function bump(key, amount)
+		gained[key] = (gained[key] or 0) + amount
+	end
+	for _, entry in ipairs(MatchLog) do
+		if type(entry) == "table" and (entry.at or 0) >= since and (entry.user == nil or entry.user == localPlayer.UserId) then
+			for id, amount in pairs(type(entry.items) == "table" and entry.items or {}) do
+				bump("item:" .. tostring(id), tonumber(amount) or 1)
+			end
+			for _, id in ipairs(type(entry.units) == "table" and entry.units or {}) do
+				bump("unit:" .. tostring(id), 1)
+			end
+		end
+	end
+	local now = AA.ownedCounts()
+	local base = AA.progress.sessionOwned
+	if type(base) ~= "table" and now.ok then
+		-- A session from before this was kept: counted from here on (the runs above still
+		-- cover everything since it began).
+		AA.progress.sessionOwned = now
+		base = now
+	end
+	if type(base) == "table" and base.ok and now.ok then
+		for _, kind in ipairs({ "items", "unique", "units" }) do
+			local before = type(base[kind]) == "table" and base[kind] or {}
+			for id, amount in pairs(now[kind]) do
+				local more = amount - (tonumber(before[id]) or 0)
+				local key = (kind == "units" and "unit:" or "item:") .. id
+				if more > (gained[key] or 0) then
+					gained[key] = more
+				end
+			end
+		end
+	end
+	local RANK = { Secret = 6, Mythic = 5, Legendary = 4, Epic = 3, Rare = 2, Uncommon = 1 }
+	local ORDER = { Units = 1, Charms = 2, Portals = 3, Items = 4 }
+	local rows = {}
+	for key, amount in pairs(gained) do
+		local kind, id = key:match("^(%a+):(.+)$")
+		if kind == "unit" then
+			local data = Units[id]
+			table.insert(rows, { group = "Units", id = id, name = tostring(data and data.name or id), amount = amount, rarity = data and data.rarity or "" })
+		elseif kind == "item" then
+			local info = AA.itemInfo(id)
+			local group = (info and info.item_group == "Charms") and "Charms" or (id:lower():find("portal", 1, true) and "Portals" or "Items")
+			local name = tostring(info and info.name or id)
+			if group == "Charms" and info and info.tier then
+				name = name .. ", tier " .. tostring(info.tier)
+			end
+			table.insert(rows, { group = group, id = id, name = name, amount = amount, rarity = info and info.rarity or "" })
+		end
+	end
+	table.sort(rows, function(a, b)
+		if a.group ~= b.group then
+			return ORDER[a.group] < ORDER[b.group]
+		elseif (RANK[a.rarity] or 0) ~= (RANK[b.rarity] or 0) then
+			return (RANK[a.rarity] or 0) > (RANK[b.rarity] or 0)
+		elseif a.name ~= b.name then
+			return a.name < b.name
+		end
+		return a.id < b.id
+	end)
+	return rows
 end
 function AA.session()
 	local since = tonumber(AA.progress.sessionAt) or 0
@@ -1280,16 +1392,19 @@ function AA.dailyKillQuest(forLevel)
 end
 
 ---Every portal item in the inventory: { uuid, id, name, tries, left, made }.
----Charms: one can be worn at a time (GameplaySettings.MAX_EQUIPPED_CHARMS = 1) and each rolls its
----own bonuses (_unique_charm_data._d = { { _t = "unit_damage", _d = 0.13 }, { _t = "reward_mul",
----_d = 0.16 } }, _e set while worn). Returns the best one for the chosen goal and the worn one.
-function AA.charmBest()
+---Charms (Summer Charm, tiers 1 to 4): one can be worn at a time, the inventory holds 8
+---(GameplaySettings.MAX_EQUIPPED_CHARMS / MAX_CHARM_SLOTS; at 8 the game stops giving charms),
+---and each rolls its own bonuses (_unique_charm_data._d = { { _t = "unit_damage", _d = 0.13 },
+---{ _t = "reward_mul", _d = 0.16 } }, _e set while worn). Selling one (delete_unique_items, the
+---inventory's own Delete) pays Summer Pearls.
+---Every charm owned, best first by the chosen goal: { uuid, id, tier, score, worn, text }.
+function AA.charms()
+	local list = {}
 	local unique = (profile().inventory or {}).unique_items
-	local best, worn
 	for _, item in pairs(type(unique) == "table" and unique or {}) do
 		local charm = type(item) == "table" and type(item._unique_item_data) == "table" and item._unique_item_data._unique_charm_data
 		if type(charm) == "table" and type(item.uuid) == "string" then
-			local score = 0
+			local score, parts = 0, {}
 			for _, bonus in pairs(type(charm._d) == "table" and charm._d or {}) do
 				local kind, weight = tostring(type(bonus) == "table" and bonus._t or ""), 1
 				if Config.CharmPick == "Damage" then
@@ -1297,38 +1412,161 @@ function AA.charmBest()
 				elseif Config.CharmPick == "Rewards" then
 					weight = kind:find("reward", 1, true) and 1 or 0.01
 				end
-				score += (type(bonus) == "table" and tonumber(bonus._d) or 0) * weight
+				local amount = type(bonus) == "table" and tonumber(bonus._d) or 0
+				score += amount * weight
+				local label = kind == "unit_damage" and "damage" or kind == "reward_mul" and "rewards" or kind:gsub("_", " ")
+				table.insert(parts, string.format("+%d%% %s", math.floor(amount * 100 + 0.5), label))
 			end
-			local entry = { uuid = item.uuid, id = tostring(item.item_id), score = score }
-			if charm._e ~= nil then
-				worn = entry
+			local info = AA.itemInfo(tostring(item.item_id))
+			table.sort(parts)
+			table.insert(list, {
+				uuid = item.uuid,
+				id = tostring(item.item_id),
+				tier = tonumber(info and info.tier) or tonumber(tostring(item.item_id):match("(%d+)$")) or 1,
+				score = score,
+				worn = charm._e ~= nil,
+				text = table.concat(parts, ", "),
+			})
+		end
+	end
+	table.sort(list, function(x, y)
+		if x.score ~= y.score then
+			return x.score > y.score
+		elseif x.tier ~= y.tier then
+			return x.tier > y.tier
+		end
+		return x.uuid < y.uuid
+	end)
+	return list
+end
+---Which charms go, by the rules of the Battle tab (nothing when Sell worse charms is off):
+---  with a tier 3 or better owned: every tier 1 and tier 2, and of each higher tier all but
+---  the best CharmKeep (3);
+---  before that: only the weakest, once more than 6 of the 8 slots are full, so the next drop
+---  always has room.
+---Returns the charms to sell and the full list (best first).
+function AA.charmPlan()
+	local list = AA.charms()
+	local sell = {}
+	if not Config.CharmSell then
+		return sell, list
+	end
+	local top = 0
+	for _, charm in ipairs(list) do
+		top = math.max(top, charm.tier)
+	end
+	if top >= 3 then
+		local keep = math.clamp(tonumber(Config.CharmKeep) or 3, 1, 8)
+		local kept = {}
+		for _, charm in ipairs(list) do
+			if charm.tier <= 2 then
+				charm.why = "tier " .. charm.tier .. ", and you own a tier " .. top
+				table.insert(sell, charm)
+			else
+				kept[charm.tier] = (kept[charm.tier] or 0) + 1
+				if kept[charm.tier] > keep then
+					charm.why = "more than " .. keep .. " of tier " .. charm.tier
+					table.insert(sell, charm)
+				end
 			end
-			if not best or score > best.score then
-				best = entry
+		end
+	else
+		local slots = tonumber(Core.Settings and Core.Settings.MAX_CHARM_SLOTS) or 8
+		local room = math.max(slots - 2, 1)
+		for index, charm in ipairs(list) do
+			if index > room then
+				charm.why = "the weakest, to keep two of the " .. slots .. " slots free"
+				table.insert(sell, charm)
 			end
 		end
 	end
-	return best, worn
+	return sell, list
 end
----Wear the best charm owned (lobby). A new drop that beats the worn one replaces it.
+---The best charm among the ones being kept, and the one worn now.
+function AA.charmBest()
+	local sell, list = AA.charmPlan()
+	local going = {}
+	for _, charm in ipairs(sell) do
+		going[charm.uuid] = true
+	end
+	local best, worn
+	for _, charm in ipairs(list) do
+		if charm.worn then
+			worn = charm
+		end
+		if not best and not going[charm.uuid] then
+			best = charm
+		end
+	end
+	return best, worn, worn ~= nil and going[worn.uuid] == true
+end
+---Sell what the plan says, never the charm that is worn and never the last one. The result is
+---read back from the inventory; a sale the game did not carry out is not tried again for ten
+---minutes. Returns how many were sold.
+function AA.charmTidy()
+	if not Config.CharmSell or os.clock() < (AA.charmSellHold or 0) then
+		return 0
+	end
+	local sell, list = AA.charmPlan()
+	local uuids, words = {}, {}
+	for _, charm in ipairs(sell) do
+		if not charm.worn then
+			table.insert(uuids, charm.uuid)
+			table.insert(words, "tier " .. charm.tier .. " (" .. charm.text .. ")")
+		end
+	end
+	if #uuids == 0 or #uuids >= #list then
+		return 0
+	end
+	AA.charmSellHold = os.clock() + 20
+	invoke("delete_unique_items", uuids)
+	task.wait(1.5)
+	local left = {}
+	for _, charm in ipairs(AA.charms()) do
+		left[charm.uuid] = true
+	end
+	local sold = 0
+	for _, uuid in ipairs(uuids) do
+		if not left[uuid] then
+			sold += 1
+		end
+	end
+	note("charmSell", { asked = #uuids, sold = sold })
+	if sold == 0 then
+		AA.charmSellHold = os.clock() + 600
+		return 0
+	end
+	local text = string.format("Sold %d %s: %s.", sold, sold == 1 and "charm" or "charms", table.concat(words, "; "))
+	AA.progress.charmLog = type(AA.progress.charmLog) == "table" and AA.progress.charmLog or {}
+	table.insert(AA.progress.charmLog, { at = os.time(), text = text })
+	while #AA.progress.charmLog > 10 do
+		table.remove(AA.progress.charmLog, 1)
+	end
+	AA.saveProgress()
+	if AA.traitNotice then
+		pcall(AA.traitNotice, "Charms", text, 12)
+	end
+	return sold
+end
+---Wear the best charm that is being kept (lobby), then sell what the plan says.
 function AA.charmStep()
-	if Config.CharmPick == "Off" then
-		return
+	if Config.CharmPick ~= "Off" then
+		-- (wornGoes: the worn one is on the list to sell, so the best kept one takes its place
+		-- even when its bonuses add up to less.)
+		local best, worn, wornGoes = AA.charmBest()
+		-- One try per charm every ten minutes, in case the server says no.
+		if best and not (worn and worn.uuid == best.uuid) and (not worn or wornGoes or best.score > worn.score + 1e-6)
+			and not (AA.charmTried == best.uuid and os.clock() - (AA.charmTriedAt or 0) < 600) then
+			AA.charmTried, AA.charmTriedAt = best.uuid, os.clock()
+			if worn then
+				invoke("request_unequip_charm", worn.uuid)
+				task.wait(0.5)
+			end
+			invoke("use_unique_item", best.uuid)
+			task.wait(0.5)
+		end
 	end
-	local best, worn = AA.charmBest()
-	if not best or (worn and best.score <= worn.score + 1e-6) then
-		return
-	end
-	-- One try per charm every ten minutes, in case the server says no.
-	if AA.charmTried == best.uuid and os.clock() - (AA.charmTriedAt or 0) < 600 then
-		return
-	end
-	AA.charmTried, AA.charmTriedAt = best.uuid, os.clock()
-	if worn then
-		invoke("request_unequip_charm", worn.uuid)
-		task.wait(0.5)
-	end
-	invoke("use_unique_item", best.uuid)
+	AA.charmTidy()
 end
 
 function AA.portalItems()
@@ -1619,6 +1857,33 @@ end
 ---(Summer Hunt, hxhant map: enemies died at 10-30% of the road for 38 of 42 waves while the whole
 ---team stood at 55-79%; a Water Goddess at 3% dealt 15M against 2-6M for the ones mid-road.)
 function AA.fightBand()
+	-- The usual depth says where enemies die on an ordinary wave. A match is lost in its last
+	-- waves, when they get much further (Summer Hunt on Go for Pearls: 10 to 30% of the road
+	-- for forty waves, then 50 to 100%). Planned on the usual depth alone, the whole team hugged
+	-- the first stretch of the road and gave up the spots that see the most of it: a Zombie on
+	-- 64 studs of a 257-stud road with 104 on offer, two Elyssias on 35 with 52 on offer. So
+	-- the road counts in full as far as enemies got in the last three runs on this stage and
+	-- map (the whole road after a lost run), and as far as they have got in this one.
+	local usual = AA.usualDepth()
+	if not usual then
+		return nil
+	end
+	local deep = usual
+	local marks = type(AA.progress.deeps) == "table" and AA.progress.deeps[AA.depthKey()]
+	if type(marks) == "table" and #marks > 0 then
+		for _, mark in ipairs(marks) do
+			deep = math.max(deep, tonumber(mark) or 0)
+		end
+	elseif AA.lostWave(Match.levelId) then
+		-- Nothing kept for this map yet, and the stage was lost in the last day.
+		deep = 1
+	end
+	for _, depth in pairs(Match.depthByWave or {}) do
+		deep = math.max(deep, depth)
+	end
+	return math.min(deep, 1)
+end
+function AA.usualDepth()
 	local list = {}
 	for _, depth in pairs(Match.depthByWave or {}) do
 		table.insert(list, depth)
@@ -6819,12 +7084,25 @@ local function finishMatch()
 	end
 	if not gaveUp and AA.leakKey() ~= "?" and Config.PlaceStyle == "Auto" then
 		AA.progress.paces = type(AA.progress.paces) == "table" and AA.progress.paces or {}
-		AA.progress.paces[AA.leakKey()] = (Match.everLong or not won) and "long" or "speed"
-		local band = AA.fightBand()
+		-- The deepest any wave got (the whole road when the base fell), kept for three runs.
+		local deepest = won and 0 or 1
+		for _, depth in pairs(Match.depthByWave or {}) do
+			deepest = math.max(deepest, depth)
+		end
+		deepest = math.floor(math.min(deepest, 1) * 100) / 100
+		AA.progress.paces[AA.leakKey()] = (Match.everLong or not won or deepest >= 0.45) and "long" or "speed"
+		local band = AA.usualDepth()
 		if band then
 			AA.progress.depths = type(AA.progress.depths) == "table" and AA.progress.depths or {}
 			AA.progress.depths[AA.depthKey()] = math.floor(band * 100) / 100
 		end
+		AA.progress.deeps = type(AA.progress.deeps) == "table" and AA.progress.deeps or {}
+		local marks = type(AA.progress.deeps[AA.depthKey()]) == "table" and AA.progress.deeps[AA.depthKey()] or {}
+		table.insert(marks, deepest)
+		while #marks > 3 do
+			table.remove(marks, 1)
+		end
+		AA.progress.deeps[AA.depthKey()] = marks
 	end
 	AA.saveProgress()
 	status = won and "Won" or (gaveUp and "Ended by a vote" or "Lost")
@@ -7176,6 +7454,10 @@ local function matchLoop()
 				-- switched on and never off again, so turning Skip waves off changed nothing).
 				if #playersService:GetPlayers() > 1 then
 					Match.sawOthers = true
+				end
+				if Config.CharmSell and os.clock() - (AA.charmTidyAt or 0) > 60 then
+					AA.charmTidyAt = os.clock()
+					task.spawn(pcall, AA.charmTidy)
 				end
 				local hold = Config.AutoSkip and AA.holdSkip() or false
 				local on = Config.AutoSkip == true and not hold
@@ -15236,6 +15518,8 @@ do
 				table.insert(names, entry[1])
 			end
 			view.items = UI.tiles(page, names)
+			view.gains = UI.list(page)
+			hint(page, "The figures on top are what you have now against the start of the session, so spending shows too. The list under them is everything the runs gave you: units, charms, portals and every other item.")
 			heading(page, "Account", "left")
 			view.account = {}
 			for _, name in ipairs({ "Gems", "Gold", "Level XP", "Units placed", "Upgrades", "Summons", "Codes redeemed" }) do
@@ -15628,7 +15912,10 @@ do
 			toggle(page, "Let other players pick", "SkipCards", "Turns on the game's own Auto-Skip Card Votes. In a match with other players your vote is then not counted.")
 
 			heading(page, "Charm", "right", "Charms work in Summer Hunt and Sky portals, and only one can be worn.")
-			segmented(page, "Wear", "CharmPick", { "Off", "Auto", "Damage", "Rewards" }, "Put on in the lobby. Auto: highest total bonus. Charms are never sold.")
+			segmented(page, "Wear", "CharmPick", { "Off", "Auto", "Damage", "Rewards" }, "Put on in the lobby. Auto: highest total bonus.")
+			toggle(page, "Sell worse charms", "CharmSell", "You can hold 8 charms and get no more past that. With a tier 3 or better owned, every tier 1 and tier 2 is sold for pearls and the best 3 of each higher tier stay. Before that only the weakest goes, once 7 slots are full. The charm you wear is never sold.")
+			view.charmSlots = UI.kv(page, "Charms held")
+			view.charmNote = UI.note(page, "")
 
 			heading(page, "Pearl shop", "left")
 			toggle(page, "Buy Sunny Stars", "BuyCapsules", "With pearls, in the lobby.")
@@ -17257,6 +17544,52 @@ do
 				for _, entry in ipairs(AA.TRACKED) do
 					local gained = session.items[entry[2]] or 0
 					view.items[entry[1]].Text = (gained > 0 and "+" or "") .. tostring(gained)
+				end
+				-- (Every two seconds: the list walks the match log and the whole inventory.)
+				if os.clock() - (view.gainsAt or 0) > 2 then
+					view.gainsAt = os.clock()
+					pcall(function()
+						local tracked = {}
+						for _, entry in ipairs(AA.TRACKED) do
+							tracked[tostring(entry[2])] = true
+						end
+						local rows, group = {}, nil
+						for _, gain in ipairs(AA.sessionGains()) do
+							if not tracked[gain.id] then
+								if gain.group ~= group then
+									group = gain.group
+									table.insert(rows, { title = group })
+								end
+								table.insert(rows, { name = gain.name, value = "+" .. tostring(gain.amount), extra = gain.rarity ~= "" and gain.rarity or nil, accent = gain.group ~= "Items" })
+							end
+						end
+						if #rows == 0 then
+							rows = { { note = "Nothing yet. Everything a run gives you is listed here." } }
+						end
+						view.gains(rows)
+						local sell, held = AA.charmPlan()
+						local slots = tonumber(Core.Settings and Core.Settings.MAX_CHARM_SLOTS) or 8
+						local top = 0
+						for _, charm in ipairs(held) do
+							top = math.max(top, charm.tier)
+						end
+						view.charmSlots.Text = #held == 0 and ("None of " .. slots) or string.format("%d of %d, best is tier %d", #held, slots, top)
+						local last = type(AA.progress.charmLog) == "table" and AA.progress.charmLog[#AA.progress.charmLog]
+						local text
+						if not Config.CharmSell then
+							text = "Nothing is sold."
+						elseif #sell > 0 then
+							text = string.format("%d to sell%s.", #sell, IS_LOBBY and "" or " (the one you wear waits for the lobby)")
+						elseif top >= 3 then
+							text = "Nothing to sell: only your best tier 3 and up are left."
+						else
+							text = "No tier 3 yet: tier 1 and 2 stay until one drops."
+						end
+						if type(last) == "table" and last.text then
+							text = text .. " Last: " .. tostring(last.text)
+						end
+						view.charmNote.Text = text
+					end)
 				end
 				local account = view.account
 				account["Gems"].Text = tostring(stats:FindFirstChild("gem_amount") and stats.gem_amount.Value or pd.gem_amount)
