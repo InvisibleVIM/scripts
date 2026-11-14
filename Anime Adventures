@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v204", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v205", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -6643,14 +6643,28 @@ do
 				if best then
 					hold = false
 				end
-				if not best then
+				if not best and not hold then
 					-- No main can: any other copy standing in the damage that happens to carry a
 					-- buff (placed after the last cast and fed since) does it just as well.
+					-- (Under the same four-second rule as the mains, and not while a main is waiting
+					-- its four seconds out. With six Elfys down, two of them were such copies: a feed
+					-- at the opening buffed them along with the mains, one of them cast the full buff
+					-- a twentieth of a second later, and with that the feed and the full buff ran out
+					-- at the same instant every 30 s. Whatever stood in a feeder's reach took the feed
+					-- first, +50%, and ignored the full cast: seven units at half buff for a whole
+					-- match.)
 					for _, unit in ipairs(feeders) do
 						local rate, ends = Conductor.rate(unit, name)
-						if info[unit].inside and info[unit].total >= most * 0.8 and rate >= 0.3 and ends - now > 0.25 and opening(info[unit]) and isReady(unit) and rate > bestRate then
-							best, bestRate = unit, rate
+						if info[unit].inside and info[unit].total >= most * 0.8 and rate >= 0.3 and ends - now > 0.25 and opening(info[unit]) and isReady(unit) then
+							if Conductor.lastMain[name] and now - Conductor.since(unit, name) < 4 and ends - now > 1.5 then
+								hold = true
+							elseif rate > bestRate then
+								best, bestRate = unit, rate
+							end
 						end
+					end
+					if best then
+						hold = false
 					end
 				end
 				if best then
