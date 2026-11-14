@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v201", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v202", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -1979,10 +1979,19 @@ function AA.laneWeights(towers)
 				end
 			end
 			weights[lane] = (0.5 + depth) * math.clamp((total / count + 1) / (have[lane] + 1), 0.5, 2.5)
-		else
-			-- (Closed for now. It opens later in the match, so it counts like the others.)
-			weights[lane] = 1
 		end
+	end
+	-- A road that is closed for now opens later in the match, so it counts like the open ones:
+	-- their average, never more. (It used to be a flat 1 against 0.5 for an open road nothing
+	-- had walked yet: on Sky Island the first unit of the match went where a wide circle saw the
+	-- most of the CLOSED road, the whole buff group followed her, and the team held one road
+	-- of three. Lost at wave 15 with four players.)
+	local sum = 0
+	for lane = 1, count do
+		sum += weights[lane] or 0
+	end
+	for lane = 1, count do
+		weights[lane] = weights[lane] or (open > 0 and sum / open or 1)
 	end
 	return weights, math.max(open, 1)
 end
@@ -3329,6 +3338,22 @@ function AA.laneShare(hits)
 	return math.max(reached / count, 0.2) ^ 2
 end
 
+---What a spot sees, in one figure that means the same for every unit: studs of road within
+---`range` (measured in 3D), each road weighed by AA.laneWeights, times the share of the roads
+---reached (AA.laneShare).
+function AA.roadSeen(position, range, weights)
+	local sum, hits = 0, {}
+	local range2 = range * range
+	pathWithin(position.X, position.Z, range, function(point, _, _, d2)
+		d2 += (point.position.Y - position.Y) ^ 2
+		if d2 <= range2 then
+			hits[point.lane] = (hits[point.lane] or 0) + 1
+			sum += weights and weights[point.lane] or 1
+		end
+	end)
+	return sum * AA.laneShare(hits)
+end
+
 ---What a unit's damage is worth against this match's enemies in the air. "Flying enemies take
 ---50% less damage from ground attacks without Anti-Air": a unit on a hill, or one whose attack
 ---has Anti-Air at that level, loses nothing; any other loses half of what it deals to the share
@@ -3368,7 +3393,7 @@ function AA.soaringMatch()
 	return level:find("sky", 1, true) ~= nil
 end
 
-local function bestSpot(data, focus, only)
+local function bestSpot(data, focus, only, free)
 	if Match.spots and Match.spotsRoad ~= Config.RoadSpots then
 		Match.spots = nil
 	end
@@ -3383,13 +3408,13 @@ local function bestSpot(data, focus, only)
 		-- the units that have no choice. With Soaring enemies in the match the hill always
 		-- wins; without them it wins unless it sees less than half the road the best ground
 		-- spot does (a buffer: unless it covers noticeably less of the team).
-		local hillSpot, hillDirection = bestSpot(data, focus, "hill")
+		local hillSpot, hillDirection = bestSpot(data, focus, "hill", free)
 		local hillScore, hillKind = Match.spotScore, Match.spotKind
 		if hillSpot then
 			if AA.soaringMatch() and not AA.buffInfo(data) then
 				return hillSpot, hillDirection
 			end
-			local groundSpot, groundDirection = bestSpot(data, focus, "ground")
+			local groundSpot, groundDirection = bestSpot(data, focus, "ground", free)
 			local groundScore = Match.spotScore
 			if groundSpot and Match.spotKind == "feeder" and hillKind ~= "feeder" then
 				-- A feeding spot (in reach of the casting copies, clear of the damage) exists
@@ -3405,7 +3430,7 @@ local function bestSpot(data, focus, only)
 		end
 		only = "ground"
 	end
-	Match.spotScore, Match.spotKind = nil, nil
+	Match.spotScore, Match.spotKind, Match.spotInGroup, Match.spotRange = nil, nil, nil, nil
 	local pool
 	if data.hill_unit or only == "hill" then
 		pool = { spots.hill }
@@ -3428,6 +3453,7 @@ local function bestSpot(data, focus, only)
 			end
 		end
 	end
+	Match.spotRange = math.max(unitStatsAt(data, 0).range, unitStatsAt(data, maxLevel).range, 2.5) * rangeMul
 	-- Units that never attack (farms like C.E.O.) go on the sidelines: as far from the road as the
 	-- map allows, packed together, so road-side spots stay free for damage units.
 	local attacks = false
@@ -3714,7 +3740,11 @@ local function bestSpot(data, focus, only)
 		-- explosions take their damage from her, and the eels she calls appear next to her.
 		-- With the chain down: inside every copy's range. Before it: next to the damage units
 		-- of that type, which is where the chain will be built.
-		local circles = buffHub(data)
+		local circles = not free and buffHub(data) or nil
+		-- The first unit of a buff group picks the place for all of it.
+		-- (Maps with several roads only: on one road the old scoring has been seen to work, and
+		-- the new one has not been tried there.)
+		local groupFirst = circles ~= nil and #circles == 0 and (Match.laneCount or 1) > 1
 		if circles then
 			if #circles > 0 then
 				-- Inside the buff, the spot that sees the most road: her own range is what her
@@ -3796,6 +3826,7 @@ local function bestSpot(data, focus, only)
 					end
 					local best = AA.pickCovered(found)
 					if best then
+						Match.spotInGroup = true
 						return best
 					end
 					local anyAvoid = false
@@ -3821,8 +3852,34 @@ local function bestSpot(data, focus, only)
 		-- most road. (Guessing three times her range put her where a 60-stud circle saw the
 		-- most, with her own 32 studs on 109 of the road's 303 points and 126 free nearby.)
 		local knownReach = type(AA.progress.summonRange) == "table" and tonumber(AA.progress.summonRange[data.id]) or nil
+		if knownReach and knownReach >= 75 and (Match.laneCount or 1) > 1 then
+			-- A summon that reaches this far (Elyssia's: 184 studs) hits the road from wherever she
+			-- stands, so it says nothing about where she should stand. It used to be scored as a
+			-- 75-stud circle around her, which is nearly flat across a map and tipped by the
+			-- smallest weight.
+			knownReach = nil
+		end
 		local ownLater = math.max(unitStatsAt(data, 0).range, unitStatsAt(data, maxLevel).range) * rangeMul
 		local summonReach = math.max(knownReach and math.clamp(knownReach, range, 75) or 0, ownLater, range)
+		if groupFirst then
+			-- The buffers and every damage unit they boost will stand around her: her spot is
+			-- judged by what THEY see from there, a circle of the range the rest of the team has.
+			local ranges = {}
+			for _, entry in ipairs(equippedUnits()) do
+				local other = entry.data
+				if entry.id ~= data.id and other and not AA.buffInfo(other) then
+					local top = other.upgrade and #other.upgrade or 0
+					if unitStatsAt(other, top).farm <= 0 and (unitStatsAt(other, top).dps > 0 or AA.isSummoner(entry.id)) then
+						local mul = statMul(entry.unit, "range")
+						table.insert(ranges, unitStatsAt(other, top).range * (type(mul) == "number" and mul == mul and math.clamp(mul, 1, 2) or 1))
+					end
+				end
+			end
+			table.sort(ranges)
+			if #ranges > 0 then
+				summonReach = math.max(summonReach, math.min(ranges[math.ceil(#ranges / 2)], 45))
+			end
+		end
 		local ownReach2 = (unitStatsAt(data, 0).range * rangeMul) ^ 2
 		local seenSpots, sliceAt = 0, os.clock()
 		local found = {}
@@ -3899,7 +3956,7 @@ local function bestSpot(data, focus, only)
 							end
 							score = sum - spot.gap * 0.05
 						end
-						table.insert(found, { spot = spot, early = early, score = score })
+						table.insert(found, { spot = spot, early = groupFirst and 0 or early, score = score })
 					end
 				end
 			end
@@ -3931,7 +3988,8 @@ local function bestSpot(data, focus, only)
 		end
 	end
 	local circles, firstGap
-	if not focus then
+	local bestPass
+	if not focus and not free then
 		circles, firstGap = buffHub(data)
 		if circles and #circles == 0 then
 			circles = nil
@@ -4065,6 +4123,7 @@ local function bestSpot(data, focus, only)
 					end
 					if score > bestScore then
 						best, bestScore, bestDirection = spot, score, direction
+						bestPass = pass
 					end
 				end
 			end
@@ -4073,7 +4132,36 @@ local function bestSpot(data, focus, only)
 	end
 	end
 	Match.spotScore = best and bestScore or nil
+	Match.spotInGroup = best ~= nil and circles ~= nil and bestPass ~= nil and bestPass < 3 or nil
 	return best, bestDirection
+end
+
+---Maps with two or three roads: the buff group is worth staying in only while it sees the roads.
+---A spot inside the group is compared with the best spot anywhere, both measured the same way
+---(AA.roadSeen at the unit's full range), and the unit leaves the group when the open spot sees
+---more than two and a half times as much: the full buff doubles its damage, it does not triple
+---it. (Sky Island: the group stood on one road; Shadow Sorcerers inside it saw 78 to 124 studs
+---with 300 to 370 on offer, Water Goddesses 28 to 38 with 250 on offer, and one road had a
+---single unit on it.)
+local groupSpot = bestSpot
+bestSpot = function(data, focus, only, free)
+	local spot, direction = groupSpot(data, focus, only, free)
+	if free or focus or not spot or not Match.spotInGroup or (Match.laneCount or 1) <= 1 or not Match.spotRange
+		or (data.hybrid_placement and not data.hill_unit and not only) then
+		return spot, direction
+	end
+	local score, kind, range = Match.spotScore, Match.spotKind, Match.spotRange
+	local weights = AA.laneWeights(myUnits())
+	local inside = AA.roadSeen(spot.position, range, weights)
+	local openSpot, openDirection = groupSpot(data, focus, only, true)
+	local outside = openSpot and AA.roadSeen(openSpot.position, range, weights) or 0
+	if openSpot and outside > inside * 2.5 then
+		note("leftGroup", { u = data.id, inside = math.floor(inside), outside = math.floor(outside) })
+		Match.spotInGroup = nil
+		return openSpot, openDirection
+	end
+	Match.spotScore, Match.spotKind, Match.spotInGroup = score, kind, true
+	return spot, direction
 end
 
 local function nearestPathPoint(position)
@@ -4158,7 +4246,9 @@ local function placeUnit(entry, focus)
 			end
 		end
 	end
-	if spot.roof and Match.spots then
+	if spot.roof and spot.roof < 8 and Match.spots then
+		-- (Only under a low roof: one refusal with no message at a spot with 16.9 studs of
+		-- headroom struck 2,283 spots off Sky Island's list for the whole match.)
 		-- Refused under a roof: every covered spot with no more headroom than this one goes
 		-- with it. (Where the server draws that line is a guess between one spot it took, 4.7
 		-- studs of headroom, and one it refused, 0.9; one match logged 32 refusals in a row.)
