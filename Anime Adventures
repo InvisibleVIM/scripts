@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v188", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v189", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -166,6 +166,7 @@ local Config = {
 	CardListOn = false,
 	CardList = "[]",
 	CardBan = "[]",
+	PearlsOnlyCurses = true,
 	CardAddName = "",
 	OpeningCore = true,
 	ChallengeFallback = "Story",
@@ -9224,7 +9225,7 @@ function CardBrain.choose(options)
 		end
 	end
 	local banned = CardBrain.banned()
-	if mode == "Pearls" then
+	if mode == "Pearls" and Config.PearlsOnlyCurses then
 		-- Pearls: curses only (they are what pays), and of the curses on offer the one that
 		-- costs the team the least; the pay only breaks a tie. A blessing is taken when no
 		-- curse is offered (or every curse on offer is on the never list).
@@ -12711,7 +12712,9 @@ do
 	heading(page, "Event cards")
 	toggle(page, "Auto pick cards", "AutoCards")
 	segmented(page, "", "CardMode", { "Safe", "Balanced", "Pearls" })
-	hint(page, "Safe: always the card that keeps the team strongest. Balanced: the same until the stage has been cleared once, then challenge cards for more pearls while the run is comfortable. Pearls: only curses, always the one that costs your team the least; a blessing only when no curse is offered. Your own order and never list below still come first.")
+	hint(page, "Safe: always the card that keeps the team strongest. Balanced: the same until the stage has been cleared once, then challenge cards for more pearls while the run is comfortable. Pearls: curses from the start. Your own order and never list below still come first.")
+	toggle(page, "Pearls: only ever take curses", "PearlsOnlyCurses")
+	hint(page, "On: at every vote the curse that costs your team the least, a blessing only when no curse is offered. That is thirteen or more curses by wave 40, and no run has got past wave 46 with it. Off: curses while the run can afford them and a blessing when it can't, which is how the runs that reached wave 50 were played (a clear pays about 800 pearls on top).")
 	do
 		local CardBrain = AA.CardBrain
 		local listLine
