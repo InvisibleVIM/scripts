@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v214", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v215", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -746,6 +746,93 @@ function AA.resetSession()
 	AA.progress.sessionOwned = owned.ok and owned or nil
 	AA.saveProgress()
 end
+---The last matches for the Home tab's log, newest first: a line with the match and the time it took, then a
+---note with how it ended, what kind it was, when, and everything it gave.
+function AA.matchRows(limit)
+	local function commas(value)
+		local text = tostring(math.floor(value + 0.5))
+		return #text > 3 and (text:reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", "")) or text
+	end
+	local function took(seconds)
+		seconds = math.max(math.floor(tonumber(seconds) or 0), 0)
+		if seconds >= 3600 then
+			return ("%dh %02dm"):format(seconds // 3600, seconds % 3600 // 60)
+		elseif seconds >= 60 then
+			return ("%dm %02ds"):format(seconds // 60, seconds % 60)
+		end
+		return seconds .. "s"
+	end
+	local KINDS = { Raid = "Raid", Portal = "Portal", Castle = "Infinity Castle", Daily = "Daily Challenge", Challenge = "Challenge", Story = "Story", Infinite = "Infinite", Legend = "Legend Stage" }
+	local rows, shown = {}, 0
+	for index = #MatchLog, 1, -1 do
+		local entry = MatchLog[index]
+		if type(entry) == "table" and (entry.user == nil or entry.user == localPlayer.UserId) then
+			shown += 1
+			if shown > limit then
+				break
+			end
+			if shown > 1 then
+				table.insert(rows, { gap = true })
+			end
+			local summer = tostring(entry.level):find("summer", 1, true) ~= nil
+			local kind = tostring(entry.level) == "summer2_event" and "Summer Hunt" or KINDS[tostring(entry.mode)] or tostring(entry.mode or "Match")
+			local name = tostring(entry.name or entry.level or kind)
+			local ending
+			if entry.won then
+				ending = entry.waves and ("Won, %d waves"):format(entry.waves) or "Won"
+			else
+				ending = (entry.gaveUp and "Ended by vote" or "Lost") .. (entry.wave and (" at wave %d"):format(entry.wave) or "") .. ((entry.wave and entry.waves) and (" of %d"):format(entry.waves) or "")
+			end
+			table.insert(rows, { name = name, value = took(entry.time), tick = entry.won == true, accent = entry.won == true })
+			local got = {}
+			if (tonumber(entry.eventCash) or 0) > 0 then
+				table.insert(got, commas(entry.eventCash) .. (summer and " Summer Pearls" or " event currency"))
+			end
+			for resource, amount in pairs(type(entry.rewards) == "table" and entry.rewards or {}) do
+				if not (resource == "GemsLegacy" and (tonumber(entry.gems) or 0) > 0) then
+					table.insert(got, commas(amount) .. " " .. tostring(resource):gsub("(%l)(%u)", "%1 %2") .. " on clearing")
+				end
+			end
+			if (tonumber(entry.gems) or 0) > 0 then
+				table.insert(got, commas(entry.gems) .. " gems")
+			end
+			if (tonumber(entry.gold) or 0) > 0 then
+				table.insert(got, commas(entry.gold) .. " gold")
+			end
+			if (tonumber(entry.xp) or 0) >= 1 then
+				table.insert(got, commas(entry.xp) .. " XP")
+			end
+			local units = {}
+			for _, id in ipairs(type(entry.units) == "table" and entry.units or {}) do
+				units[id] = (units[id] or 0) + 1
+			end
+			local things = {}
+			for id, amount in pairs(units) do
+				local data = Units[id]
+				table.insert(things, tostring(data and data.name or id) .. " (unit" .. (data and data.rarity and (", " .. tostring(data.rarity)) or "") .. ")" .. (amount > 1 and (" x" .. amount) or ""))
+			end
+			for id, amount in pairs(type(entry.items) == "table" and entry.items or {}) do
+				local info = AA.itemInfo(tostring(id))
+				local label = tostring(info and info.name or id)
+				if info and info.item_group == "Charms" and info.tier then
+					label = label .. " tier " .. tostring(info.tier)
+				end
+				table.insert(things, label .. ((tonumber(amount) or 1) > 1 and (" x" .. commas(amount)) or ""))
+			end
+			table.sort(things)
+			for _, thing in ipairs(things) do
+				table.insert(got, thing)
+			end
+			local when = os.date("%b %d, %H:%M", tonumber(entry.at) or 0)
+			table.insert(rows, { note = ("%s. %s%s.\n%s"):format(ending, kind ~= name and (kind .. ", ") or "", when, #got > 0 and ("Got: " .. table.concat(got, ", ") .. ".") or "Got nothing.") })
+		end
+	end
+	if #rows == 0 then
+		rows = { { note = "No matches logged yet." } }
+	end
+	return rows
+end
+
 ---Every unit and item gained this session, most valuable first:
 ---{ { group = "Units" | "Charms" | "Portals" | "Items", id, name, amount, rarity } }.
 ---Two sources, and the larger figure of the two counts: what the match results listed (drops of
@@ -7641,6 +7728,29 @@ local function finishMatch()
 	for _, unit in pairs(type(result.new_units) == "table" and result.new_units or {}) do
 		table.insert(units, type(unit) == "table" and tostring(unit.unit_id or unit.id) or tostring(unit))
 	end
+	pcall(function()
+		local before, owned = Match.ownedAt, AA.ownedCounts()
+		if type(before) ~= "table" or not before.ok or not owned.ok then
+			return
+		end
+		for _, kind in ipairs({ "items", "unique" }) do
+			for itemId, amount in pairs(owned[kind]) do
+				local gained = amount - (before[kind][itemId] or 0)
+				if gained > (items[itemId] or 0) then
+					items[itemId] = gained
+				end
+			end
+		end
+		local have = {}
+		for _, unitId in ipairs(units) do
+			have[unitId] = (have[unitId] or 0) + 1
+		end
+		for unitId, amount in pairs(owned.units) do
+			for _ = 1, amount - (before.units[unitId] or 0) - (have[unitId] or 0) do
+				table.insert(units, unitId)
+			end
+		end
+	end)
 	local summary = {
 		level = id,
 		name = data.name,
@@ -7665,6 +7775,15 @@ local function finishMatch()
 		gems = tonumber(result.gem_reward),
 		gold = tonumber(result.gold_reward),
 		xp = tonumber(result.xp_reward),
+		rewards = (function()
+			local paid = {}
+			for name, amount in pairs(type(result.resource_reward) == "table" and result.resource_reward or {}) do
+				if type(amount) == "number" and amount > 0 then
+					paid[tostring(name)] = amount
+				end
+			end
+			return next(paid) and paid or nil
+		end)(),
 		first = result.first_completion or nil,
 		items = next(items) and items or nil,
 		units = #units > 0 and units or nil,
@@ -7732,6 +7851,7 @@ local function resetMatch()
 	Match.leakKey = nil
 	Match.extraDamage = nil
 	Match.dropLog = nil
+	Match.ownedAt = AA.ownedCounts()
 	Match.killsPhase = nil
 	Match.voteNoted = nil
 	Match.startVote, Match.startVotesSeen, Match.startTimeFirst = nil, nil, nil
@@ -16202,6 +16322,9 @@ do
 					task.wait(IS_LOBBY and 20 or 60)
 				end
 			end)
+			heading(page, "Match log", "right")
+			view.matchLog = UI.list(page)
+			hint(page, "Your last 10 matches, newest first: what it was and how it ended, how long it took, and everything it gave you. Currency paid in the lobby afterwards is not in a match's line.")
 		end
 
 		-- Mode: which mode, what happens between matches, who you play with.
@@ -18177,6 +18300,9 @@ do
 							rows = { { note = "Nothing yet. Everything a run gives you is listed here." } }
 						end
 						view.gains(rows)
+						pcall(function()
+							view.matchLog(AA.matchRows(10))
+						end)
 						local sell, held = AA.charmPlan()
 						local slots = tonumber(Core.Settings and Core.Settings.MAX_CHARM_SLOTS) or 8
 						local top = 0
