@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v206", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v207", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -10299,13 +10299,81 @@ end
 -- The user's own order of cards. A card is known by its name without the tier ("+ Enemy
 -- Health III" -> "+ Enemy Health") and without the little picture some names start with.
 CardBrain.FAMILIES = {
-	{ "+ Attack", true }, { "+ Range", true }, { "- Cooldown", true }, { "- Active Cooldown", true }, { "+ Boss Damage", true },
-	{ "+ Double Attack, Double Cooldown", true }, { "+ Yen", true }, { "Leyline", true }, { "Mana Surge", true }, { "Dispel", true },
-	{ "Cinders", true }, { "Mud", true }, { "Rain Barrel", true },
-	{ "+ Enemy Health", false }, { "+ Enemy Speed", false }, { "+ Enemy Regen", false }, { "+ Enemy Shield", false },
-	{ "+ Explosive Deaths", false }, { "+ Plated Enemies", false }, { "+ Resistant Enemies", false }, { "+ Spellproof Enemies", false },
-	{ "Arcane Storm", false }, { "Arcane Ward", false }, { "Mana Shield", false }, { "Flash Flood", false }, { "Heatwave", false },
-	{ "Phoenix", false }, { "Scorch", false }, { "Torrent", false }, { "Washout", false },
+	{ "+ Attack", true }, { "+ Range", true }, { "- Cooldown", true }, { "- Active Cooldown", true }, { "+ Boss Damage", true }, { "+ Yen", true },
+	{ "+ Double Attack, Double Cooldown", true }, { "+ Double Attack, Half Range", true }, { "+ Random Blessings", true }, { "Cinders", true },
+	{ "Mud", true }, { "Firebreak", true }, { "Rain Barrel", true }, { "Kite Strings", true }, { "Grounded", true }, { "Leyline", true },
+	{ "Mana Surge", true }, { "Dispel", true }, { "Bonfire", true }, { "Frostbite", true }, { "Ice Breaker", true }, { "Clear Skies", true },
+	{ "Sandblast", true }, { "Buried Treasure", true }, { "Stardust", true }, { "Low Tide", true }, { "Salvage", true },
+	{ "+ Random Curses", false }, { "+ Enemy Health", false }, { "+ Enemy Speed", false }, { "+ Enemy Regen", false }, { "+ Enemy Shield", false },
+	{ "+ Explosive Deaths", false }, { "+ Plated Enemies", false }, { "+ Spellproof Enemies", false }, { "+ Resistant Enemies", false },
+	{ "Gale", false }, { "Cyclone", false }, { "Crosswind", false }, { "Scorch", false }, { "Flash Flood", false }, { "Heatwave", false },
+	{ "Washout", false }, { "Phoenix", false }, { "Torrent", false }, { "Arcane Storm", false }, { "Arcane Ward", false }, { "Mana Shield", false },
+	{ "Whiteout", false }, { "Permafrost", false }, { "Hailstorm", false }, { "Sand Armor", false }, { "Haboob", false }, { "Dust Devil", false },
+	{ "Cosmic Rays", false }, { "Starforged", false }, { "Doomsday", false }, { "Wishing Star", false }, { "Rising Tide", false },
+	{ "Tidal Surge", false }, { "Tsunami", false },
+}
+-- What the cards do, for the menu, until this computer has seen them in a vote itself.
+CardBrain.SEED = {
+	["+ Attack I"] = { title = "+ Attack I", option_type = "Good", effects = { { type = "stat_mul", amount = 0.12, stat = "damage" } } },
+	["+ Attack II"] = { title = "+ Attack II", option_type = "Good", effects = { { type = "stat_mul", amount = 0.25, stat = "damage" } } },
+	["+ Attack III"] = { title = "+ Attack III", option_type = "Good", effects = { { type = "stat_mul", amount = 0.4, stat = "damage" } } },
+	["+ Range I"] = { title = "+ Range I", option_type = "Good", effects = { { type = "stat_mul", amount = 0.15, stat = "range" } } },
+	["+ Range II"] = { title = "+ Range II", option_type = "Good", effects = { { type = "stat_mul", amount = 0.25, stat = "range" } } },
+	["+ Range III"] = { title = "+ Range III", option_type = "Good", effects = { { type = "stat_mul", amount = 0.35, stat = "range" } } },
+	["- Cooldown I"] = { title = "- Cooldown I", option_type = "Good", effects = { { type = "stat_mul", amount = -0.05, stat = "attack_cooldown" } } },
+	["- Cooldown II"] = { title = "- Cooldown II", option_type = "Good", effects = { { type = "stat_mul", amount = -0.1, stat = "attack_cooldown" } } },
+	["- Cooldown III"] = { title = "- Cooldown III", option_type = "Good", effects = { { type = "stat_mul", amount = -0.15, stat = "attack_cooldown" } } },
+	["- Active Cooldown I"] = { title = "- Active Cooldown I", option_type = "Good", effects = { { type = "stat_mul", amount = -0.2, stat = "active_attack_cooldown" } } },
+	["- Active Cooldown II"] = { title = "- Active Cooldown II", option_type = "Good", effects = { { type = "stat_mul", amount = -0.3, stat = "active_attack_cooldown" } } },
+	["+ Boss Damage I"] = { title = "+ Boss Damage I", option_type = "Good", effects = { { type = "boss_damage", amount = 0.35 } } },
+	["+ Boss Damage II"] = { title = "+ Boss Damage II", option_type = "Good", effects = { { type = "boss_damage", amount = 0.5 } } },
+	["+ Yen I"] = { title = "+ Yen I", option_type = "Good", effects = { { type = "resource_gain", amount = 3000 } } },
+	["+ Yen II"] = { title = "+ Yen II", option_type = "Good", effects = { { type = "resource_gain", amount = 6000 } } },
+	["+ Double Attack, Double Cooldown"] = { title = "+ Double Attack, Double Cooldown", option_type = "Good", effects = { { type = "stat_mul_real", amount = 2, stat = "damage", text = "Doubles" }, { type = "stat_mul_real", amount = 2, stat = "attack_cooldown", text = "Doubles" } } },
+	["+ Double Attack, Half Range"] = { title = "+ Double Attack, Half Range", option_type = "Good", effects = { { type = "stat_mul_real", amount = 2, stat = "damage", text = "Doubles" }, { type = "stat_mul_real", amount = 0.5, stat = "range", text = "Halves" } } },
+	["+ Random Blessings I"] = { title = "+ Random Blessings I", option_type = "Good", effects = { { type = "random_effects", amount = 2, _type = "Good", tier = "1" } } },
+	["+ Random Blessings II"] = { title = "+ Random Blessings II", option_type = "Good", effects = { { type = "random_effects", amount = 2, _type = "Good", tier = "2" } } },
+	["+ Random Curses I"] = { title = "+ Random Curses I", option_type = "Bad", effects = { { type = "random_effects", amount = 2, _type = "Bad", tier = "1" }, { type = "secret_drop", amount = 0.25 }, { type = "candy_multiplier", amount = 0.7 } } },
+	["+ Random Curses II"] = { title = "+ Random Curses II", option_type = "Bad", effects = { { type = "random_effects", amount = 2, _type = "Bad", tier = "2" }, { type = "secret_drop", amount = 0.5 }, { type = "candy_multiplier", amount = 1.5 }, { type = "add_reward", amount = 1 } } },
+	["+ Enemy Health I"] = { title = "+ Enemy Health I", option_type = "Bad", effects = { { type = "enemy_stat_mul", amount = 0.5, stat = "health" }, { type = "candy_multiplier", amount = 0.3 } } },
+	["+ Enemy Health II"] = { title = "+ Enemy Health II", option_type = "Bad", effects = { { type = "enemy_stat_mul", amount = 0.8, stat = "health" }, { type = "secret_drop", amount = 0.25 }, { type = "candy_multiplier", amount = 0.7 } } },
+	["+ Enemy Health III"] = { title = "+ Enemy Health III", option_type = "Bad", effects = { { type = "enemy_stat_mul", amount = 2, stat = "health" }, { type = "secret_drop", amount = 0.5 }, { type = "candy_multiplier", amount = 1.5 } } },
+	["+ Enemy Speed I"] = { title = "+ Enemy Speed I", option_type = "Bad", effects = { { type = "enemy_speedup", amount = 0.25 }, { type = "candy_multiplier", amount = 0.3 } } },
+	["+ Enemy Speed II"] = { title = "+ Enemy Speed II", option_type = "Bad", effects = { { type = "enemy_speedup", amount = 0.5 }, { type = "secret_drop", amount = 0.25 }, { type = "candy_multiplier", amount = 0.7 } } },
+	["+ Enemy Speed III"] = { title = "+ Enemy Speed III", option_type = "Bad", effects = { { type = "enemy_speedup", amount = 1 }, { type = "secret_drop", amount = 0.5 }, { type = "candy_multiplier", amount = 1.5 } } },
+	["+ Enemy Regen I"] = { title = "+ Enemy Regen I", option_type = "Bad", effects = { { type = "enemy_regen", amount = 0.005 }, { type = "candy_multiplier", amount = 0.3 } } },
+	["+ Enemy Regen II"] = { title = "+ Enemy Regen II", option_type = "Bad", effects = { { type = "enemy_regen", amount = 0.02 }, { type = "secret_drop", amount = 0.25 }, { type = "candy_multiplier", amount = 0.7 } } },
+	["+ Enemy Regen III"] = { title = "+ Enemy Regen III", option_type = "Bad", effects = { { type = "enemy_regen", amount = 0.05 }, { type = "secret_drop", amount = 0.5 }, { type = "candy_multiplier", amount = 1.5 } } },
+	["+ Enemy Shield I"] = { title = "+ Enemy Shield I", option_type = "Bad", effects = { { type = "enemy_shield", amount = 3 }, { type = "candy_multiplier", amount = 0.3 } } },
+	["+ Enemy Shield II"] = { title = "+ Enemy Shield II", option_type = "Bad", effects = { { type = "enemy_shield", amount = 6 }, { type = "secret_drop", amount = 0.25 }, { type = "candy_multiplier", amount = 0.7 } } },
+	["+ Enemy Shield III"] = { title = "+ Enemy Shield III", option_type = "Bad", effects = { { type = "enemy_shield", amount = 10 }, { type = "secret_drop", amount = 0.5 }, { type = "candy_multiplier", amount = 1.5 } } },
+	["+ Explosive Deaths I"] = { title = "+ Explosive Deaths I", option_type = "Bad", effects = { { type = "enemy_bomb", amount = 6 }, { type = "candy_multiplier", amount = 0.3 } } },
+	["+ Explosive Deaths II"] = { title = "+ Explosive Deaths II", option_type = "Bad", effects = { { type = "enemy_bomb", amount = 12 }, { type = "secret_drop", amount = 0.25 }, { type = "candy_multiplier", amount = 0.7 } } },
+	["+ Explosive Deaths III"] = { title = "+ Explosive Deaths III", option_type = "Bad", effects = { { type = "enemy_bomb", amount = 24 }, { type = "secret_drop", amount = 0.5 }, { type = "candy_multiplier", amount = 1.5 } } },
+	["+ Plated Enemies I"] = { title = "+ Plated Enemies I", option_type = "Bad", effects = { { type = "enemy_resistance_specific", amount = 75, damage_type = "physical" }, { type = "candy_multiplier", amount = 0.3 } } },
+	["+ Plated Enemies II"] = { title = "+ Plated Enemies II", option_type = "Bad", effects = { { type = "enemy_resistance_specific", amount = 150, damage_type = "physical" }, { type = "candy_multiplier", amount = 0.7 } } },
+	["+ Plated Enemies III"] = { title = "+ Plated Enemies III", option_type = "Bad", effects = { { type = "enemy_resistance_specific", amount = 300, damage_type = "physical" }, { type = "secret_drop", amount = 0.5 }, { type = "candy_multiplier", amount = 1.5 } } },
+	["+ Spellproof Enemies I"] = { title = "+ Spellproof Enemies I", option_type = "Bad", effects = { { type = "enemy_resistance_specific", amount = 75, damage_type = "magic" }, { type = "candy_multiplier", amount = 0.3 } } },
+	["+ Spellproof Enemies II"] = { title = "+ Spellproof Enemies II", option_type = "Bad", effects = { { type = "enemy_resistance_specific", amount = 150, damage_type = "magic" }, { type = "candy_multiplier", amount = 0.7 } } },
+	["+ Spellproof Enemies III"] = { title = "+ Spellproof Enemies III", option_type = "Bad", effects = { { type = "enemy_resistance_specific", amount = 300, damage_type = "magic" }, { type = "secret_drop", amount = 0.5 }, { type = "candy_multiplier", amount = 1.5 } } },
+	["+ Resistant Enemies I"] = { title = "+ Resistant Enemies I", option_type = "Bad", effects = { { type = "enemy_resistance_specific", amount = 50, damage_type = "physical" }, { type = "enemy_resistance_specific", amount = 50, damage_type = "magic" }, { type = "candy_multiplier", amount = 0.3 } } },
+	["+ Resistant Enemies II"] = { title = "+ Resistant Enemies II", option_type = "Bad", effects = { { type = "enemy_resistance_specific", amount = 100, damage_type = "physical" }, { type = "enemy_resistance_specific", amount = 100, damage_type = "magic" }, { type = "candy_multiplier", amount = 0.7 } } },
+	["+ Resistant Enemies III"] = { title = "+ Resistant Enemies III", option_type = "Bad", effects = { { type = "enemy_resistance_specific", amount = 200, damage_type = "physical" }, { type = "enemy_resistance_specific", amount = 200, damage_type = "magic" }, { type = "secret_drop", amount = 0.5 }, { type = "candy_multiplier", amount = 1.5 } } },
+	["Cinders"] = { title = "Cinders", option_type = "Good", effects = { { type = "boss_damage", amount = 0.5 } } },
+	["Mud"] = { title = "Mud", option_type = "Good", effects = { { type = "enemy_speedup", amount = -0.25 } } },
+	["Firebreak"] = { title = "Firebreak", option_type = "Good", effects = { { type = "enemy_speedup", amount = -0.3 } } },
+	["Rain Barrel"] = { title = "Rain Barrel", option_type = "Good", effects = { { type = "resource_gain", amount = 6000 } } },
+	["Kite Strings"] = { title = "Kite Strings", option_type = "Good", effects = { { type = "flying_damage", amount = 0.75 } } },
+	["Grounded"] = { title = "Grounded", option_type = "Good", effects = { { type = "weather_flying_chance", amount = -0.2 } } },
+	["Gale"] = { title = "Gale", option_type = "Bad", effects = { { type = "weather_flying_chance", amount = 0.15 }, { type = "candy_multiplier", amount = 0.5 } } },
+	["Cyclone"] = { title = "Cyclone", option_type = "Bad", effects = { { type = "weather_flying_chance", amount = 0.3 }, { type = "enemy_speedup", amount = 0.25 }, { type = "candy_multiplier", amount = 1 } } },
+	["Crosswind"] = { title = "Crosswind", option_type = "Bad", effects = { { type = "stat_mul", amount = 0.15, stat = "attack_cooldown" }, { type = "candy_multiplier", amount = 0.5 } } },
+	["Scorch"] = { title = "Scorch", option_type = "Bad", effects = { { type = "stat_mul", amount = 0.15, stat = "attack_cooldown" }, { type = "candy_multiplier", amount = 0.5 } } },
+	["Flash Flood"] = { title = "Flash Flood", option_type = "Bad", effects = { { type = "enemy_speedup", amount = 0.25 }, { type = "candy_multiplier", amount = 0.5 } } },
+	["Heatwave"] = { title = "Heatwave", option_type = "Bad", effects = { { type = "enemy_speedup", amount = 0.25 }, { type = "candy_multiplier", amount = 0.5 } } },
+	["Washout"] = { title = "Washout", option_type = "Bad", effects = { { type = "enemy_stat_mul", amount = 0.5, stat = "health" }, { type = "candy_multiplier", amount = 0.5 } } },
+	["Phoenix"] = { title = "Phoenix", option_type = "Bad", effects = { { type = "enemy_stat_mul", amount = 0.5, stat = "health" }, { type = "enemy_speedup", amount = 0.25 }, { type = "candy_multiplier", amount = 1 } } },
+	["Torrent"] = { title = "Torrent", option_type = "Bad", effects = { { type = "enemy_speedup", amount = 0.5 }, { type = "enemy_stat_mul", amount = 0.5, stat = "health" }, { type = "candy_multiplier", amount = 1 } } },
 }
 function CardBrain.family(title)
 	local name = tostring(title):gsub("[\128-\255]+", ""):gsub("%s+I+$", ""):gsub("^%s+", ""):gsub("%s+$", "")
@@ -10860,15 +10928,61 @@ end
 -- so a card can be described once a vote has shown it: this session's votes plus the ones
 -- logged in cards.json. Nothing is known about a card the game has not offered yet.
 CardBrain.shown = {}
+-- The card book: every card a vote has ever shown on this computer, kept for good in
+-- cardbook.json. (cards.json only holds the last 300 votes, and the menu's card names and
+-- descriptions were read from it: a card that had not come up in the last 300 votes dropped out
+-- of "Add a card" and lost its description. A user's Take First list of 52 cards could no
+-- longer be rebuilt because half the names were gone from the picker.)
+function CardBrain.book()
+	if not CardBrain.bookCache then
+		local book = {}
+		pcall(function()
+			local file = SETTINGS_FOLDER .. "/cardbook.json"
+			if isfile(file) then
+				for title, option in pairs(httpService:JSONDecode(readfile(file))) do
+					if type(title) == "string" and type(option) == "table" and type(option.effects) == "table" then
+						book[title] = option
+					end
+				end
+			end
+		end)
+		CardBrain.bookCache = book
+	end
+	return CardBrain.bookCache
+end
+---Put a card in the book (true when it was not in it yet).
+function CardBrain.keep(option)
+	local book = CardBrain.book()
+	if book[option.title] then
+		return false
+	end
+	book[option.title] = { title = option.title, option_type = option.option_type, effects = option.effects }
+	CardBrain.bookDirty = true
+	return true
+end
+function CardBrain.saveBook()
+	if not CardBrain.bookDirty then
+		return
+	end
+	CardBrain.bookDirty = false
+	pcall(function()
+		if not isfolder(SETTINGS_FOLDER) then
+			makefolder(SETTINGS_FOLDER)
+		end
+		writefile(SETTINGS_FOLDER .. "/cardbook.json", httpService:JSONEncode(CardBrain.book()))
+	end)
+end
 do
 	local learn = CardBrain.learn
 	function CardBrain.learn(options)
 		for _, option in pairs(type(options) == "table" and options or {}) do
 			if type(option) == "table" and type(option.title) == "string" and type(option.effects) == "table" then
 				CardBrain.shown[option.title] = option
+				CardBrain.keep(option)
 				CardBrain.catalogCache = nil
 			end
 		end
+		CardBrain.saveBook()
 		return learn(options)
 	end
 end
@@ -10968,9 +11082,15 @@ function CardBrain.catalog()
 			end
 		end)
 		CardBrain.logged = logged
+		-- Everything still in the vote log goes into the book once.
+		for _, option in pairs(logged) do
+			CardBrain.keep(option)
+		end
+		CardBrain.saveBook()
 	end
 	local catalog = {}
-	for _, source in ipairs({ CardBrain.logged, CardBrain.shown }) do
+	-- Later sources win: what shipped with the script, the book, the vote log, this session.
+	for _, source in ipairs({ CardBrain.SEED or {}, CardBrain.book(), CardBrain.logged, CardBrain.shown }) do
 		for title, option in pairs(source) do
 			local family = CardBrain.family(title)
 			local entry = catalog[family] or { tiers = {}, order = {} }
