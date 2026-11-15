@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v205", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v206", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -1149,6 +1149,9 @@ end
 local Field = { at = -1, towers = {}, summons = {}, enemies = {}, others = {} }
 AA.Field = Field
 local function scanField(fresh)
+	if AA.dry and coroutine.running() == AA.dry.thread then
+		return AA.dry.field
+	end
 	local now = os.clock()
 	if not fresh and now - Field.at < 0.1 then
 		return Field
@@ -1181,6 +1184,19 @@ local function scanField(fresh)
 	return Field
 end
 
+---Ask "where would it put this" against a field of my choosing, in a live match, without the
+---playing loops noticing: inside fn every field scan made by THIS thread returns the given
+---towers. `blank` also hides what this match has shown of how far enemies get (the state at
+---wave 1). AA.dryRun({}, {}, true, function() return AA.bestSpot(data) end)
+function AA.dryRun(towers, others, blank, fn)
+	AA.dry = { thread = coroutine.running(), blank = blank == true, field = { at = math.huge, towers = towers or {}, summons = {}, enemies = {}, others = others or {} } }
+	local results = table.pack(pcall(fn))
+	AA.dry = nil
+	return table.unpack(results, 1, results.n)
+end
+function AA.dryBlank()
+	return AA.dry ~= nil and AA.dry.blank and coroutine.running() == AA.dry.thread
+end
 ---The towers I placed (never their summons).
 local function myUnits()
 	return scanField().towers
@@ -1897,22 +1913,49 @@ function AA.fightBand()
 			end
 		end
 	end
-	for _, depth in pairs(Match.depthByWave or {}) do
+	if kept == 0 then
+		-- Nothing kept for this stage and map: the mode's last runs.
+		local mode = AA.modeDepths()
+		for _, mark in ipairs(mode and mode.deeps or {}) do
+			deep = math.max(deep, tonumber(mark) or 0)
+		end
+	end
+	for _, depth in pairs(not AA.dryBlank() and Match.depthByWave or {}) do
 		deep = math.max(deep, depth)
 	end
 	return math.min(deep, 1)
 end
+---What the mode being played has shown lately ({ usual = { .. }, deeps = { .. } }), for a stage
+---or map with no record of its own. Infinity Castle is a new stage on every floor and Summer Hunt
+---draws a new map: without this the first unit of such a match was placed with no idea where
+---the fight would be, by plain "most road", and the buff group followed it. (Castle floor 37,
+---Boros' ship: the whole team at 47-77% of the road while everything died before 20%.)
+function AA.modeDepths()
+	local all = AA.progress.modeDepths
+	local mode = type(all) == "table" and AA.matchKindName and all[AA.matchKindName()]
+	return type(mode) == "table" and mode or nil
+end
 function AA.usualDepth()
 	local list = {}
-	for _, depth in pairs(Match.depthByWave or {}) do
+	for _, depth in pairs(not AA.dryBlank() and Match.depthByWave or {}) do
 		table.insert(list, depth)
 	end
 	if #list >= 6 then
 		table.sort(list)
 		return list[math.ceil(#list * 0.8)]
 	end
-	local saved = type(AA.progress.depths) == "table" and AA.progress.depths[AA.depthKey()]
-	return tonumber(saved)
+	local saved = type(AA.progress.depths) == "table" and tonumber(AA.progress.depths[AA.depthKey()])
+	if saved then
+		return saved
+	end
+	local mode = AA.modeDepths()
+	local usual = mode and type(mode.usual) == "table" and mode.usual or {}
+	if #usual >= 2 then
+		local sorted = table.clone(usual)
+		table.sort(sorted)
+		return tonumber(sorted[math.ceil(#sorted / 2)])
+	end
+	return nil
 end
 ---Per stage AND map: Summer Hunt is played on a different map each run and the roads differ.
 function AA.depthKey()
@@ -3771,9 +3814,7 @@ local function bestSpot(data, focus, only, free)
 		-- of that type, which is where the chain will be built.
 		local circles = not free and buffHub(data) or nil
 		-- The first unit of a buff group picks the place for all of it.
-		-- (Maps with several roads only: on one road the old scoring has been seen to work, and
-		-- the new one has not been tried there.)
-		local groupFirst = circles ~= nil and #circles == 0 and (Match.laneCount or 1) > 1
+		local groupFirst = circles ~= nil and #circles == 0
 		if circles then
 			if #circles > 0 then
 				-- Inside the buff, the spot that sees the most road: her own range is what her
@@ -3881,7 +3922,7 @@ local function bestSpot(data, focus, only, free)
 		-- most road. (Guessing three times her range put her where a 60-stud circle saw the
 		-- most, with her own 32 studs on 109 of the road's 303 points and 126 free nearby.)
 		local knownReach = type(AA.progress.summonRange) == "table" and tonumber(AA.progress.summonRange[data.id]) or nil
-		if knownReach and knownReach >= 75 and (Match.laneCount or 1) > 1 then
+		if knownReach and knownReach >= 75 then
 			-- A summon that reaches this far (Elyssia's: 184 studs) hits the road from wherever she
 			-- stands, so it says nothing about where she should stand. It used to be scored as a
 			-- 75-stud circle around her, which is nearly flat across a map and tipped by the
@@ -7292,6 +7333,23 @@ local function finishMatch()
 			table.remove(marks, 1)
 		end
 		AA.progress.deeps[AA.depthKey()] = marks
+		-- The same two figures for the mode as a whole (last five and last three runs).
+		AA.progress.modeDepths = type(AA.progress.modeDepths) == "table" and AA.progress.modeDepths or {}
+		local kind = tostring(AA.matchKindName())
+		local mode = type(AA.progress.modeDepths[kind]) == "table" and AA.progress.modeDepths[kind] or {}
+		mode.usual = type(mode.usual) == "table" and mode.usual or {}
+		mode.deeps = type(mode.deeps) == "table" and mode.deeps or {}
+		if band then
+			table.insert(mode.usual, math.floor(band * 100) / 100)
+			while #mode.usual > 5 do
+				table.remove(mode.usual, 1)
+			end
+		end
+		table.insert(mode.deeps, deepest)
+		while #mode.deeps > 3 do
+			table.remove(mode.deeps, 1)
+		end
+		AA.progress.modeDepths[kind] = mode
 	end
 	AA.saveProgress()
 	status = won and "Won" or (gaveUp and "Ended by a vote" or "Lost")
