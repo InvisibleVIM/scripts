@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v216", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v217", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -760,6 +760,37 @@ function AA.resetSession()
 	AA.progress.sessionOwned = owned.ok and owned or nil
 	AA.saveProgress()
 end
+---A result lists a new unit by its copy's uuid ("{3a05...}"), not by the unit: look the copy up.
+function AA.unitOf(id)
+	id = tostring(id)
+	if not id:find("^{") then
+		return id
+	end
+	local found
+	pcall(function()
+		local copy = collectionData().owned_units[id]
+		found = type(copy) == "table" and copy.unit_id or nil
+	end)
+	return found and tostring(found) or id
+end
+task.spawn(function()
+	-- Entries logged with the uuid: named once the collection knows the copy.
+	task.wait(10)
+	local changed = false
+	for index = #MatchLog, math.max(1, #MatchLog - 80), -1 do
+		local entry = MatchLog[index]
+		for slot, id in ipairs(type(entry) == "table" and type(entry.units) == "table" and entry.units or {}) do
+			local unitId = AA.unitOf(id)
+			if unitId ~= id then
+				entry.units[slot], changed = unitId, true
+			end
+		end
+	end
+	if changed then
+		pcall(writefile, MATCH_FILE, httpService:JSONEncode(MatchLog))
+	end
+end)
+
 ---The last matches for the Home tab's log, newest first: a line with the match and the time it took, then a
 ---note with how it ended, what kind it was, when, and everything it gave.
 function AA.matchRows(limit)
@@ -798,6 +829,13 @@ function AA.matchRows(limit)
 				ending = (entry.gaveUp and "Ended by vote" or "Lost") .. (entry.wave and (" at wave %d"):format(entry.wave) or "") .. ((entry.wave and entry.waves) and (" of %d"):format(entry.waves) or "")
 			end
 			table.insert(rows, { name = name, value = took(entry.time), tick = entry.won == true, accent = entry.won == true })
+			if (tonumber(entry.players) or 1) > 1 then
+				ending = ending .. (", %d players"):format(entry.players)
+			end
+			if not entry.won and type(entry.boss) == "table" and entry.boss.id then
+				local data = Units[entry.boss.id]
+				ending = ending .. (", %s at %d%% health"):format(tostring(data and data.name or "the boss"), tonumber(entry.boss.left) or 0)
+			end
 			local got = {}
 			local fromWaves, bonus = tonumber(entry.eventCash) or 0, 0
 			if tonumber(entry.eventTotal) then
@@ -832,6 +870,7 @@ function AA.matchRows(limit)
 			end
 			local units = {}
 			for _, id in ipairs(type(entry.units) == "table" and entry.units or {}) do
+				id = AA.unitOf(id)
 				units[id] = (units[id] or 0) + 1
 			end
 			local things = {}
@@ -1062,8 +1101,15 @@ end
 local Detail = { events = {}, waves = {} }
 AA.Detail = Detail
 local function note(kind, info)
-	if #Detail.events >= 600 then
-		return
+	if #Detail.events >= 1500 then
+		local drop = 1
+		for index, event in ipairs(Detail.events) do
+			if event.k == "buff" or event.k == "buffreal" or event.k == "skipCount" or event.k == "skipVote" or event.k == "boss" or event.k == "tank" or event.k == "busy" then
+				drop = index
+				break
+			end
+		end
+		table.remove(Detail.events, drop)
 	end
 	info = info or {}
 	info.k = kind
@@ -5476,6 +5522,46 @@ function AA.sellUnit(unit, why)
 	return false
 end
 
+---Health walking past `from` of the road that no defender will get to hit: an enemy is a leak
+---once it is past the last road point of its lane that any defender reaches (and in nobody's
+---range now). Third result: the old measure (in nobody's range this instant), for the log.
+function AA.leakScan(enemies, reach, from)
+	local coverEnd = {}
+	for _, tower in ipairs(reach) do
+		local range2 = tower.range * tower.range
+		pathWithin(tower.position.X, tower.position.Z, tower.range, function(point, _, _, d2)
+			if d2 + (point.position.Y - tower.position.Y) ^ 2 <= range2 and point.progress > (coverEnd[point.lane] or -1) then
+				coverEnd[point.lane] = point.progress
+			end
+		end)
+	end
+	local leak, leakHealth, wasHealth = nil, 0, 0
+	for _, enemy in ipairs(enemies) do
+		local humanoid = enemy:FindFirstChildOfClass("Humanoid")
+		if humanoid and humanoid.Health > 0 then
+			local position = enemy:GetPivot().Position
+			local point = nearestPath(position)
+			if point and point.progress >= from then
+				local inRange = false
+				for _, tower in ipairs(reach) do
+					if (tower.position - position).Magnitude <= tower.range then
+						inRange = true
+						break
+					end
+				end
+				if not inRange then
+					wasHealth += humanoid.Health
+					if (coverEnd[point.lane] or -1) < point.progress - 0.01 then
+						leak = leak or position
+						leakHealth += humanoid.Health
+					end
+				end
+			end
+		end
+	end
+	return leak, leakHealth, wasHealth
+end
+
 -- Leak guard: an enemy deep down the path with nothing able to reach it gets a unit placed in
 -- front of it; if we can't afford one, the furthest-back unit is sold (25% refund) and moved.
 local LEAK_AT = 0.72
@@ -5508,33 +5594,16 @@ local function leakGuard()
 			end
 		end
 	end
-	local leak, leakHealth = nil, 0
-	for _, enemy in ipairs(field.enemies) do
-		local humanoid = enemy:FindFirstChildOfClass("Humanoid")
-		if humanoid and humanoid.Health > 0 then
-			local position = enemy:GetPivot().Position
-			if pathProgress(position) >= LEAK_AT then
-				local covered = false
-				for _, tower in ipairs(reach) do
-					if (tower.position - position).Magnitude <= tower.range then
-						covered = true
-						break
-					end
-				end
-				if not covered then
-					leak = leak or position
-					leakHealth += humanoid.Health
-				end
-			end
-		end
-	end
+	local leak, leakHealth, wasHealth = AA.leakScan(field.enemies, reach, LEAK_AT)
 	local health = baseHealth()
 	Match.leakRisk = health > 0 and leakHealth / health or 0
+	Match.leakWas = health > 0 and wasHealth / health or 0
 	if not leak or Match.leakRisk < 0.4 then
 		return false
 	end
 	local maySell = Config.LeakSell and Match.leakRisk >= 0.8
 	note("guard", { risk = math.floor(Match.leakRisk * 100), hp = math.floor(health) })
+	Match.guardCount = (Match.guardCount or 0) + 1
 	Match.guardAt = os.clock()
 	-- Guard with the hardest hitter we can afford (a cheap opener can't stop what's leaking now:
 	-- the Daily loss leaked 43k-health enemies past a level-0 Jane); cheapest only if nothing fits.
@@ -5595,6 +5664,74 @@ local function leakGuard()
 	placeUnit(pick, LEAK_AT)
 	return true
 end
+
+---The evolution a placed unit is collecting takedowns for: its name, takedowns so far (the
+---copy's total before this match plus what its placed copies have made in it) and the number
+---the evolution asks for. The one furthest from its number when several are.
+function AA.takedownGoal()
+	local made = {}
+	for _, unit in ipairs(scanField().towers) do
+		local count = unit._stats:FindFirstChild("takedown_count")
+		local id = unit._stats.id.Value
+		made[id] = (made[id] or 0) + (count and tonumber(count.Value) or 0)
+	end
+	local best
+	for _, entry in ipairs(equippedUnits()) do
+		local evolve = type(entry.data.evolve) == "table" and entry.data.evolve or nil
+		local recipe = evolve and (evolve[entry.unit.shiny and "shiny" or "normal"] or evolve.normal)
+		local need = type(recipe) == "table" and tonumber(recipe._takedown_requirement) or nil
+		if need and made[entry.id] then
+			local have = (tonumber(entry.unit.total_takedowns) or 0) + made[entry.id]
+			if not best or need - have > best.need - best.have then
+				best = { name = tostring(entry.data.name or entry.id), have = have, need = need }
+			end
+		end
+	end
+	return best
+end
+
+---The biggest boss on the road, for the log: when seen, every 20 s, and how it ended. A lost
+---run then says how much of it was left (the Sky Island boss walked through a full-health base
+---three times and nothing in the log said whether it had been close).
+function AA.bossStep()
+	local best, bestMax, bestHumanoid
+	local usual = Match.enemyMedian
+	for _, enemy in ipairs(scanField().enemies) do
+		local humanoid = enemy:FindFirstChildOfClass("Humanoid")
+		if humanoid and humanoid.MaxHealth > 0 and humanoid.Health > 0 then
+			local id = enemy._stats:FindFirstChild("id") and enemy._stats.id.Value or enemy.Name
+			local big = (usual ~= nil and humanoid.MaxHealth >= usual * 5) or (tostring(id):find("boss") ~= nil and not tostring(id):find("miniboss"))
+			if big and humanoid.MaxHealth > (bestMax or 0) then
+				best, bestMax, bestHumanoid = enemy, humanoid.MaxHealth, humanoid
+			end
+		end
+	end
+	local now = os.clock()
+	local seen = Match.bossSeen
+	if best then
+		if not seen or seen.enemy ~= best then
+			local id = best._stats:FindFirstChild("id") and best._stats.id.Value or best.Name
+			seen = { enemy = best, id = id, max = bestMax, at = now, noted = 0, wave = currentWave() }
+			Match.bossSeen = seen
+		end
+		seen.left, seen.p, seen.last, seen.gone = bestHumanoid.Health / bestMax, pathProgress(best:GetPivot().Position), now, nil
+		if now - seen.noted >= 20 then
+			seen.noted = now
+			note("boss", { id = seen.id, max = math.floor(bestMax), left = math.floor(seen.left * 100), p = math.floor(seen.p * 100) })
+		end
+	elseif seen and not seen.gone then
+		seen.gone = true
+		note("bossGone", { id = seen.id, left = math.floor((seen.left or 0) * 100), p = math.floor((seen.p or 0) * 100), secs = math.floor(now - seen.at) })
+	end
+end
+task.spawn(function()
+	while AA.alive do
+		task.wait(2)
+		if not IS_LOBBY and Match.pathPoints and #Match.pathPoints > 0 then
+			pcall(AA.bossStep)
+		end
+	end
+end)
 
 ---Is the team behind what is on the road? Two ways to be:
 ---  "boss": a boss or tank (five times the wave's usual health) has walked further than it has
@@ -7754,31 +7891,14 @@ local function finishMatch()
 	end
 	local units = {}
 	for _, unit in pairs(type(result.new_units) == "table" and result.new_units or {}) do
-		table.insert(units, type(unit) == "table" and tostring(unit.unit_id or unit.id) or tostring(unit))
+		local unitId = AA.unitOf(type(unit) == "table" and tostring(unit.unit_id or unit.id) or tostring(unit))
+		-- (Not in the collection yet: a stage with one unit as its prize names it.)
+		local prize = type(data.rewards) == "table" and data.rewards.unit
+		if unitId:find("^{") and type(prize) == "table" and #prize == 1 and type(prize[1]) == "table" and prize[1].unit_id then
+			unitId = tostring(prize[1].unit_id)
+		end
+		table.insert(units, unitId)
 	end
-	pcall(function()
-		local before, owned = Match.ownedAt, AA.ownedCounts()
-		if type(before) ~= "table" or not before.ok or not owned.ok then
-			return
-		end
-		for _, kind in ipairs({ "items", "unique" }) do
-			for itemId, amount in pairs(owned[kind]) do
-				local gained = amount - (before[kind][itemId] or 0)
-				if gained > (items[itemId] or 0) then
-					items[itemId] = gained
-				end
-			end
-		end
-		local have = {}
-		for _, unitId in ipairs(units) do
-			have[unitId] = (have[unitId] or 0) + 1
-		end
-		for unitId, amount in pairs(owned.units) do
-			for _ = 1, amount - (before.units[unitId] or 0) - (have[unitId] or 0) do
-				table.insert(units, unitId)
-			end
-		end
-	end)
 	local summary = {
 		level = id,
 		name = data.name,
@@ -7787,6 +7907,15 @@ local function finishMatch()
 		wave = wave,
 		-- Event currency earned in the match itself (the balance at the last logged wave minus
 		-- the one at the first): the clear bonus is paid after this and isn't in it.
+		players = #playersService:GetPlayers(),
+		boss = (function()
+			local seen = Match.bossSeen
+			if won or type(seen) ~= "table" or not seen.left or os.clock() - (seen.last or 0) > 30 then
+				return nil
+			end
+			return { id = seen.id, left = math.floor(seen.left * 100 + 0.5), max = math.floor(seen.max) }
+		end)(),
+		alarms = Match.guardCount,
 		eventCash = AA.runEventCash(),
 		eventPay = select(2, AA.runEventParts()),
 		eventRes = (Match.levelData or {}).roguelike_multiplier_resource,
@@ -7968,7 +8097,7 @@ local function resetMatch()
 	Match.leakKey = nil
 	Match.extraDamage = nil
 	Match.dropLog = nil
-	Match.ownedAt = AA.ownedCounts()
+	Match.bossSeen, Match.guardCount = nil, nil
 	Match.killsPhase = nil
 	Match.voteNoted = nil
 	Match.startVote, Match.startVotesSeen, Match.startTimeFirst = nil, nil, nil
@@ -18371,6 +18500,10 @@ do
 						healthFraction = maxHealth > 0 and health / maxHealth or 0
 						if cards then
 							figures[2] = { string.format("x%.1f", 1 + (cards.mult or 0)), "pearl multiplier" }
+						end
+						local goal = AA.takedownGoal()
+						if goal then
+							figures[2] = { string.format("%d / %d", goal.have, goal.need), "evolve takedowns" }
 						end
 					elseif not Config.AutoJoin then
 						sub = "Join matches is off. " .. sub
