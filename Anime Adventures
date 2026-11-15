@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v210", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v211", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -16024,15 +16024,22 @@ do
 						end
 						for _, slot in ipairs(entry.slots) do
 							local each = (rates[slot.rarity] or 0) * slot.chance
-							-- A unit's own rarity, not the slot's: Phoenix is the banner's Secret.
+							-- A unit's own rarity, not the slot's: Phoenix (marco) is a Secret that the Summer
+							-- banner lists in a slot marked Mythic with a 25% share, which read as 1 in 400.
+							-- The banner states the Secret's chance by itself: _show_secret_unit_chance
+							-- (0.000025 = 1 in 40,000, the figure the user gave and the guides give).
 							local rarity = tostring(Units[slot.id] and Units[slot.id].rarity or slot.rarity)
-							-- Phoenix (Summer banner, Sunny Stars): 1 in 40,000 a pull. The line above gave
-							-- 1 in 400, the figure of a Mythic slot. The user corrected it and two guides
-							-- give the same number; how the banner data states it has still to be read
-							-- (no client was connected when this was written), so it is set here by name.
-							local known = ({ Phoenix = 1 / 40000 })[slot.name]
-							if known then
-								each, rarity = known, "Secret"
+							local unlisted = false
+							if rarity == "Secret" then
+								local secrets = 0
+								for _, other in ipairs(entry.slots) do
+									if Units[other.id] and Units[other.id].rarity == "Secret" then
+										secrets += 1
+									end
+								end
+								local chance = tonumber(banner._show_secret_unit_chance)
+								each = chance and chance / math.max(secrets, 1) or 0
+								unlisted = chance == nil
 							end
 							local odds = each > 0 and tostring(math.floor(1 / each + 0.5)) or nil
 							if odds and #odds > 4 then
@@ -16040,7 +16047,7 @@ do
 							end
 							table.insert(rows, {
 								name = slot.name .. (rarity ~= "Mythic" and (" (" .. rarity .. ")") or ""),
-								value = odds and ("1 in " .. odds) or (slot.chance > 0 and ("%d%% share"):format(slot.chance * 100 + 0.5) or nil),
+								value = odds and ("1 in " .. odds) or (unlisted and "rate not listed") or (slot.chance > 0 and ("%d%% share"):format(slot.chance * 100 + 0.5) or nil),
 								accent = slot.top or nil,
 								tick = owned[slot.id] or nil,
 							})
