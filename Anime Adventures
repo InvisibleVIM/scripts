@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v213", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v214", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -7124,6 +7124,7 @@ function AA.startVoteDue(votes)
 		vote.judged = true
 		if count > vote.before then
 			vote.landed = true
+			pcall(AA.startPromptText)
 		elseif count < vote.before then
 			note("voteToggle", { before = vote.before, after = count })
 			return true
@@ -7203,6 +7204,19 @@ do
 			Match.loseVoteAt = os.clock()
 			note("loseVote", { votes = tonumber(first) })
 		end))
+	end
+end
+---The game's "Vote start:" prompt looks the same before and after you vote: Yes and No stay on
+---it and the count reads 1/2 until the others vote or the countdown runs out. With a friend in
+---the match that read as "the script has not voted" every time (asked twice). Once the vote is
+---seen to have landed the title says so; a new vote puts the game's own title back.
+function AA.startPromptText()
+	local playerGui = localPlayer:FindFirstChildOfClass("PlayerGui")
+	local prompt = playerGui and playerGui:FindFirstChild("VoteStart")
+	local title = prompt and prompt:FindFirstChild("Holder") and prompt.Holder:FindFirstChild("Title")
+	if title and title:IsA("TextLabel") then
+		local voted = Match.startVote ~= nil and Match.startVote.landed == true
+		title.Text = voted and "You voted:" or "Vote start:"
 	end
 end
 ---Cast the skip vote, if the game's "Skip Wave?" prompt is up. The prompt is up exactly while I
@@ -7721,6 +7735,7 @@ local function resetMatch()
 	Match.killsPhase = nil
 	Match.voteNoted = nil
 	Match.startVote, Match.startVotesSeen, Match.startTimeFirst = nil, nil, nil
+	pcall(AA.startPromptText)
 	Match.shieldHits, Match.shieldAt, Match.shieldMode = nil, nil, nil
 	Match.enemyMedian, Match.tankNoted, Match.shieldOn, Match.blesserId = nil, nil, nil, nil
 	Match.soaring, Match.spotScore, Match.openingDone, Match.flyShare, Match.bufferMoved = nil, nil, nil, nil, nil
