@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v207", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v208", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -3826,6 +3826,13 @@ local function bestSpot(data, focus, only, free)
 				-- unit (one in-between circle misses a road that lies right at its edge).
 				local own = math.max(unitStatsAt(data, 0).range, unitStatsAt(data, maxLevel).range, 6) * rangeMul
 				local early2 = (unitStatsAt(data, 0).range * rangeMul) ^ 2
+				local standing = AA.summonReach(data.id)
+				if standing then
+					own = math.max(own, math.min(standing, 75))
+					if AA.noOwnAttack(data) then
+						early2 = own * own
+					end
+				end
 				local hubLanes = (Match.laneCount or 1) > 1 and AA.laneWeights(myUnits()) or nil
 				local hubBand = Match.pace ~= "speed" and not hubLanes and AA.fightBand() or nil
 				for attempt = 1, 2 do
@@ -3921,7 +3928,12 @@ local function bestSpot(data, focus, only, free)
 		-- she is): then only her own attack's reach counts, and she goes where that sees the
 		-- most road. (Guessing three times her range put her where a 60-stud circle saw the
 		-- most, with her own 32 studs on 109 of the road's 303 points and 126 free nearby.)
-		local knownReach = type(AA.progress.summonRange) == "table" and tonumber(AA.progress.summonRange[data.id]) or nil
+		local knownReach = AA.summonReach(data.id)
+		local idle = knownReach ~= nil and AA.noOwnAttack(data)
+		-- Her eels reach the road from well back, so she may stand back too: up to six tenths of
+		-- their reach from the road, which leaves the kerb to the units that need it. (As the
+		-- first unit of a buff group no more than 18 studs: the group gathers around her.)
+		local gapMax = knownReach and math.max(range, math.min(knownReach * 0.6, groupFirst and 18 or 32)) or range
 		if knownReach and knownReach >= 75 then
 			-- A summon that reaches this far (Elyssia's: 184 studs) hits the road from wherever she
 			-- stands, so it says nothing about where she should stand. It used to be scored as a
@@ -3961,7 +3973,7 @@ local function bestSpot(data, focus, only, free)
 					task.wait()
 					sliceAt = os.clock()
 				end
-				if spot.gap <= range and not Match.badSpots[spotKey(p)] then
+				if spot.gap <= gapMax and not Match.badSpots[spotKey(p)] then
 					local free = true
 					for _, other in ipairs(taken) do
 						local dx, dz = other.X - p.X, other.Z - p.Z
@@ -4008,7 +4020,7 @@ local function bestSpot(data, focus, only, free)
 										weight *= summonLanes[point.lane] or 1
 									end
 									if knownReach then
-										if d2 <= ownReach2 then
+										if d2 <= ownReach2 and not idle then
 											weight *= 1.5
 										end
 									elseif d2 > ownReach2 then
@@ -4230,6 +4242,26 @@ function AA.chainReaches(id, data)
 					return true
 				end
 			end
+		end
+	end
+	return false
+end
+
+---How far the summons that stand beside a summoner reach, or nil when hers walk the road.
+---Elyssia: three eels four studs from her, range 51, never move; her jellyfish walk the road and
+---hit whatever they meet wherever she stands (measured, and the user said the same). The old
+---figure, progress.summonRange, took the largest range of ANY summon, walkers included: 184 for
+---her, which is no use for choosing a spot.
+AA.SUMMON_REACH = { elyssia = 51, elyssia_evolved = 51 }
+function AA.summonReach(id)
+	local seen = type(AA.progress.summonReach) == "table" and tonumber(AA.progress.summonReach[id])
+	return seen or AA.SUMMON_REACH[id]
+end
+---"Does not attack, but instead summons ...": her own range is nothing to place her by.
+function AA.noOwnAttack(data)
+	for _, passive in pairs(data and type(data.passives) == "table" and data.passives or {}) do
+		if type(passive) == "table" and type(passive.description) == "string" and passive.description:lower():find("does not attack", 1, true) then
+			return true
 		end
 	end
 	return false
@@ -11328,6 +11360,28 @@ local function measureLoop()
 			local owner = summonOwner(unit)
 			local ownerId = owner and owner:FindFirstChild("_stats") and owner._stats:FindFirstChild("id") and owner._stats.id.Value
 			local summonRange = unit._stats:FindFirstChild("range")
+			if ownerId and summonRange and AA.rv(summonRange) > 0 and (unit:GetPivot().Position - owner:GetPivot().Position).Magnitude <= 15 then
+				-- A summon standing beside its tower: its range is what the tower's spot reaches.
+				AA.progress.summonReach = type(AA.progress.summonReach) == "table" and AA.progress.summonReach or {}
+				local reach = math.floor(math.min(AA.rv(summonRange), 120))
+				-- (The largest seen: the eels' range grows with her upgrades, 38 at the start and 51
+				-- two upgrades in, and the spot is chosen for the whole match.)
+				if reach > (tonumber(AA.progress.summonReach[ownerId]) or AA.SUMMON_REACH[ownerId] or 0) then
+					-- Seen on the same spot ten looks in a row: a walker passing her is not it.
+					Match.reachSeen = Match.reachSeen or setmetatable({}, { __mode = "k" })
+					local look, here = Match.reachSeen[unit], unit:GetPivot().Position
+					if look and (look.at - here).Magnitude <= 2 then
+						look.n += 1
+					else
+						look = { at = here, n = 1 }
+						Match.reachSeen[unit] = look
+					end
+					if look.n >= 10 then
+						AA.progress.summonReach[ownerId] = reach
+						AA.progressDirty = true
+					end
+				end
+			end
 			if ownerId and summonRange and AA.rv(summonRange) > 0 then
 				AA.progress.summonRange = type(AA.progress.summonRange) == "table" and AA.progress.summonRange or {}
 				local known = tonumber(AA.progress.summonRange[ownerId]) or 0
