@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v212", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v213", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -146,6 +146,7 @@ local Config = {
 	-- In match
 	AutoStart = true,
 	AutoSkip = true,
+	SkipHold = false,
 	AutoPlace = true,
 	AutoUpgrade = true,
 	AutoAbility = true,
@@ -1002,7 +1003,8 @@ end
 ---skipping brings the next wave while the last one is still on the road.
 function AA.holdSkip()
 	-- Behind on the road right now (AA.roadBusy, defined with the enemy scan): no skipping.
-	if AA.roadBusy then
+	-- Only with "Wait for bosses" switched on (Battle tab, off by default).
+	if Config.SkipHold and AA.roadBusy then
 		local busy, why = AA.roadBusy()
 		if busy then
 			return true, nil, why
@@ -7178,7 +7180,8 @@ if not IS_LOBBY then
 				note("skipVote", { players = #playersService:GetPlayers(), byGame = byGame or nil, wanted = wanted or nil })
 			end
 			if wanted and not byGame then
-				task.spawn(invoke, "vote_wave_skip")
+				-- (A moment later: the prompt has to be on screen for AA.voteSkip to see it.)
+				task.delay(0.3, AA.voteSkip)
 			end
 		end))
 	end
@@ -7201,6 +7204,30 @@ do
 			note("loseVote", { votes = tonumber(first) })
 		end))
 	end
+end
+---Cast the skip vote, if the game's "Skip Wave?" prompt is up. The prompt is up exactly while I
+---have not voted: the game's Yes button hides it when the vote is accepted, and so does this.
+---The vote used to be sent only at the moment the prompt opened. With the hold of v212 the
+---prompt opened while a boss was ahead, the hold ended ten seconds later, and nobody voted: the
+---prompt sat at 0/2 for the rest of the wave with Skip waves on (user's screenshot).
+function AA.voteSkip()
+	local playerGui = localPlayer:FindFirstChildOfClass("PlayerGui")
+	local prompt = playerGui and playerGui:FindFirstChild("VoteSkip")
+	if not (prompt and prompt.Enabled) or os.clock() - (Match.skipAskAt or 0) < 2 then
+		return false
+	end
+	Match.skipAskAt = os.clock()
+	task.spawn(function()
+		local ok, accepted = invoke("vote_wave_skip")
+		if ok and accepted then
+			prompt.Enabled = false
+			Match.skipCast = (Match.skipCast or 0) + 1
+			if Match.skipCast <= 40 then
+				note("skipCast", {})
+			end
+		end
+	end)
+	return true
 end
 ---Is the game's matchmaking switched on (Mode tab) for a match of this kind on this level?
 ---kind: "Daily", "Challenge", "Castle", or anything else for a level with its own queue
@@ -7833,6 +7860,11 @@ local function matchLoop()
 					note("skip", { on = on })
 				end
 				setGameSetting("autoskip_waves", on)
+				-- A prompt left open (it came up while skipping was held, or before the game's
+				-- own setting was back on) gets its vote now.
+				if on then
+					AA.voteSkip()
+				end
 			end
 			-- (This only ever switched the game's setting on: turning the switch off in the menu
 			-- left it on in the game, and with other players in the match the game then ignores
@@ -16579,6 +16611,7 @@ do
 			toggle(page, "Start the match", "AutoStart")
 			slider(page, "Wait before starting", "StartDelay", 0, 60, 1, offOr(" s"), "Holds the start vote, for example while friends join.")
 			toggle(page, "Skip waves", "AutoSkip", "Casts your skip vote the moment the game opens one. With other players a wave is skipped once everyone has voted.")
+			toggle(page, "Wait for bosses", "SkipHold", "With Skip waves on: holds your vote while a boss or tank has more health left than road left, or while enemies are well past where they usually die, and casts it as soon as that is over. Slower runs, fewer waves piling up. Worth turning on for hard portals.")
 			hint(page, "This switches the game's own Auto-Skip Waves setting on and off.\n\nOne exception: a stage you lost within its first 8 waves in the last day is played without skipping until two waves past that point, because skipping puts the next wave on the road while the last one is still there. A match ended by a vote to lose does not count as such a loss.")
 			view.skipHold = UI.note(page, "")
 			view.skipHold.Visible = false
@@ -18169,7 +18202,7 @@ do
 					end
 					view.skipHold.Visible = hold == true and (lostAt ~= nil or why ~= nil)
 					if hold and why then
-						view.skipHold.Text = why == "boss" and "Not skipping: a boss is further along the road than it has been worn down." or "Not skipping: enemies are past the point where they usually die."
+						view.skipHold.Text = why == "boss" and "Waiting to skip: a boss has more health left than road left. Your vote goes in as soon as that changes." or "Waiting to skip: enemies are well past where they usually die. Your vote goes in as soon as they are not."
 					elseif hold and lostAt then
 						view.skipHold.Text = string.format("Playing every wave until wave %d: this stage was lost at wave %d in the last day.", lostAt + 3, lostAt)
 					end
