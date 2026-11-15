@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v215", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v216", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -683,6 +683,20 @@ AA.TRACKED = {
 	{ "Summer Pearls", "pearls" },
 	{ "Star Fruit", "StarFruit" },
 }
+---The live balance of an event currency: the player's "_resource<Name>" stat (in a match the
+---profile's copy is frozen at what it was on joining that server), else the profile.
+function AA.eventBalance(resource)
+	local stats = localPlayer:FindFirstChild("_stats")
+	local live = stats and stats:FindFirstChild("_resource" .. tostring(resource))
+	if live and type(live.Value) == "number" then
+		return live.Value
+	end
+	local held
+	pcall(function()
+		held = tonumber(profile().resources[resource])
+	end)
+	return held
+end
 function AA.itemCounts()
 	local counts = {}
 	pcall(function()
@@ -695,7 +709,7 @@ function AA.itemCounts()
 			elseif key == "trait_rerolls" then
 				counts[key] = tonumber(data.trait_reroll_tokens) or 0
 			elseif key == "pearls" then
-				counts[key] = tonumber(data.resources and data.resources.SummerPearls) or 0
+				counts[key] = AA.eventBalance("SummerPearls") or 0
 			else
 				counts[key] = tonumber(items[key]) or 0
 			end
@@ -785,12 +799,26 @@ function AA.matchRows(limit)
 			end
 			table.insert(rows, { name = name, value = took(entry.time), tick = entry.won == true, accent = entry.won == true })
 			local got = {}
-			if (tonumber(entry.eventCash) or 0) > 0 then
-				table.insert(got, commas(entry.eventCash) .. (summer and " Summer Pearls" or " event currency"))
+			local fromWaves, bonus = tonumber(entry.eventCash) or 0, 0
+			if tonumber(entry.eventTotal) then
+				local pay = tonumber(entry.eventPay) or 0
+				if entry.won and fromWaves > 0 and pay > 0 then
+					bonus = math.max(entry.eventTotal - fromWaves - pay, 0)
+					-- (Far more than a few waves' worth is not a bonus: the wave log was cut short.)
+					bonus = bonus <= pay * 8 and bonus or 0
+				end
+				fromWaves = entry.eventTotal - bonus
+			end
+			local currency = summer and " Summer Pearls" or " event currency"
+			if fromWaves > 0 then
+				table.insert(got, commas(fromWaves) .. currency .. (bonus > 0 and " from waves" or ""))
+			end
+			if bonus > 0 then
+				table.insert(got, commas(bonus) .. currency .. " clear bonus")
 			end
 			for resource, amount in pairs(type(entry.rewards) == "table" and entry.rewards or {}) do
-				if not (resource == "GemsLegacy" and (tonumber(entry.gems) or 0) > 0) then
-					table.insert(got, commas(amount) .. " " .. tostring(resource):gsub("(%l)(%u)", "%1 %2") .. " on clearing")
+				if resource ~= entry.eventRes and not (resource == "GemsLegacy" and (tonumber(entry.gems) or 0) > 0) then
+					table.insert(got, commas(amount) .. " " .. AA.spaced(resource))
 				end
 			end
 			if (tonumber(entry.gems) or 0) > 0 then
@@ -7760,8 +7788,10 @@ local function finishMatch()
 		-- Event currency earned in the match itself (the balance at the last logged wave minus
 		-- the one at the first): the clear bonus is paid after this and isn't in it.
 		eventCash = AA.runEventCash(),
+		eventPay = select(2, AA.runEventParts()),
+		eventRes = (Match.levelData or {}).roguelike_multiplier_resource,
 		waves = (type(result.stats) == "table" and tonumber(result.stats.num_waves)) or Match.totalWaves or nil,
-		time = math.floor(os.clock() - Match.startedAt),
+		time = math.floor((type(result.stats) == "table" and tonumber(result.stats.time_taken)) or (os.clock() - Match.startedAt)),
 		at = os.time(),
 		mode = kind,
 		picked = Config.Mode,
@@ -7789,8 +7819,33 @@ local function finishMatch()
 		units = #units > 0 and units or nil,
 		after = after,
 	}
+	-- The result names the match's whole pay per currency (Summer Hunt: 4,880 with 4,114 in
+	-- the wave log, the rest paid in one lump at the finish: the last wave and the clear bonus).
+	if summary.eventRes and type(result.resource_reward) == "table" and tonumber(result.resource_reward[summary.eventRes]) then
+		summary.eventTotal = tonumber(result.resource_reward[summary.eventRes])
+	end
 	logMatch(summary)
 	saveDetail(summary)
+	if summary.eventCash and summary.eventRes and not summary.eventTotal then
+		AA.progress.eventMark = { at = summary.at, t = os.time(), res = summary.eventRes, base = (AA.runEventParts()), floor = summary.eventCash, pay = summary.eventPay }
+		task.spawn(function()
+			-- Until the next run is into its second wave (or 75 s): after that the balance is
+			-- the next run's.
+			local deadline, restarted = os.clock() + 75, false
+			while AA.alive and os.clock() < deadline and AA.progress.eventMark and AA.progress.eventMark.at == summary.at do
+				local now = currentWave()
+				restarted = restarted or now < (wave or 0)
+				if restarted and now >= 2 then
+					break
+				end
+				AA.settleEvent(false)
+				task.wait(1)
+			end
+			if AA.alive and AA.progress.eventMark and AA.progress.eventMark.at == summary.at then
+				AA.settleEvent(true, restarted and currentWave() >= 2)
+			end
+		end)
+	end
 	if not gaveUp then
 		pcall(AA.CardBrain.learnRun, id, won, wave)
 	end
@@ -7826,6 +7881,68 @@ function AA.runEventCash()
 	end
 	return first and last and (last - first) or nil
 end
+
+---The balance at the first logged wave, and what the last full wave paid.
+function AA.runEventParts()
+	local first, last, prior
+	for _, row in ipairs(Detail.waves) do
+		if row.res then
+			first = first or row.res
+			prior, last = last, row.res
+		end
+	end
+	return first, (last and prior) and math.max(last - prior, 0) or 0
+end
+
+---Gives the last finished match its full event-currency total once the balance shows it (the
+---mark holds the balance the match started on). Watched after the finish, and read once more
+---on the next load: nothing is paid before the next run's first waves end, so the balance
+---there is still the last run's end. A reading that is lower than the waves paid, or far above
+---them, is something else (spending, a later run) and is left out.
+function AA.settleEvent(final, skip)
+	local mark = AA.progress.eventMark
+	if type(mark) ~= "table" or not mark.at or not mark.base then
+		return
+	end
+	local balance = (not skip and os.time() - (tonumber(mark.t) or 0) <= 900) and AA.eventBalance(mark.res) or nil
+	if balance then
+		local total = balance - mark.base
+		local extra = total - (tonumber(mark.floor) or 0)
+		if extra >= 0 and extra <= (tonumber(mark.pay) or 0) * 15 + 50 then
+			for index = #MatchLog, math.max(1, #MatchLog - 5), -1 do
+				local entry = MatchLog[index]
+				if entry.at == mark.at then
+					if entry.eventTotal ~= total then
+						entry.eventTotal = total
+						pcall(writefile, MATCH_FILE, httpService:JSONEncode(MatchLog))
+					end
+					break
+				end
+			end
+		end
+	end
+	if final then
+		AA.progress.eventMark = nil
+		AA.saveProgress()
+	end
+end
+task.spawn(function()
+	-- A match that ended just before a teleport: settle it here, before this server pays anything.
+	local mark = AA.progress.eventMark
+	if type(mark) ~= "table" then
+		return
+	end
+	task.wait(4)
+	for _ = 1, 30 do
+		if not AA.alive or AA.eventBalance(mark.res) then
+			break
+		end
+		task.wait(1)
+	end
+	if AA.alive and AA.progress.eventMark == mark then
+		AA.settleEvent(true, not IS_LOBBY and currentWave() > 1)
+	end
+end)
 
 function AA.startDetail()
 	table.clear(Detail.events)
@@ -18269,8 +18386,9 @@ do
 				view.tiles["Win rate"].Text = (session.wins + session.losses) > 0 and string.format("%d%%", math.floor(session.wins / (session.wins + session.losses) * 100 + 0.5)) or "None yet"
 				view.tiles["Runs"].Text = tostring(session.runs)
 				view.time.Text = AA.clock(session.seconds)
-				view.gems.Text = string.format("%d in %d matches", session.gems, Stats.rateMatches or 0)
-				view.rate.Text = tostring(Stats.gemRate or math.floor(Stats.gems / hours))
+				view.gems.Text = string.format("%d in %d %s", session.gems, session.runs, session.runs == 1 and "match" or "matches")
+				-- (The rate is over the last 30 logged matches, not the session: say so.)
+				view.rate.Text = string.format("%d, last %d matches", Stats.gemRate or math.floor(Stats.gems / hours), Stats.rateMatches or 0)
 				local half, daily = AA.challengeTimers()
 				view.half.Text = (AA.challengeOpen() and "Open, next in " or "Done, next in ") .. AA.clock(half)
 				view.daily.Text = (AA.dailyOpen() and "Open, resets in " or "Done, resets in ") .. AA.clock(daily)
