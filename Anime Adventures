@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v208", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v209", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -11544,15 +11544,47 @@ end))
 do
 	pcall(function()
 		local guiService = game:GetService("GuiService")
-		table.insert(AA.connections, guiService.ErrorMessageChanged:Connect(function(message)
-			if Config.AutoRejoin and AA.alive and type(message) == "string" and message ~= "" then
-				note("rejoin", { msg = message:sub(1, 80) })
-				task.wait(5)
+		-- It used to try once, five seconds after the prompt. A Wi-Fi drop outlasts that: the one
+		-- teleport failed with no connection and the client sat on "Disconnected" for good. Now
+		-- it keeps trying, every 20 s for the first ten minutes and every minute after that, for
+		-- up to six hours, until a teleport goes through (which ends this copy of the script).
+		local function rejoin(message)
+			if AA.rejoining or not (Config.AutoRejoin and AA.alive) then
+				return
+			end
+			AA.rejoining = true
+			note("rejoin", { msg = tostring(message):sub(1, 80) })
+			pcall(AA.saveProgress)
+			local started, tries = os.clock(), 0
+			task.wait(5)
+			while AA.alive and Config.AutoRejoin and os.clock() - started < 6 * 3600 do
+				tries += 1
+				AA.rejoinTries = tries
 				pcall(function()
 					game:GetService("TeleportService"):Teleport(LOBBY_PLACE_ID, localPlayer)
 				end)
+				task.wait(os.clock() - started < 600 and 20 or 60)
+			end
+			AA.rejoining = false
+		end
+		table.insert(AA.connections, guiService.ErrorMessageChanged:Connect(function(message)
+			if type(message) == "string" and message ~= "" then
+				rejoin(message)
 			end
 		end))
+		-- The prompt can also be up without the signal having been seen (script loaded late, or
+		-- the message set before the connection above): look for it every 15 s.
+		task.spawn(function()
+			while AA.alive do
+				task.wait(15)
+				local ok, message = pcall(function()
+					return guiService:GetErrorMessage()
+				end)
+				if ok and type(message) == "string" and message ~= "" then
+					rejoin(message)
+				end
+			end
+		end)
 	end)
 end
 
