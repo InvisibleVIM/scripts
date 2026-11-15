@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v211", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v212", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -1001,6 +1001,13 @@ end
 ---A stage lost in its first waves is played without skipping until two waves past that point:
 ---skipping brings the next wave while the last one is still on the road.
 function AA.holdSkip()
+	-- Behind on the road right now (AA.roadBusy, defined with the enemy scan): no skipping.
+	if AA.roadBusy then
+		local busy, why = AA.roadBusy()
+		if busy then
+			return true, nil, why
+		end
+	end
 	local _, _, lostLow = AA.lostWave(AA.Match and AA.Match.levelId)
 	if lostLow and lostLow <= 8 then
 		local wave = workspace:FindFirstChild("_wave_num")
@@ -3877,7 +3884,7 @@ local function bestSpot(data, focus, only, free)
 											local zone = killZone(point.lane)
 											weight = point.progress <= zone and 4 * (1 - point.progress / zone * 0.8) or 0.1
 										else
-											weight = 1 + (1 - point.progress) * 0.25
+											weight = AA.roadWeight(point.progress)
 											if hubBand and point.progress > hubBand + 0.05 then
 												weight *= math.max(0.15, math.exp(-(point.progress - hubBand - 0.05) / 0.2))
 											end
@@ -4012,7 +4019,7 @@ local function bestSpot(data, focus, only, free)
 								d2 += (point.position.Y - p.Y) ^ 2
 								if d2 <= reach2 then
 									laneHits[point.lane] = (laneHits[point.lane] or 0) + 1
-									local weight = 1 + (1 - point.progress) * 0.25
+									local weight = AA.roadWeight(point.progress)
 									if band and point.progress > band + 0.05 then
 										weight *= math.max(0.15, math.exp(-(point.progress - band - 0.05) / 0.2))
 									end
@@ -4147,7 +4154,7 @@ local function bestSpot(data, focus, only, free)
 							elseif multi then
 								-- Several roads: plain coverage. Where enemies died in earlier
 								-- runs says where the team stood then, not where it should stand.
-								weight = 1 + (1 - point.progress) * 0.25
+								weight = AA.roadWeight(point.progress)
 							elseif Match.pace == "speed" then
 								-- Weak waves die right at the spawn: put the damage there so each one
 								-- dies the moment it appears. Road past the kill zone is nearly worthless.
@@ -4155,7 +4162,7 @@ local function bestSpot(data, focus, only, free)
 								weight = point.progress <= zone and 4 * (1 - point.progress / zone * 0.8) or 0.1
 							elseif Match.longHaul then
 								-- Long modes: plain road coverage (bends, loops), a little earlier is better.
-								weight = 1 + (1 - point.progress) * 0.25
+								weight = AA.roadWeight(point.progress)
 							elseif Config.PlaceStart then
 								-- Kill them early: waves clear (and auto-skip) faster.
 								weight = 1 + (1 - point.progress) * 0.6
@@ -4658,6 +4665,13 @@ local function planAction()
 	do
 		local byWave = Match.pressByWave or {}
 		pressed = math.max(byWave[wave] or 0, byWave[wave - 1] or 0) >= 0.6
+		if not pressed and AA.roadBusy then
+			local busy, why = AA.roadBusy()
+			if busy and why == "boss" then
+				pressed = true
+				Match.threatAt = os.clock()
+			end
+		end
 	end
 	-- (Letting the farm cost twice the damage units was tried in v99: same final wave, but the
 	-- second Elyssia came 13 s later and wave 6 nearly leaked. The cap stays.)
@@ -5463,6 +5477,80 @@ local function leakGuard()
 	status = "Leak: guarding the base"
 	placeUnit(pick, LEAK_AT)
 	return true
+end
+
+---Is the team behind what is on the road? Two ways to be:
+---  "boss": a boss or tank (five times the wave's usual health) has walked further than it has
+---  been worn down: its health left is more than the road it has left;
+---  "deep": an ordinary enemy is past 40% of the road (or 20 points past where they usually die).
+---While that is so no wave is skipped, and (boss only) no farm is bought.
+---The Explosion Mage's portal, 30 waves, Megumin guaranteed on a win: every wave was skipped
+---13 s in although the game gives each one 60, the wave-5 boss (7.8M health, team at 0.2M a
+---second) walked the whole road in 75 s with three more waves stacked behind it and took all
+---750,750 of the base at wave 8. By then 17,300 of the 50,000 earned had gone into the farm:
+---"pressure" only counts health in the last fifth of the road, so nothing said the boss was a
+---problem until it was 20 s from the base.
+function AA.roadBusy()
+	if IS_LOBBY or not Match.pathPoints then
+		return false
+	end
+	local now = os.clock()
+	if Match.busyAt and now - Match.busyAt < 0.5 then
+		return Match.busy == true, Match.busyWhy
+	end
+	Match.busyAt = now
+	local usual = Match.enemyMedian
+	local limit = math.max(0.4, (AA.usualDepth() or 0.2) + 0.2)
+	local why
+	for _, enemy in ipairs(scanField().enemies) do
+		local humanoid = enemy:FindFirstChildOfClass("Humanoid")
+		if humanoid and humanoid.MaxHealth > 0 and humanoid.Health > 0 then
+			local progress = pathProgress(enemy:GetPivot().Position)
+			local id = enemy._stats:FindFirstChild("id") and enemy._stats.id.Value or enemy.Name
+			local big = (usual ~= nil and humanoid.MaxHealth >= usual * 5) or (tostring(id):find("boss") ~= nil and not tostring(id):find("miniboss"))
+			if big then
+				if progress > 0.08 and humanoid.Health / humanoid.MaxHealth > (1 - progress) * 1.05 then
+					why = "boss"
+				end
+			elseif progress > limit and why == nil then
+				why = "deep"
+			end
+		end
+	end
+	if why then
+		Match.busyWhy, Match.busyUntil = why, now + (why == "boss" and 6 or 3)
+	end
+	-- (Held a few seconds past the last sighting, so it does not flicker between two scans.)
+	Match.busy = Match.busyUntil ~= nil and now < Match.busyUntil
+	if not Match.busy then
+		Match.busyWhy = nil
+	end
+	if Match.busy and Match.busyNoted ~= currentWave() then
+		Match.busyNoted = currentWave()
+		note("busy", { why = Match.busyWhy })
+	end
+	return Match.busy, Match.busyWhy
+end
+
+---Burst enemies ("spawn really fast, but slow down as they get closer to your base"): how long
+---an enemy spends on a stud of road at this point, against the average. Measured on the wave-5
+---boss of the Explosion Mage's portal: 2.4% of the road a second at the start, 1.4 in the middle,
+---0.9 at the end, which fits speed = 1 + 2.3 x (1 - progress)^2. A unit by the base has an enemy
+---in range nearly three times as long as one by the spawn; the team stood at 9-30% of the road.
+function AA.burstMatch()
+	local level = Match.levelData
+	local burst = type(level) == "table" and (level._challenge == "burst_enemies" or tostring(level._challenge):find("burst") ~= nil)
+	if burst and Match.pace == "speed" then
+		-- (Speed pace puts everything at the spawn, the one place Burst enemies run through.)
+		Match.pace, Match.everLong = "long", true
+	end
+	return burst
+end
+function AA.roadWeight(progress)
+	if AA.burstMatch() then
+		return 1.535 / (1 + 2.3 * (1 - progress) ^ 2)
+	end
+	return 1 + (1 - progress) * 0.25
 end
 
 -- Targeting. Smart: units by the base always take First (nothing leaks); units further up burn the
@@ -18075,12 +18163,14 @@ do
 				account["Codes redeemed"].Text = tostring(Stats.codes)
 				do
 					-- Why waves are not being skipped right now, when that is the script's own doing.
-					local hold, lostAt = false, nil
+					local hold, lostAt, why = false, nil, nil
 					if not IS_LOBBY and Config.AutoSkip then
-						hold, lostAt = AA.holdSkip()
+						hold, lostAt, why = AA.holdSkip()
 					end
-					view.skipHold.Visible = hold == true and lostAt ~= nil
-					if hold and lostAt then
+					view.skipHold.Visible = hold == true and (lostAt ~= nil or why ~= nil)
+					if hold and why then
+						view.skipHold.Text = why == "boss" and "Not skipping: a boss is further along the road than it has been worn down." or "Not skipping: enemies are past the point where they usually die."
+					elseif hold and lostAt then
 						view.skipHold.Text = string.format("Playing every wave until wave %d: this stage was lost at wave %d in the last day.", lostAt + 3, lostAt)
 					end
 				end
