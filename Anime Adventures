@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v209", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v210", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -16024,9 +16024,23 @@ do
 						end
 						for _, slot in ipairs(entry.slots) do
 							local each = (rates[slot.rarity] or 0) * slot.chance
+							-- A unit's own rarity, not the slot's: Phoenix is the banner's Secret.
+							local rarity = tostring(Units[slot.id] and Units[slot.id].rarity or slot.rarity)
+							-- Phoenix (Summer banner, Sunny Stars): 1 in 40,000 a pull. The line above gave
+							-- 1 in 400, the figure of a Mythic slot. The user corrected it and two guides
+							-- give the same number; how the banner data states it has still to be read
+							-- (no client was connected when this was written), so it is set here by name.
+							local known = ({ Phoenix = 1 / 40000 })[slot.name]
+							if known then
+								each, rarity = known, "Secret"
+							end
+							local odds = each > 0 and tostring(math.floor(1 / each + 0.5)) or nil
+							if odds and #odds > 4 then
+								odds = odds:reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", "")
+							end
 							table.insert(rows, {
-								name = slot.name .. (slot.rarity ~= "Mythic" and (" (" .. slot.rarity .. ")") or ""),
-								value = each > 0 and ("1 in %d"):format(1 / each + 0.5) or (slot.chance > 0 and ("%d%% share"):format(slot.chance * 100 + 0.5) or nil),
+								name = slot.name .. (rarity ~= "Mythic" and (" (" .. rarity .. ")") or ""),
+								value = odds and ("1 in " .. odds) or (slot.chance > 0 and ("%d%% share"):format(slot.chance * 100 + 0.5) or nil),
 								accent = slot.top or nil,
 								tick = owned[slot.id] or nil,
 							})
