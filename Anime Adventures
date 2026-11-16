@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v218", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v219", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -91,8 +91,8 @@ local SETTINGS_FILE = SETTINGS_FOLDER .. "/settings.json"
 local MATCH_FILE = SETTINGS_FOLDER .. "/matches.json"
 local LOBBY_PLACE_ID = 8304191830
 local IS_LOBBY = game.PlaceId == LOBBY_PLACE_ID or workspace:FindFirstChild("_LOBBIES") ~= nil
-local CODES = { "SUMMERCOMEBACK", "CELESTIALCOMPASSU21", "AACOMEBACK", "APRILFOOLS", "DUNGEONS" }
-local CODE_LEVELS = { SUMMERCOMEBACK = 20, AACOMEBACK = 10, APRILFOOLS = 20 }
+local CODES = { "UPDATESOON5189", "DUNGEONS", "CELESTIALCOMPASSU21", "AACOMEBACK", "SUMMERCOMEBACK", "APRILFOOLS", "2MILLIONFAVES", "MILLIONFAVES", "2BILLIONAA" }
+local CODE_LEVELS = { AACOMEBACK = 10, SUMMERCOMEBACK = 20, APRILFOOLS = 20, ["2MILLIONFAVES"] = 20, MILLIONFAVES = 20, ["2BILLIONAA"] = 50 }
 
 -- Palette.
 local STEEL = Color3.fromHex("16212A")
@@ -9853,22 +9853,97 @@ local function alreadyTried(key, stamp)
 	return false
 end
 
+---What is known about each code on this account, from the server's own answers: done
+---(redeemed or already redeemed), the level it asks for, or that it wants the group joined.
+function AA.codeState()
+	local name = "codes_" .. tostring(localPlayer.UserId)
+	local state = AA.progress[name]
+	if type(state) ~= "table" then
+		state = {}
+		AA.progress[name] = state
+	end
+	if not state.since then
+		-- First run of this record: the older "asked at this level" marks said nothing about
+		-- the answer, so every code is asked once more.
+		state.since = os.time()
+		local tried = AA.progress["tried_" .. tostring(localPlayer.UserId)]
+		for key in pairs(type(tried) == "table" and tried or {}) do
+			if tostring(key):sub(1, 5) == "code:" then
+				tried[key] = nil
+			end
+		end
+	end
+	state.done = type(state.done) == "table" and state.done or {}
+	state.level = type(state.level) == "table" and state.level or {}
+	state.social = type(state.social) == "table" and state.social or {}
+	return state
+end
+
+---One line for the Shop page: what is in, what waits for a level, what needs the player.
+function AA.codeNote()
+	local state, level = AA.codeState(), playerLevel()
+	local done, waiting, order, social, refused = 0, {}, {}, {}, {}
+	for _, code in ipairs(CODES) do
+		local need = tonumber(state.level[code]) or CODE_LEVELS[code] or 1
+		if state.done[code] then
+			done += 1
+		elseif state.social[code] then
+			table.insert(social, code)
+		elseif need > level then
+			if not waiting[need] then
+				waiting[need] = {}
+				table.insert(order, need)
+			end
+			table.insert(waiting[need], code)
+		elseif state.asked and state.asked[code] then
+			table.insert(refused, code)
+		end
+	end
+	table.sort(order)
+	local parts = { ("%d of %d codes in. You are level %d."):format(done, #CODES, level) }
+	for _, need in ipairs(order) do
+		table.insert(parts, ("Level %d: %s."):format(need, table.concat(waiting[need], ", ")))
+	end
+	if #social > 0 then
+		table.insert(parts, ("%s asks you to join the group and like and favorite the game: redeem it in the game's own Codes window."):format(table.concat(social, ", ")))
+	end
+	if #refused > 0 then
+		table.insert(parts, ("Not accepted: %s."):format(table.concat(refused, ", ")))
+	end
+	return table.concat(parts, " ")
+end
+
 local function claimRewards()
 	local pd = profile()
 	local level = playerLevel()
 	local day = math.floor(os.time() / 86400)
 	if Config.AutoCodes then
 		-- Codes are level gated (10 / 20): one try per code per player level, so no error spam.
-		local redeemed = pd.redeemed_codes or {}
+		local state = AA.codeState()
 		for _, code in ipairs(CODES) do
-			local done = redeemed[code] or redeemed[code:lower()] or table.find(redeemed, code)
-			if not done and level >= (CODE_LEVELS[code] or 1) and not alreadyTried("code:" .. code, level) then
-				invoke("redeem_code", code)
-				task.wait(1)
-				local now = profile().redeemed_codes or {}
-				if now[code] then
+			local need = tonumber(state.level[code]) or CODE_LEVELS[code] or 1
+			-- (One that wants the group joined is asked again once a day: the player may have
+			-- done it since.)
+			if not state.done[code] and level >= need and not alreadyTried("code:" .. code, state.social[code] and (level .. ":" .. day) or level) then
+				AA.lastMessage = nil
+				local _, reply = invoke("redeem_code", code)
+				task.wait(1.2)
+				local message = tostring(AA.lastMessage or "")
+				local gate = tonumber(message:match("level (%d+)%+"))
+				state.social[code] = reply == "needs_social" or nil
+				if reply == "needs_social" then
+					-- Nothing more to do from here.
+				elseif gate then
+					state.level[code] = gate
+				elseif message:lower():find("already redeemed", 1, true) then
+					state.done[code] = true
+				elseif message:lower():find("redeemed", 1, true) then
+					state.done[code] = true
 					Stats.codes += 1
 				end
+				state.asked = type(state.asked) == "table" and state.asked or {}
+				state.asked[code] = true
+				AA.progressDirty = true
 			end
 		end
 	end
@@ -17577,6 +17652,7 @@ do
 			local page = makePage("Shop", "Free rewards and the shops the script may buy from.", "Account")
 			heading(page, "Free rewards", "left", "Collected in the lobby.")
 			toggle(page, "Redeem codes", "AutoCodes")
+			view.codeNote = UI.note(page, "")
 			toggle(page, "Daily and level rewards", "AutoDaily")
 			toggle(page, "Quest rewards", "AutoQuests")
 			toggle(page, "Battle pass rewards", "AutoPass")
@@ -18643,6 +18719,11 @@ do
 							text = text .. " Last: " .. tostring(last.text)
 						end
 						view.charmNote.Text = text
+					end)
+				end
+				if view.codeNote then
+					pcall(function()
+						view.codeNote.Text = Config.AutoCodes and AA.codeNote() or "Codes are not redeemed."
 					end)
 				end
 				local account = view.account
