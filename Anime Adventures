@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v225", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v227", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -7924,8 +7924,10 @@ local function finishMatch()
 	local after = Config.AfterGame
 	local level = id and Levels[id]
 	local story = level and level.story_level_rank ~= nil and not level.infinite
-	if not Config.AutoJoin or kind == "Dungeon" then
-		-- Not requeueing (or the dungeon controller picks the next room).
+	if kind == "Dungeon" or (not Config.AutoJoin and (after == "Lobby" or kind == "Portal")) then
+		-- The dungeon controller picks the next room. With Auto join off, "After a match" still
+		-- continues in the match (USER: "it should do it immediately after the match finishes");
+		-- only a trip to the lobby or a new portal waits for the player.
 		after = "Stay"
 	elseif after == "Auto" and (kind == "Challenge" or kind == "Daily") then
 		-- USER RULE (v224): a challenge pays once per half hour and the Daily once a day, so a
@@ -7973,18 +7975,34 @@ local function finishMatch()
 			portalNext = nil
 		end
 	end
+	Match.lastAfter = after
 	note("end", { won = won, gaveUp = gaveUp or nil, after = after, portal = portalNext and portalNext.id or nil })
+	-- Every vote and what the server answered, kept in votes.txt (the match log is saved before
+	-- the vote has had time to work, so it can't say why a Next Level never loaded).
+	local endedAt = os.clock()
+	local function voteLog(text)
+		pcall(function()
+			appendfile(ACCOUNT_FOLDER .. "/votes.txt", os.date("%m-%d %H:%M:%S") .. string.format(" +%.1fs ", os.clock() - endedAt) .. tostring(id) .. " " .. text .. "\n")
+		end)
+	end
+	local function send(...)
+		local args = { ... }
+		task.spawn(function()
+			local ok, a, b = invoke(table.unpack(args))
+			voteLog(tostring(args[1]) .. " " .. tostring(args[2]) .. " -> " .. tostring(ok) .. " " .. tostring(a) .. " " .. tostring(b))
+		end)
+	end
 	local function castVote()
 		if after == "Castle" then
 			-- A fixed room (Castle floor on the Mode tab) is played again; otherwise climb after a win.
 			local room = Config.CastleFloor > 0 and Config.CastleFloor or ((won and floor) and floor + 1 or floor or 1)
-			task.spawn(invoke, "request_start_infinite_tower_from_game", room)
+			send("request_start_infinite_tower_from_game", room)
 		elseif after == "Next" then
-			task.spawn(invoke, "set_game_finished_vote", "next_story")
+			send("set_game_finished_vote", "next_story")
 		elseif after == "Replay" and portalNext then
-			task.spawn(invoke, "set_game_finished_vote", "replay", { item_uuid = portalNext.uuid })
+			send("set_game_finished_vote", "replay", { item_uuid = portalNext.uuid })
 		elseif after == "Replay" then
-			task.spawn(invoke, "set_game_finished_vote", "replay")
+			send("set_game_finished_vote", "replay")
 		end
 	end
 	castVote()
@@ -8115,22 +8133,30 @@ local function finishMatch()
 	if after == "Stay" then
 		return
 	end
-	-- A rematch restarts in this server; a next act teleports. With other players the vote can
-	-- take a while: the vote is cast again after 20 s, and only after 45 s with nothing
-	-- happening does it fall back to the lobby.
-	deadline = os.clock() + (after == "Lobby" and 0 or 20)
-	while AA.alive and os.clock() < deadline and gameFinished() do
-		task.wait(0.5)
-	end
-	if AA.alive and gameFinished() and after ~= "Lobby" then
-		note("revote", { after = after })
-		castVote()
-		deadline = os.clock() + 25
+	voteLog("decided " .. after .. (AA.Party and AA.Party.on() and (AA.Party.leading() and " (party leader)" or " (party member)") or ""))
+	-- USER RULE: not on Lobby = never the lobby. A vote that doesn't take is cast again every
+	-- 20 s; a Next Level that still hasn't loaded after 40 s turns into Replay. Only after three
+	-- minutes on the result screen (and only with Auto join on) is the lobby the way out.
+	local started = os.clock()
+	Match.voting = true
+	while AA.alive and gameFinished() and after ~= "Lobby" and os.clock() - started < 180 do
+		deadline = os.clock() + 20
 		while AA.alive and os.clock() < deadline and gameFinished() do
 			task.wait(0.5)
 		end
+		if AA.alive and gameFinished() then
+			if after == "Next" and os.clock() - started > 35 then
+				after = "Replay"
+				Match.lastAfter = "Replay"
+			end
+			note("revote", { after = after })
+			voteLog("still on the result screen: voting " .. after .. " again")
+			castVote()
+		end
 	end
-	if AA.alive and gameFinished() then
+	Match.voting = nil
+	if AA.alive and gameFinished() and (after == "Lobby" or Config.AutoJoin) then
+		voteLog("going to the lobby")
 		invoke("teleport_back_to_lobby")
 	end
 end
@@ -8326,21 +8352,21 @@ local function matchLoop()
 					invoke("teleport_back_to_lobby")
 				end
 			end
-			if Match.ended and Config.AutoJoin and matchKind() ~= "Dungeon" then
+			if Match.ended and not Match.voting and (Config.AutoJoin or Config.AfterGame ~= "Lobby") and matchKind() ~= "Dungeon" then
 				-- Still on the result screen a minute later (a vote or teleport that didn't go
 				-- through, or the script was reloaded here): the lobby, asked again every 30 s.
 				Match.finishedSince = Match.finishedSince or os.clock()
 				-- Not on Lobby: first try to continue right here (Replay, or Next for a won story
 				-- act), the way Auto would have voted. The lobby only if that does nothing either.
 				local challenge = matchKind() == "Challenge" or matchKind() == "Daily"
-				local here = Config.AfterGame ~= "Lobby" and not challenge and not Match.revoted and not (AA.Party and AA.Party.on() and not AA.Party.leading())
+				local here = Config.AfterGame ~= "Lobby" and not challenge and Match.lastAfter ~= "Stay" and Match.lastAfter ~= "Lobby" and not Match.revoted and not (AA.Party and AA.Party.on() and not AA.Party.leading())
 				if here and os.clock() - Match.finishedSince > 8 then
 					Match.revoted = true
 					Match.finishedSince = os.clock()
-					local vote = Config.AfterGame == "Next" and "next_story" or "replay"
+					local vote = (Config.AfterGame == "Next" or Match.lastAfter == "Next") and "next_story" or "replay"
 					note("stuck", { level = Match.levelId, vote = vote })
 					task.spawn(invoke, "set_game_finished_vote", vote)
-				elseif not here and os.clock() - Match.finishedSince > (Match.finishedAsked and 30 or 60) then
+				elseif not here and Config.AutoJoin and os.clock() - Match.finishedSince > (Match.finishedAsked and 30 or 60) then
 					Match.finishedSince, Match.finishedAsked = os.clock(), true
 					note("stuck", { level = Match.levelId })
 					invoke("teleport_back_to_lobby")
