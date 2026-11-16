@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v221", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v222", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -230,6 +230,9 @@ local Config = {
 	SnipeUnits = "",
 	MerchantWant = "",
 	JoinFriend = "",
+	PartyOn = false,
+	PartyWith = "",
+	PartyRole = "Member",
 	MacroPlay = false,
 	MacroName = "",
 	MacroAnyMap = false,
@@ -8013,6 +8016,13 @@ local function finishMatch()
 		-- the portal without it having been picked (the mode was changed during the match).
 		after = "Lobby"
 	end
+	if AA.Party and AA.Party.on() then
+		-- Party: the leader decides, the member votes the same.
+		after = AA.Party.afterMatch(after)
+		if not AA.Party.leading() then
+			portalNext = nil
+		end
+	end
 	note("end", { won = won, gaveUp = gaveUp or nil, after = after, portal = portalNext and portalNext.id or nil })
 	if after == "Castle" then
 		task.spawn(invoke, "request_start_infinite_tower_from_game", (won and floor) and floor + 1 or floor or 1)
@@ -9570,7 +9580,327 @@ if IS_LOBBY then
 	end)
 end
 
+-- ============================================================
+--  Party: this account and another on this PC play together
+-- ============================================================
+-- One account leads: it goes to its own hub (a personal lobby server with a join ID), invites the
+-- other when it arrives and starts the mode picked on its own menu once both are in one party. The
+-- other follows: it joins the leader's hub, accepts the leader's invite only, never starts anything
+-- itself (the game pulls a party into the leader's lobby), and votes in a match what the leader
+-- voted. The two find each other through a small file per account in AnimeAdventures/party/ (both
+-- run on this PC and share the executor's workspace folder).
+do
+	local Party = { dir = "AnimeAdventures/party", text = "Off", lastInvite = 0, lastTravel = 0, lastHubCheck = 0 }
+	AA.Party = Party
+	local teleportService = game:GetService("TeleportService")
+
+	local function clean(name)
+		return (tostring(name or ""):gsub("^%s+", ""):gsub("%s+$", ""))
+	end
+	function Party.partnerName()
+		return clean(Config.PartyWith)
+	end
+	function Party.on()
+		local partner = Party.partnerName()
+		return Config.PartyOn == true and partner ~= "" and partner:lower() ~= localPlayer.Name:lower()
+	end
+	function Party.leading()
+		return Config.PartyRole == "Leader"
+	end
+	local function fileFor(name)
+		return Party.dir .. "/" .. tostring(name):lower() .. ".json"
+	end
+	---The other account's last report (nil when it has not written one for 20 s).
+	function Party.partnerStatus()
+		local path = fileFor(Party.partnerName())
+		local ok, data = pcall(function()
+			return isfile(path) and httpService:JSONDecode(readfile(path)) or nil
+		end)
+		if not ok or type(data) ~= "table" or os.time() - (tonumber(data.at) or 0) > 20 then
+			return nil, ok and type(data) == "table" and data or nil
+		end
+		return data
+	end
+	---The partner's Player in this server, by user or display name (any letter case).
+	function Party.partnerPlayer()
+		local want = Party.partnerName():lower()
+		for _, player in ipairs(playersService:GetPlayers()) do
+			if player ~= localPlayer and (player.Name:lower() == want or player.DisplayName:lower() == want) then
+				return player
+			end
+		end
+		return nil
+	end
+	---Both in one party (the game's own attributes on the two players).
+	function Party.together()
+		local partner = Party.partnerPlayer()
+		local mine = localPlayer:GetAttribute("PartyId")
+		return partner ~= nil and mine ~= nil and partner:GetAttribute("PartyId") == mine
+	end
+
+	-- Hubs: hub_get_state lists the hubs you have been in; yours is the one you own.
+	local function hubState()
+		local ok, state = invoke("hub_get_state")
+		return ok and type(state) == "table" and state or nil
+	end
+	local function myHubId(state)
+		if type(state) ~= "table" then
+			return nil
+		end
+		local mine = state.mine
+		if type(mine) == "table" and mine.id then
+			return tostring(mine.id)
+		elseif type(mine) == "string" then
+			return mine
+		end
+		for _, entry in pairs(type(state.saved) == "table" and state.saved or {}) do
+			if type(entry) == "table" and tonumber(entry.owner) == localPlayer.UserId and entry.id then
+				return tostring(entry.id)
+			end
+		end
+		return nil
+	end
+	function Party.inOwnHub()
+		return workspace:GetAttribute("IsHub") == true and tostring(workspace:GetAttribute("HubOwner")) == tostring(localPlayer.UserId)
+	end
+
+	---What this account tells the other, every two seconds.
+	function Party.publish()
+		local report = {
+			name = localPlayer.Name,
+			userId = localPlayer.UserId,
+			role = Party.leading() and "Leader" or "Member",
+			with = Party.partnerName(),
+			place = game.PlaceId,
+			job = game.JobId,
+			lobby = IS_LOBBY,
+			hub = Party.hubId,
+			inHub = IS_LOBBY and Party.inOwnHub() or false,
+			partyId = localPlayer:GetAttribute("PartyId"),
+			after = Party.after,
+			at = os.time(),
+		}
+		pcall(function()
+			if not isfolder("AnimeAdventures") then
+				makefolder("AnimeAdventures")
+			end
+			if not isfolder(Party.dir) then
+				makefolder(Party.dir)
+			end
+			writefile(fileFor(localPlayer.Name), httpService:JSONEncode(report))
+		end)
+	end
+
+	---Why the lobby must not start a match yet (nil: go ahead).
+	function Party.gate()
+		if not Party.on() or not IS_LOBBY then
+			return nil
+		end
+		if not Party.leading() then
+			return "Party: " .. Party.partnerName() .. " leads and starts the matches"
+		end
+		if not Party.together() then
+			return Party.text
+		end
+		return nil
+	end
+
+	-- Member: accept the leader's invite (and only theirs) the moment it comes.
+	do
+		local events = replicatedStorage.endpoints:FindFirstChild("server_to_client")
+		local received = events and events:FindFirstChild("party_invite_received")
+		if received then
+			table.insert(AA.connections, received.OnClientEvent:Connect(function(inviter)
+				if not (AA.alive and Party.on()) or Party.leading() or typeof(inviter) ~= "Instance" then
+					return
+				end
+				local want = Party.partnerName():lower()
+				if inviter.Name:lower() == want or inviter.DisplayName:lower() == want then
+					task.spawn(function()
+						local ok, accepted = invoke("party_respond_invite", inviter, true)
+						note("party", { k = "accept", from = inviter.Name, ok = ok and accepted ~= false })
+					end)
+				end
+			end))
+		end
+	end
+
+	local function setText(text)
+		Party.text = text
+		if Party.label then
+			pcall(function()
+				Party.label.Text = text
+			end)
+		end
+	end
+
+	---One look at where things stand, and one move toward playing together.
+	function Party.step()
+		if not Party.on() then
+			setText(Config.PartyOn and "Type the other account's name." or "Off")
+			return
+		end
+		local partner = Party.partnerName()
+		local theirs, stale = Party.partnerStatus()
+		if theirs and theirs.role == (Party.leading() and "Leader" or "Member") then
+			setText("Both accounts are set to " .. theirs.role .. ": set one to Leader and the other to Member.")
+			return
+		end
+		if theirs and clean(theirs.with):lower() ~= localPlayer.Name:lower() then
+			setText(partner .. "'s script is set to party with " .. tostring(theirs.with) .. ", not this account.")
+			return
+		end
+		if not IS_LOBBY then
+			setText(Party.together() and ("In a match with " .. partner) or ("In a match; " .. partner .. " is not here"))
+			return
+		end
+		-- In a party with someone else: leave it first.
+		local owner = localPlayer:GetAttribute("PartyOwnerId")
+		local partnerPlayer = Party.partnerPlayer()
+		if localPlayer:GetAttribute("PartyId") and not Party.together() and owner ~= localPlayer.UserId and os.clock() - (Party.leftAt or 0) > 10 then
+			Party.leftAt = os.clock()
+			invoke("party_leave")
+			note("party", { k = "leave", owner = owner })
+		end
+		if Party.leading() then
+			-- The hub: create it once, then make sure we are in it.
+			if not Party.hubId or os.clock() - Party.lastHubCheck > 120 then
+				Party.lastHubCheck = os.clock()
+				local state = hubState()
+				Party.hubId = myHubId(state)
+				if state and not Party.hubId and not Party.hubCreateTried then
+					Party.hubCreateTried = true
+					invoke("hub_create")
+					task.wait(2)
+					Party.hubId = myHubId(hubState())
+					note("party", { k = "hubCreate", id = Party.hubId })
+				end
+			end
+			if Party.together() then
+				setText("In a party with " .. partner .. ". Starting your mode here.")
+				return
+			end
+			if Party.hubId and not Party.inOwnHub() and not Party.hubFailed then
+				if os.clock() - Party.lastTravel > 25 then
+					Party.lastTravel = os.clock()
+					Party.hubTries = (Party.hubTries or 0) + 1
+					if Party.hubTries > 3 then
+						-- The hub never took us: the other account comes to this server instead.
+						Party.hubFailed = true
+						note("party", { k = "hubFailed" })
+					else
+						setText("Going to your hub (" .. Party.hubId .. ") so " .. partner .. " can join.")
+						note("party", { k = "toHub", id = Party.hubId })
+						invoke("hub_my_server")
+					end
+				end
+				return
+			end
+			if not partnerPlayer then
+				setText(theirs and (theirs.lobby and ("Waiting for " .. partner .. " to join this server.") or (partner .. " is in a match; waiting for them to come back.")) or ("Waiting for " .. partner .. "'s script (it has to be running with Party on)."))
+				return
+			end
+			if os.clock() - Party.lastInvite > 31 then
+				Party.lastInvite = os.clock()
+				local ok, sent = invoke("party_invite", partnerPlayer)
+				note("party", { k = "invite", to = partnerPlayer.Name, ok = ok and sent == true })
+				if not (ok and sent == true) then
+					-- Refused ("please wait for that player to load"): ask again in five seconds,
+					-- not after the 30 s an invite lasts.
+					Party.lastInvite = os.clock() - 26
+				end
+			end
+			setText("Invited " .. partner .. "; waiting for them to accept.")
+			return
+		end
+		-- Member.
+		if Party.together() then
+			setText("In " .. partner .. "'s party. They start the matches.")
+			return
+		end
+		if not theirs then
+			setText("Waiting for " .. partner .. "'s script (it has to be running with Party on)." .. (stale and " Last seen " .. (os.time() - (tonumber(stale.at) or 0)) .. " s ago." or ""))
+			return
+		end
+		if not theirs.lobby then
+			setText(partner .. " is in a match; waiting for them to come back to the lobby.")
+			return
+		end
+		if theirs.job == game.JobId or partnerPlayer then
+			setText("In " .. partner .. "'s server; waiting for their invite.")
+			return
+		end
+		if os.clock() - Party.lastTravel < 25 then
+			return
+		end
+		Party.lastTravel = os.clock()
+		if theirs.hub and theirs.inHub then
+			setText("Joining " .. partner .. "'s hub (" .. tostring(theirs.hub) .. ").")
+			note("party", { k = "joinHub", id = theirs.hub })
+			invoke("hub_join_id", tostring(theirs.hub))
+		elseif theirs.place and theirs.job and theirs.job ~= "" then
+			setText("Joining " .. partner .. "'s server.")
+			note("party", { k = "joinServer", job = theirs.job })
+			pcall(function()
+				teleportService:TeleportToPlaceInstance(tonumber(theirs.place), tostring(theirs.job), localPlayer)
+			end)
+		end
+	end
+
+	---End of a match: the leader writes what it voted, the member votes the same.
+	function Party.afterMatch(after)
+		if not Party.on() then
+			return after
+		end
+		if Party.leading() then
+			Party.after = { after = after, job = game.JobId, at = os.time() }
+			Party.publish()
+			return after
+		end
+		local deadline = os.clock() + 25
+		while AA.alive and os.clock() < deadline do
+			local theirs = Party.partnerStatus()
+			local decided = theirs and type(theirs.after) == "table" and theirs.after
+			if decided and decided.job == game.JobId and os.time() - (tonumber(decided.at) or 0) < 120 then
+				-- The tower's next room is started by the leader alone.
+				local mine = decided.after == "Castle" and "Stay" or tostring(decided.after)
+				note("party", { k = "follow", after = mine })
+				return mine
+			end
+			task.wait(0.5)
+		end
+		note("party", { k = "follow", after = "Lobby", why = "no word" })
+		return "Lobby"
+	end
+
+	task.spawn(function()
+		while AA.alive do
+			local ok, err = pcall(function()
+				if Party.on() or Config.PartyOn then
+					Party.publish()
+					Party.step()
+				else
+					setText("Off")
+				end
+			end)
+			setthreadidentity(8)
+			if not ok then
+				AA.errors.party = tostring(err)
+			end
+			task.wait(2)
+		end
+	end)
+end
+
 local function joinGame()
+	do
+		-- Party: the member never starts anything, the leader only once both are in one party.
+		local wait = AA.Party and AA.Party.gate()
+		if wait then
+			status = wait
+			return false
+		end
+	end
 	if #equippedUnits() == 0 then
 		equipBest()
 		task.wait(1)
@@ -16882,6 +17212,17 @@ do
 					Config.JoinFriend = friendBox.Text:gsub("^%s+", ""):gsub("%s+$", "")
 				end)
 			end
+			toggle(page, "Party with my other account", "PartyOn", "Both accounts play every match together, in one party.")
+			do
+				local partyBox = UI.textbox(page, "Other account", "User or display name", "Type the other account's name here, and this account's name in the other one's menu.")
+				partyBox.Text = tostring(Config.PartyWith or "")
+				partyBox.FocusLost:Connect(function()
+					Config.PartyWith = partyBox.Text:gsub("^%s+", ""):gsub("%s+$", "")
+				end)
+			end
+			segmented(page, "This account", "PartyRole", { "Leader", "Member" }, "Leader: goes to its hub, invites the other account and starts the mode picked on its own menu. Member: joins the leader's hub, accepts its invite and follows.")
+			AA.Party.label = UI.note(page, AA.Party.text)
+			hint(page, "Set one account to Leader and the other to Member, each with the other's name. The leader's Mode, difficulty and After a match decide everything; the member's are ignored while the party is on, and in a match it votes what the leader voted. Join this player's lobby is ignored while the party is on.")
 			toggle(page, "Jump into any portal that opens", "PortalInstant", "The moment someone in the lobby opens a portal you are put in it. Works with Join matches off.")
 			UI.note(page, "Use the game's matchmaking for:")
 			toggle(page, "Daily Challenge", "MatchDaily")
