@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v220", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v221", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -5507,13 +5507,14 @@ local function planAction()
 	-- Daily while cheaper upgrades half as good were bought instead, and the run was lost.)
 	if pick.score < 1e5 then
 		-- Income and wave length as they are now, not as the match averaged them: both grow.
-		local income = math.max(Match.incomeRate or 0, Match.incomeRecent or 0, 1)
+		local short = Match.totalWaves and not Match.infinite and Match.totalWaves <= 25
+		local income = math.max(Match.incomeRate or 0, short and Match.incomeRecent or 0, 1)
 		local elapsed = os.clock() - (Match.startedAt or os.clock())
 		local perWave = math.clamp(elapsed / math.max(wave, 1), 15, 60)
 		do
 			local rows = Detail.waves
 			local last, back = rows[#rows], rows[#rows - 3]
-			if last and back and last.t and back.t and (last.w or 0) - (back.w or 0) == 3 then
+			if short and last and back and last.t and back.t and (last.w or 0) - (back.w or 0) == 3 then
 				perWave = math.clamp(math.max(perWave, (last.t - back.t) / 3), 15, 90)
 			end
 		end
@@ -5523,7 +5524,7 @@ local function planAction()
 		-- last wave, which is the long one (the boss walks the whole road).
 		local bounded = Match.totalWaves and not Match.infinite
 		local finalWave = bounded and left <= 0
-		local use = horizon + ((bounded and not finalWave) and AA.lastWaveSecs() or 0)
+		local use = horizon + ((short and not finalWave) and AA.lastWaveSecs() or 0)
 		if danger or deep then
 			-- Under threat only the next half minute counts. (The old rule took the first
 			-- affordable thing on the list: 6000 went into Elfy upgrades worth a tenth of the
@@ -5937,6 +5938,26 @@ local function targetingStep()
 		note("tank", { p = math.floor((enemies.tankProgress or 0) * 100) })
 	end
 	Match.towerProgress = Match.towerProgress or setmetatable({}, { __mode = "k" })
+	-- Is anything of ours standing by the base to take what gets past?
+	local baseLine = false
+	if enemies and enemies.boss then
+		for _, unit in ipairs(myUnits()) do
+			local data = Units[unit._stats.id.Value]
+			local progress = Match.towerProgress[unit]
+			if not progress then
+				progress = pathProgress(unit:GetPivot().Position)
+				Match.towerProgress[unit] = progress
+			end
+			if progress >= 0.7 and data and not AA.buffInfo(data) and unitStatsAt(data, 0).farm <= 0 then
+				baseLine = true
+				break
+			end
+		end
+		if not baseLine and Match.focusNoted ~= currentWave() then
+			Match.focusNoted = currentWave()
+			note("noLine", {})
+		end
+	end
 	for _, unit in ipairs(myUnits()) do
 		local unitStats = unit._stats
 		local priority = unitStats:FindFirstChild("priority")
@@ -5966,7 +5987,7 @@ local function targetingStep()
 					want = "soaring"
 				elseif enemies.flying and (onHill or unit:GetAttribute("_anti_air") == true) then
 					want = "flying"
-				elseif enemies.boss and shape.kind ~= "circle" then
+				elseif enemies.boss and shape.kind ~= "circle" and baseLine then
 					want = "strongest"
 				else
 					want = "first"
