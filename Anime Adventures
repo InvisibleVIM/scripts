@@ -9676,6 +9676,7 @@ do
 			lobby = IS_LOBBY,
 			hub = Party.hubId,
 			inHub = IS_LOBBY and Party.inOwnHub() or false,
+			hubFailed = Party.hubFailed or nil,
 			partyId = localPlayer:GetAttribute("PartyId"),
 			after = Party.after,
 			at = os.time(),
@@ -9829,6 +9830,17 @@ do
 		if theirs.job == game.JobId or partnerPlayer then
 			setText("In " .. partner .. "'s server; waiting for their invite.")
 			return
+		end
+		-- The leader is on its way to its hub: wait for it there instead of chasing the server it
+		-- is about to leave (up to a minute; then its current server will do).
+		if theirs.hub and not theirs.inHub and not theirs.hubFailed then
+			Party.outSince = Party.outSince or os.clock()
+			if os.clock() - Party.outSince < 60 then
+				setText("Waiting for " .. partner .. " to reach their hub.")
+				return
+			end
+		else
+			Party.outSince = nil
 		end
 		if os.clock() - Party.lastTravel < 25 then
 			return
