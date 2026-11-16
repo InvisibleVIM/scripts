@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v223", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v224", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -7927,6 +7927,15 @@ local function finishMatch()
 	if not Config.AutoJoin or kind == "Dungeon" then
 		-- Not requeueing (or the dungeon controller picks the next room).
 		after = "Stay"
+	elseif after == "Auto" and (kind == "Challenge" or kind == "Daily") then
+		-- USER RULE (v224): a challenge pays once per half hour and the Daily once a day, so a
+		-- finished one is never replayed: back to the lobby, which takes the next challenge or
+		-- the mode set for after challenges (a lost one is retried from there while it's open).
+		after = "Lobby"
+	elseif after == "Auto" and (Config.Mode == "Challenge" or Config.Mode == "Daily")
+		and ((Config.Mode == "Challenge" and AA.challengeOpen()) or (AA.challengePending() and Match.pendingAtStart == false)) then
+		-- A challenge opened while the in-between mode was running: this match is done, go take it.
+		after = "Lobby"
 	elseif after == "Auto" then
 		-- USER RULE (v223): Auto never goes back to the lobby. It continues from the result
 		-- screen: the tower's next room, Next Level after a win when there is a next act, and
@@ -8323,7 +8332,8 @@ local function matchLoop()
 				Match.finishedSince = Match.finishedSince or os.clock()
 				-- Not on Lobby: first try to continue right here (Replay, or Next for a won story
 				-- act), the way Auto would have voted. The lobby only if that does nothing either.
-				local here = Config.AfterGame ~= "Lobby" and not Match.revoted and not (AA.Party and AA.Party.on() and not AA.Party.leading())
+				local challenge = matchKind() == "Challenge" or matchKind() == "Daily"
+				local here = Config.AfterGame ~= "Lobby" and not challenge and not Match.revoted and not (AA.Party and AA.Party.on() and not AA.Party.leading())
 				if here and os.clock() - Match.finishedSince > 8 then
 					Match.revoted = true
 					Match.finishedSince = os.clock()
@@ -17178,7 +17188,7 @@ do
 			end, true)
 
 			heading(page, "After a match", "left")
-			segmented(page, "Then", "AfterGame", { "Auto", "Next", "Replay", "Lobby" }, "Auto never leaves the match: Next Level after a win when there is a next act, the next room in the mansion, otherwise Replay. Only Lobby goes back to the lobby (and a portal run with no portal of that kind left).")
+			segmented(page, "Then", "AfterGame", { "Auto", "Next", "Replay", "Lobby" }, "Auto never leaves the match: Next Level after a win when there is a next act, the next room in the mansion, otherwise Replay. Only Lobby goes back to the lobby, plus a finished challenge (it pays once) and a portal run with no portal of that kind left.")
 
 			heading(page, "Other players", "right", "Story acts and portals have no matchmaking.")
 			toggle(page, "Friends only", "FriendsOnly", "Keeps strangers out of lobbies and portals the script opens.")
