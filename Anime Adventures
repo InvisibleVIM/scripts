@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v222", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v223", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -7785,12 +7785,9 @@ function AA.checkExpected()
 		end
 		task.wait(0.5)
 	end
+	-- (Auto used to leave for the lobby here. USER RULE v223: Auto stays in the match and plays
+	-- whatever loaded.)
 	note("unexpected", { want = tostring(expect.level) .. "/" .. tostring(expect.difficulty), got = tostring(data.id) .. "/" .. tostring(data._difficulty) })
-	if Config.AutoJoin and Config.AfterGame == "Auto" then
-		status = "Wrong act: back to the lobby"
-		invoke("teleport_back_to_lobby")
-		task.wait(10)
-	end
 end
 
 local function finishMatch()
@@ -7927,87 +7924,31 @@ local function finishMatch()
 	local after = Config.AfterGame
 	local level = id and Levels[id]
 	local story = level and level.story_level_rank ~= nil and not level.infinite
-	local challengeMode = Config.Mode == "Challenge" or Config.Mode == "Daily"
-	local opened = challengeMode and kind ~= "Challenge" and kind ~= "Daily"
-		and ((Config.Mode == "Challenge" and AA.challengeOpen()) or (AA.challengePending() and Match.pendingAtStart == false))
 	if not Config.AutoJoin or kind == "Dungeon" then
 		-- Not requeueing (or the dungeon controller picks the next room).
 		after = "Stay"
-	elseif opened and after == "Auto" then
-		-- A challenge opened while the in-between mode was running: this match is done, go take it.
-		after = "Lobby"
-	elseif after == "Auto" and AA.betterWaiting() then
-		-- The fallback was only for while nothing better could be played.
-		after = "Lobby"
-	elseif castle and after == "Auto" then
-		-- The in-game "next room" keeps this match's difficulty (and a fixed room would climb):
-		-- a different difficulty or a fixed room goes through the lobby.
-		after = (data._difficulty ~= AA.castleDifficulty(floor) or Config.CastleFloor > 0) and "Lobby" or "Castle"
 	elseif after == "Auto" then
-		if kind == "Challenge" or kind == "Daily" then
-			-- A challenge pays once per rotation: back to the lobby for the next one (or the
-			-- fallback). A lost challenge gets one more try right away while it's still open.
-			after = (not won and kind == "Challenge" and (select(2, AA.lostWave(id)) or 0) < 2) and "Replay" or "Lobby"
-		elseif kind == "Story" and (Config.Mode == "Story" or (challengeMode and Config.ChallengeFallback == "Story")) then
-			if not won then
-				-- One more go with everything in damage; an act lost three times goes back to
-				-- the lobby, which farms an easier one until the team has grown.
-				after = AA.tooHard(id) and "Lobby" or "Replay"
-			elseif challengeMode and AA.challengeOpen() then
-				-- A new challenge rolled in while this act was running.
-				after = "Lobby"
-			else
-				-- What the lobby would pick next decides it. Tested live: "next" loads the following
-				-- act in this server in ~12 s but always on Normal, and a replay keeps its
-				-- difficulty. Anything else (a Hard act, a world skip, an act further on) starts
-				-- from the lobby. (Logs: "next" after Act 6 loaded the next world's Act 1, an act
-				-- the world skip had already cleared.)
-				local okPick, nextId, nextDifficulty, nextKind = pcall(function()
-					return AA.chooseTarget("Story")
-				end)
-				if not story then
-					after = "Replay"
-				elseif okPick and nextKind == "story" and nextId == AA.nextStory(id) and nextDifficulty == "Normal" then
-					after = "Next"
-					AA.expectMatch(nextId, "Normal")
-				elseif okPick and nextKind == "story" and nextId == id and nextDifficulty == data._difficulty then
-					after = "Replay"
-				else
-					after = "Lobby"
-				end
-			end
-		elseif Config.Mode == "Missions" and not story then
-			-- Infinite for a mission: again while it is open; once it is complete, the lobby (the
-			-- reward is claimed there and the next target picked).
-			after = AA.dailyKillQuest(id) and "Replay" or "Lobby"
-		elseif Config.Mode == "Missions" and won and story then
-			-- An act of the mission's world, played because its infinite is still locked: climb
-			-- (the next act loads here in seconds; kills count on every act), and after Act 6 go
-			-- to the lobby, where infinite is open now.
-			local nextId = AA.nextStory(id)
-			if nextId and Levels[nextId] and Levels[nextId].world == level.world then
-				after = "Next"
-				AA.expectMatch(nextId, "Normal")
-			else
-				after = "Lobby"
-			end
+		-- USER RULE (v223): Auto never goes back to the lobby. It continues from the result
+		-- screen: the tower's next room, Next Level after a win when there is a next act, and
+		-- Replay otherwise. Only Lobby (picked on the Mode tab) leaves.
+		-- Next Level only where the mode climbs (Story, Missions, Story as the challenge
+		-- fallback); Level and every other mode replay the act they are on.
+		local playing = AA.playMode()
+		local climbs = playing == "Story" or playing == "Missions" or ((Config.Mode == "Challenge" or Config.Mode == "Daily") and Config.ChallengeFallback == "Story")
+		if castle then
+			after = "Castle"
+		elseif won and story and climbs and AA.nextStory(id) then
+			after = "Next"
+			AA.expectMatch(AA.nextStory(id), "Normal")
 		else
 			after = "Replay"
 		end
 	end
-	if Config.AutoJoin and Config.AfterGame == "Auto" and (after == "Replay" or after == "Castle") and AA.matchmakingOn(kind, id) then
-		-- Matchmaking is on for this kind of match: a rematch here would run with whoever is
-		-- left in this server (usually nobody). The lobby queues for the next one.
-		after = "Lobby"
-	end
-	if AA.playMode() == "Quests" and Config.AutoJoin then
-		-- The lobby claims the quest and picks the next one.
-		after = "Lobby"
-	end
 	local portalNext
-	if kind == "Portal" and after ~= "Lobby" and Config.AutoJoin and AA.playMode() == "Portals" then
+	if kind == "Portal" and after == "Replay" and Config.AutoJoin then
 		-- The next portal straight from the result screen (the game's own "replay with another
-		-- portal" button), no lobby in between. None left of the picked kind: the lobby.
+		-- portal" button), no lobby in between. None left of that kind: nothing to replay, so
+		-- the lobby is the only way on.
 		task.wait(1.5)
 		portalNext = AA.portalChoose(data.portal_group)
 		after = portalNext and "Replay" or "Lobby"
@@ -8024,15 +7965,20 @@ local function finishMatch()
 		end
 	end
 	note("end", { won = won, gaveUp = gaveUp or nil, after = after, portal = portalNext and portalNext.id or nil })
-	if after == "Castle" then
-		task.spawn(invoke, "request_start_infinite_tower_from_game", (won and floor) and floor + 1 or floor or 1)
-	elseif after == "Next" then
-		task.spawn(invoke, "set_game_finished_vote", "next_story")
-	elseif after == "Replay" and portalNext then
-		task.spawn(invoke, "set_game_finished_vote", "replay", { item_uuid = portalNext.uuid })
-	elseif after == "Replay" then
-		task.spawn(invoke, "set_game_finished_vote", "replay")
+	local function castVote()
+		if after == "Castle" then
+			-- A fixed room (Castle floor on the Mode tab) is played again; otherwise climb after a win.
+			local room = Config.CastleFloor > 0 and Config.CastleFloor or ((won and floor) and floor + 1 or floor or 1)
+			task.spawn(invoke, "request_start_infinite_tower_from_game", room)
+		elseif after == "Next" then
+			task.spawn(invoke, "set_game_finished_vote", "next_story")
+		elseif after == "Replay" and portalNext then
+			task.spawn(invoke, "set_game_finished_vote", "replay", { item_uuid = portalNext.uuid })
+		elseif after == "Replay" then
+			task.spawn(invoke, "set_game_finished_vote", "replay")
+		end
 	end
+	castVote()
 
 	-- The server's own result (gems, drops) arrives about three seconds after the finish flag.
 	local deadline = os.clock() + 5
@@ -8160,10 +8106,20 @@ local function finishMatch()
 	if after == "Stay" then
 		return
 	end
-	-- A rematch restarts in this server; a next act teleports. If neither happens, go back to the lobby.
+	-- A rematch restarts in this server; a next act teleports. With other players the vote can
+	-- take a while: the vote is cast again after 20 s, and only after 45 s with nothing
+	-- happening does it fall back to the lobby.
 	deadline = os.clock() + (after == "Lobby" and 0 or 20)
 	while AA.alive and os.clock() < deadline and gameFinished() do
 		task.wait(0.5)
+	end
+	if AA.alive and gameFinished() and after ~= "Lobby" then
+		note("revote", { after = after })
+		castVote()
+		deadline = os.clock() + 25
+		while AA.alive and os.clock() < deadline and gameFinished() do
+			task.wait(0.5)
+		end
 	end
 	if AA.alive and gameFinished() then
 		invoke("teleport_back_to_lobby")
@@ -8365,7 +8321,16 @@ local function matchLoop()
 				-- Still on the result screen a minute later (a vote or teleport that didn't go
 				-- through, or the script was reloaded here): the lobby, asked again every 30 s.
 				Match.finishedSince = Match.finishedSince or os.clock()
-				if os.clock() - Match.finishedSince > (Match.finishedAsked and 30 or 60) then
+				-- Not on Lobby: first try to continue right here (Replay, or Next for a won story
+				-- act), the way Auto would have voted. The lobby only if that does nothing either.
+				local here = Config.AfterGame ~= "Lobby" and not Match.revoted and not (AA.Party and AA.Party.on() and not AA.Party.leading())
+				if here and os.clock() - Match.finishedSince > 8 then
+					Match.revoted = true
+					Match.finishedSince = os.clock()
+					local vote = Config.AfterGame == "Next" and "next_story" or "replay"
+					note("stuck", { level = Match.levelId, vote = vote })
+					task.spawn(invoke, "set_game_finished_vote", vote)
+				elseif not here and os.clock() - Match.finishedSince > (Match.finishedAsked and 30 or 60) then
 					Match.finishedSince, Match.finishedAsked = os.clock(), true
 					note("stuck", { level = Match.levelId })
 					invoke("teleport_back_to_lobby")
@@ -8373,7 +8338,7 @@ local function matchLoop()
 			end
 			task.wait(0.5)
 		else
-			Match.finishedSince, Match.finishedAsked = nil, nil
+			Match.finishedSince, Match.finishedAsked, Match.revoted = nil, nil, nil
 			if Match.ended and Match.leftLogged then
 				-- Still here after asking to leave (slow or refused teleport): ask again. This
 				-- used to be read as a replay and wiped the match, so the reason for leaving
@@ -17213,7 +17178,7 @@ do
 			end, true)
 
 			heading(page, "After a match", "left")
-			segmented(page, "Then", "AfterGame", { "Auto", "Next", "Replay", "Lobby" }, "Auto: next act after a win, same act after a loss, next room in the mansion. A mode with matchmaking on goes back to the lobby instead and queues again there.")
+			segmented(page, "Then", "AfterGame", { "Auto", "Next", "Replay", "Lobby" }, "Auto never leaves the match: Next Level after a win when there is a next act, the next room in the mansion, otherwise Replay. Only Lobby goes back to the lobby (and a portal run with no portal of that kind left).")
 
 			heading(page, "Other players", "right", "Story acts and portals have no matchmaking.")
 			toggle(page, "Friends only", "FriendsOnly", "Keeps strangers out of lobbies and portals the script opens.")
@@ -17238,7 +17203,7 @@ do
 			toggle(page, "Jump into any portal that opens", "PortalInstant", "The moment someone in the lobby opens a portal you are put in it. Works with Join matches off.")
 			UI.note(page, "Use the game's matchmaking for:")
 			toggle(page, "Daily Challenge", "MatchDaily")
-			hint(page, "Each switch queues that kind of match with other players; off means you start it alone. If nobody is found in 45 seconds the stage starts alone anyway.\n\nOther players can only be found from the lobby: a rematch inside the match keeps whoever is still there. So with a switch on, the script goes back to the lobby after every match of that kind and queues again (when After a match is on Auto). With it off, the rematch starts right where you are.")
+			hint(page, "Each switch queues that kind of match with other players; off means you start it alone. If nobody is found in 45 seconds the stage starts alone anyway.\n\nOther players can only be found from the lobby: a rematch inside the match keeps whoever is still there. So with a switch on, pick Lobby under After a match to queue again after every match; on Auto the rematch starts right where you are with whoever is still there.")
 			toggle(page, "Half-hour challenges", "MatchChallenge")
 			toggle(page, "Infinite", "MatchInfinite")
 			toggle(page, "Legend stages", "MatchLegend")
