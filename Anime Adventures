@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v227", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v228", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -5440,7 +5440,18 @@ local function planAction()
 				for id, row in pairs(rows) do
 					if row.age >= 120 and row.expect > 0 then
 						local ratio = (row.dealt / dealtTotal) / (row.expect / expectTotal)
-						if ratio < 0.5 then
+						-- The other way round too (v228): a unit dealing more than twice the share its
+						-- numbers promised gets that much more of the next cash (up to four times).
+						-- (Summer Hunt: a level 1 Zombie on 3,400 cash dealt 7.4x her expected share,
+						-- more damage per cash than anything else on the field, and her 2,500 upgrade
+						-- sat behind a 70,000 one for the whole run.)
+						if ratio > 2 and row.dealt / dealtTotal >= 0.005 then
+							live[id] = math.min(ratio / 2, 4)
+							local was = Match.live and Match.live[id]
+							if not was or math.abs(was - live[id]) >= 0.5 then
+								note("live", { u = id, x = math.floor(live[id] * 100) / 100, share = math.floor(row.dealt / dealtTotal * 1000) / 10 })
+							end
+						elseif ratio < 0.5 then
 							live[id] = math.max(ratio * 2, 0.1)
 							local was = Match.live and Match.live[id]
 							if not was or math.abs(was - live[id]) >= 0.25 then
