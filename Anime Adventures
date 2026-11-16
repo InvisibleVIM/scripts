@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v219", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v220", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -87,8 +87,70 @@ local localPlayer = playersService.LocalPlayer
 
 -- Constants.
 local SETTINGS_FOLDER = "AnimeAdventures"
-local SETTINGS_FILE = SETTINGS_FOLDER .. "/settings.json"
-local MATCH_FILE = SETTINGS_FOLDER .. "/matches.json"
+-- Each account has its own settings, progress, match log, match details, stat visuals and
+-- music list under accounts/<user id>/. What the script has LEARNED about the game (unit data,
+-- measurements, the card book) and what the player made (macros, orders, music files, themes)
+-- stays shared by every account on the device.
+local ACCOUNT_FOLDER = SETTINGS_FOLDER .. "/accounts/" .. tostring(localPlayer.UserId)
+local SETTINGS_FILE = ACCOUNT_FOLDER .. "/settings.json"
+local MATCH_FILE = ACCOUNT_FOLDER .. "/matches.json"
+do
+	-- An account's first run: it starts from what the shared files held, so nothing set up or
+	-- learned so far is lost. The account most of the logged matches belong to also takes the
+	-- match details; any other account starts its own session and run markers.
+	local ok, problem = pcall(function()
+		for _, folder in ipairs({ SETTINGS_FOLDER, SETTINGS_FOLDER .. "/accounts", ACCOUNT_FOLDER }) do
+			if not isfolder(folder) then
+				makefolder(folder)
+			end
+		end
+		if isfile(ACCOUNT_FOLDER .. "/settings.json") or isfile(ACCOUNT_FOLDER .. "/progress.json") then
+			return
+		end
+		local http = game:GetService("HttpService")
+		local mine, others = 0, 0
+		local read, log = pcall(function()
+			return http:JSONDecode(readfile(SETTINGS_FOLDER .. "/matches.json"))
+		end)
+		for _, entry in ipairs((read and type(log) == "table") and log or {}) do
+			if type(entry) == "table" and entry.user == localPlayer.UserId then
+				mine += 1
+			elseif type(entry) == "table" and entry.user then
+				others += 1
+			end
+		end
+		local owner = mine > 0 and mine >= others
+		for _, name in ipairs({ "settings.json", "matches.json", "visuals.json", "music.json", "progress.json" }) do
+			local from = SETTINGS_FOLDER .. "/" .. name
+			if isfile(from) then
+				local text = readfile(from)
+				if name == "progress.json" and not owner then
+					local decoded, data = pcall(http.JSONDecode, http, text)
+					if decoded and type(data) == "table" then
+						for _, key in ipairs({ "session", "sessionAt", "sessionItems", "sessionOwned", "lobbyRes", "resRun", "eventMark", "charmLog", "detailIndex" }) do
+							data[key] = nil
+						end
+						data.accountFresh = true
+						text = http:JSONEncode(data)
+					end
+				end
+				writefile(ACCOUNT_FOLDER .. "/" .. name, text)
+			end
+		end
+		if owner and isfolder(SETTINGS_FOLDER .. "/detail") then
+			makefolder(ACCOUNT_FOLDER .. "/detail")
+			for index = 1, 80 do
+				local from = SETTINGS_FOLDER .. "/detail/" .. index .. ".json"
+				if isfile(from) then
+					writefile(ACCOUNT_FOLDER .. "/detail/" .. index .. ".json", readfile(from))
+				end
+			end
+		end
+	end)
+	if not ok then
+		warn("[Anime Adventures] Could not set up this account's own files: " .. tostring(problem))
+	end
+end
 local LOBBY_PLACE_ID = 8304191830
 local IS_LOBBY = game.PlaceId == LOBBY_PLACE_ID or workspace:FindFirstChild("_LOBBIES") ~= nil
 local CODES = { "UPDATESOON5189", "DUNGEONS", "CELESTIALCOMPASSU21", "AACOMEBACK", "SUMMERCOMEBACK", "APRILFOOLS", "2MILLIONFAVES", "MILLIONFAVES", "2BILLIONAA" }
@@ -1119,7 +1181,7 @@ local function note(kind, info)
 end
 local function saveDetail(summary)
 	pcall(function()
-		local folder = SETTINGS_FOLDER .. "/detail"
+		local folder = ACCOUNT_FOLDER .. "/detail"
 		if not isfolder(SETTINGS_FOLDER) then
 			makefolder(SETTINGS_FOLDER)
 		end
@@ -1136,19 +1198,31 @@ end
 -- Progress the game doesn't hand the client (castle rooms cleared).
 AA.progress = {}
 pcall(function()
-	if isfile(SETTINGS_FOLDER .. "/progress.json") then
-		AA.progress = httpService:JSONDecode(readfile(SETTINGS_FOLDER .. "/progress.json"))
+	if isfile(ACCOUNT_FOLDER .. "/progress.json") then
+		AA.progress = httpService:JSONDecode(readfile(ACCOUNT_FOLDER .. "/progress.json"))
 	end
 end)
 if type(AA.progress) ~= "table" then
 	AA.progress = {}
+end
+AA.accountFolder = ACCOUNT_FOLDER
+if AA.progress.accountFresh then
+	-- Started from another account's files: this account's session begins now.
+	task.spawn(function()
+		task.wait(12)
+		if AA.progress.accountFresh then
+			AA.progress.accountFresh = nil
+			pcall(AA.resetSession)
+			AA.saveProgress()
+		end
+	end)
 end
 function AA.saveProgress()
 	pcall(function()
 		if not isfolder(SETTINGS_FOLDER) then
 			makefolder(SETTINGS_FOLDER)
 		end
-		writefile(SETTINGS_FOLDER .. "/progress.json", httpService:JSONEncode(AA.progress))
+		writefile(ACCOUNT_FOLDER .. "/progress.json", httpService:JSONEncode(AA.progress))
 	end)
 end
 ---Wave this account last lost a level at (kept a day; a win clears it).
@@ -1797,7 +1871,7 @@ function AA.portalKinds()
 		AA.progress.portalsSeeded = true
 		changed = true
 		pcall(function()
-			local log = httpService:JSONDecode(readfile(SETTINGS_FOLDER .. "/matches.json"))
+			local log = httpService:JSONDecode(readfile(MATCH_FILE))
 			for _, entry in ipairs(type(log) == "table" and log or {}) do
 				for itemId in pairs(type(entry) == "table" and type(entry.items) == "table" and entry.items or {}) do
 					if tostring(itemId):lower():find("portal", 1, true) and seen[itemId] == nil then
@@ -12871,7 +12945,7 @@ end
 -- files in AnimeAdventures/music/<Anime>/.
 local Music = { library = {}, results = {}, status = "Off", index = 0 }
 AA.Music = Music
-local MUSIC_FILE = SETTINGS_FOLDER .. "/music.json"
+local MUSIC_FILE = ACCOUNT_FOLDER .. "/music.json"
 local ANIME_BY_MAP = {
 	{ "namek", "Dragon Ball" }, { "west_city", "Dragon Ball" }, { "kai_planet", "Dragon Ball" }, { "christmas_map", "Dragon Ball" }, { "tournament_of_power", "Dragon Ball" },
 	{ "aot", "Attack on Titan" }, { "demonslayer", "Demon Slayer" }, { "entertainment_district", "Demon Slayer" },
@@ -16197,7 +16271,7 @@ AA.Visual = {
 	},
 	GRADES = { "C-", "C", "C+", "B-", "B", "B+", "A-", "A", "A+", "S-", "S", "S+", "SS", "SSS" },
 	FROM = { 0, 1 / 9, 2 / 9, 1 / 3, 4 / 9, 5 / 9, 2 / 3, 2 / 3 + 0.7 / 9, 2 / 3 + 1.4 / 9, 0.9, 0.925, 0.95, 0.975, 1 },
-	FILE = SETTINGS_FOLDER .. "/visuals.json",
+	FILE = ACCOUNT_FOLDER .. "/visuals.json",
 	saved = {}, -- [uuid] = { potency_stat = 1.2, ... } what to show
 	orig = {}, -- [uuid] = the real trait stats
 	wrote = {}, -- [uuid][stat] = the last value this script put into the profile copy
