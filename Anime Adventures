@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v224", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v225", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -9635,6 +9635,10 @@ do
 		end
 		return nil
 	end
+	---This account owns the game's party (only the owner's lobby starts matches for both).
+	function Party.ownsParty()
+		return tostring(localPlayer:GetAttribute("PartyOwnerId")) == tostring(localPlayer.UserId)
+	end
 	function Party.inOwnHub()
 		return workspace:GetAttribute("IsHub") == true and tostring(workspace:GetAttribute("HubOwner")) == tostring(localPlayer.UserId)
 	end
@@ -9675,7 +9679,7 @@ do
 		if not Party.leading() then
 			return "Party: " .. Party.partnerName() .. " leads and starts the matches"
 		end
-		if not Party.together() then
+		if not Party.together() or not Party.ownsParty() then
 			return Party.text
 		end
 		return nil
@@ -9738,6 +9742,25 @@ do
 			invoke("party_leave")
 			note("party", { k = "leave", owner = owner })
 		end
+		-- Leader and Member switched while already in one party: the game can't hand a party over,
+		-- so the old owner leaves and the new leader invites again (in this server, no hub trip).
+		if Party.together() and Party.leading() ~= Party.ownsParty() then
+			if Party.ownsParty() then
+				setText("Switched to Member: leaving the party so " .. partner .. " can lead.")
+			else
+				Party.swapSince = Party.swapSince or os.clock()
+				setText("Switched to Leader: waiting for " .. partner .. " to leave so this account can invite.")
+			end
+			-- The new leader leaves itself if the old one's script doesn't (not running, or older).
+			local mustLeave = Party.ownsParty() or os.clock() - Party.swapSince > 15
+			if mustLeave and os.clock() - (Party.leftAt or 0) > 10 then
+				Party.leftAt = os.clock()
+				invoke("party_leave")
+				note("party", { k = "swap", owner = Party.ownsParty() })
+			end
+			return
+		end
+		Party.swapSince = nil
 		if Party.leading() then
 			-- The hub: create it once, then make sure we are in it.
 			if not Party.hubId or os.clock() - Party.lastHubCheck > 120 then
@@ -9756,7 +9779,7 @@ do
 				setText("In a party with " .. partner .. ". Starting your mode here.")
 				return
 			end
-			if Party.hubId and not Party.inOwnHub() and not Party.hubFailed then
+			if Party.hubId and not Party.inOwnHub() and not Party.hubFailed and not partnerPlayer then
 				if os.clock() - Party.lastTravel > 25 then
 					Party.lastTravel = os.clock()
 					Party.hubTries = (Party.hubTries or 0) + 1
