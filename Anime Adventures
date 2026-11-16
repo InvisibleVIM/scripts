@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v217", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v218", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -5432,15 +5432,30 @@ local function planAction()
 	-- score for every 45 s of saving: Elyssia's 10000 upgrade topped the list for six waves of a
 	-- Daily while cheaper upgrades half as good were bought instead, and the run was lost.)
 	if pick.score < 1e5 then
-		local income = math.max(Match.incomeRate or 0, 1)
+		-- Income and wave length as they are now, not as the match averaged them: both grow.
+		local income = math.max(Match.incomeRate or 0, Match.incomeRecent or 0, 1)
 		local elapsed = os.clock() - (Match.startedAt or os.clock())
 		local perWave = math.clamp(elapsed / math.max(wave, 1), 15, 60)
+		do
+			local rows = Detail.waves
+			local last, back = rows[#rows], rows[#rows - 3]
+			if last and back and last.t and back.t and (last.w or 0) - (back.w or 0) == 3 then
+				perWave = math.clamp(math.max(perWave, (last.t - back.t) / 3), 15, 90)
+			end
+		end
 		local horizon = math.clamp(math.max(left, 1) * perWave, 20, 600)
+		-- A match with an end: the last wave pays nothing while it runs, so on it only what can
+		-- be paid now counts; before it, a buy is on the field for the waves left AND for the
+		-- last wave, which is the long one (the boss walks the whole road).
+		local bounded = Match.totalWaves and not Match.infinite
+		local finalWave = bounded and left <= 0
+		local use = horizon + ((bounded and not finalWave) and AA.lastWaveSecs() or 0)
 		if danger or deep then
 			-- Under threat only the next half minute counts. (The old rule took the first
 			-- affordable thing on the list: 6000 went into Elfy upgrades worth a tenth of the
 			-- Water Goddess upgrade that was two seconds of income away.)
 			horizon = math.min(horizon, 60)
+			use = math.min(use, 60)
 		end
 		local best, bestValue
 		for _, option in ipairs(options) do
@@ -5450,8 +5465,8 @@ local function planAction()
 			-- the Elyssia upgrade that was next on the list.)
 			-- (While the base guard is firing only what can be paid now counts: the wait is
 			-- worked out from the match's average income, which stops when the kills do.)
-			if option.score < 1e5 and wait < ((Match.leakRisk or 0) >= 0.4 and 2 or horizon * 0.8) then
-				local value = option.score * (1 - wait / horizon)
+			if option.score < 1e5 and wait < (((Match.leakRisk or 0) >= 0.4 or finalWave) and 2 or horizon * 0.8) then
+				local value = option.score * (1 - wait / use)
 				if not bestValue or value > bestValue then
 					best, bestValue = option, value
 				end
@@ -5471,6 +5486,13 @@ local function planAction()
 		end
 	end
 	return pick, money
+end
+
+---How long the last wave of this stage ran the last time it was reached (30-300 s), 120 s for
+---a stage not seen to its end yet.
+function AA.lastWaveSecs()
+	local seen = type(AA.progress.lastWave) == "table" and tonumber(AA.progress.lastWave[tostring(Match.levelId)]) or nil
+	return math.clamp(seen or 120, 30, 300)
 end
 
 ---Can a tower (or a spot) reach the stretch of road where enemies currently die (spawn .. fight depth)?
@@ -5559,7 +5581,23 @@ function AA.leakScan(enemies, reach, from)
 			end
 		end
 	end
-	return leak, leakHealth, wasHealth
+	return leak, leakHealth, wasHealth, coverEnd
+end
+
+---Where on the road a damage unit placed now should start covering: just ahead of the biggest
+---boss, when that boss has walked past the last road point any defender reaches. nil otherwise.
+function AA.aheadFocus()
+	local seen, cover = Match.bossSeen, Match.coverEnd
+	if type(seen) ~= "table" or seen.gone or not cover or os.clock() - (seen.last or 0) > 6 or os.clock() - (Match.coverAt or 0) > 6 or (seen.left or 0) < 0.03 then
+		return nil
+	end
+	local ok, point = pcall(function()
+		return nearestPath(seen.enemy:GetPivot().Position)
+	end)
+	if not ok or not point or (cover[point.lane] or -1) >= point.progress - 0.02 then
+		return nil
+	end
+	return math.min(point.progress + 0.02, 0.97)
 end
 
 -- Leak guard: an enemy deep down the path with nothing able to reach it gets a unit placed in
@@ -5594,7 +5632,8 @@ local function leakGuard()
 			end
 		end
 	end
-	local leak, leakHealth, wasHealth = AA.leakScan(field.enemies, reach, LEAK_AT)
+	local leak, leakHealth, wasHealth, coverEnd = AA.leakScan(field.enemies, reach, LEAK_AT)
+	Match.coverEnd, Match.coverAt = coverEnd, os.clock()
 	local health = baseHealth()
 	Match.leakRisk = health > 0 and leakHealth / health or 0
 	Match.leakWas = health > 0 and wasHealth / health or 0
@@ -5661,7 +5700,7 @@ local function leakGuard()
 		end
 	end
 	status = "Leak: guarding the base"
-	placeUnit(pick, LEAK_AT)
+	placeUnit(pick, math.max(LEAK_AT, AA.aheadFocus() or 0))
 	return true
 end
 
@@ -6406,6 +6445,17 @@ local function matchStep()
 	end
 	Match.lastCash = cash
 	Match.incomeRate = (Match.earned or 0) / math.max(os.clock() - (Match.startedAt or os.clock()), 30)
+	do
+		local now, log = os.clock(), Match.earnLog or {}
+		Match.earnLog = log
+		if #log == 0 or now - log[#log].t >= 5 then
+			table.insert(log, { t = now, earned = Match.earned or 0 })
+		end
+		while #log > 1 and now - log[1].t > 90 do
+			table.remove(log, 1)
+		end
+		Match.incomeRecent = (#log > 1 and now - log[1].t >= 30) and ((Match.earned or 0) - log[1].earned) / (now - log[1].t) or nil
+	end
 	local action, money = planAction()
 	if not action then
 		status = "Waiting"
@@ -6420,7 +6470,14 @@ local function matchStep()
 	end
 	if action.kind == "place" and Config.AutoPlace then
 		status = "Placing " .. tostring(action.entry.data.name or action.entry.id)
-		placeUnit(action.entry)
+		local data = action.entry.data
+		local ahead = (not data.hill_unit and not AA.buffInfo(data) and unitStatsAt(data, 0).dps > 0) and AA.aheadFocus() or nil
+		if ahead then
+			note("ahead", { u = action.entry.id, p = math.floor(ahead * 100) })
+		end
+		if not placeUnit(action.entry, ahead) and ahead then
+			placeUnit(action.entry)
+		end
 	elseif action.kind == "upgrade" then
 		status = "Upgrading " .. tostring(action.unit._stats.id.Value)
 		upgradeUnit(action.unit)
@@ -7953,6 +8010,15 @@ local function finishMatch()
 	if summary.eventRes and type(result.resource_reward) == "table" and tonumber(result.resource_reward[summary.eventRes]) then
 		summary.eventTotal = tonumber(result.resource_reward[summary.eventRes])
 	end
+	do
+		-- How long the last wave ran, for the planner's clock next time.
+		local rows = Detail.waves
+		local last = rows[#rows]
+		if id and Match.totalWaves and last and last.t and (last.w or 0) >= Match.totalWaves then
+			AA.progress.lastWave = type(AA.progress.lastWave) == "table" and AA.progress.lastWave or {}
+			AA.progress.lastWave[tostring(id)] = math.floor((os.clock() - Detail.startedAt) - last.t)
+		end
+	end
 	logMatch(summary)
 	saveDetail(summary)
 	if summary.eventCash and summary.eventRes and not summary.eventTotal then
@@ -8098,6 +8164,7 @@ local function resetMatch()
 	Match.extraDamage = nil
 	Match.dropLog = nil
 	Match.bossSeen, Match.guardCount = nil, nil
+	Match.earnLog, Match.incomeRecent, Match.coverEnd = nil, nil, nil
 	Match.killsPhase = nil
 	Match.voteNoted = nil
 	Match.startVote, Match.startVotesSeen, Match.startTimeFirst = nil, nil, nil
