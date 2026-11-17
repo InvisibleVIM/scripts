@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v229", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v230", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -389,7 +389,7 @@ do
 		CharmPick = { "Off", "Auto", "Damage", "Rewards" },
 		OrderAddKind = { "Place", "Upgrade" },
 		Targeting = { "Smart", "First", "Last", "Closest", "Farthest", "Strongest", "Weakest", "Off" },
-		CardStrategy = { "Win", "Balanced", "Pearls" },
+		CardStrategy = { "Win", "Balanced", "Pearls", "Secret" },
 		MenuFont = { "Own", "Roblox" },
 		TraitUse = { "Tokens", "Remnants", "Both" },
 	}
@@ -11795,19 +11795,18 @@ function CardBrain.situation(state)
 	return sit
 end
 
-CardBrain.STRATEGIES = { "Win", "Balanced", "Pearls" }
+CardBrain.STRATEGIES = { "Win", "Balanced", "Pearls", "Secret" }
 -- Win: a curse may cost this share of the team's power at most, and this much clear chance.
 -- Balanced: the clear chance it will not go under by choice.
--- Pearls: a curse is passed over when a blessing is expected to pay more pearls (share 1), or,
--- with "never pass on a curse", only when the curse leaves under half of what the blessing would
--- or under a one in four chance of standing three waves from now.
+-- Pearls: a curse at every vote that offers one (v230, user rule), the one expected to pay the
+-- most pearls; a blessing only when the vote has no curse.
 -- reserve: how much of the coming all-curse votes each strategy sets margin aside for.
 -- (The logged votes of eleven full runs, replayed through this model: Win kept the clear at 99%
 -- for 1209 pearls a run before account bonuses, Balanced 85% for 1604, Pearls 45% for 2130.
 -- Never passing on a curse came to 2% and 1726: the run ends in the low 40s, before the big
 -- multiplier has paid. 67 of the 166 votes went differently in at least one strategy. A
 -- projection, not played matches.)
-CardBrain.RULES = { freePower = 0.97, freeClear = 0.01, keepClear = 0.85, pearlsShare = 1, pearlsEvery = 0.5, pearlsSoon = 0.25, reserve = { Win = 0, Balanced = 0.7, Pearls = 1 } }
+CardBrain.RULES = { freePower = 0.97, freeClear = 0.01, keepClear = 0.85, pearlsShare = 1, pearlsEvery = 0.5, pearlsSoon = 0.25, reserve = { Win = 0, Balanced = 0.7, Pearls = 1, Secret = 0.7 } }
 
 ---The decision itself, from plain values (so it can be tested without a match).
 ---banned: { [family] = true }. order: the user's list of families, or nil. everyCurse: the
@@ -11822,6 +11821,12 @@ function CardBrain.decide(options, sit, state, strategy, banned, order, everyCur
 			-- (Some card names start with a little picture; the menu and the log carry the words.)
 			local row = { key = key, title = CardBrain.family(option.title) .. (tostring(option.title):match("%s+I+$") or ""), power = power, candy = candy or 0, extra = reward - (candy or 0), curse = option.option_type == "Bad", family = CardBrain.family(option.title) }
 			row.banned = banned[row.family] == true
+			row.secret = 0
+			for _, effect in pairs(type(option.effects) == "table" and option.effects or {}) do
+				if type(effect) == "table" and effect.type == "secret_drop" then
+					row.secret += tonumber(effect.amount) or 0
+				end
+			end
 			row.pearls, row.clear = CardBrain.expected(sit, power, row.candy, rules.reserve[strategy])
 			-- Other rewards (a better secret-drop chance, an extra reward) only break ties.
 			row.pearls *= 1 + 0.01 * row.extra
@@ -11859,6 +11864,13 @@ function CardBrain.decide(options, sit, state, strategy, banned, order, everyCur
 			end
 		end
 		return best
+	end
+	-- USER RULE (v230): Wishing Star whenever it is on offer, in every strategy and before the
+	-- user's own order. Only the never list stops it.
+	for _, row in ipairs(open) do
+		if row.family == "Wishing Star" then
+			return done(row, "Wishing Star is taken whenever it is offered")
+		end
 	end
 	-- The user's own order comes before every strategy (and after the never list).
 	for rank, name in ipairs(order or {}) do
@@ -11909,29 +11921,33 @@ function CardBrain.decide(options, sit, state, strategy, banned, order, everyCur
 		end
 		local pick = top(safe, "pearls", "power")
 		return done(pick, string.format("Balanced: most pearls with the clear still likely (%d%%)", pick.clear * 100 + 0.5))
+	elseif strategy == "Secret" then
+		-- USER (v230): "add a go for secret drop rate mode". The drop comes with the clear, so
+		-- the clear is kept likely (the same 85% Balanced holds) and, among the cards that keep
+		-- it, the one adding the most Secret Drop Rate is taken. With none on offer, or the base
+		-- under pressure, the strongest card: it buys the room for the next one that has it.
+		local secret = {}
+		for _, row in ipairs(sit.danger and {} or open) do
+			if row.secret > 0 and row.clear >= rules.keepClear then
+				table.insert(secret, row)
+			end
+		end
+		if #secret > 0 then
+			local pick = top(secret, "secret", "power")
+			return done(pick, string.format("Secret: +%d%% Secret Drop Rate with the clear still likely (%d%%)", pick.secret * 100 + 0.5, pick.clear * 100 + 0.5))
+		end
+		return done(strongest, sit.danger and "Secret: the base is under pressure, strongest card" or "Secret: no card here adds Secret Drop Rate and keeps the clear likely, strongest card")
 	end
 	-- Pearls: a curse whenever one is on offer.
 	if #curses == 0 then
 		return done(top(open, "pearls", "power"), "Pearls: no curse on offer, best blessing")
 	end
+	-- USER RULE (v230): "it should go for pearls every chance it gets" and "pick the least
+	-- harmful but pearl maximizing curses". A curse is never passed over for a blessing; which
+	-- curse is the one expected to pay the most pearls over the rest of the run, which weighs
+	-- what it adds to the multiplier against how soon it would end the run (the milder one on
+	-- a tie). The old "Never pass on a curse" switch is this, always.
 	local curse = top(curses, "pearls", "power")
-	local others = {}
-	for _, row in ipairs(open) do
-		if not row.curse then
-			table.insert(others, row)
-		end
-	end
-	local other = top(others, "pearls", "power")
-	if other then
-		local soon = CardBrain.holds(CardBrain.margin(sit, curse.power, math.min(sit.wave + 3, sit.bound), 0))
-		if everyCurse then
-			if curse.pearls < rules.pearlsEvery * other.pearls or soon < rules.pearlsSoon then
-				return done(other, "Pearls: every curse on offer would end the run, blessing instead")
-			end
-		elseif curse.pearls < rules.pearlsShare * other.pearls then
-			return done(other, string.format("Pearls: the blessing is worth more pearls (%d against %d)", other.pearls + 0.5, curse.pearls + 0.5))
-		end
-	end
 	return done(curse, string.format("Pearls: the curse worth the most pearls (+%s to the multiplier)", tostring(curse.candy)))
 end
 
@@ -17499,20 +17515,19 @@ do
 			UI.choiceCards(page, "CardStrategy", {
 				{ value = "Win", title = "Go for win", text = "The card that keeps the clear most likely. A curse only when it costs your team next to nothing.", gauges = { { "Clear chance", 3 }, { "Pearls", 1 }, { "Risk taken", 1 } } },
 				{ value = "Balanced", title = "Balanced", text = "Curses for as long as the clear stays likely, then it stops and protects the run.", gauges = { { "Clear chance", 2 }, { "Pearls", 2 }, { "Risk taken", 2 } } },
-				{ value = "Pearls", title = "Go for pearls", text = "Whatever is expected to pay the most pearls, even when that costs the clear.", gauges = { { "Clear chance", 1 }, { "Pearls", 3 }, { "Risk taken", 3 } } },
+				{ value = "Pearls", title = "Go for pearls", text = "A curse at every vote that offers one: the one expected to pay the most pearls.", gauges = { { "Clear chance", 1 }, { "Pearls", 3 }, { "Risk taken", 3 } } },
+				{ value = "Secret", title = "Go for secret", text = "The card with the most Secret Drop Rate, as long as the clear stays likely.", gauges = { { "Clear chance", 2 }, { "Pearls", 2 }, { "Risk taken", 2 } } },
 			})
 			local DETAIL = {
 				Win = "Go for win takes the card that leaves your team strongest. It takes a curse in two cases only: the curse costs under 3% of your damage and leaves the clear as likely as before, or the vote offers nothing but curses, and then it takes the mildest one. Projected on the votes of your eleven logged full runs: the clear in 99% of them, and a little under 60% of the pearls Go for pearls makes.",
 				Balanced = "Balanced projects the rest of the run before each vote and takes the card that pays the most pearls among those that keep the chance to clear at 85% or better, with room set aside for the votes that offer nothing but curses. When no card keeps it there, or the base is under pressure, it takes the strongest card. A stage you have never cleared is played like Go for win until it has been cleared once. Same projection: the clear in 85%, and about three quarters of the pearls.",
-				Pearls = "Go for pearls takes the card with the highest expected pearl payout for the rest of the run. That is a curse at most votes, heavy ones included, and a blessing only when it is worth more pearls than any curse on offer because the run would end before the bigger multiplier has paid. It still tries to reach the last wave: the late waves pay the most. Same projection: the clear in a little under half the runs, and the most pearls of the three.",
+				Secret = "Go for secret takes the card that adds the most Secret Drop Rate among those that keep the chance to clear at 85% or better: Doomsday (+100%), Starforged and tier III curses (+50%), tier II curses (+25%). When no card on offer has any, or none keeps the clear likely, or the base is under pressure, it takes the strongest card, which makes room for the next one that does. Pearls come along with those curses but are not what it picks by.",
+				Pearls = "Go for pearls takes a curse at every vote that offers one, and never a blessing in its place. Of the curses on offer it takes the one expected to pay the most pearls over the rest of the run: what it adds to the multiplier, weighed against how soon it would end the run. A blessing is taken only when the vote has no curse. Highest multiplier of the three, and the least likely to reach the last wave.",
 			}
 			local detail = UI.callout(page, "")
-			toggle(page, "Never pass on a curse", "PearlsOnlyCurses", "Go for pearls only. Takes a curse at every vote unless the run would fall within three waves. Highest multiplier, but in the same projection the run ends in the low 40s and pays about a fifth less.")
-			local everyRow = UI.lastRow[page].row
-			UI.note(page, "Your never list below is applied first in all three: a card on it is never voted for.")
+			UI.note(page, "Your never list below is applied first in all three: a card on it is never voted for. Wishing Star is taken whenever it is offered, in all three.")
 			local function showStrategy()
 				detail.Text = DETAIL[CardBrain.strategy()]
-				everyRow.Visible = CardBrain.strategy() == "Pearls"
 			end
 			table.insert(UI.refreshers, showStrategy)
 			showStrategy()
