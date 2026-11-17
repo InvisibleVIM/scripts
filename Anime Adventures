@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v228", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v229", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -127,7 +127,7 @@ do
 				if name == "progress.json" and not owner then
 					local decoded, data = pcall(http.JSONDecode, http, text)
 					if decoded and type(data) == "table" then
-						for _, key in ipairs({ "session", "sessionAt", "sessionItems", "sessionOwned", "lobbyRes", "resRun", "eventMark", "charmLog", "detailIndex" }) do
+						for _, key in ipairs({ "session", "sessionAt", "sessionItems", "sessionOwned", "lobbyRes", "resRun", "eventMark", "charmLog", "detailIndex", "CastleNormal", "CastleHard" }) do
 							data[key] = nil
 						end
 						data.accountFresh = true
@@ -7706,7 +7706,20 @@ function AA.castleNext()
 		return Config.CastleFloor
 	end
 	local tower = profile().level_data and profile().level_data.infinite_tower
-	local reached = math.max((type(tower) == "table" and tonumber(tower.floor_reached) or 1) - 1, 0)
+	local known = type(tower) == "table" and tonumber(tower.floor_reached)
+	local reached = math.max((known or 1) - 1, 0)
+	if IS_LOBBY and known then
+		-- In the lobby the game's own number is the truth. (A second account started from the
+		-- first one's files: its record said room 82 cleared while the game had it on room 3,
+		-- and it kept asking for room 83.)
+		for _, key in ipairs({ "CastleNormal", "CastleHard" }) do
+			if (AA.progress[key] or 0) > reached then
+				AA.progress[key] = reached
+				AA.saveProgress()
+			end
+		end
+		return reached + 1
+	end
 	return math.max(reached, AA.progress.CastleNormal or 0, AA.progress.CastleHard or 0) + 1
 end
 
