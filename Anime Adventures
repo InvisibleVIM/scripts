@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v230", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v231", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -7948,10 +7948,11 @@ local function finishMatch()
 	local after = Config.AfterGame
 	local level = id and Levels[id]
 	local story = level and level.story_level_rank ~= nil and not level.infinite
-	if kind == "Dungeon" or (not Config.AutoJoin and (after == "Lobby" or kind == "Portal")) then
-		-- The dungeon controller picks the next room. With Auto join off, "After a match" still
-		-- continues in the match (USER: "it should do it immediately after the match finishes");
-		-- only a trip to the lobby or a new portal waits for the player.
+	if kind == "Dungeon" or not Config.AutoJoin then
+		-- The dungeon controller picks the next room. USER RULE (v231): with Join matches off no
+		-- new match is started in any way, a replay or next act from the result screen included
+		-- ("even after i turn join match off it starts another?"). v226 had "After a match"
+		-- carry on with it off; that was wrong.
 		after = "Stay"
 	elseif after == "Auto" and (kind == "Challenge" or kind == "Daily") then
 		-- USER RULE (v224): a challenge pays once per half hour and the Daily once a day, so a
@@ -8163,12 +8164,12 @@ local function finishMatch()
 	-- minutes on the result screen (and only with Auto join on) is the lobby the way out.
 	local started = os.clock()
 	Match.voting = true
-	while AA.alive and gameFinished() and after ~= "Lobby" and os.clock() - started < 180 do
+	while AA.alive and gameFinished() and after ~= "Lobby" and Config.AutoJoin and os.clock() - started < 180 do
 		deadline = os.clock() + 20
 		while AA.alive and os.clock() < deadline and gameFinished() do
 			task.wait(0.5)
 		end
-		if AA.alive and gameFinished() then
+		if AA.alive and gameFinished() and Config.AutoJoin then
 			if after == "Next" and os.clock() - started > 35 then
 				after = "Replay"
 				Match.lastAfter = "Replay"
@@ -8376,7 +8377,7 @@ local function matchLoop()
 					invoke("teleport_back_to_lobby")
 				end
 			end
-			if Match.ended and not Match.voting and (Config.AutoJoin or Config.AfterGame ~= "Lobby") and matchKind() ~= "Dungeon" then
+			if Match.ended and not Match.voting and Config.AutoJoin and matchKind() ~= "Dungeon" then
 				-- Still on the result screen a minute later (a vote or teleport that didn't go
 				-- through, or the script was reloaded here): the lobby, asked again every 30 s.
 				Match.finishedSince = Match.finishedSince or os.clock()
@@ -10994,16 +10995,55 @@ function AA.shopStep()
 			end
 		end
 	end
-	if Config.BuyCapsules and currency("SummerPearls") >= 150 + Config.KeepPearls then
-		local n = math.floor((currency("SummerPearls") - Config.KeepPearls) / 150)
-		if n >= 1 then
+	-- USER (v231): "buy sunny stars and open sunny stars should both be way faster ... open them
+	-- as fast as possible". The shop sells 100, 10 or 1 at a time and the item can be used all
+	-- at once (the game's own Buy100 and Use All buttons); it was 10 bought and one opened per
+	-- pass of this loop. Each request waits only until the count has moved.
+	if Config.BuyCapsules then
+		for _ = 1, 60 do
+			local pearls = currency("SummerPearls")
+			local n = math.floor((pearls - Config.KeepPearls) / 150)
+			if n < 1 or not AA.alive or not Config.BuyCapsules then
+				break
+			end
 			status = "Buying Sunny Stars"
-			invoke("buy_item_generic", "capsule_summer2", "event", "event_shop", tostring(math.min(n, 10)))
+			task.spawn(invoke, "buy_item_generic", "capsule_summer2", "event", "event_shop", n >= 100 and "100" or n >= 10 and "10" or "1")
+			local deadline = os.clock() + 2
+			while os.clock() < deadline and currency("SummerPearls") == pearls do
+				task.wait(0.05)
+			end
+			if currency("SummerPearls") == pearls then
+				break
+			end
 		end
 	end
-	if Config.OpenCapsules and itemCount("capsule_summer2") > 0 then
-		status = "Opening Sunny Stars"
-		invoke("use_item", "capsule_summer2")
+	if Config.OpenCapsules then
+		local options = { { use_all = true }, { use10 = true }, false }
+		local index = 1
+		for _ = 1, 400 do
+			local count = itemCount("capsule_summer2")
+			if count <= 0 or not AA.alive or not Config.OpenCapsules then
+				break
+			end
+			status = "Opening Sunny Stars"
+			local option = options[index]
+			if option then
+				task.spawn(invoke, "use_item", "capsule_summer2", option)
+			else
+				task.spawn(invoke, "use_item", "capsule_summer2")
+			end
+			local deadline = os.clock() + 2
+			while os.clock() < deadline and itemCount("capsule_summer2") == count do
+				task.wait(0.05)
+			end
+			if itemCount("capsule_summer2") == count then
+				-- Refused that way: the next smaller one, and stop when even one at a time fails.
+				if index >= #options then
+					break
+				end
+				index += 1
+			end
+		end
 	end
 end
 
