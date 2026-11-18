@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v236", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v237", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -10208,7 +10208,7 @@ function AA.dungeonStep()
 			status = "Dungeon: chests kept unopened"
 			pcall(note, "dungeonChests", { treasure = (data._resources or {}).treasure, gold = (data._resources or {}).treasure_gold })
 		elseif kind == "1" then
-			-- Shop: buy what the run's money covers, cheapest first (curse items are left alone).
+			-- Shop: buy what the run's money covers, best first (curse items are left alone).
 			status = "Dungeon: shop"
 			local dungeon = findData("DungeonServiceCore", "sum_item_values")
 			local items = dungeon and dungeon.ITEMS or {}
@@ -10220,38 +10220,60 @@ function AA.dungeonStep()
 					deals[entry.data._base_damage_type == "magic" and "magic" or "physical"] = true
 				end
 			end
-			local offers = {}
-			for index, offer in pairs(type(room.data) == "table" and room.data or room) do
-				local item = type(offer) == "table" and items[offer.id]
-				if item and item.cost and not item.curse_chance and not item.curse_super_chance then
-					local useful = true
-					for _, effect in pairs(type(item.wave_modifier_effects) == "table" and item.wave_modifier_effects or {}) do
-						local stat = type(effect) == "table" and tostring(effect.stat or "") or ""
-						if (stat:find("physical") and not deals.physical) or (stat:find("magic") and not deals.magic) or stat:find("true_damage") then
-							useful = false
+			-- USER RULE (v237): chests come first, gold ones above all, and after that whatever
+			-- keeps the run winnable. So: the Philosopher's Stone (every carried chest becomes a
+			-- rare one) once two or more plain chests are carried, the Treasure Chest item, then
+			-- the old order (rewards and cheaper units, then damage the team can use).
+			-- The shop is read again after every purchase and the item found by its id, in case
+			-- the list moves up when something is bought.
+			local function best()
+				if not dungeon then
+					return nil
+				end
+				local data = profile().dungeon_data or {}
+				local step = type(data.current_shops) == "table" and (type(data.current_shops[1]) == "table" and data.current_shops[1] or data.current_shops) or {}
+				local scale = math.max(0, (tonumber(gameCall(dungeon.sum_item_values, data, "shop_prices")) or 0) + 1)
+				local resources = data._resources or {}
+				local money = tonumber(resources.money) or 0
+				local plain = tonumber(resources.treasure) or 0
+				local pick
+				for index, offer in pairs(type(step.data) == "table" and step.data or step) do
+					local item = type(offer) == "table" and items[offer.id]
+					if item and item.cost and not item.curse_chance and not item.curse_super_chance and money >= math.ceil(item.cost * scale) then
+						local useful = true
+						for _, effect in pairs(type(item.wave_modifier_effects) == "table" and item.wave_modifier_effects or {}) do
+							local stat = type(effect) == "table" and tostring(effect.stat or "") or ""
+							if (stat:find("physical") and not deals.physical) or (stat:find("magic") and not deals.magic) or stat:find("true_damage") then
+								useful = false
+							end
+						end
+						local rank = DUNGEON_SHOP_RANK[offer.id] or 50
+						if offer.id == "philospher_stone" then
+							rank = plain >= 2 and -2 or (plain >= 1 and 0.5 or 60)
+						elseif offer.id == "chest_mock_item" then
+							rank = -1
+						end
+						if useful and (not pick or rank < pick.rank or (rank == pick.rank and item.cost < pick.cost)) then
+							pick = { index = index, id = offer.id, rank = rank, cost = item.cost, price = math.ceil(item.cost * scale), money = money }
 						end
 					end
-					if useful then
-						table.insert(offers, { index = index, cost = item.cost, rank = DUNGEON_SHOP_RANK[offer.id] or 50 })
-					end
 				end
+				return pick
 			end
-			-- Best first (rewards and cheaper units, then damage), not cheapest first: the run's
-			-- money used to go on tier-1 daggers before a Golden Mushroom could be paid for.
-			table.sort(offers, function(x, y)
-				if x.rank ~= y.rank then
-					return x.rank < y.rank
+			for _ = 1, 8 do
+				local offer = best()
+				if not offer then
+					break
 				end
-				return x.cost < y.cost
-			end)
-			for _, offer in ipairs(offers) do
-				local data = profile().dungeon_data or {}
-				local scale = math.max(0, (tonumber(gameCall(dungeon.sum_item_values, data, "shop_prices")) or 0) + 1)
-				local money = tonumber((data._resources or {}).money) or 0
-				if money >= math.ceil(offer.cost * scale) then
-					pcall(note, "dungeonBuy", { i = offer.index, cost = math.ceil(offer.cost * scale), money = money })
-					invoke("dungeon_buy_shop", offer.index)
-					task.wait(0.4)
+				pcall(note, "dungeonBuy", { id = offer.id, i = offer.index, cost = offer.price, money = offer.money })
+				invoke("dungeon_buy_shop", offer.index)
+				local deadline = os.clock() + 2
+				while os.clock() < deadline and (tonumber(((profile().dungeon_data or {})._resources or {}).money) or 0) >= offer.money do
+					task.wait(0.1)
+				end
+				if (tonumber(((profile().dungeon_data or {})._resources or {}).money) or 0) >= offer.money then
+					-- The money did not move: refused, stop rather than ask for the same thing again.
+					break
 				end
 			end
 		elseif kind == "7" then
