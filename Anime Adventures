@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v231", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v232", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -10145,7 +10145,12 @@ end
 
 -- Dungeon runs: dungeon_data.next holds the room choices (choice_str -> {_l = level, _t = room types}).
 -- Types: 0 curse, 1 shop, 2 money, 3 gold treasure, 4 treasure, 5 final boss, 6 open chests, 7 shrine.
-local ROOM_VALUE = { ["3"] = 6, ["4"] = 5, ["6"] = 4, ["2"] = 3, ["5"] = 3, ["7"] = 2, ["1"] = 1, ["0"] = -6 }
+-- USER RULE (v232): "it should prioritize chests". A room that gives a chest beats every room
+-- that doesn't, a gold chest beats a plain one, and a curse on the same room no longer talks it
+-- out of it (treasure 5 + curse -6 used to lose to a bare shop). The room that opens chests
+-- counts as a chest room only while chests are being carried (see dungeonStep).
+local ROOM_VALUE = { ["3"] = 200, ["4"] = 100, ["6"] = 4, ["2"] = 3, ["5"] = 3, ["7"] = 2, ["1"] = 1, ["0"] = -6 }
+local ROOM_OPEN_CARRYING = 150
 
 -- Shop order (lower buys first): loot and luck, cheaper units, then damage.
 local DUNGEON_SHOP_RANK = {}
@@ -10294,6 +10299,9 @@ function AA.dungeonStep()
 			local value = 0
 			for roomType in pairs(option._t or {}) do
 				value += ROOM_VALUE[tostring(roomType)] or 0
+				if tostring(roomType) == "6" and resourceTotal(data) > 0 then
+					value += ROOM_OPEN_CARRYING
+				end
 			end
 			-- Easier rooms first when the rewards tie.
 			value -= (option._l._lobby_difficulty_scale or 1)
@@ -10308,6 +10316,7 @@ function AA.dungeonStep()
 		return false
 	end
 	status = "Dungeon: room " .. tostring(best)
+	pcall(note, "dungeonRoom", { room = tostring(best), value = bestValue, carrying = resourceTotal(data) })
 	invoke("dungeon_enter_room", tostring(best))
 	AA.waitForTeleport(25)
 	return true
