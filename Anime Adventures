@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v234", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v235", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -10202,29 +10202,16 @@ function AA.dungeonStep()
 		end
 		local kind = tostring(room._t)
 		if kind == "6" then
-			-- Open every chest: the game's own buttons send no argument for a normal chest and
-			-- `true` for a gold one.
-			status = "Dungeon: opening chests"
-			for _ = 1, 40 do
-				local resources = (profile().dungeon_data or {})._resources or {}
-				local gold = (tonumber(resources.treasure_gold) or 0) > 0
-				if not gold and (tonumber(resources.treasure) or 0) <= 0 then
-					break
-				end
-				local before = resourceTotal(profile().dungeon_data or {})
-				if gold then
-					invoke("dungeon_open_chest", true)
-				else
-					invoke("dungeon_open_chest")
-				end
-				local deadline = os.clock() + 1.5
-				while os.clock() < deadline and resourceTotal(profile().dungeon_data or {}) >= before do
-					task.wait(0.1)
-				end
-				if resourceTotal(profile().dungeon_data or {}) >= before then
-					break
-				end
+			-- USER RULE (v235): "make sure the script doesnt ever open chests. especially the
+			-- rare/gold chests." The Open Treasure screen is left exactly as it is: nothing is
+			-- opened and it is not continued past either (whether moving on keeps the unopened
+			-- chests is not known), so the run waits here for the player.
+			status = "Dungeon: chests left unopened for you"
+			if Match.chestNoted ~= true then
+				Match.chestNoted = true
+				pcall(note, "dungeonChests", { treasure = (data._resources or {}).treasure, gold = (data._resources or {}).treasure_gold })
 			end
+			return false
 		elseif kind == "1" then
 			-- Shop: buy what the run's money covers, cheapest first (curse items are left alone).
 			status = "Dungeon: shop"
