@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v238", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v239", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -10207,6 +10207,20 @@ function AA.dungeonStep()
 			-- "pressing continue keeps the chests", so the screen is continued past below.
 			status = "Dungeon: chests kept unopened"
 			pcall(note, "dungeonChests", { treasure = (data._resources or {}).treasure, gold = (data._resources or {}).treasure_gold })
+			-- The last room is different (v239): the game's own Leave Dungeon box says "Make sure
+			-- you open all your Chests before leaving", so Finish there gives them up. With chests
+			-- carried and the dungeon finished (or no room left to go to) the script stops here
+			-- and waits for the player: it may not open them and must not throw them away.
+			local onward = false
+			for _, option in pairs(type(data.next) == "table" and data.next or {}) do
+				if type(option) == "table" and option._l then
+					onward = true
+				end
+			end
+			if resourceTotal(data) > 0 and (data._finished or not onward) then
+				status = "Dungeon: last room, " .. tostring(resourceTotal(data)) .. " chests waiting for you to open"
+				return true
+			end
 		elseif kind == "1" then
 			-- Shop: buy what the run's money covers, best first (curse items are left alone).
 			status = "Dungeon: shop"
@@ -10358,6 +10372,11 @@ function AA.dungeonStep()
 		end)
 	end
 	if not best then
+		if resourceTotal(data) > 0 then
+			-- Nowhere left to go with chests still carried: leaving would give them up (v239).
+			status = "Dungeon: last room, " .. tostring(resourceTotal(data)) .. " chests waiting for you to open"
+			return true
+		end
 		status = "Dungeon: finishing"
 		invoke("dungeon_continue_shop")
 		return false
