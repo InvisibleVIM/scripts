@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v235", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v236", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -10203,15 +10203,10 @@ function AA.dungeonStep()
 		local kind = tostring(room._t)
 		if kind == "6" then
 			-- USER RULE (v235): "make sure the script doesnt ever open chests. especially the
-			-- rare/gold chests." The Open Treasure screen is left exactly as it is: nothing is
-			-- opened and it is not continued past either (whether moving on keeps the unopened
-			-- chests is not known), so the run waits here for the player.
-			status = "Dungeon: chests left unopened for you"
-			if Match.chestNoted ~= true then
-				Match.chestNoted = true
-				pcall(note, "dungeonChests", { treasure = (data._resources or {}).treasure, gold = (data._resources or {}).treasure_gold })
-			end
-			return false
+			-- rare/gold chests." Nothing is opened on the Open Treasure screen. USER (v236):
+			-- "pressing continue keeps the chests", so the screen is continued past below.
+			status = "Dungeon: chests kept unopened"
+			pcall(note, "dungeonChests", { treasure = (data._resources or {}).treasure, gold = (data._resources or {}).treasure_gold })
 		elseif kind == "1" then
 			-- Shop: buy what the run's money covers, cheapest first (curse items are left alone).
 			status = "Dungeon: shop"
@@ -10260,10 +10255,14 @@ function AA.dungeonStep()
 				end
 			end
 		elseif kind == "7" then
-			-- A shrine trades a super curse for loot. Faster, regenerating or random-curse enemies
-			-- are the ones that end runs: those are walked past.
+			-- A shrine gives a blessing item together with a super curse (USER, v236). Faster,
+			-- regenerating or random-curse enemies are the ones that end runs: those are walked past.
 			local curse
+			local gifts = {}
 			local function scan(value, depth)
+				if type(value) == "table" and type(value.id) == "string" and not value.id:find("^_curse") then
+					table.insert(gifts, value.id)
+				end
 				if type(value) == "string" and DUNGEON_SHRINE_SKIP[value] ~= nil then
 					curse = value
 				elseif type(value) == "table" and depth < 4 then
@@ -10280,7 +10279,7 @@ function AA.dungeonStep()
 				status = "Dungeon: shrine"
 				invoke("dungeon_shrine_accept")
 			end
-			pcall(note, "shrine", { c = tostring(curse), took = not (curse and DUNGEON_SHRINE_SKIP[curse]) })
+			pcall(note, "shrine", { c = tostring(curse), gifts = table.concat(gifts, ","), took = not (curse and DUNGEON_SHRINE_SKIP[curse]) })
 			task.wait(0.6)
 		end
 		invoke("dungeon_continue_shop")
