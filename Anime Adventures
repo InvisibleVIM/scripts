@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v241", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v242", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -208,6 +208,8 @@ local Config = {
 	Difficulty = "Normal",
 	Legend = "clover_legend",
 	LegendAct = 1,
+	-- Relic mode: the relic whose materials are being farmed (an item id from the game's relic data).
+	Relic = "noelle_crown",
 	Raid = "naruto_raid_1",
 	Artifact = "artifact_usopp_ts",
 	CastleFloor = 0,
@@ -387,7 +389,7 @@ do
 	end
 	-- A saved choice that is no longer an option (an older version's) goes back to its default.
 	local choices = {
-		Mode = { "Story", "Level", "Infinite", "Legend", "Raid", "Artifact", "Challenge", "Daily", "Missions", "Quests", "Summer", "Cursed Womb", "Tournament", "Castle", "Dungeon", "Portals", "Kills" },
+		Mode = { "Story", "Level", "Infinite", "Legend", "Relic", "Raid", "Artifact", "Challenge", "Daily", "Missions", "Quests", "Summer", "Cursed Womb", "Tournament", "Castle", "Dungeon", "Portals", "Kills" },
 		AfterGame = { "Auto", "Next", "Replay", "Lobby" },
 		Difficulty = { "Normal", "Hard" },
 		PlaceStyle = { "Auto", "Front", "Normal" },
@@ -7957,12 +7959,19 @@ local function finishMatch()
 	local after = Config.AfterGame
 	local level = id and Levels[id]
 	local story = level and level.story_level_rank ~= nil and not level.infinite
+	local relicAfter = (after == "Auto" and Config.AutoJoin and kind ~= "Dungeon" and (AA.playMode() == "Relic" or Config.Mode == "Relic")) and AA.Relic.afterMatch(id) or nil
 	if kind == "Dungeon" or not Config.AutoJoin then
 		-- The dungeon controller picks the next room. USER RULE (v231): with Join matches off no
 		-- new match is started in any way, a replay or next act from the result screen included
 		-- ("even after i turn join match off it starts another?"). v226 had "After a match"
 		-- carry on with it off; that was wrong.
 		after = "Stay"
+	elseif relicAfter then
+		-- Relic mode: the same stage again while it is still the one to farm; the lobby only to
+		-- change stage (another one drops what is missing now) or to hand over to the mode set
+		-- for "when that has nothing to play" once everything is collected. A stage can't be
+		-- changed from the result screen, so this is the one trip Auto makes here.
+		after = relicAfter
 	elseif after == "Auto" and (kind == "Challenge" or kind == "Daily") then
 		-- USER RULE (v224): a challenge pays once per half hour and the Daily once a day, so a
 		-- finished one is never replayed: back to the lobby, which takes the next challenge or
@@ -9334,6 +9343,11 @@ AA.chooseInner = function(modeOverride)
 			return nil, nil, "locked"
 		end
 		return id, "Hard", "story"
+	elseif mode == "Relic" then
+		-- The stage that drops what the picked relic still needs (AA.Relic, below). As the
+		-- picked mode it steps aside once everything is collected and "When that has nothing to
+		-- play" is set; as somebody's fallback it just keeps farming.
+		return AA.Relic.choose(modeOverride ~= nil or Config.Mode ~= "Relic")
 	elseif mode == "Legend" then
 		local world = Worlds[Config.Legend]
 		local level = world and world.levels and (world.levels[tostring(Config.LegendAct)] or world.levels[Config.LegendAct])
@@ -9436,11 +9450,25 @@ chooseTarget = function(modeOverride)
 	end
 	AA.targetMode = Config.Mode
 	local id, difficulty, kind, group = AA.chooseInner()
+	if not id and kind == "relicwait" then
+		-- Relic mode could not read the inventory yet: wait for it, don't wander off to the
+		-- fallback on a guess.
+		return nil, nil, kind
+	end
 	if not id and Config.Otherwise ~= "None" and Config.Otherwise ~= Config.Mode then
 		local otherId, otherDifficulty, otherKind, otherGroup = AA.chooseInner(Config.Otherwise)
 		if otherId then
 			AA.targetMode = Config.Otherwise
 			return otherId, otherDifficulty, otherKind, otherGroup
+		end
+	end
+	if not id and Config.Mode == "Relic" and kind == "relicdone" then
+		-- Everything is collected and the fallback has nothing to play (or can't be started):
+		-- back to farming extra materials.
+		local relicId, relicDifficulty, relicKind = AA.Relic.choose(true)
+		if relicId then
+			AA.targetMode = "Relic"
+			return relicId, relicDifficulty, relicKind
 		end
 	end
 	return id, difficulty, kind, group
@@ -10009,7 +10037,7 @@ local function joinGame()
 		AA.saveProgress()
 	end
 	if not id then
-		status = kind == "quests" and "No quest the script can play right now (see the list on the Mode tab)" or kind == "wombkey" and "No Cursed Womb Key (drops in Haunted Academy infinite)" or kind == "portal" and "No portal items" or kind == "raid" and "Waiting for a raid" or (kind == "challenge" and "No challenge left" or ((kind == "artifact" or kind == "locked") and "Locked: clear the story first" or "Nothing to join"))
+		status = kind == "relicwait" and "Relic: reading your inventory" or kind == "relicnone" and "Relic: pick a relic on the Mode tab" or kind == "reliclocked" and "Relic: no stage that drops the missing materials is open (clear the story acts before it, or it was lost three times today)" or kind == "relicdone" and "Relic: everything collected, and the mode set for after it has nothing to play" or kind == "quests" and "No quest the script can play right now (see the list on the Mode tab)" or kind == "wombkey" and "No Cursed Womb Key (drops in Haunted Academy infinite)" or kind == "portal" and "No portal items" or kind == "raid" and "Waiting for a raid" or (kind == "challenge" and "No challenge left" or ((kind == "artifact" or kind == "locked") and "Locked: clear the story first" or "Nothing to join"))
 		return false
 	end
 	do
@@ -10672,6 +10700,298 @@ local function itemCount(id)
 	local inventory = profile().inventory
 	local items = inventory and inventory.normal_items
 	return items and tonumber(items[id]) or 0
+end
+
+-- Relic mode -----------------------------------------------------------------------------------
+-- Farms the materials of one relic. Nothing here is a hand-written table: the relics and their
+-- recipes are the game's relic items (Data.Items.UniqueItems.Relics, crafting_recipe), what an
+-- ingredient is itself made of comes from the item data (Ingots (Steel) = 15 Ore (Steel)), and
+-- where a material drops is read off the levels (_show_rewards and rewards). A new relic or a
+-- new legend stage in the game shows up here by itself.
+-- Supported = every raw material drops in a legend stage, which is what this mode can queue
+-- (the three Relic Shard relics need raid and portal drops and are left out).
+AA.Relic = {}
+do
+	local Relic = AA.Relic
+	local relicItems, itemData, sources
+	local function relics()
+		if not relicItems then
+			relicItems = {}
+			local ok, folder = pcall(function()
+				return replicatedStorage.src.Data.Items.UniqueItems.Relics
+			end)
+			for _, module in ipairs(ok and folder and folder:GetChildren() or {}) do
+				local data = module:IsA("ModuleScript") and gameRequire(module)
+				for id, item in pairs(type(data) == "table" and data or {}) do
+					if type(item) == "table" and type(item.crafting_recipe) == "table" and next(item.crafting_recipe) ~= nil then
+						relicItems[id] = item
+					end
+				end
+			end
+		end
+		return relicItems
+	end
+	local function item(id)
+		if itemData == nil then
+			itemData = findData("Items", "ingots_steel") or false
+		end
+		return (itemData and itemData[id]) or relics()[id]
+	end
+	---What an item is crafted from, or nil for a raw material.
+	local function recipeOf(id)
+		local data = item(id)
+		local recipe = data and data.crafting_recipe
+		return type(recipe) == "table" and next(recipe) ~= nil and recipe or nil
+	end
+	---item id -> legend stages that list it as a drop, in a stable order.
+	local function sourcesOf(id)
+		if not sources then
+			sources = {}
+			for levelId, level in pairs(Levels) do
+				if type(levelId) == "string" and type(level) == "table" and levelId:find("_legend_", 1, true) then
+					local function add(dropId)
+						if type(dropId) == "string" then
+							sources[dropId] = sources[dropId] or {}
+							if not table.find(sources[dropId], levelId) then
+								table.insert(sources[dropId], levelId)
+							end
+						end
+					end
+					for _, reward in pairs(type(level._show_rewards) == "table" and level._show_rewards or {}) do
+						add(type(reward) == "table" and type(reward.params) == "table" and reward.params.item_id)
+					end
+					for _, group in pairs(type(level.rewards) == "table" and level.rewards or {}) do
+						for _, reward in pairs(type(group) == "table" and type(group.item) == "table" and group.item or {}) do
+							add(type(reward) == "table" and reward.item_id)
+						end
+					end
+				end
+			end
+			for _, list in pairs(sources) do
+				table.sort(list)
+			end
+		end
+		return sources[id] or {}
+	end
+	function Relic.itemName(id)
+		local data = item(id)
+		return data and data.name or AA.spaced(id)
+	end
+	function Relic.stageName(levelId)
+		local level = Levels[levelId]
+		local world = level and Worlds[level.world]
+		return level and ((world and world.name and (world.name .. ": ") or "") .. tostring(level.name or levelId)) or tostring(levelId)
+	end
+	---Raw materials of a relic: id -> true (through everything that is crafted on the way).
+	local function leaves(id, into, depth)
+		into = into or {}
+		for sub in pairs(recipeOf(id) or {}) do
+			if recipeOf(sub) and (depth or 0) < 5 then
+				leaves(sub, into, (depth or 0) + 1)
+			else
+				into[sub] = true
+			end
+		end
+		return into
+	end
+	---The relics this mode can farm, in the game's own order: { id =, name =, rarity =, gold = }.
+	function Relic.list()
+		local list = {}
+		for id, data in pairs(relics()) do
+			local farmable = true
+			for leaf in pairs(leaves(id)) do
+				farmable = farmable and #sourcesOf(leaf) > 0
+			end
+			if farmable then
+				table.insert(list, { id = id, name = data.name or AA.spaced(id), rarity = data.rarity, gold = tonumber(data.crafting_cost) or 0, order = tonumber(data.layout_order) or 99 })
+			end
+		end
+		table.sort(list, function(a, b)
+			if a.order ~= b.order then
+				return a.order < b.order
+			end
+			return a.name < b.name
+		end)
+		return list
+	end
+	---How many of an item the player holds: stackable materials, or copies of a unique item (a
+	---Tear Blade is itself a relic and an ingredient of the next one).
+	function Relic.owned(id, inventory)
+		local stack = type(inventory.normal_items) == "table" and tonumber(inventory.normal_items[id])
+		if stack then
+			return stack
+		end
+		local count = 0
+		for _, unique in pairs(type(inventory.unique_items) == "table" and inventory.unique_items or {}) do
+			if type(unique) == "table" and unique.item_id == id then
+				count += 1
+			end
+		end
+		return count
+	end
+	---Where the picked relic stands. nil while the inventory can't be read.
+	---rows: { id, name, required, owned, remaining, crafted, depth, stages } in display order (an
+	---ingredient that is crafted is followed by what its missing copies still need).
+	function Relic.plan(relicId)
+		relicId = relicId or Config.Relic
+		local data = relics()[relicId]
+		if not data then
+			return nil, "none"
+		end
+		local inventory = profile().inventory
+		if type(inventory) ~= "table" or type(inventory.normal_items) ~= "table" then
+			return nil, "wait"
+		end
+		local plan = { id = relicId, name = data.name or AA.spaced(relicId), gold = tonumber(data.crafting_cost) or 0, rows = {}, leaves = {} }
+		local function add(id, amount, depth)
+			local owned = Relic.owned(id, inventory)
+			local recipe = depth < 5 and recipeOf(id) or nil
+			local row = { id = id, name = Relic.itemName(id), required = amount, owned = owned, remaining = math.max(amount - owned, 0), crafted = recipe ~= nil, depth = depth }
+			table.insert(plan.rows, row)
+			if recipe then
+				local subs = {}
+				for sub, each in pairs(recipe) do
+					table.insert(subs, { sub, tonumber(each) or 1 })
+				end
+				table.sort(subs, function(a, b)
+					return a[1] < b[1]
+				end)
+				for _, sub in ipairs(subs) do
+					if row.remaining > 0 then
+						add(sub[1], sub[2] * row.remaining, depth + 1)
+					end
+				end
+			else
+				row.stages = sourcesOf(id)
+				table.insert(plan.leaves, row)
+			end
+		end
+		local direct = {}
+		for id, amount in pairs(data.crafting_recipe) do
+			table.insert(direct, { id, tonumber(amount) or 1 })
+		end
+		table.sort(direct, function(a, b)
+			return Relic.itemName(a[1]) < Relic.itemName(b[1])
+		end)
+		for _, entry in ipairs(direct) do
+			add(entry[1], entry[2], 0)
+		end
+		-- Progress in the recipe's own units: a crafted ingredient counts what is held plus what
+		-- its collected sub-materials already cover.
+		local have, total = 0, 0
+		for index, row in ipairs(plan.rows) do
+			if row.depth == 0 then
+				local covered = row.owned
+				if row.crafted and row.remaining > 0 then
+					local share = 1
+					local index2 = index + 1
+					while plan.rows[index2] and plan.rows[index2].depth > 0 do
+						local sub = plan.rows[index2]
+						if sub.depth == 1 and sub.required > 0 then
+							share = math.min(share, math.min(sub.owned, sub.required) / sub.required)
+						end
+						index2 += 1
+					end
+					covered += math.floor(row.remaining * share)
+				end
+				row.covered = math.min(covered, row.required)
+				have += row.covered
+				total += row.required
+			end
+		end
+		plan.have, plan.total = have, total
+		plan.ready = true
+		plan.toCraft = {}
+		for _, row in ipairs(plan.leaves) do
+			plan.ready = plan.ready and row.remaining == 0
+		end
+		for _, row in ipairs(plan.rows) do
+			if row.crafted and row.remaining > 0 then
+				table.insert(plan.toCraft, ("%d %s"):format(row.remaining, row.name))
+			end
+		end
+		return plan
+	end
+	---The stage to farm: id, difficulty, kind (like chooseInner). keepGoing = farm extras once
+	---everything is collected (no fallback to hand over to).
+	function Relic.choose(keepGoing)
+		local plan, why = Relic.plan()
+		if not plan then
+			Relic.activity = why == "none" and "No relic picked" or "Reading your inventory"
+			return nil, nil, why == "none" and "relicnone" or "relicwait"
+		end
+		local done = completedLevels()
+		local open, scores = {}, {}
+		for _, row in ipairs(plan.leaves) do
+			row.open = {}
+			for _, levelId in ipairs(row.stages or {}) do
+				if open[levelId] == nil then
+					open[levelId] = Levels[levelId] ~= nil and levelUnlocked(levelId, done) and not AA.tooHard(levelId)
+				end
+				if open[levelId] then
+					table.insert(row.open, levelId)
+				end
+			end
+		end
+		if plan.ready and not keepGoing and Config.Otherwise ~= "None" and Config.Otherwise ~= "Relic" then
+			Relic.activity = "Ready to craft"
+			return nil, nil, "relicdone"
+		end
+		for _, row in ipairs(plan.leaves) do
+			-- Missing materials decide; once nothing is missing, the material with the thinnest
+			-- stock compared with one recipe does (extras for the next craft).
+			local weight = plan.ready and (1 / (1 + row.owned / math.max(row.required, 1))) or (row.remaining / math.max(row.required, 1))
+			-- A material only one stage drops counts fully for it; a shared one is split.
+			for _, levelId in ipairs(row.open) do
+				scores[levelId] = (scores[levelId] or 0) + weight / #row.open
+			end
+		end
+		local best, bestScore
+		for levelId, score in pairs(scores) do
+			if score > 0 and (not bestScore or score > bestScore or (score == bestScore and levelId < best)) then
+				best, bestScore = levelId, score
+			end
+		end
+		if not best then
+			Relic.activity = "No stage open for the missing materials"
+			return nil, nil, "reliclocked"
+		end
+		-- No hopping: stay on the stage in hand while it is still worth most of the best one.
+		local current = type(AA.progress.relicStage) == "table" and AA.progress.relicStage.relic == plan.id and AA.progress.relicStage.level or nil
+		if current and scores[current] and scores[current] > 0 and scores[current] >= bestScore * 0.6 then
+			best = current
+		end
+		if current ~= best then
+			AA.progress.relicStage = { relic = plan.id, level = best }
+			AA.saveProgress()
+		end
+		Relic.activity = Relic.stageName(best)
+		return best, "Hard", "story"
+	end
+	---On the result screen of the stage `levelId`: "Replay", "Lobby", or nil to let the usual
+	---rules decide (a fallback match while there is nothing for the relic to farm).
+	function Relic.afterMatch(levelId)
+		local nextId, _, kind = Relic.choose(Config.Mode ~= "Relic")
+		if AA.playMode() ~= "Relic" then
+			-- A match of another mode with Relic picked now (the mode was changed during it, or
+			-- this is the fallback): leave for the lobby only when there is something to farm.
+			if nextId then
+				return nextId == levelId and "Replay" or "Lobby"
+			end
+			return nil
+		end
+		if nextId == nil and kind == "relicdone" then
+			local ok, otherId = pcall(AA.chooseInner, Config.Otherwise)
+			if ok and otherId then
+				return "Lobby"
+			end
+			nextId, _, kind = Relic.choose(true)
+		end
+		if nextId == nil then
+			return kind == "relicwait" and "Replay" or "Lobby"
+		end
+		return nextId == levelId and "Replay" or "Lobby"
+	end
 end
 
 local function currency(id)
@@ -14894,6 +15214,16 @@ AA.ui = UI
 			for index, row in ipairs(rows) do
 				if row.gap then
 					create("Frame", { Size = UDim2.new(1, 0, 0, 6), BackgroundTransparency = 1, LayoutOrder = index, Parent = holder })
+				elseif row.bar then
+					-- A progress bar (0 to 1) under the row before it; green once full.
+					local track = create("Frame", { Size = UDim2.new(1, 0, 0, row.tall and 8 or 5), BackgroundColor3 = UI.roles.Control, BorderSizePixel = 0, LayoutOrder = index, Parent = holder }, { create("UICorner", { CornerRadius = UDim.new(1, 0) }) })
+					local share = math.clamp(tonumber(row.bar) or 0, 0, 1)
+					if share > 0 then
+						local fill = create("Frame", { Size = UDim2.fromScale(share, 1), BackgroundColor3 = share >= 1 and WIN or UI.roles.Accent, BorderSizePixel = 0, Parent = track }, { create("UICorner", { CornerRadius = UDim.new(1, 0) }) })
+						if share >= 1 then
+							fill:SetAttribute("NoTheme", true)
+						end
+					end
 				elseif row.title then
 					local head = create("Frame", { Size = UDim2.new(1, 0, 0, 22), BackgroundTransparency = 1, LayoutOrder = index, Parent = holder }, {
 						create("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, VerticalAlignment = Enum.VerticalAlignment.Center, Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder }),
@@ -17206,7 +17536,7 @@ do
 			return options
 		end
 
-		local MODES = { "Story", "Level", "Infinite", "Legend", "Raid", "Artifact", "Challenge", "Daily", "Missions", "Quests", "Summer", "Cursed Womb", "Tournament", "Castle", "Dungeon", "Portals", "Farm kills" }
+		local MODES = { "Story", "Level", "Infinite", "Legend", "Relic", "Raid", "Artifact", "Challenge", "Daily", "Missions", "Quests", "Summer", "Cursed Womb", "Tournament", "Castle", "Dungeon", "Portals", "Farm kills" }
 		local function modeName(mode)
 			return mode == "Kills" and "Farm kills" or mode
 		end
@@ -17279,6 +17609,63 @@ do
 				view.account[name] = UI.kv(page, name)
 			end
 
+			heading(page, "Relic progress", "right")
+			view.relic = UI.list(page)
+			hint(page, "The relic picked on the Mode tab: every material against what you hold, counted from your inventory every few seconds. A crafted ingredient (ingots) is followed by what its missing copies still need. Ready to craft means the Golden King can make it now, after any ingots are made.")
+			task.spawn(function()
+				while AA.alive and page.Parent do
+					local ok, plan, why = pcall(AA.Relic.plan)
+					local rows = {}
+					local chain = Config.Mode == "Relic" or Config.Otherwise == "Relic" or ((Config.Mode == "Challenge" or Config.Mode == "Daily") and Config.ChallengeFallback == "Relic")
+					if not ok or not plan then
+						rows = { { note = (ok and why == "none") and "No relic picked yet: choose Relic as the mode on the Mode tab, then the relic." or "Reading your inventory." } }
+					else
+						local share = plan.total > 0 and plan.have / plan.total or 0
+						table.insert(rows, { title = plan.name, right = plan.ready and "Ready to craft" or "Farming missing materials" })
+						for _, row in ipairs(plan.rows) do
+							local covered = math.min(row.owned, row.required)
+							table.insert(rows, {
+								name = (row.depth > 0 and string.rep("   ", row.depth) .. "for those: " or "") .. row.name,
+								extra = row.remaining > 0 and ("need %d more"):format(row.remaining) or nil,
+								value = ("%d / %d"):format(row.owned, row.required),
+								tick = row.remaining == 0 or nil,
+							})
+							table.insert(rows, { bar = row.required > 0 and covered / row.required or 1 })
+						end
+						table.insert(rows, { gap = true })
+						table.insert(rows, { title = "Overall", right = ("%d / %d materials (%.1f%%)"):format(plan.have, plan.total, share * 100) })
+						table.insert(rows, { bar = share, tall = true })
+						local activity
+						if not chain then
+							activity = "Relic mode is off (Mode tab)"
+						elseif not IS_LOBBY then
+							local level = Levels[Match.levelId or ""]
+							activity = (AA.playMode() == "Relic" or not level) and AA.Relic.stageName(Match.levelId or "") or (tostring(AA.playMode()) .. ": " .. tostring(level.name))
+							if not Match.levelId then
+								activity = tostring(AA.playMode())
+							end
+						elseif not Config.AutoJoin then
+							activity = "Join matches is off"
+						else
+							activity = (AA.targetMode and AA.targetMode ~= "Relic" and Config.Mode == "Relic") and ("Fallback: " .. tostring(AA.targetMode)) or (AA.Relic.activity or "Choosing a stage")
+						end
+						table.insert(rows, { name = "Current activity", value = activity })
+						local statusText = "Farming missing materials"
+						if plan.ready then
+							statusText = #plan.toCraft > 0 and ("Ready to craft (make " .. table.concat(plan.toCraft, ", ") .. " first)") or "Ready to craft"
+						end
+						table.insert(rows, { name = "Status", value = statusText, tick = plan.ready or nil, accent = plan.ready or nil })
+						table.insert(rows, { note = ("Crafting it costs %s Gold at the Golden King."):format(tostring(plan.gold)) })
+						for _, row in ipairs(plan.leaves) do
+							if row.remaining > 0 and #(row.stages or {}) == 0 then
+								table.insert(rows, { note = row.name .. " has no legend stage that drops it." })
+							end
+						end
+					end
+					view.relic(rows)
+					task.wait(3)
+				end
+			end)
 			heading(page, "Challenges", "right")
 			view.half = UI.kv(page, "Half-hour")
 			view.daily = UI.kv(page, "Daily")
@@ -17609,6 +17996,29 @@ do
 			only({ "Legend" })
 			segmented(page, "Legend act", "LegendAct", { 1, 2, 3 })
 			only({ "Legend" })
+			UI.dropdown(page, "Relic", function()
+				local names = {}
+				for _, relic in ipairs(AA.Relic.list()) do
+					table.insert(names, relic.name)
+				end
+				return names
+			end, function()
+				for _, relic in ipairs(AA.Relic.list()) do
+					if relic.id == Config.Relic then
+						return relic.name
+					end
+				end
+				return "Pick one"
+			end, function(option)
+				for _, relic in ipairs(AA.Relic.list()) do
+					if relic.name == option then
+						Config.Relic = relic.id
+					end
+				end
+			end, "Farms the legend stages that drop what this relic is crafted from, the stage with the most still missing first. Progress is on the Home tab.")
+			only({ "Relic" })
+			hint(page, "Relic mode never stops by itself. With everything collected it keeps farming extra materials, or plays the mode set under \"When that has nothing to play\" if you set one there. Crafting (and turning ore into ingots) is done at the Golden King in the lobby; the script does not craft.")
+			only({ "Relic" })
 			cycler(page, "Raid", function()
 				local options = {}
 				for _, id in ipairs(Order.RAID_WORLD_ORDER or {}) do
