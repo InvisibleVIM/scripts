@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v242", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v243", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -2925,15 +2925,17 @@ do
 				local pct = tonumber(lower:match("attack by (%d+)%%") or lower:match("damage by (%d+)%%"))
 				if pct and lower:find("minion", 1, true) and lower:find("summon", 1, true) then
 					-- "Whenever another minion is summoned, this unit buffs that minion's ... Attack by N%"
-					return { pct = pct / 100, stacks = lower:find("stack", 1, true) ~= nil, coverage = 1, matches = function(otherId, otherData)
+					return { key = "minion", pct = pct / 100, stacks = lower:find("stack", 1, true) ~= nil, coverage = 1, matches = function(otherId, otherData)
 						return AA.isSummoner(otherId) or AA.ritualUnit(otherData or Units[otherId])
 					end }
 				end
 				local auraPct, auraType = lower:match("%+(%d+)%% {?([%a_]*)}? ?damage")
-				if tonumber(auraPct) and (lower:find("allies", 1, true) or lower:find("ally", 1, true)) and (lower:find("in range", 1, true) or lower:find("in its range", 1, true) or lower:find("nearby", 1, true)) and not lower:find(" for %d+ ?s") then
+				-- ("Units in range of this unit have +50% Water damage." is Water Goddess's wording:
+				-- it says units, not allies, and was read as no aura at all until v243.)
+				if tonumber(auraPct) and (lower:find("allies", 1, true) or lower:find("ally", 1, true) or lower:find("units in range", 1, true)) and (lower:find("in range", 1, true) or lower:find("in its range", 1, true) or lower:find("nearby", 1, true)) and not lower:find(" for %d+ ?s") then
 					-- "Allies in range deal +N% {type} damage" with no duration: a standing aura.
 					local kind = auraType ~= "" and auraType or nil
-					return { pct = tonumber(auraPct) / 100, coverage = 0.6, matches = function(_, otherData)
+					return { key = "aura:" .. tostring(kind or "all"), pct = tonumber(auraPct) / 100, coverage = 0.6, matches = function(_, otherData)
 						if not kind or not otherData then
 							return otherData ~= nil
 						end
@@ -8787,77 +8789,107 @@ local function equipBest()
 	table.sort(list, function(a, b)
 		return a.power > b.power
 	end)
-	-- Buff units are worth what they add to the rest of the team: buff % x the power of the
-	-- damage units it boosts (the would-be team without it), if enough copies fit for full uptime.
-	do
-		local team = {}
-		for _, entry in ipairs(list) do
-			if #team < (bestFarm and 5 or 6) - 1 and not AA.buffInfo(Units[entry.id]) then
-				table.insert(team, entry)
-			end
-		end
-		local changed = false
-		for _, entry in ipairs(list) do
-			local synergy = AA.synergyInfo(entry.id)
-			if synergy then
-				local boosted = 0
-				for _, member in ipairs(team) do
-					if member.id ~= entry.id and synergy.matches(member.id, Units[member.id]) then
-						boosted += member.power
-					end
-				end
-				local copies = synergy.stacks and math.min(placeCap(Units[entry.id]), 8) or 1
-				local gain = synergy.pct * copies * boosted * synergy.coverage
-				if gain > 0 then
-					entry.ownPower = entry.ownPower or entry.power
-					entry.power = entry.power + gain
-					entry.buffer = true
-					changed = true
-				end
-			end
-		end
-		for _, entry in ipairs(list) do
-			local buff = AA.buffInfo(Units[entry.id])
-			if buff then
-				local boosted = 0
-				for _, member in ipairs(team) do
-					if AA.buffMatches(buff, Units[member.id]) then
-						boosted += member.power
-					end
-				end
-				-- With four copies the chain holds +100% on everything of its type in range
-				-- (about 60% of the team's damage ends up standing inside it).
-				local copies = math.min(placeCap(Units[entry.id]), AA.buffCopies(buff, Units[entry.id]))
-				entry.ownPower = entry.power
-				entry.power = entry.power + AA.buffValue(buff, copies) * boosted * 0.6
-				entry.buffer = true
-				changed = true
-			end
-		end
-		if changed then
-			table.sort(list, function(a, b)
-				return a.power > b.power
-			end)
-		end
-	end
-	-- Wanted order: strongest first (slot 1 is the one shown off next to you, slots 2-3 with the
-	-- gamepass), then down by power; the farm unit takes the last slot.
+	-- The team is picked as a whole (v243). Each buffer used to be priced by itself against the
+	-- four strongest damage units, and then took the place of those very units: Elfy, Windsong
+	-- and Commander all got in, each "worth" the same damage, and Shadow Sorcerer (Ritual) and
+	-- Water Goddess, which that damage came from, were left on the bench.
+	-- USER RULE: "units can only be buffed by either elfy OR windsong. not both." Two buffs of
+	-- one damage type don't add up, so a unit takes the best one in the team and a second
+	-- buffer of that type is worth only its own damage. Auras and blessings (Water Goddess,
+	-- Zombie) are their own things and count next to it, once per kind.
 	local slots = bestFarm and 5 or 6
 	local picks = {}
-	-- Units you pinned always go in; the rest fill by power.
-	for _, entry in ipairs(list) do
-		if pinned[entry.id] and #picks < slots then
-			entry.pinned = true
-			table.insert(picks, entry)
+	do
+		local pool, forced = {}, 0
+		for index, entry in ipairs(list) do
+			entry.ownPower = entry.power
+			entry.buff = AA.buffInfo(Units[entry.id]) or nil
+			entry.syn = AA.synergyInfo(entry.id) or nil
+			entry.buffer = (entry.buff or entry.syn) ~= nil
+			entry.pinned = pinned[entry.id] == true or nil
+			if #pool < 18 and (index <= 10 or entry.buffer or entry.pinned) then
+				table.insert(pool, entry)
+			end
 		end
+		-- Pinned units first, so every team tried holds them.
+		table.sort(pool, function(a, b)
+			if (a.pinned == true) ~= (b.pinned == true) then
+				return a.pinned == true
+			end
+			return a.ownPower > b.ownPower
+		end)
+		for _, entry in ipairs(pool) do
+			forced += entry.pinned and 1 or 0
+		end
+		forced = math.min(forced, slots)
+		local function teamValue(team, without)
+			local total = 0
+			for _, unit in ipairs(team) do
+				if unit ~= without then
+					local data = Units[unit.id]
+					local typeBonus, others = 0, {}
+					for _, other in ipairs(team) do
+						if other ~= unit and other ~= without then
+							if other.buff and AA.buffMatches(other.buff, data) then
+								local copies = math.min(placeCap(Units[other.id]), AA.buffCopies(other.buff, Units[other.id]))
+								-- (0.6: the share of the team's damage that ends up standing in the
+								-- buff. The stronger buff wins a tie between two full chains.)
+								typeBonus = math.max(typeBonus, AA.buffValue(other.buff, copies) * 0.6 * (1 + other.buff.pct * 0.01))
+							end
+							if other.syn and other.syn.matches(unit.id, data) then
+								local copies = other.syn.stacks and math.min(placeCap(Units[other.id]), 8) or 1
+								local key = other.syn.key or other.id
+								others[key] = math.max(others[key] or 0, other.syn.pct * copies * other.syn.coverage)
+							end
+						end
+					end
+					local bonus = typeBonus
+					for _, value in pairs(others) do
+						bonus += value
+					end
+					total += unit.ownPower * (1 + bonus)
+				end
+			end
+			return total
+		end
+		local size = math.min(slots, #pool)
+		local bestTeam, bestValue
+		local team = {}
+		local function try(from)
+			if #team == size then
+				local value = teamValue(team)
+				if not bestValue or value > bestValue then
+					bestValue = value
+					bestTeam = table.clone(team)
+				end
+				return
+			end
+			for index = from, #pool - (size - #team) + 1 do
+				table.insert(team, pool[index])
+				try(index + 1)
+				table.remove(team)
+			end
+		end
+		for index = 1, forced do
+			table.insert(team, pool[index])
+		end
+		try(forced + 1)
+		picks = bestTeam or {}
+		-- What each pick is worth to this team: its own damage plus what it adds to the others.
+		for _, entry in ipairs(picks) do
+			entry.power = math.max((bestValue or 0) - teamValue(picks, entry), entry.ownPower)
+		end
+		table.sort(picks, function(a, b)
+			return a.power > b.power
+		end)
 	end
-	for _, entry in ipairs(list) do
-		if #picks >= slots then
-			break
+	local function picked(entry)
+		for _, pick in ipairs(picks) do
+			if pick.id == entry.id then
+				return true
+			end
 		end
-		if not entry.pinned then
-			table.insert(picks, entry)
-		end
+		return false
 	end
 	-- Every unit is ranked on what the game data gives (AA.Eval). A unit with parts the data
 	-- hides is ranked on the rest, which is the least it can do. Optional: such a unit that has
@@ -8896,8 +8928,8 @@ local function equipBest()
 		hasHill = hasHill or canHill(entry)
 	end
 	if not hasHill and #picks == slots then
-		for i = slots + 1, #list do
-			if canHill(list[i]) then
+		for i = 1, #list do
+			if not picked(list[i]) and canHill(list[i]) then
 				for j = #picks, 1, -1 do
 					if not picks[j].pinned and not picks[j].trial then
 						picks[j] = list[i]
@@ -8915,8 +8947,8 @@ local function equipBest()
 		hasOpener = hasOpener or (Units[entry.id].cost or 0) <= 1000
 	end
 	if not hasOpener and #picks == slots then
-		for i = slots + 1, #list do
-			if (Units[list[i].id].cost or 0) <= 1000 then
+		for i = 1, #list do
+			if not picked(list[i]) and (Units[list[i].id].cost or 0) <= 1000 then
 				-- Replace the weakest pick that isn't the only hill unit.
 				for j = #picks, 2, -1 do
 					if not canHill(picks[j]) and not picks[j].pinned and not picks[j].trial then
