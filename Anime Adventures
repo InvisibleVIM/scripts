@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v240", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v241", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -92,6 +92,15 @@ local SETTINGS_FOLDER = "AnimeAdventures"
 -- measurements, the card book) and what the player made (macros, orders, music files, themes)
 -- stays shared by every account on the device.
 local ACCOUNT_FOLDER = SETTINGS_FOLDER .. "/accounts/" .. tostring(localPlayer.UserId)
+---Adds a line to a text log. The executor's appendfile refuses a file that does not exist yet
+---("file does not exist"), which is why votes.txt and dungeon.txt were never written before v241.
+function AA.appendLog(path, text)
+	if isfile(path) then
+		appendfile(path, text)
+	else
+		writefile(path, text)
+	end
+end
 local SETTINGS_FILE = ACCOUNT_FOLDER .. "/settings.json"
 local MATCH_FILE = ACCOUNT_FOLDER .. "/matches.json"
 do
@@ -8007,7 +8016,7 @@ local function finishMatch()
 	local endedAt = os.clock()
 	local function voteLog(text)
 		pcall(function()
-			appendfile(ACCOUNT_FOLDER .. "/votes.txt", os.date("%m-%d %H:%M:%S") .. string.format(" +%.1fs ", os.clock() - endedAt) .. tostring(id) .. " " .. text .. "\n")
+			AA.appendLog(ACCOUNT_FOLDER .. "/votes.txt", os.date("%m-%d %H:%M:%S") .. string.format(" +%.1fs ", os.clock() - endedAt) .. tostring(id) .. " " .. text .. "\n")
 		end)
 	end
 	local function send(...)
@@ -10241,7 +10250,7 @@ function AA.dungeonStep()
 						task.wait(0.1)
 					end
 					pcall(function()
-						appendfile(ACCOUNT_FOLDER .. "/dungeon.txt", os.date("%m-%d %H:%M:%S") .. " last room: opened a " .. (gold > 0 and "rare" or "plain") .. " chest, " .. tostring(resourceTotal(profile().dungeon_data or {})) .. " left\n")
+						AA.appendLog(ACCOUNT_FOLDER .. "/dungeon.txt", os.date("%m-%d %H:%M:%S") .. " last room: opened a " .. (gold > 0 and "rare" or "plain") .. " chest, " .. tostring(resourceTotal(profile().dungeon_data or {})) .. " left\n")
 					end)
 					if resourceTotal(profile().dungeon_data or {}) >= gold + plain then
 						break
@@ -10313,7 +10322,7 @@ function AA.dungeonStep()
 				end
 				pcall(note, "dungeonBuy", { id = offer.id, i = offer.index, cost = offer.price, money = offer.money })
 				pcall(function()
-					appendfile(ACCOUNT_FOLDER .. "/dungeon.txt", os.date("%m-%d %H:%M:%S") .. " shop: bought " .. tostring(offer.id) .. " for " .. tostring(offer.price) .. " of " .. tostring(offer.money) .. "\n")
+					AA.appendLog(ACCOUNT_FOLDER .. "/dungeon.txt", os.date("%m-%d %H:%M:%S") .. " shop: bought " .. tostring(offer.id) .. " for " .. tostring(offer.price) .. " of " .. tostring(offer.money) .. "\n")
 				end)
 				invoke("dungeon_buy_shop", offer.index)
 				local deadline = os.clock() + 2
@@ -10352,7 +10361,7 @@ function AA.dungeonStep()
 			end
 			pcall(note, "shrine", { c = tostring(curse), gifts = table.concat(gifts, ","), took = not (curse and DUNGEON_SHRINE_SKIP[curse]) })
 			pcall(function()
-				appendfile(ACCOUNT_FOLDER .. "/dungeon.txt", os.date("%m-%d %H:%M:%S") .. " shrine: " .. ((curse and DUNGEON_SHRINE_SKIP[curse]) and "declined" or "accepted") .. " " .. table.concat(gifts, ",") .. " with " .. tostring(curse) .. "\n")
+				AA.appendLog(ACCOUNT_FOLDER .. "/dungeon.txt", os.date("%m-%d %H:%M:%S") .. " shrine: " .. ((curse and DUNGEON_SHRINE_SKIP[curse]) and "declined" or "accepted") .. " " .. table.concat(gifts, ",") .. " with " .. tostring(curse) .. "\n")
 			end)
 			task.wait(0.6)
 		end
@@ -10400,7 +10409,7 @@ function AA.dungeonStep()
 	if best then
 		table.sort(lines)
 		pcall(function()
-			appendfile(ACCOUNT_FOLDER .. "/dungeon.txt", os.date("%m-%d %H:%M:%S") .. " picked " .. tostring(best) .. " | " .. table.concat(lines, " | ") .. " | carrying " .. tostring((data._resources or {}).treasure or 0) .. " chest, " .. tostring((data._resources or {}).treasure_gold or 0) .. " gold, money " .. tostring((data._resources or {}).money or 0) .. "\n")
+			AA.appendLog(ACCOUNT_FOLDER .. "/dungeon.txt", os.date("%m-%d %H:%M:%S") .. " picked " .. tostring(best) .. " | " .. table.concat(lines, " | ") .. " | carrying " .. tostring((data._resources or {}).treasure or 0) .. " chest, " .. tostring((data._resources or {}).treasure_gold or 0) .. " gold, money " .. tostring((data._resources or {}).money or 0) .. "\n")
 		end)
 	end
 	if not best then
