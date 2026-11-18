@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v233", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v234", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -10194,6 +10194,12 @@ function AA.dungeonStep()
 	end
 	local room = data.current_shops
 	if type(room) == "table" and next(room) ~= nil then
+		-- The game keeps the step as a list of one: current_shops[1] = { _t = type, data = offers }
+		-- (its own menu reads current_shops[1]). Read flat, the type came out as nil and every
+		-- shop, shrine and Open Treasure screen was walked past without buying or opening (v234).
+		if type(room[1]) == "table" then
+			room = room[1]
+		end
 		local kind = tostring(room._t)
 		if kind == "6" then
 			-- Open every chest: the game's own buttons send no argument for a normal chest and
@@ -10233,7 +10239,7 @@ function AA.dungeonStep()
 				end
 			end
 			local offers = {}
-			for index, offer in pairs(room) do
+			for index, offer in pairs(type(room.data) == "table" and room.data or room) do
 				local item = type(offer) == "table" and items[offer.id]
 				if item and item.cost and not item.curse_chance and not item.curse_super_chance then
 					local useful = true
@@ -10261,6 +10267,7 @@ function AA.dungeonStep()
 				local scale = math.max(0, (tonumber(gameCall(dungeon.sum_item_values, data, "shop_prices")) or 0) + 1)
 				local money = tonumber((data._resources or {}).money) or 0
 				if money >= math.ceil(offer.cost * scale) then
+					pcall(note, "dungeonBuy", { i = offer.index, cost = math.ceil(offer.cost * scale), money = money })
 					invoke("dungeon_buy_shop", offer.index)
 					task.wait(0.4)
 				end
