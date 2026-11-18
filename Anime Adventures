@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v237", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v238", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -10266,6 +10266,9 @@ function AA.dungeonStep()
 					break
 				end
 				pcall(note, "dungeonBuy", { id = offer.id, i = offer.index, cost = offer.price, money = offer.money })
+				pcall(function()
+					appendfile(ACCOUNT_FOLDER .. "/dungeon.txt", os.date("%m-%d %H:%M:%S") .. " shop: bought " .. tostring(offer.id) .. " for " .. tostring(offer.price) .. " of " .. tostring(offer.money) .. "\n")
+				end)
 				invoke("dungeon_buy_shop", offer.index)
 				local deadline = os.clock() + 2
 				while os.clock() < deadline and (tonumber(((profile().dungeon_data or {})._resources or {}).money) or 0) >= offer.money do
@@ -10302,25 +10305,57 @@ function AA.dungeonStep()
 				invoke("dungeon_shrine_accept")
 			end
 			pcall(note, "shrine", { c = tostring(curse), gifts = table.concat(gifts, ","), took = not (curse and DUNGEON_SHRINE_SKIP[curse]) })
+			pcall(function()
+				appendfile(ACCOUNT_FOLDER .. "/dungeon.txt", os.date("%m-%d %H:%M:%S") .. " shrine: " .. ((curse and DUNGEON_SHRINE_SKIP[curse]) and "declined" or "accepted") .. " " .. table.concat(gifts, ",") .. " with " .. tostring(curse) .. "\n")
+			end)
 			task.wait(0.6)
 		end
 		invoke("dungeon_continue_shop")
 		task.wait(1.5)
 		return true
 	end
+	-- The room behind each choice is known too: data.next["next" .. choice] holds the rooms that
+	-- choice leads to. USER (v238): "it just picked a path with nothing ahead when the other path
+	-- had coins ahead" (two empty rooms tied, and only the room itself was looked at). A choice
+	-- is now worth its own room plus the best room it leads to.
+	local TYPE_NAMES = { ["0"] = "curse", ["1"] = "shop", ["2"] = "money", ["3"] = "gold chest", ["4"] = "chest", ["5"] = "final boss", ["6"] = "open treasure", ["7"] = "shrine" }
+	local function roomValue(option)
+		local value, names = 0, {}
+		for roomType in pairs(type(option._t) == "table" and option._t or {}) do
+			value += ROOM_VALUE[tostring(roomType)] or 0
+			table.insert(names, TYPE_NAMES[tostring(roomType)] or tostring(roomType))
+		end
+		table.sort(names)
+		-- Easier rooms first when the rewards tie.
+		return value - (option._l and option._l._lobby_difficulty_scale or 1), #names > 0 and table.concat(names, "+") or "nothing"
+	end
 	local best, bestValue = nil, -math.huge
+	local lines = {}
 	for choice, option in pairs(data.next or {}) do
 		if type(option) == "table" and option._l then
-			local value = 0
-			for roomType in pairs(option._t or {}) do
-				value += ROOM_VALUE[tostring(roomType)] or 0
+			local value, what = roomValue(option)
+			local ahead, aheadWhat = nil, {}
+			for _, after in pairs(type(data.next["next" .. tostring(choice)]) == "table" and data.next["next" .. tostring(choice)] or {}) do
+				if type(after) == "table" and after._l then
+					local afterValue, afterNames = roomValue(after)
+					table.insert(aheadWhat, afterNames)
+					ahead = math.max(ahead or -math.huge, afterValue)
+				end
 			end
-			-- Easier rooms first when the rewards tie.
-			value -= (option._l._lobby_difficulty_scale or 1)
+			value += 0.9 * (ahead or 0)
+			table.insert(lines, string.format("%s: %s, then %s = %.1f", tostring(choice), what, #aheadWhat > 0 and table.concat(aheadWhat, " or ") or "unknown", value))
 			if value > bestValue then
 				best, bestValue = option._l._dungeon and option._l._dungeon.choice_str or choice, value
 			end
 		end
+	end
+	-- Every choice and the pick, kept in dungeon.txt (the match log is per match server and the
+	-- pick is made as it closes).
+	if best then
+		table.sort(lines)
+		pcall(function()
+			appendfile(ACCOUNT_FOLDER .. "/dungeon.txt", os.date("%m-%d %H:%M:%S") .. " picked " .. tostring(best) .. " | " .. table.concat(lines, " | ") .. " | carrying " .. tostring((data._resources or {}).treasure or 0) .. " chest, " .. tostring((data._resources or {}).treasure_gold or 0) .. " gold, money " .. tostring((data._resources or {}).money or 0) .. "\n")
+		end)
 	end
 	if not best then
 		status = "Dungeon: finishing"
