@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v239", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v240", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -10203,8 +10203,8 @@ function AA.dungeonStep()
 		local kind = tostring(room._t)
 		if kind == "6" then
 			-- USER RULE (v235): "make sure the script doesnt ever open chests. especially the
-			-- rare/gold chests." Nothing is opened on the Open Treasure screen. USER (v236):
-			-- "pressing continue keeps the chests", so the screen is continued past below.
+			-- rare/gold chests." Nothing is opened on an Open Treasure screen during the run.
+			-- USER (v236): "pressing continue keeps the chests", so it is continued past below.
 			status = "Dungeon: chests kept unopened"
 			pcall(note, "dungeonChests", { treasure = (data._resources or {}).treasure, gold = (data._resources or {}).treasure_gold })
 			-- The last room is different (v239): the game's own Leave Dungeon box says "Make sure
@@ -10216,6 +10216,38 @@ function AA.dungeonStep()
 				if type(option) == "table" and option._l then
 					onward = true
 				end
+			end
+			-- USER (v240): "have the script open them all once i complete the final room/depth".
+			-- This is the one place chests are opened: the dungeon is finished (the boss room is
+			-- beaten, which is also when rare chests can drop a secret unit). Rare ones first,
+			-- each request waiting for the count to move. Finish is only pressed below once
+			-- nothing is left; a refused open stops here and leaves the rest for the player.
+			if data._finished and resourceTotal(data) > 0 then
+				for _ = 1, 200 do
+					local now = profile().dungeon_data or {}
+					local resources = now._resources or {}
+					local gold, plain = tonumber(resources.treasure_gold) or 0, tonumber(resources.treasure) or 0
+					if gold + plain <= 0 or not AA.alive then
+						break
+					end
+					status = "Dungeon: opening chests (" .. tostring(gold) .. " rare, " .. tostring(plain) .. " plain left)"
+					if gold > 0 then
+						task.spawn(invoke, "dungeon_open_chest", true)
+					else
+						task.spawn(invoke, "dungeon_open_chest")
+					end
+					local deadline = os.clock() + 4
+					while os.clock() < deadline and resourceTotal(profile().dungeon_data or {}) >= gold + plain do
+						task.wait(0.1)
+					end
+					pcall(function()
+						appendfile(ACCOUNT_FOLDER .. "/dungeon.txt", os.date("%m-%d %H:%M:%S") .. " last room: opened a " .. (gold > 0 and "rare" or "plain") .. " chest, " .. tostring(resourceTotal(profile().dungeon_data or {})) .. " left\n")
+					end)
+					if resourceTotal(profile().dungeon_data or {}) >= gold + plain then
+						break
+					end
+				end
+				data = profile().dungeon_data or {}
 			end
 			if resourceTotal(data) > 0 and (data._finished or not onward) then
 				status = "Dungeon: last room, " .. tostring(resourceTotal(data)) .. " chests waiting for you to open"
