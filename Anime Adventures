@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v247", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v248", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -11954,7 +11954,13 @@ function CardBrain.gain(kind, stat, damageType, total, state)
 		-- least 10% left": with Resistant I and II already taken, Resistant III, +200 to
 		-- physical and magic, scored as costing nothing and was picked as the cheapest
 		-- curse on offer. Two runs ended within a few waves of it.)
-		return 1 + (state.share[damageType] or 0) * (100 / (100 + math.max(total, -90)) - 1)
+		-- (Below zero, e.g. Clear Skies, -55 magic with no weather curse in play: the same curve
+		-- mirrored, +35% at -55 and never more than double. The formula above run backwards
+		-- made -55 worth x1.9 and -110 worth x7.8: Clear Skies was taken over a +0.5 weather
+		-- curse at wave 17 two runs running, and the "team strength" read 672%. What the
+		-- server really does with a negative figure is not known; this is the careful guess.)
+		local taken = total >= 0 and 100 / (100 + total) or 2 - 100 / (100 - total)
+		return 1 + (state.share[damageType] or 0) * (taken - 1)
 	elseif kind == "enemy_amp_specific" then
 		return 1 + (state.share[damageType] or 0) * total
 	elseif kind == "weather_flying_chance" or kind == "weather_soaring_share" then
@@ -13128,6 +13134,11 @@ function CardBrain.selfTest()
 		end
 		check("the same vote in the same state gets the same answer", same, nil)
 		check("the look-ahead ran (enough votes are logged)", first.plan ~= nil, first.plan and ("%d futures, %.0f ms"):format(first.plan.rollouts, first.plan.ms) or "one step only")
+	end
+	do
+		local state = fresh()
+		local once, twice = CardBrain.gain("enemy_resistance_specific", nil, "magic", -55, state), CardBrain.gain("enemy_resistance_specific", nil, "magic", -110, state)
+		check("resistance below zero is a modest gain, not a multiplication", once > 1 and once < 1.5 and twice > once and twice < 2, ("x%.2f, x%.2f"):format(once, twice))
 	end
 	do
 		-- v247: the multiplier's timing and the road reading.
