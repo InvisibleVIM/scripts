@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v244", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v245", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -3853,7 +3853,41 @@ local function bestSpot(data, focus, only, free)
 				ally.need = reachedBy == 0 and 1 or reachedBy == 1 and 0.6 or 0.15
 			end
 		end
-		-- (Not while a damage unit stands outside every copy's reach: covering it comes first.)
+		-- The chain comes before coverage. The full buff needs four copies in each other's reach
+		-- around the same damage (two cast, two feed them; a feeder that can't reach the casters
+		-- feeds nothing). Until four stand together, the next copy joins the group around the
+		-- copy that reaches the most damage, and damage further off waits for copies five and
+		-- six. (Measured in a Summer Hunt with Elyssia on one side and four Water Goddesses 40
+		-- studs away: copies two and four went to "cover" the far side, one feeder was left for
+		-- two casters, and every cast for fifteen waves was the plain +50%.)
+		local core, chainOpen = {}, false
+		if activeBuff and #partners > 0 and math.min(AA.buffCopies(activeBuff, data), placeCap(data)) >= 3 then
+			local lead, leadWeight = partners[1], -1
+			for _, partner in ipairs(partners) do
+				local reached = 0
+				for _, ally in ipairs(allies) do
+					if (ally.position - partner).Magnitude <= range + 0.7 then
+						reached += ally.weight
+					end
+				end
+				if reached > leadWeight then
+					lead, leadWeight = partner, reached
+				end
+			end
+			for _, partner in ipairs(partners) do
+				if (partner - lead).Magnitude <= range + 0.7 then
+					table.insert(core, partner)
+				end
+			end
+			chainOpen = #core < 4
+			if chainOpen then
+				for _, ally in ipairs(allies) do
+					ally.need = (ally.position - lead).Magnitude <= range + 0.7 and 1 or 0.1
+				end
+			end
+		end
+		-- (Not while a damage unit stands outside every copy's reach: covering it comes first,
+		-- once the chain stands.)
 		local uncovered = false
 		for _, anchor in ipairs(anchors) do
 			local reached = false
@@ -3864,7 +3898,7 @@ local function bestSpot(data, focus, only, free)
 				end
 			end
 			if not reached then
-				uncovered = true
+				uncovered = not chainOpen
 				break
 			end
 		end
@@ -4002,6 +4036,15 @@ local function bestSpot(data, focus, only, free)
 					end
 					if not linked then
 						free = false
+					end
+					if free and chainOpen then
+						for _, partner in ipairs(core) do
+							local dx, dz = partner.X - p.X, partner.Z - p.Z
+							if dx * dx + dz * dz + (partner.Y - p.Y - 1.3) ^ 2 > range * range then
+								free = false
+								break
+							end
+						end
 					end
 					if free then
 						for _, ally in ipairs(allies) do
