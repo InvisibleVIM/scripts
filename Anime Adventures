@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v246", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v247", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -12238,8 +12238,15 @@ function CardBrain.margin(sit, power, wave, reserve)
 		-- Early: the team is still being built and the road says nothing about wave 50.
 		return prior
 	end
-	-- From the road: how far enemies get now, carried forward to that wave.
-	local seen = CardBrain.LEAK_AT / math.max(sit.depth, CardBrain.DEPTH_FLOOR) * power * CardBrain.difficulty(sit.wave, sit.bound) / there
+	-- From the road: how far enemies get now, read as the margin that leaves on the last wave.
+	local seen
+	if CardBrain.roadLegacy then
+		-- (Before v247, kept for CardBrain.replay: depth as one over the team's power, carried
+		-- forward along the difficulty curve.)
+		seen = CardBrain.LEAK_AT / math.max(sit.depth, CardBrain.DEPTH_FLOOR) * power * CardBrain.difficulty(sit.wave, sit.bound) / there
+	else
+		seen = CardBrain.roadMargin(sit.depth) * power * last / there
+	end
 	if sit.depth <= CardBrain.DEPTH_FLOOR then
 		-- Everything dies at the door. That says the team is not at its limit yet, not how far
 		-- from it: in the runs that fell in the low 40s nothing got past the first tenth of
@@ -12247,6 +12254,25 @@ function CardBrain.margin(sit, power, wave, reserve)
 		return prior
 	end
 	return seen ^ 0.65 * prior ^ 0.35
+end
+
+-- The road, v247. USER: "achieving a massive multiplier near the end but earning only
+-- approximately 5,000 pearls". Measured over 22 logged Summer Hunts (20 cleared): how deep the
+-- toughest enemy gets hardly moves from wave 20 to wave 50 (23% -> 36%, 4% -> 10%, 33% -> 39%),
+-- and it sits on steps (50%, 65%, 74%: where the towers stand), so it is not one over the
+-- team's power and the last wave is not 3.8 times deeper than the middle. The old reading
+-- took a steady 65% at wave 20 for a 3% clear, in runs that then cleared half the time, and
+-- Go for pearls defended from wave 20 to wave 38: it passed +0.5 and +1.0 weather curses and
+-- +0.7 curses for thirty waves (the waves that pay 10 a wave) and only took the big tier III
+-- curses in the last votes, when little was left to multiply.
+-- Now: the depth is read straight as a chance to clear, from those runs: a coin flip at 65% of
+-- the road, 90% at half way, 10% at 83%. (Nine runs with full card logs, two lost: the old
+-- forecasts scored 0.093 against what happened, these 0.074, lower is better. A small sample.)
+CardBrain.ROAD = { mid = 0.65, width = 0.08 }
+function CardBrain.roadMargin(depth)
+	local road = CardBrain.ROAD
+	local chance = math.clamp(1 / (1 + math.exp((depth - road.mid) / road.width)), 0.02, 0.995)
+	return (chance / (1 - chance)) ^ (1 / CardBrain.STEEP)
 end
 
 function CardBrain.holds(margin)
@@ -12353,6 +12379,21 @@ function CardBrain.situation(state)
 		minClear = math.clamp((tonumber(Config.PearlsMinClear) or 80) / 100, 0.3, 0.99),
 		level = Match.levelId,
 	}
+	-- What a wave really pays against the level's table: the account's own bonus (measured
+	-- from the waves of this run, e.g. 62 pearls on a wave that pays 10 at x2.6 = x2.4).
+	do
+		local ratios, rows = {}, Detail.waves
+		for index = #rows, math.max(#rows - 8, 2), -1 do
+			local row, prev = rows[index], rows[index - 1]
+			local base = sit.pay(tonumber(row.w) or 0) * (1 + (tonumber(prev.mult) or 0))
+			if row.res and prev.res and row.res > prev.res and base > 0 and (tonumber(row.mult) or 0) == (tonumber(prev.mult) or 0) then
+				table.insert(ratios, (row.res - prev.res) / base)
+			end
+		end
+		table.sort(ratios)
+		local middle = ratios[math.ceil(#ratios / 2)]
+		sit.factor = middle and middle >= 0.5 and middle <= 20 and middle or nil
+	end
 	-- A base that has just been hit says more than the road does.
 	sit.depth = (fraction < 0.6 and 1) or ((bleeding or fraction < 0.95) and math.max(depth, 0.85)) or depth
 	return sit
@@ -12825,6 +12866,25 @@ function CardBrain.logVote(options, pick, view, state)
 		return string.format("%d%%", x * 100 + 0.5)
 	end
 	local _, standing = CardBrain.expected(sit, 1, 0, 0)
+	-- What the waves still to come pay at x1.0, and what one whole point of multiplier adds.
+	local restPay = 0
+	for wave = sit.wave + 1, sit.bound do
+		restPay += sit.pay(wave)
+	end
+	local bonusPay = CardBrain.CLEAR_WAVES * sit.pay(sit.bound)
+	local factor = sit.factor or 1
+	-- For the end-of-run summary: what was on offer and what was taken.
+	do
+		local chosen, bestRow
+		for _, row in ipairs(view.rows or {}) do
+			chosen = row.key == pick and row or chosen
+			if not row.banned and (not bestRow or row.candy > bestRow.candy) then
+				bestRow = row
+			end
+		end
+		Match.cardVotes = Match.cardVotes or {}
+		table.insert(Match.cardVotes, { wave = sit.wave, title = chosen and chosen.title, candy = chosen and chosen.candy or 0, best = bestRow and bestRow.title, bestCandy = bestRow and bestRow.candy or 0, bestPower = bestRow and bestRow.power, bestWin = bestRow and (bestRow.win or bestRow.clear), rest = restPay + bonusPay, factor = factor, stance = view.stance })
+	end
 	CardBrain.log(string.format("== %s %s wave %d/%d | strategy %s%s ==", os.date("%m-%d %H:%M:%S"), tostring(sit.level), sit.wave, sit.bound, tostring(view.strategy), view.floor and (" | floor " .. pct(view.floor)) or ""))
 	CardBrain.log(string.format("[state] base %s | deepest enemy %s of the road | pearl multiplier x%.1f | team strength %s of an uncursed team | margin now %.2f, on the last wave %.2f (1 = just holding) | clear chance as it stands %s%s%s", pct(sit.health), pct(sit.depth), 1 + sit.mult, pct(sit.stacked), CardBrain.margin(sit, 1, sit.wave, 0), CardBrain.margin(sit, 1, sit.bound, 0), pct(standing), sit.danger and " | BASE UNDER PRESSURE" or "", view.stance and (" | " .. view.stance) or ""))
 	-- What has changed since the vote before, against what was expected then.
@@ -12874,6 +12934,11 @@ function CardBrain.logVote(options, pick, view, state)
 		else
 			CardBrain.log(string.format("         one step ahead: %d pearls, clear %s", row.pearls + 0.5, pct(row.clear)))
 		end
+		if row.candy and row.candy > 0 and not row.banned then
+			-- The multiplier's own return: it counts for every wave still to come and the bonus.
+			local alone = row.candy * (restPay + bonusPay) * factor
+			CardBrain.log(string.format("         multiplier x%.1f -> x%.1f with %d waves left: the +%.1f alone pays +%d pearls by the end if the run is cleared (%d from the waves, %d on the clear bonus)%s; the same card nine waves later would pay %d", 1 + sit.mult, 1 + sit.mult + row.candy, sit.bound - sit.wave, row.candy, alone + 0.5, row.candy * restPay * factor + 0.5, row.candy * bonusPay * factor + 0.5, factor > 1.01 and "" or " (before your account bonus)", row.candy * (math.max(restPay - 90, 0) + bonusPay) * factor + 0.5))
+		end
 		if row.verdict then
 			CardBrain.log("         -> " .. row.verdict)
 		end
@@ -12881,6 +12946,10 @@ function CardBrain.logVote(options, pick, view, state)
 	local taken
 	for _, row in ipairs(view.rows or {}) do
 		taken = row.key == pick and row or taken
+	end
+	if view.stance then
+		local stance = tostring(view.stance)
+		CardBrain.log("[phase] " .. (stance:find("^pressing") and "multiplier growth: the run has room, so the multiplier comes first" or stance:find("^defending") and "victory security: the clear is under your floor, so the safest card" or "balanced development: nothing here pays for what it costs, so strength for later curses"))
 	end
 	CardBrain.log(string.format("[decision] %s | %s%s", taken and taken.title or "no vote cast", tostring(view.why), view.plan and string.format(" | %d futures drawn from %d logged votes, %.0f ms", view.plan.rollouts, view.plan.votes, view.plan.ms) or ""))
 	if taken then
@@ -12897,12 +12966,66 @@ function CardBrain.logResult(picked, info, strength)
 	local mult = tonumber(info and info.candy_multiplier)
 	CardBrain.log(string.format("[result] the vote went to %s (%s) | multiplier now x%.1f (expected x%.1f) | team strength now %d%% (expected %d%%)%s", title, title == before.title and "the script's pick" or ("NOT the script's pick, which was " .. tostring(before.title)), 1 + (mult or before.mult), 1 + before.mult, (strength or 0) * 100 + 0.5, before.strength * 100 + 0.5, (mult and math.abs(mult - before.mult) > 0.05 or math.abs((strength or before.strength) - before.strength) > 0.05) and " | DIFFERS FROM THE FORECAST" or ""))
 end
+---End of run: how the multiplier grew, what each part of the run paid, and what the multipliers
+---that were passed over would have paid (USER: a big multiplier at the end is not a good run;
+---what counts is the multiplier the waves were paid at).
+function CardBrain.logCurve(won)
+	local rows = Detail.waves
+	local pay = CardBrain.paySteps(Match.levelData or {})
+	local parts, marks = { 0, 0, 0 }, {}
+	local paid, plain, weighted, weight = 0, 0, 0, 0
+	local perWave = {}
+	for index = 2, #rows do
+		local row, prev = rows[index], rows[index - 1]
+		local wave = tonumber(row.w) or 0
+		if row.res and prev.res and row.res >= prev.res and wave >= 1 then
+			local got = row.res - prev.res
+			local multiplier = 1 + (tonumber(prev.mult) or 0)
+			paid += got
+			plain += got / multiplier
+			weighted += pay(wave) * multiplier
+			weight += pay(wave)
+			parts[wave <= 17 and 1 or wave <= 34 and 2 or 3] += got
+			if wave % 5 == 0 then
+				table.insert(marks, string.format("wave %d x%.1f", wave, 1 + (tonumber(row.mult) or 0)))
+			end
+			if wave % 3 == 0 then
+				table.insert(perWave, string.format("%d: %d", wave, got))
+			end
+		end
+	end
+	if paid <= 0 then
+		return
+	end
+	CardBrain.log("[multiplier by wave] " .. table.concat(marks, " | "))
+	CardBrain.log("[pearls a wave] " .. table.concat(perWave, " | "))
+	CardBrain.log(string.format("[pearls by part] waves 1-17: %d (%d%%) | waves 18-34: %d (%d%%) | waves 35-50: %d (%d%%) | from the waves in all: %d%s", parts[1], parts[1] / paid * 100 + 0.5, parts[2], parts[2] / paid * 100 + 0.5, parts[3], parts[3] / paid * 100 + 0.5, paid, won and " (the clear bonus comes on top: four more of the last wave)" or " (no clear bonus)"))
+	CardBrain.log(string.format("[from the multiplier] the same waves at x1.0 would have paid %d, so %d pearls (%d%%) came from the multiplier | the waves were paid at x%.1f on average, the run ended on x%.1f", plain + 0.5, paid - plain + 0.5, (paid - plain) / paid * 100 + 0.5, weight > 0 and weighted / weight or 1, 1 + (tonumber(rows[#rows].mult) or 0)))
+	local missed, lines = 0, {}
+	for _, vote in ipairs(Match.cardVotes or {}) do
+		local gap = (vote.bestCandy or 0) - (vote.candy or 0)
+		if gap > 0.05 then
+			local worth = gap * (vote.rest or 0) * (vote.factor or 1)
+			missed += worth
+			table.insert(lines, string.format("wave %d: %s (+%.1f) taken over %s (+%.1f, team strength x%.2f%s): about %d pearls, had the run still been cleared", vote.wave, tostring(vote.title), vote.candy or 0, tostring(vote.best), vote.bestCandy, vote.bestPower or 1, vote.bestWin and string.format(", clear %d%% with it", vote.bestWin * 100 + 0.5) or "", worth + 0.5))
+		end
+	end
+	if #lines > 0 then
+		CardBrain.log(string.format("[multipliers passed over] %d votes, about %d pearls at most (an upper figure: each of those cards also cost strength, and the run had to be cleared with all of them)", #lines, missed + 0.5))
+		for _, line in ipairs(lines) do
+			CardBrain.log("   " .. line)
+		end
+	else
+		CardBrain.log("[multipliers passed over] none: every vote took the biggest multiplier on offer")
+	end
+end
 function CardBrain.logRun(levelId, won, wave)
 	local before = Match.cardPred
 	if not before then
 		return
 	end
 	local sit = Match.cardSit
+	pcall(CardBrain.logCurve, won)
 	CardBrain.log(string.format("[run] %s %s at wave %s | multiplier x%.1f | the last forecast (wave %d) gave the clear %d%% | margin figure for this stage is now %.2f", tostring(levelId), won and "CLEARED" or "LOST", tostring(wave), 1 + (sit and sit.mult or before.mult), before.wave, before.win * 100 + 0.5, CardBrain.m0(levelId)))
 	CardBrain.log("")
 end
@@ -13006,6 +13129,22 @@ function CardBrain.selfTest()
 		check("the same vote in the same state gets the same answer", same, nil)
 		check("the look-ahead ran (enough votes are logged)", first.plan ~= nil, first.plan and ("%d futures, %.0f ms"):format(first.plan.rollouts, first.plan.ms) or "one step only")
 	end
+	do
+		-- v247: the multiplier's timing and the road reading.
+		local early, late = situation(3, 6, 1, 0), situation(27, 6, 1, 0)
+		local e0, e1 = CardBrain.expected(early, 1, 0, 0), CardBrain.expected(early, 1, 1, 0)
+		local l0, l1 = CardBrain.expected(late, 1, 0, 0), CardBrain.expected(late, 1, 1, 0)
+		check("the same +1.0 multiplier is worth more at wave 3 than at wave 27", (e1 - e0) > (l1 - l0) * 1.5, ("+%d against +%d"):format(e1 - e0 + 0.5, l1 - l0 + 0.5))
+		local shallow, level, deep = CardBrain.roadMargin(0.3), CardBrain.roadMargin(0.65), CardBrain.roadMargin(0.9)
+		check("the deeper the enemies get, the smaller the margin read off the road", shallow > level and level > deep and near(level, 1), ("%.2f, %.2f, %.2f"):format(shallow, level, deep))
+		local steady = situation(29, 9.76, 0.15, 3)
+		steady.depth = 0.65
+		local _, now = CardBrain.expected(steady, 1, 0, 0)
+		CardBrain.roadLegacy = true
+		local _, before = CardBrain.expected(steady, 1, 0, 0)
+		CardBrain.roadLegacy = nil
+		check("a steady 65% of the road at wave 29 reads as a contested run, not a lost one", now > 0.4 and now < 0.8 and before < 0.3, ("%d%% now, %d%% before"):format(now * 100 + 0.5, before * 100 + 0.5))
+	end
 	local passed = 0
 	for _, result in ipairs(results) do
 		passed += result.ok and 1 or 0
@@ -13100,6 +13239,109 @@ function CardBrain.backtest(runs, rollouts)
 		end
 		table.insert(result.lines, ("(%d logged votes drawn from, %.0f s. Scored by the script's own model of the run: this ranks the rules, it does not prove the model.)"):format(book.count, os.clock() - started))
 		pcall(writefile, ACCOUNT_FOLDER .. "/cards_backtest.txt", os.date("%m-%d %H:%M:%S") .. "\n" .. table.concat(result.lines, "\n") .. "\n")
+		result.done = true
+	end)
+	return result
+end
+
+---The logged Go for pearls votes decided again, once with the road read as before v247 and
+---once as now, each in the state the real run was in (strength and multiplier rebuilt from the
+---cards that run took; depth and base from cards.txt or the vote's own record). It shows where
+---the two part ways and what the extra multiplier is worth over the waves that were left. It
+---does not show what the run would have done next: after a different card the run is another.
+---Background; the result lands in CardBrain.replayResult and accounts/<id>/cards_replay.txt.
+function CardBrain.replay(maxVotes)
+	local result = { done = false, lines = {} }
+	CardBrain.replayResult = result
+	local okState, state0 = pcall(CardBrain.state)
+	local file = SETTINGS_FOLDER .. "/cards.json"
+	if not okState or next(state0.share) == nil or not isfile(file) then
+		result.done, result.error = true, "needs a team on the field and logged votes"
+		return result
+	end
+	task.spawn(function()
+		local seenAt = {}
+		pcall(function()
+			local stamp, wave
+			for line in readfile(ACCOUNT_FOLDER .. "/cards.txt"):gmatch("[^\n]+") do
+				local s, w = line:match("^== (%d+%-%d+ %d+:%d+):%d+ %S+ wave (%d+)/")
+				if s then
+					stamp, wave = s, w
+				end
+				local base, depth = line:match("^%[state%] base (%d+)%% | deepest enemy (%d+)%%")
+				if base and stamp then
+					seenAt[stamp .. "|" .. wave] = { health = tonumber(base) / 100, depth = tonumber(depth) / 100 }
+				end
+			end
+		end)
+		local banned = {}
+		for _, name in ipairs(CardBrain.banned()) do
+			banned[name] = true
+		end
+		local log = httpService:JSONDecode(readfile(file))
+		local totals, stacked, mult, lastWave, lastLevel = {}, 1, 0, math.huge, nil
+		local votes, changed, more, less, gained, lost = 0, 0, 0, 0, 0, 0
+		local bands = { { 0, 0 }, { 0, 0 }, { 0, 0 } }
+		for index, entry in ipairs(log) do
+			local wave = tonumber(entry.wave) or 0
+			if wave <= lastWave or entry.level ~= lastLevel then
+				totals, stacked, mult = {}, 1, 0
+			end
+			lastWave, lastLevel = wave, entry.level
+			local data = (Core.RawLevels and Core.RawLevels[entry.level]) or Levels[entry.level]
+			local state = { share = state0.share, totals = totals, antiAir = state0.antiAir, buffer = state0.buffer, spent = state0.spent }
+			local seen = type(entry.sit) == "table" and entry.sit or seenAt[os.date("%m-%d %H:%M", entry.at or 0) .. "|" .. wave] or seenAt[os.date("%m-%d %H:%M", (entry.at or 0) - 60) .. "|" .. wave] or seenAt[os.date("%m-%d %H:%M", (entry.at or 0) + 60) .. "|" .. wave]
+			if entry.strategy == "Pearls" and data and seen and type(entry.options) == "table" and #log - index < (maxVotes or 200) then
+				local bound = tonumber(data._override_infinite_bound_waves) or 50
+				local pay = CardBrain.paySteps(data)
+				local function sit()
+					return { wave = wave, bound = bound, health = seen.health or 1, stacked = stacked, mult = mult, pay = pay, m0 = CardBrain.m0(entry.level), every = 3, danger = (seen.health or 1) < 0.6 or (seen.depth or 0) >= 0.8, unproven = false, depth = seen.depth or 0.05, minClear = math.clamp((tonumber(Config.PearlsMinClear) or 80) / 100, 0.3, 0.99), level = entry.level, rollouts = 24 }
+				end
+				CardBrain.roadLegacy = true
+				local okOld, pickOld = pcall(CardBrain.decide, entry.options, sit(), state, "Pearls", banned, nil)
+				CardBrain.roadLegacy = nil
+				local okNew, pickNew, _, viewNew = pcall(CardBrain.decide, entry.options, sit(), state, "Pearls", banned, nil)
+				if okOld and okNew and pickOld and pickNew then
+					votes += 1
+					local rest = CardBrain.CLEAR_WAVES * pay(bound)
+					for at = wave + 1, bound do
+						rest += pay(at)
+					end
+					local _, _, candyOld = CardBrain.score(entry.options[pickOld], state)
+					local _, _, candyNew = CardBrain.score(entry.options[pickNew], state)
+					local gap = (candyNew or 0) - (candyOld or 0)
+					local band = bands[wave < 20 and 1 or wave < 35 and 2 or 3]
+					band[1] += 1
+					if pickOld ~= pickNew then
+						changed += 1
+						band[2] += 1
+						more += gap > 0 and 1 or 0
+						less += gap < 0 and 1 or 0
+						gained += math.max(gap, 0) * rest
+						lost += math.max(-gap, 0) * rest
+						local win
+						for _, row in ipairs(viewNew and viewNew.rows or {}) do
+							win = row.key == pickNew and (row.win or row.clear) or win
+						end
+						if #result.lines < 40 then
+							table.insert(result.lines, ("wave %d, x%.1f, strength %d%%, depth %d%%: before %s (+%.1f), now %s (+%.1f%s) -> %+d pearls over the waves left"):format(wave, 1 + mult, stacked * 100 + 0.5, (seen.depth or 0) * 100 + 0.5, tostring(entry.options[pickOld].title), candyOld or 0, tostring(entry.options[pickNew].title), candyNew or 0, win and (", clear %d%% if played safe after"):format(win * 100 + 0.5) or "", gap * rest + 0.5))
+						end
+					end
+				end
+				task.wait()
+			end
+			-- The run goes on with the card it really took.
+			local option = entry.pick and entry.options and entry.options[entry.pick]
+			if type(option) == "table" and type(option.effects) == "table" then
+				local factor, _, candy = CardBrain.score(option, state)
+				stacked *= factor
+				mult += candy or 0
+				CardBrain.applyTotals(totals, option)
+			end
+		end
+		table.insert(result.lines, 1, ("%d logged Go for pearls votes decided again: %d come out differently (%d for a bigger multiplier, %d for a smaller one) | by part of the run: waves 1-19 %d of %d, waves 20-34 %d of %d, waves 35-50 %d of %d | multiplier taken earlier is worth %+d pearls over the waves that were left, given up %d (level units, before the account bonus, and only if those runs were still cleared)"):format(votes, changed, more, less, bands[1][2], bands[1][1], bands[2][2], bands[2][1], bands[3][2], bands[3][1], gained + 0.5, lost + 0.5))
+		result.votes, result.changed, result.gained, result.lost = votes, changed, gained, lost
+		pcall(writefile, ACCOUNT_FOLDER .. "/cards_replay.txt", os.date("%m-%d %H:%M:%S") .. "\n" .. table.concat(result.lines, "\n") .. "\n")
 		result.done = true
 	end)
 	return result
@@ -13205,7 +13447,7 @@ if not IS_LOBBY then
 				pcall(function()
 					local file = SETTINGS_FOLDER .. "/cards.json"
 					local log = isfile(file) and httpService:JSONDecode(readfile(file)) or {}
-					table.insert(log, { at = os.time(), level = Match.levelId, wave = currentWave(), options = options, pick = pick, why = report, strategy = view.strategy })
+					table.insert(log, { at = os.time(), level = Match.levelId, wave = currentWave(), options = options, pick = pick, why = report, strategy = view.strategy, sit = { depth = sit.depth, health = sit.health, stacked = sit.stacked, mult = sit.mult, danger = sit.danger or nil, m0 = sit.m0, floor = sit.minClear } })
 					while #log > 300 do
 						table.remove(log, 1)
 					end
