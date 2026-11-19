@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v249", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v250", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -12194,8 +12194,19 @@ CardBrain.WEATHER = {
 	sandstorm = { shroud = 0.2, effects = { { type = "enemy_resistance_specific", damage_type = "magic", amount = 75 }, { type = "enemy_amp_specific", damage_type = "physical", amount = 0.25 } } },
 	mana = { effects = { { type = "enemy_resistance_specific", damage_type = "physical", amount = 150 }, { type = "enemy_amp_specific", damage_type = "magic", amount = 0.25 } } },
 	rain = { effects = { { type = "enemy_speedup", amount = 0.2 } } },
+	-- (Also immune to slows and stuns, and the best ground burns: learned in the margin.)
 	fire = { effects = { { type = "enemy_speedup", amount = 0.5 } } },
-	windy = { effects = { { type = "weather_flying_chance", amount = 0.2 } } },
+	-- ("Up to 75% faster with the wind": how much of the road runs with it differs by map; a
+	-- quarter of that is assumed.)
+	windy = { effects = { { type = "weather_flying_chance", amount = 0.2 }, { type = "enemy_speedup", amount = 0.2 } } },
+	-- Range -30%. (The lightning that stuns the dearest unit 3 s in every 10: in the margin.)
+	downpour = { effects = { { type = "stat_mul", stat = "range", amount = -0.3 } } },
+	-- Half the enemies only take proper damage from Fire, enemies burst ahead, golems fall: no
+	-- card of these weathers stacks on any of that, so there is nothing to seed. What they do
+	-- to the run is learned per weather (CardBrain.m0).
+	snow = { effects = {} },
+	underwater = { effects = {} },
+	meteor_shower = { effects = {} },
 }
 function CardBrain.weather(id)
 	return CardBrain.WEATHER[tostring(id or (Match.levelData or {})._weather)]
@@ -12353,8 +12364,11 @@ function CardBrain.paySteps(data)
 	end
 end
 
-function CardBrain.m0(levelId)
-	local learned = type(AA.progress.cardM0) == "table" and tonumber(AA.progress.cardM0[tostring(levelId)]) or nil
+---`weather`: the margin learned under that weather when there is one (snow, where half the
+---enemies shrug off anything but fire, is not the run a windy day is), else the stage's own.
+function CardBrain.m0(levelId, weather)
+	local book = type(AA.progress.cardM0) == "table" and AA.progress.cardM0 or {}
+	local learned = (weather and tonumber(book[tostring(levelId) .. ":" .. tostring(weather)])) or tonumber(book[tostring(levelId)]) or nil
 	return learned and math.clamp(learned, 2, 20) or CardBrain.M0
 end
 
@@ -12413,7 +12427,8 @@ function CardBrain.situation(state)
 		stacked = stacked,
 		mult = tonumber(Match.roguelike and Match.roguelike.candy_multiplier) or 0,
 		pay = CardBrain.paySteps(data),
-		m0 = CardBrain.m0(Match.levelId),
+		m0 = CardBrain.m0(Match.levelId, (Match.levelData or {})._weather),
+		weather = (Match.levelData or {})._weather,
 		every = Match.voteEvery,
 		danger = fraction < 0.6 or (Match.leakRisk or 0) >= 0.4 or depth >= 0.8,
 		-- A stage with an end that has never been finished (the clear is what drops its portal).
@@ -12951,7 +12966,7 @@ function CardBrain.logVote(options, pick, view, state)
 		CardBrain.log("[in play] " .. (#inPlay > 0 and table.concat(inPlay, " | ") or "no cards yet"), true)
 		local weather = CardBrain.weather()
 		if weather then
-			CardBrain.log(string.format("[weather] %s: its own effects are counted under the cards above%s", tostring((Match.levelData or {})._weather), weather.shroud and string.format(" | enemies can't be hurt on the first %d%% of the road, so the depth is read from there", weather.shroud * 100) or ""))
+			CardBrain.log(string.format("[weather] %s: its own effects are counted under the cards above, margin figure for it %.2f%s", tostring((Match.levelData or {})._weather), sit.m0, weather.shroud and string.format(" | enemies can't be hurt on the first %d%% of the road, so the depth is read from there", weather.shroud * 100) or ""))
 		end
 	end
 	for index, row in ipairs(view.rows or {}) do
@@ -13072,7 +13087,7 @@ function CardBrain.logRun(levelId, won, wave)
 	end
 	local sit = Match.cardSit
 	pcall(CardBrain.logCurve, won)
-	CardBrain.log(string.format("[run] %s %s at wave %s | multiplier x%.1f | the last forecast (wave %d) gave the clear %d%% | margin figure for this stage is now %.2f", tostring(levelId), won and "CLEARED" or "LOST", tostring(wave), 1 + (sit and sit.mult or before.mult), before.wave, before.win * 100 + 0.5, CardBrain.m0(levelId)))
+	CardBrain.log(string.format("[run] %s %s at wave %s | multiplier x%.1f | the last forecast (wave %d) gave the clear %d%% | margin figure for this stage%s is now %.2f", tostring(levelId), won and "CLEARED" or "LOST", tostring(wave), 1 + (sit and sit.mult or before.mult), before.wave, before.win * 100 + 0.5, sit and sit.weather and (" in " .. tostring(sit.weather)) or "", CardBrain.m0(levelId, sit and sit.weather)))
 	CardBrain.log("")
 end
 
@@ -13451,13 +13466,20 @@ function CardBrain.learnRun(levelId, won, wave)
 	local last = CardBrain.difficulty(sit.bound, sit.bound)
 	local seen
 	if won then
-		seen = math.max(1.3 / math.max(sit.stacked, 0.01), CardBrain.m0(levelId))
+		seen = math.max(1.3 / math.max(sit.stacked, 0.01), CardBrain.m0(levelId, sit.weather))
 	elseif wave / sit.bound >= 0.6 then
 		seen = CardBrain.difficulty(wave, sit.bound) / (last * math.max(sit.stacked, 0.01))
 	end
 	if seen then
 		AA.progress.cardM0 = type(AA.progress.cardM0) == "table" and AA.progress.cardM0 or {}
 		local old = CardBrain.m0(levelId)
+		if sit.weather then
+			-- The same lesson for this weather's own figure (it starts from the stage's).
+			local key = tostring(levelId) .. ":" .. tostring(sit.weather)
+			local was = CardBrain.m0(levelId, sit.weather)
+			AA.progress.cardM0[key] = math.clamp(math.exp(math.log(was) * 0.75 + math.log(math.clamp(seen, 1, 40)) * 0.25), 2, 20)
+			note("cardM0", { weather = sit.weather, was = math.floor(was * 100) / 100, seen = math.floor(seen * 100) / 100, now = math.floor(AA.progress.cardM0[key] * 100) / 100 })
+		end
 		-- A slow average: one odd run (a disconnect, a hand-played one) moves it a quarter.
 		AA.progress.cardM0[tostring(levelId)] = math.clamp(math.exp(math.log(old) * 0.75 + math.log(math.clamp(seen, 1, 40)) * 0.25), 2, 20)
 		note("cardM0", { was = math.floor(old * 100) / 100, seen = math.floor(seen * 100) / 100, now = math.floor(AA.progress.cardM0[tostring(levelId)] * 100) / 100 })
