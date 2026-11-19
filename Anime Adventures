@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v243", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v244", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -263,6 +263,10 @@ local Config = {
 	CardList = "[]",
 	CardBan = "[]",
 	PearlsOnlyCurses = false,
+	-- Go for pearls: the lowest chance to clear it will accept by choice (per cent).
+	PearlsMinClear = 80,
+	-- How much the card log (accounts/<id>/cards.txt) writes: Off, Normal or Full.
+	CardLog = "Normal",
 	MenuFont = "Own",
 	OpeningCore = true,
 	ChallengeFallback = "Story",
@@ -401,10 +405,11 @@ do
 		OrderAddKind = { "Place", "Upgrade" },
 		Targeting = { "Smart", "First", "Last", "Closest", "Farthest", "Strongest", "Weakest", "Off" },
 		CardStrategy = { "Win", "Balanced", "Pearls", "Secret" },
+		CardLog = { "Off", "Normal", "Full" },
 		MenuFont = { "Own", "Roblox" },
 		TraitUse = { "Tokens", "Remnants", "Both" },
 	}
-	local defaults = { CardStrategy = "Balanced", MenuFont = "Own", TraitUse = "Tokens", WarlordMode = "Auto", SpellMode = "Safe", CharmPick = "Auto", OrderPlacement = "Smart", OrderAddKind = "Place", Mode = "Story", AfterGame = "Auto", Difficulty = "Normal", PlaceStyle = "Auto", SnipeMode = "Normal", Targeting = "Smart" }
+	local defaults = { CardLog = "Normal", CardStrategy = "Balanced", MenuFont = "Own", TraitUse = "Tokens", WarlordMode = "Auto", SpellMode = "Safe", CharmPick = "Auto", OrderPlacement = "Smart", OrderAddKind = "Place", Mode = "Story", AfterGame = "Auto", Difficulty = "Normal", PlaceStyle = "Auto", SnipeMode = "Normal", Targeting = "Smart" }
 	for key, list in pairs(choices) do
 		if not table.find(list, Config[key]) then
 			Config[key] = defaults[key]
@@ -11719,7 +11724,9 @@ end)
 -- wave and the pearls that pays. The three strategies read that projection differently:
 --   Win       the card that keeps the clear most likely; a curse only when it costs next to nothing
 --   Balanced  the most pearls among the cards that keep the clear likely
---   Pearls    a curse at every vote, the one worth the most pearls, unless it would end the run
+--   Pearls    the card with the highest expected pearls for the whole run, clear bonus included,
+--             found by playing the rest of the run forward (CardBrain.plan), among the cards
+--             that keep the chance to clear at or above the user's floor
 -- The user's never list is applied before any of this and nothing overrides it.
 do
 local CardBrain = {}
@@ -12297,6 +12304,8 @@ function CardBrain.situation(state)
 		danger = fraction < 0.6 or (Match.leakRisk or 0) >= 0.4 or depth >= 0.8,
 		-- A stage with an end that has never been finished (the clear is what drops its portal).
 		unproven = (data._override_infinite_bound_waves ~= nil or data._infinite_bound_level ~= nil) and Match.levelId ~= nil and not AA.stageCleared(Match.levelId),
+		minClear = math.clamp((tonumber(Config.PearlsMinClear) or 80) / 100, 0.3, 0.99),
+		level = Match.levelId,
 	}
 	-- A base that has just been hit says more than the road does.
 	sit.depth = (fraction < 0.6 and 1) or ((bleeding or fraction < 0.95) and math.max(depth, 0.85)) or depth
@@ -12306,15 +12315,235 @@ end
 CardBrain.STRATEGIES = { "Win", "Balanced", "Pearls", "Secret" }
 -- Win: a curse may cost this share of the team's power at most, and this much clear chance.
 -- Balanced: the clear chance it will not go under by choice.
--- Pearls: a curse at every vote that offers one (v230, user rule), the one expected to pay the
--- most pearls; a blessing only when the vote has no curse.
+-- Pearls (v244): the card whose expected pearls for the rest of the run are highest, counting
+-- the clear bonus, with the clear chance kept at or above the user's floor (pearlsFloor is the
+-- default) whenever any card on offer can do that. See CardBrain.plan.
 -- reserve: how much of the coming all-curse votes each strategy sets margin aside for.
 -- (The logged votes of eleven full runs, replayed through this model: Win kept the clear at 99%
 -- for 1209 pearls a run before account bonuses, Balanced 85% for 1604, Pearls 45% for 2130.
 -- Never passing on a curse came to 2% and 1726: the run ends in the low 40s, before the big
 -- multiplier has paid. 67 of the 166 votes went differently in at least one strategy. A
 -- projection, not played matches.)
-CardBrain.RULES = { freePower = 0.97, freeClear = 0.01, keepClear = 0.85, pearlsShare = 1, pearlsEvery = 0.5, pearlsSoon = 0.25, reserve = { Win = 0, Balanced = 0.7, Pearls = 1, Secret = 0.7 } }
+CardBrain.RULES = { freePower = 0.97, freeClear = 0.01, keepClear = 0.85, pearlsFloor = 0.8, pearlsShare = 1, pearlsEvery = 0.5, pearlsSoon = 0.25, reserve = { Win = 0, Balanced = 0.7, Pearls = 1, Secret = 0.7 } }
+
+-- Go for pearls, v244 ----------------------------------------------------------------------
+-- USER (v244): "optimize total expected pearls earned per game, including the victory bonus",
+-- "subject to an appropriately high, configurable minimum acceptable win probability whenever
+-- that constraint is feasible". This replaces the v230 rule (a curse at every vote), which took
+-- pearls now and lost the late waves and the clear bonus with them.
+--
+-- What a card is worth is not what it pays this vote but what the whole rest of the run pays
+-- once it is in play: every later wave at the new multiplier, times the chance of still being
+-- there, plus the clear bonus (CLEAR_WAVES waves of pay at the final multiplier), and with it
+-- the room it leaves or takes for the votes still to come. So each card on offer is tried by
+-- playing the rest of the run forward many times:
+--   * the votes still to come are drawn from the votes this computer has logged at about the
+--     same wave (cards.json: real offers, so the mix of tiers, the weather cards and the three
+--     in eight votes with nothing but curses come as they really do);
+--   * each of those is answered the way this strategy would answer it one step ahead (most
+--     expected pearls among the cards that keep the clear at the floor, else the safest);
+--   * every card played changes the totals in play, so a second +health is rated on top of
+--     the first (CardBrain.score), and the team's margin on every wave follows from that;
+--   * the same draws are used for every card on offer, so they are compared on equal futures.
+-- The answer per card: expected pearls from play, expected clear bonus, and the chance to clear.
+-- Nothing here is new knowledge about the game: the pay table, the clear bonus, the margin
+-- curve and the card effects are the ones the rest of CardBrain already uses.
+CardBrain.PLAN = { rollouts = 48, minVotes = 30 }
+---Logged votes, by wave: { count =, sample = function(wave, rng) -> options or nil }.
+function CardBrain.voteBook(levelId)
+	local cached = CardBrain.voteBookCache
+	if cached and cached.level == levelId and os.clock() - cached.at < 300 then
+		return cached.book
+	end
+	local all, same = {}, {}
+	pcall(function()
+		local file = SETTINGS_FOLDER .. "/cards.json"
+		if isfile(file) then
+			for _, entry in ipairs(httpService:JSONDecode(readfile(file))) do
+				local cards = 0
+				for _, option in pairs(type(entry) == "table" and type(entry.options) == "table" and entry.options or {}) do
+					cards += (type(option) == "table" and type(option.effects) == "table" and type(option.title) == "string") and 1 or 0
+				end
+				if cards >= 2 and tonumber(entry.wave) then
+					local vote = { wave = tonumber(entry.wave), options = entry.options }
+					table.insert(all, vote)
+					if levelId and entry.level == levelId then
+						table.insert(same, vote)
+					end
+				end
+			end
+		end
+	end)
+	-- This stage's own votes when there are enough of them (another event's cards differ).
+	local votes = #same >= CardBrain.PLAN.minVotes * 2 and same or all
+	local buckets = {}
+	local book = { count = #votes }
+	function book.sample(wave, rng)
+		local bucket = buckets[wave]
+		if bucket == nil then
+			bucket = {}
+			for _, reach in ipairs({ 1, 2, 4 }) do
+				for _, vote in ipairs(votes) do
+					if math.abs(vote.wave - wave) <= reach then
+						table.insert(bucket, vote.options)
+					end
+				end
+				if #bucket >= 5 then
+					break
+				end
+				table.clear(bucket)
+			end
+			buckets[wave] = bucket
+		end
+		if #bucket == 0 then
+			return nil
+		end
+		return bucket[rng:NextInteger(1, #bucket)]
+	end
+	CardBrain.voteBookCache = { level = levelId, at = os.clock(), book = book }
+	return book
+end
+---Adds a card's lasting effects to the running totals the next card is rated against.
+function CardBrain.applyTotals(totals, option)
+	for _, effect in ipairs(type(option.effects) == "table" and option.effects or {}) do
+		if type(effect) == "table" then
+			local kind = effect.type
+			if kind ~= "candy_multiplier" and kind ~= "secret_drop" and kind ~= "add_reward" and kind ~= "resource_gain" and kind ~= "random_effects" and kind ~= "stat_mul_real" and kind ~= "new_path" then
+				local key = CardBrain.key(effect)
+				totals[key] = (totals[key] or 0) + (tonumber(effect.amount) or 0)
+			end
+		end
+	end
+end
+---Plays the rest of the run forward for every open row. Fills row.ev (expected pearls for the
+---rest of the run), row.evPlay, row.evBonus and row.win (chance to clear). Returns what it did,
+---or nil and the reason it could not look ahead.
+function CardBrain.plan(rows, options, sit, state, banned, floor, rollouts)
+	local book = CardBrain.voteBook(sit.level)
+	if not book or book.count < CardBrain.PLAN.minVotes then
+		return nil, ("only %d votes logged so far, %d needed to look ahead"):format(book and book.count or 0, CardBrain.PLAN.minVotes)
+	end
+	local started = os.clock()
+	local count = rollouts or CardBrain.PLAN.rollouts
+	local every = math.max(sit.every or CardBrain.FORCED.every, 1)
+	local bound, clearWaves, holds = sit.bound, CardBrain.CLEAR_WAVES, CardBrain.holds
+	local base, payAt = {}, {}
+	for wave = sit.wave, bound do
+		base[wave] = CardBrain.margin(sit, 1, wave, 0)
+		payAt[wave] = sit.pay(wave)
+	end
+	local sim = { share = state.share, antiAir = state.antiAir, buffer = state.buffer, spent = state.spent }
+	-- What the votes with nothing but curses after a given wave are expected to cost. A later
+	-- vote is answered with that set aside: without it the answers spend the margin down to
+	-- the floor at every step and the forced curses then take the run under it (a team with
+	-- three times the margin it needed came out at a 39% clear in the first version).
+	local forcedAfter = {}
+	do
+		local forced, factor = CardBrain.FORCED, 1
+		for wave = bound, sit.wave, -1 do
+			forcedAfter[wave] = factor
+			if (wave - sit.wave) % every == 0 and wave > sit.wave then
+				factor *= (wave / bound < 0.5 and forced.early or forced.late) ^ forced.share
+			end
+		end
+	end
+	---The answer to a later vote, one step ahead: option, its power factor, its multiplier.
+	local function answer(offer, totals, rel, mult, alive, wave, safe)
+		sim.totals = totals
+		local best, bestValue, bestF, bestC
+		local safest, safestAlive, safestF, safestC
+		for _, option in pairs(offer) do
+			if type(option) == "table" and type(option.effects) == "table" then
+				local family = CardBrain.family(option.title)
+				if not banned[family] then
+					local factor, _, candy = CardBrain.score(option, sim)
+					candy = candy or 0
+					if family == "Wishing Star" then
+						-- (User rule: taken whenever it is offered.)
+						return option, factor, candy
+					end
+					local left, value, multiplier = alive, 0, 1 + mult + candy
+					for at = wave, bound do
+						local chance = holds(base[at] * rel * factor)
+						if chance < left then
+							left = chance
+						end
+						value += payAt[at] * multiplier * left
+					end
+					value += clearWaves * payAt[bound] * multiplier * left
+					-- (The floor is asked of the last wave with the coming forced curses taken off.)
+					local kept = math.min(left, holds(base[bound] * rel * factor * forcedAfter[wave]))
+					if not safe and kept >= floor and (not bestValue or value > bestValue) then
+						best, bestValue, bestF, bestC = option, value, factor, candy
+					end
+					if not safestAlive or left > safestAlive then
+						safest, safestAlive, safestF, safestC = option, left, factor, candy
+					end
+				end
+			end
+		end
+		if best then
+			return best, bestF, bestC
+		end
+		return safest, safestF, safestC
+	end
+	local seed = sit.wave * 1009 + math.floor(sit.mult * 10 + 0.5) * 31 + math.floor(sit.stacked * 1000)
+	---One future for one card: pearls from waves, clear bonus, chance to clear.
+	local function future(row, index, safe)
+		local rng = Random.new(seed + index)
+		local totals = table.clone(state.totals or {})
+		CardBrain.applyTotals(totals, options[row.key])
+		local rel, mult, alive, play = row.power, sit.mult + row.candy, 1, 0
+		local nextVote = sit.wave + every
+		for wave = sit.wave, bound do
+			if wave == nextVote then
+				nextVote += every
+				local offer = book.sample(wave, rng)
+				if offer then
+					local option, factor, candy = answer(offer, totals, rel, mult, alive, wave, safe)
+					if option then
+						rel *= factor
+						mult += candy
+						CardBrain.applyTotals(totals, option)
+					end
+				end
+			end
+			local chance = holds(base[wave] * rel)
+			if chance < alive then
+				alive = chance
+			end
+			play += payAt[wave] * (1 + mult) * alive
+		end
+		return play, clearWaves * payAt[bound] * (1 + mult) * alive, alive
+	end
+	-- Two readings of the same futures for every card on offer:
+	--   played on for pearls (every later vote answered for the most pearls that keep the
+	--   floor): what the card is worth, row.ev, and where that line of play ends up, row.winOn;
+	--   played safe from here (every later vote answered with its safest card): row.win, the
+	--   best clear chance still within reach once this card is in play. The floor is asked of
+	--   that one: a card is allowed while the run can still be brought home at the floor by
+	--   playing safe afterwards. Judging it by the pearl line instead refuses every curse,
+	--   because that line spends the margin down to the floor by itself (the first version
+	--   cleared 95% of its runs and made fewer pearls than Balanced).
+	for _, row in ipairs(rows) do
+		if not row.banned and options[row.key] then
+			local sumPlay, sumBonus, sumOn, sumSafe, low, high = 0, 0, 0, 0, math.huge, -math.huge
+			for index = 1, count do
+				local play, bonus, alive = future(row, index, false)
+				sumPlay += play
+				sumBonus += bonus
+				sumOn += alive
+				low, high = math.min(low, play + bonus), math.max(high, play + bonus)
+				local _, _, safeAlive = future(row, index, true)
+				sumSafe += safeAlive
+			end
+			row.evPlay, row.evBonus, row.winOn, row.win = sumPlay / count, sumBonus / count, sumOn / count, sumSafe / count
+			row.ev = row.evPlay + row.evBonus
+			row.evLow, row.evHigh = low, high
+		end
+	end
+	return { rollouts = count, votes = book.count, ms = (os.clock() - started) * 1000, floor = floor }
+end
 
 ---The decision itself, from plain values (so it can be tested without a match).
 ---banned: { [family] = true }. order: the user's list of families, or nil. everyCurse: the
@@ -12446,17 +12675,66 @@ function CardBrain.decide(options, sit, state, strategy, banned, order, everyCur
 		end
 		return done(strongest, sit.danger and "Secret: the base is under pressure, strongest card" or "Secret: no card here adds Secret Drop Rate and keeps the clear likely, strongest card")
 	end
-	-- Pearls: a curse whenever one is on offer.
-	if #curses == 0 then
-		return done(top(open, "pearls", "power"), "Pearls: no curse on offer, best blessing")
+	-- Kept for the self-test only: what Go for pearls did before v244.
+	if strategy == "PearlsV230" then
+		-- (v230: a curse at every vote that offers one, the one worth the most one step ahead.)
+		if #curses == 0 then
+			return done(top(open, "pearls", "power"), "Pearls v230: no curse on offer, best blessing")
+		end
+		return done(top(curses, "pearls", "power"), "Pearls v230: a curse at every vote")
+	elseif strategy == "PearlsStep" then
+		-- (Before v230: the most pearls one step ahead, no floor and no look at later votes.)
+		return done(top(open, "pearls", "power"), "Pearls (one step): most expected pearls")
 	end
-	-- USER RULE (v230): "it should go for pearls every chance it gets" and "pick the least
-	-- harmful but pearl maximizing curses". A curse is never passed over for a blessing; which
-	-- curse is the one expected to pay the most pearls over the rest of the run, which weighs
-	-- what it adds to the multiplier against how soon it would end the run (the milder one on
-	-- a tie). The old "Never pass on a curse" switch is this, always.
-	local curse = top(curses, "pearls", "power")
-	return done(curse, string.format("Pearls: the curse worth the most pearls (+%s to the multiplier)", tostring(curse.candy)))
+	-- Pearls (v244): the most expected pearls for the whole run, clear bonus included, among the
+	-- cards that keep the chance to clear at the floor. See CardBrain.plan.
+	local floor = math.clamp(sit.minClear or rules.pearlsFloor, 0.3, 0.99)
+	local plan, noPlan = CardBrain.plan(rows, options, sit, state, banned, floor, sit.rollouts)
+	view.plan, view.floor = plan, floor
+	for _, row in ipairs(open) do
+		if not plan then
+			-- Too little logged to play the run forward: one step ahead, with room set aside
+			-- for the votes that offer nothing but curses.
+			row.ev, row.win = row.pearls, row.clear
+		end
+		row.step, row.stepClear = row.pearls, row.clear
+		row.pearls, row.clear = row.ev, row.win
+	end
+	local allowed = {}
+	for _, row in ipairs(open) do
+		if row.win >= floor then
+			table.insert(allowed, row)
+		end
+	end
+	local pick, stance
+	if #allowed > 0 then
+		pick = top(allowed, "ev", "win")
+		stance = pick.curse and (pick.win >= floor + 0.1 and "pressing: room to spare" or "pressing: at the limit") or (#curses > 0 and "holding: the curses here cost more than they pay" or "building: no curse on offer")
+	else
+		-- No card keeps the floor: the run is protected first, pearls break ties.
+		pick = top(open, "win", "ev")
+		stance = "defending: nothing here keeps the floor"
+	end
+	view.stance = stance
+	for _, row in ipairs(open) do
+		if row == pick then
+			row.verdict = "taken"
+		elseif #allowed > 0 and row.win < floor then
+			row.verdict = string.format("refused: even played safe from here the clear would be %d%%, under the floor of %d%%", row.win * 100 + 0.5, floor * 100 + 0.5)
+		elseif #allowed > 0 then
+			row.verdict = string.format("passed over: %d fewer pearls expected", pick.ev - row.ev + 0.5)
+		else
+			row.verdict = string.format("passed over: clear %d%% against %d%%", row.win * 100 + 0.5, pick.win * 100 + 0.5)
+		end
+		table.insert(report, string.format("plan %s: %d pearls expected (%s) clear %d%% if played safe from here%s -> %s", row.title, row.ev + 0.5, row.evPlay and string.format("%d play + %d bonus", row.evPlay + 0.5, row.evBonus + 0.5) or "one step", row.win * 100 + 0.5, row.winOn and string.format(", %d%% if played on for pearls", row.winOn * 100 + 0.5) or "", row.verdict))
+	end
+	if not plan then
+		table.insert(report, "no look-ahead: " .. tostring(noPlan))
+	end
+	if #allowed > 0 then
+		return done(pick, string.format("Pearls: most expected pearls for the run (%d) among the cards that leave a %d%% clear within reach (this one: %d%%), %s", pick.ev + 0.5, floor * 100 + 0.5, pick.win * 100 + 0.5, stance))
+	end
+	return done(pick, string.format("Pearls: no card keeps the clear at %d%%, so the safest one (clear %d%%)", floor * 100 + 0.5, pick.win * 100 + 0.5))
 end
 
 function CardBrain.strategy()
@@ -12472,8 +12750,313 @@ function CardBrain.choose(options)
 		banned[name] = true
 	end
 	local pick, report, view = CardBrain.decide(options, sit, state, CardBrain.strategy(), banned, Config.CardListOn and CardBrain.list() or nil, Config.PearlsOnlyCurses)
-	view.sit = sit
+	view.sit, view.state = sit, state
 	return pick, report, view
+end
+
+-- The card log ----------------------------------------------------------------------------
+-- accounts/<id>/cards.txt: for every vote, what the run looked like, what each card would do
+-- and why one was taken; after the vote, what actually happened against what was expected; at
+-- the end of the run, the result against the last forecast. Config.CardLog: Off, Normal (the
+-- state, one line per card, the decision, the outcomes) or Full (adds every effect with the
+-- totals before and after, the team's damage split and the spread of the simulated futures).
+function CardBrain.log(text, full)
+	local want = Config.CardLog
+	if want == "Off" or (full and want ~= "Full") then
+		return
+	end
+	pcall(AA.appendLog, ACCOUNT_FOLDER .. "/cards.txt", text .. "\n")
+end
+local function effectLine(effect)
+	return string.format("%s%s %+g", tostring(effect.type), (effect.stat or effect.damage_type) and (":" .. tostring(effect.stat or effect.damage_type)) or "", tonumber(effect.amount) or 0)
+end
+function CardBrain.logVote(options, pick, view, state)
+	if Config.CardLog == "Off" then
+		return
+	end
+	local sit = view.sit
+	local function pct(x)
+		return string.format("%d%%", x * 100 + 0.5)
+	end
+	local _, standing = CardBrain.expected(sit, 1, 0, 0)
+	CardBrain.log(string.format("== %s %s wave %d/%d | strategy %s%s ==", os.date("%m-%d %H:%M:%S"), tostring(sit.level), sit.wave, sit.bound, tostring(view.strategy), view.floor and (" | floor " .. pct(view.floor)) or ""))
+	CardBrain.log(string.format("[state] base %s | deepest enemy %s of the road | pearl multiplier x%.1f | team strength %s of an uncursed team | margin now %.2f, on the last wave %.2f (1 = just holding) | clear chance as it stands %s%s%s", pct(sit.health), pct(sit.depth), 1 + sit.mult, pct(sit.stacked), CardBrain.margin(sit, 1, sit.wave, 0), CardBrain.margin(sit, 1, sit.bound, 0), pct(standing), sit.danger and " | BASE UNDER PRESSURE" or "", view.stance and (" | " .. view.stance) or ""))
+	-- What has changed since the vote before, against what was expected then.
+	local before = Match.cardPred
+	if before then
+		CardBrain.log(string.format("[since wave %d] forecast then: clear %s with %s. Now: still standing, base %s (was %s), deepest enemy %s (was %s), clear chance %s", before.wave, pct(before.win), tostring(before.title), pct(sit.health), pct(before.health), pct(sit.depth), pct(before.depth), pct(standing)))
+	end
+	do
+		local towers, split = #myUnits(), {}
+		for kind, share in pairs(state.share or {}) do
+			if share >= 0.01 then
+				table.insert(split, string.format("%s %s", tostring(kind):gsub("_damage", ""), pct(share)))
+			end
+		end
+		table.sort(split)
+		CardBrain.log(string.format("[my side] %d towers, %d spent | damage: %s | reaches flyers: %s | has a buffer: %s", towers, state.spent or 0, table.concat(split, ", "), tostring(state.antiAir), tostring(state.buffer == true)), true)
+		local inPlay = {}
+		for key, total in pairs(state.totals or {}) do
+			table.insert(inPlay, string.format("%s %+g", key, total))
+		end
+		table.sort(inPlay)
+		CardBrain.log("[in play] " .. (#inPlay > 0 and table.concat(inPlay, " | ") or "no cards yet"), true)
+	end
+	for index, row in ipairs(view.rows or {}) do
+		local option = options[row.key] or {}
+		local effects = {}
+		for _, effect in ipairs(type(option.effects) == "table" and option.effects or {}) do
+			if type(effect) == "table" then
+				table.insert(effects, effectLine(effect))
+			end
+		end
+		CardBrain.log(string.format("[card %d] %s (%s): %s", index, row.title, row.curse and "curse" or "blessing", table.concat(effects, ", ")))
+		CardBrain.log(string.format("         team strength x%.2f | multiplier %+.1f | secret drop %+d%%%s", row.power, row.candy, (row.secret or 0) * 100 + 0.5, row.banned and " | ON YOUR NEVER LIST" or ""))
+		for _, effect in ipairs(type(option.effects) == "table" and option.effects or {}) do
+			-- Each lasting effect on top of what is already in play.
+			if type(effect) == "table" and effect.type ~= "candy_multiplier" and effect.type ~= "secret_drop" and effect.type ~= "add_reward" and effect.type ~= "resource_gain" and effect.type ~= "random_effects" and effect.type ~= "stat_mul_real" and effect.type ~= "new_path" then
+				local key = CardBrain.key(effect)
+				local now = (state.totals or {})[key] or 0
+				local after = now + (tonumber(effect.amount) or 0)
+				CardBrain.log(string.format("         %s: total %+g -> %+g, my killing power for it x%.2f -> x%.2f (stacks on what is in play, lasts the whole run)", key, now, after, CardBrain.gain(effect.type, effect.stat, effect.damage_type, now, state), CardBrain.gain(effect.type, effect.stat, effect.damage_type, after, state)), true)
+			elseif type(effect) == "table" and effect.type == "random_effects" then
+				CardBrain.log(string.format("         %s random tier %s cards: rated as that many typical ones (what they turn out to be is not known before the vote)", tostring(effect.amount), tostring(effect.tier)), true)
+			end
+		end
+		if row.ev then
+			CardBrain.log(string.format("         whole run: %d pearls expected%s | clear %s if played safe from here%s | one step ahead: %d pearls, clear %s", row.ev + 0.5, row.evPlay and string.format(" (%d from waves + %d clear bonus; futures ranged %d to %d)", row.evPlay + 0.5, row.evBonus + 0.5, row.evLow + 0.5, row.evHigh + 0.5) or "", pct(row.win), row.winOn and (", " .. pct(row.winOn) .. " if played on for pearls") or "", (row.step or row.pearls) + 0.5, pct(row.stepClear or row.clear)))
+		else
+			CardBrain.log(string.format("         one step ahead: %d pearls, clear %s", row.pearls + 0.5, pct(row.clear)))
+		end
+		if row.verdict then
+			CardBrain.log("         -> " .. row.verdict)
+		end
+	end
+	local taken
+	for _, row in ipairs(view.rows or {}) do
+		taken = row.key == pick and row or taken
+	end
+	CardBrain.log(string.format("[decision] %s | %s%s", taken and taken.title or "no vote cast", tostring(view.why), view.plan and string.format(" | %d futures drawn from %d logged votes, %.0f ms", view.plan.rollouts, view.plan.votes, view.plan.ms) or ""))
+	if taken then
+		Match.cardPred = { wave = sit.wave, title = taken.title, win = taken.win or taken.clear, ev = taken.ev or taken.pearls, mult = sit.mult + taken.candy, strength = sit.stacked * taken.power, health = sit.health, depth = sit.depth }
+	end
+end
+---After the vote: what the server put in play against what was expected.
+function CardBrain.logResult(picked, info, strength)
+	local before = Match.cardPred
+	if not before then
+		return
+	end
+	local title = CardBrain.family(picked.title) .. (tostring(picked.title):match("%s+I+$") or "")
+	local mult = tonumber(info and info.candy_multiplier)
+	CardBrain.log(string.format("[result] the vote went to %s (%s) | multiplier now x%.1f (expected x%.1f) | team strength now %d%% (expected %d%%)%s", title, title == before.title and "the script's pick" or ("NOT the script's pick, which was " .. tostring(before.title)), 1 + (mult or before.mult), 1 + before.mult, (strength or 0) * 100 + 0.5, before.strength * 100 + 0.5, (mult and math.abs(mult - before.mult) > 0.05 or math.abs((strength or before.strength) - before.strength) > 0.05) and " | DIFFERS FROM THE FORECAST" or ""))
+end
+function CardBrain.logRun(levelId, won, wave)
+	local before = Match.cardPred
+	if not before then
+		return
+	end
+	local sit = Match.cardSit
+	CardBrain.log(string.format("[run] %s %s at wave %s | multiplier x%.1f | the last forecast (wave %d) gave the clear %d%% | margin figure for this stage is now %.2f", tostring(levelId), won and "CLEARED" or "LOST", tostring(wave), 1 + (sit and sit.mult or before.mult), before.wave, before.win * 100 + 0.5, CardBrain.m0(levelId)))
+	CardBrain.log("")
+end
+
+-- Tests ---------------------------------------------------------------------------------------
+-- CardBrain.selfTest(): the card arithmetic and the decisions on set-up situations, from plain
+-- values (no match needed). CardBrain.backtest(): whole runs replayed for each strategy on the
+-- same drawn votes, scored by the same model the script votes with. That shows which rule gets
+-- the most out of the model; it does not show how true the model is. Only real runs do.
+function CardBrain.selfTest()
+	local results = {}
+	local function check(name, ok, detail)
+		table.insert(results, { name = name, ok = ok == true, detail = detail })
+	end
+	local function near(a, b)
+		return math.abs(a - b) < 1e-6
+	end
+	local seed = CardBrain.SEED
+	local function fresh(totals)
+		return { share = { magic = 0.9, physical = 0.1 }, totals = totals or {}, antiAir = true, buffer = true, spent = 60000 }
+	end
+	local power, _, candy = CardBrain.score(seed["+ Enemy Health I"], fresh())
+	check("Enemy Health I: +50% health leaves 1/1.5 of the team", near(power, 1 / 1.5), power)
+	check("Enemy Health I adds 0.3 to the multiplier", near(candy, 0.3), candy)
+	power = CardBrain.score(seed["+ Enemy Health I"], fresh({ ["enemy_stat_mul:health"] = 0.5 }))
+	check("a second Enemy Health I is rated on top of the first (0.75, not 0.67)", near(power, 0.75), power)
+	power = CardBrain.score(seed["+ Plated Enemies III"], fresh())
+	check("Plated III against a 10% physical team costs 7.5%", near(power, 1 + 0.1 * (100 / 400 - 1)), power)
+	power = CardBrain.score(seed["+ Spellproof Enemies I"], fresh())
+	check("Spellproof I against a 90% magic team costs 39%", near(power, 1 + 0.9 * (100 / 175 - 1)), power)
+	power = CardBrain.score(seed["+ Attack II"], fresh())
+	check("Attack II is +25%", near(power, 1.25), power)
+	power = CardBrain.score(seed["Mud"], fresh())
+	check("Mud (-25% enemy speed) is worth 1/0.75", near(power, 1 / 0.75), power)
+	power, _, candy = CardBrain.score(seed["Torrent"], fresh())
+	check("Torrent: speed and health both count (1/1.5 x 1/1.5) for +1", near(power, 1 / 1.5 / 1.5) and near(candy, 1), power)
+	do
+		local totals = {}
+		CardBrain.applyTotals(totals, seed["+ Enemy Health I"])
+		CardBrain.applyTotals(totals, seed["+ Enemy Health I"])
+		check("cards played add up in the running totals", near(totals["enemy_stat_mul:health"] or 0, 1) and totals["candy_multiplier:"] == nil, totals["enemy_stat_mul:health"])
+	end
+	check("a margin of 1 holds half the time", near(CardBrain.holds(1), 0.5), CardBrain.holds(1))
+	local pay = function(wave)
+		return wave <= 3 and 0 or wave <= 10 and 5 or 10
+	end
+	local function situation(wave, m0, stacked, mult)
+		return { wave = wave, bound = 50, health = 1, stacked = stacked or 1, mult = mult or 0, pay = pay, m0 = m0, every = 3, danger = false, unproven = false, depth = 0.05, minClear = 0.8, level = "summer2_event", rollouts = 32 }
+	end
+	do
+		local sit = situation(20, 6)
+		check("the last wave is the hardest", CardBrain.margin(sit, 1, 50, 0) < CardBrain.margin(sit, 1, 30, 0), nil)
+		local pearlsA, clearA = CardBrain.expected(sit, 1, 0, 0)
+		local pearlsB, clearB = CardBrain.expected(sit, 1, 1, 0)
+		local _, clearC = CardBrain.expected(sit, 0.5, 0, 0)
+		check("a bigger multiplier at the same strength pays more", pearlsB > pearlsA and near(clearA, clearB), nil)
+		check("a weaker team clears less often", clearC < clearA, nil)
+	end
+	local function decide(names, sit, strategy, banned)
+		local options = {}
+		for index, name in ipairs(names) do
+			options[tostring(index)] = seed[name] or name
+		end
+		local pick, _, view = CardBrain.decide(options, sit, fresh(), strategy or "Pearls", banned or {}, nil)
+		local option = pick and options[pick]
+		return option and option.title, view
+	end
+	do
+		-- Greed that loses the run: a thin margin late, a big curse on offer.
+		local names = { "+ Attack II", "+ Enemy Health III" }
+		local mine, view = decide(names, situation(38, 3.2, 0.6, 3))
+		local old = decide(names, situation(38, 3.2, 0.6, 3), "PearlsV230")
+		check("thin margin late: the blessing is taken, not Enemy Health III", mine == "+ Attack II", tostring(mine) .. " | " .. tostring(view.why))
+		check("(the v230 rule took the curse there)", old == "+ Enemy Health III", old)
+	end
+	do
+		local mine, view = decide({ "+ Attack I", "Gale" }, situation(5, 12))
+		check("plenty of margin early: the cheap curse is taken", mine == "Gale", tostring(mine) .. " | " .. tostring(view.why))
+	end
+	do
+		local mine, view = decide({ "+ Enemy Health II", "+ Enemy Speed I", "+ Enemy Shield I" }, situation(44, 1.6, 0.5, 4))
+		local best
+		for _, row in ipairs(view.rows) do
+			best = (not best or row.win > best.win) and row or best
+		end
+		check("nothing keeps the floor: the safest card is taken", best ~= nil and seed[mine] ~= nil and view.pick == best.key and best.win < 0.8, tostring(mine) .. " | " .. tostring(view.why))
+	end
+	do
+		local mine = decide({ "+ Attack I", "Gale" }, situation(5, 12), "Pearls", { Gale = true })
+		check("a card on the never list is not taken", mine == "+ Attack I", mine)
+		local star = { title = "Wishing Star", option_type = "Good", effects = { { type = "golem_chance", amount = 1 } } }
+		check("Wishing Star is taken whenever it is offered", decide({ "+ Attack III", star }, situation(5, 12)) == "Wishing Star", nil)
+	end
+	do
+		local _, first = decide({ "+ Attack I", "+ Enemy Speed II", "Gale" }, situation(20, 6, 0.8, 1.5))
+		local _, second = decide({ "+ Attack I", "+ Enemy Speed II", "Gale" }, situation(20, 6, 0.8, 1.5))
+		local same = first.pick == second.pick
+		for index, row in ipairs(first.rows) do
+			same = same and near(row.ev or 0, second.rows[index].ev or 0)
+		end
+		check("the same vote in the same state gets the same answer", same, nil)
+		check("the look-ahead ran (enough votes are logged)", first.plan ~= nil, first.plan and ("%d futures, %.0f ms"):format(first.plan.rollouts, first.plan.ms) or "one step only")
+	end
+	local passed = 0
+	for _, result in ipairs(results) do
+		passed += result.ok and 1 or 0
+	end
+	return passed, #results, results
+end
+---Whole runs for every strategy on the same drawn votes, at three strengths of team. Runs in the
+---background (it yields between runs); the table lands in CardBrain.backtestResult and in
+---accounts/<id>/cards_backtest.txt.
+function CardBrain.backtest(runs, rollouts)
+	runs, rollouts = runs or 20, rollouts or 24
+	local levelId = "summer2_event"
+	local data = (Core.RawLevels and Core.RawLevels[levelId]) or Levels[levelId]
+	local book = CardBrain.voteBook(levelId)
+	if not data or not book or book.count < CardBrain.PLAN.minVotes then
+		CardBrain.backtestResult = { done = true, error = "needs the Summer Hunt level data and at least " .. CardBrain.PLAN.minVotes .. " logged votes" }
+		return CardBrain.backtestResult
+	end
+	local okState, state0 = pcall(CardBrain.state)
+	if not okState or next(state0.share) == nil then
+		CardBrain.backtestResult = { done = true, error = "could not read the team's damage split" }
+		return CardBrain.backtestResult
+	end
+	local banned = {}
+	for _, name in ipairs(CardBrain.banned()) do
+		banned[name] = true
+	end
+	local pay = CardBrain.paySteps(data)
+	local bound = tonumber(data._override_infinite_bound_waves) or 50
+	local learned = CardBrain.m0(levelId)
+	local floor = math.clamp((tonumber(Config.PearlsMinClear) or 80) / 100, 0.3, 0.99)
+	local policies = { "Win", "Balanced", "PearlsV230", "PearlsStep", "Pearls" }
+	local labels = { Win = "Go for win", Balanced = "Balanced", PearlsV230 = "Pearls before (v230: a curse every vote)", PearlsStep = "Pearls before v230 (one step ahead)", Pearls = "Go for pearls now (v244)" }
+	local settings = { { "hard (margin x0.6)", learned * 0.6 }, { "as learned", learned }, { "easy (margin x1.6)", learned * 1.6 } }
+	local last = CardBrain.difficulty(bound, bound)
+	local result = { done = false, lines = {}, table = {} }
+	CardBrain.backtestResult = result
+	task.spawn(function()
+		local started = os.clock()
+		for _, setting in ipairs(settings) do
+			local sums = {}
+			for _, policy in ipairs(policies) do
+				sums[policy] = { win = 0, play = 0, bonus = 0, mult = 0, thrown = 0, time = 0, votes = 0 }
+			end
+			for run = 1, runs do
+				-- The same votes for every strategy.
+				local rng = Random.new(run * 7919 + 13)
+				local offers = {}
+				for wave = 2, bound - 1, 3 do
+					offers[wave] = book.sample(wave, rng)
+				end
+				for _, policy in ipairs(policies) do
+					local sum = sums[policy]
+					local totals, stacked, mult, alive, play = {}, 1, 0, 1, 0
+					for wave = 1, bound do
+						local offer = offers[wave]
+						if offer then
+							local state = { share = state0.share, totals = totals, antiAir = state0.antiAir, buffer = state0.buffer, spent = state0.spent }
+							local sit = { wave = wave, bound = bound, health = 1, stacked = stacked, mult = mult, pay = pay, m0 = setting[2], every = 3, danger = false, unproven = false, depth = 0.05, minClear = floor, level = levelId, rollouts = rollouts }
+							local clock = os.clock()
+							local pick = CardBrain.decide(offer, sit, state, policy, banned, nil)
+							sum.time += os.clock() - clock
+							sum.votes += 1
+							local option = pick and offer[pick]
+							if option then
+								local factor, _, candy = CardBrain.score(option, state)
+								stacked *= factor
+								mult += candy or 0
+								CardBrain.applyTotals(totals, option)
+							end
+						end
+						local chance = CardBrain.holds(setting[2] * stacked * last / CardBrain.difficulty(wave, bound))
+						alive = math.min(alive, chance)
+						play += pay(wave) * (1 + mult) * alive
+					end
+					local bonus = CardBrain.CLEAR_WAVES * pay(bound) * (1 + mult) * alive
+					sum.win += alive
+					sum.play += play
+					sum.bonus += bonus
+					sum.mult += 1 + mult
+					sum.thrown += alive < 0.5 and 1 or 0
+				end
+				task.wait()
+			end
+			table.insert(result.lines, ("-- %s: %d runs, floor %d%% --"):format(setting[1], runs, floor * 100 + 0.5))
+			for _, policy in ipairs(policies) do
+				local sum = sums[policy]
+				local row = { setting = setting[1], policy = labels[policy], win = sum.win / runs, total = (sum.play + sum.bonus) / runs, play = sum.play / runs, bonus = sum.bonus / runs, mult = sum.mult / runs, thrown = sum.thrown / runs, ms = sum.time / math.max(sum.votes, 1) * 1000 }
+				table.insert(result.table, row)
+				table.insert(result.lines, ("%-42s clear %3d%% | pearls %5d (waves %5d + bonus %4d) | multiplier x%.1f | runs more likely lost than won %3d%% | %.1f ms a vote"):format(row.policy, row.win * 100 + 0.5, row.total + 0.5, row.play + 0.5, row.bonus + 0.5, row.mult, row.thrown * 100 + 0.5, row.ms))
+			end
+		end
+		table.insert(result.lines, ("(%d logged votes drawn from, %.0f s. Scored by the script's own model of the run: this ranks the rules, it does not prove the model.)"):format(book.count, os.clock() - started))
+		pcall(writefile, ACCOUNT_FOLDER .. "/cards_backtest.txt", os.date("%m-%d %H:%M:%S") .. "\n" .. table.concat(result.lines, "\n") .. "\n")
+		result.done = true
+	end)
+	return result
 end
 
 ---What the menu shows about the run's cards.
@@ -12511,6 +13094,9 @@ end
 ---A loss at wave w with the stack at S means the margin ran out there: M0 x S x last / diff(w)
 ---was about 1. A clear means it was above 1 on the last wave, so the figure is only raised.
 function CardBrain.learnRun(levelId, won, wave)
+	task.defer(function()
+		pcall(CardBrain.logRun, levelId, won, wave)
+	end)
 	local sit = Match.cardSit
 	-- (Only runs that took a few curses say anything: a multiplier of 1.5 is three mild ones.)
 	if not (levelId and sit and (sit.mult or 0) >= 1.5) then
@@ -12580,6 +13166,7 @@ if not IS_LOBBY then
 					writefile(file, httpService:JSONEncode(log))
 				end)
 				note("cards", { pick = pick and options[pick] and options[pick].title, why = table.concat(report, " | "), strategy = view.strategy, danger = sit.danger or nil, unproven = sit.unproven or nil, depth = math.floor(sit.depth * 100) / 100, stacked = math.floor(sit.stacked * 100) / 100 })
+				pcall(CardBrain.logVote, options, pick, view, view.state or {})
 				-- With the game's own Auto-Skip Card Votes on, the other players pick.
 				local theirs = Config.SkipCards and #playersService:GetPlayers() > 1
 				if Config.AutoCards and pick ~= nil and not theirs then
@@ -12601,6 +13188,7 @@ if not IS_LOBBY then
 						Match.cardSit = sit
 					end
 					note("cardResult", { title = picked.title, mult = info and info.candy_multiplier, stacked = math.floor((Match.cardPower or 1) * 100) / 100 })
+					pcall(CardBrain.logResult, picked, info, Match.cardPower)
 				end
 			end))
 		end
@@ -18113,17 +18701,21 @@ do
 			UI.choiceCards(page, "CardStrategy", {
 				{ value = "Win", title = "Go for win", text = "The card that keeps the clear most likely. A curse only when it costs your team next to nothing.", gauges = { { "Clear chance", 3 }, { "Pearls", 1 }, { "Risk taken", 1 } } },
 				{ value = "Balanced", title = "Balanced", text = "Curses for as long as the clear stays likely, then it stops and protects the run.", gauges = { { "Clear chance", 2 }, { "Pearls", 2 }, { "Risk taken", 2 } } },
-				{ value = "Pearls", title = "Go for pearls", text = "A curse at every vote that offers one: the one expected to pay the most pearls.", gauges = { { "Clear chance", 1 }, { "Pearls", 3 }, { "Risk taken", 3 } } },
+				{ value = "Pearls", title = "Go for pearls", text = "The most pearls for the whole run, clear bonus included, without letting the clear chance fall under your floor.", gauges = { { "Clear chance", 2 }, { "Pearls", 3 }, { "Risk taken", 2 } } },
 				{ value = "Secret", title = "Go for secret", text = "The card with the most Secret Drop Rate, as long as the clear stays likely.", gauges = { { "Clear chance", 2 }, { "Pearls", 2 }, { "Risk taken", 2 } } },
 			})
 			local DETAIL = {
 				Win = "Go for win takes the card that leaves your team strongest. It takes a curse in two cases only: the curse costs under 3% of your damage and leaves the clear as likely as before, or the vote offers nothing but curses, and then it takes the mildest one. Projected on the votes of your eleven logged full runs: the clear in 99% of them, and a little under 60% of the pearls Go for pearls makes.",
 				Balanced = "Balanced projects the rest of the run before each vote and takes the card that pays the most pearls among those that keep the chance to clear at 85% or better, with room set aside for the votes that offer nothing but curses. When no card keeps it there, or the base is under pressure, it takes the strongest card. A stage you have never cleared is played like Go for win until it has been cleared once. Same projection: the clear in 85%, and about three quarters of the pearls.",
 				Secret = "Go for secret takes the card that adds the most Secret Drop Rate among those that keep the chance to clear at 85% or better: Doomsday (+100%), Starforged and tier III curses (+50%), tier II curses (+25%). When no card on offer has any, or none keeps the clear likely, or the base is under pressure, it takes the strongest card, which makes room for the next one that does. Pearls come along with those curses but are not what it picks by.",
-				Pearls = "Go for pearls takes a curse at every vote that offers one, and never a blessing in its place. Of the curses on offer it takes the one expected to pay the most pearls over the rest of the run: what it adds to the multiplier, weighed against how soon it would end the run. A blessing is taken only when the vote has no curse. Highest multiplier of the three, and the least likely to reach the last wave.",
+				Pearls = "Go for pearls plays the rest of the run forward before each vote: for every card on offer it draws the votes still to come from the ones logged on this computer, answers them the same way, and adds up what every later wave and the clear bonus would pay with the chance of still being there. It takes the card with the most expected pearls among those that keep the chance to clear at or above the floor set below. A curse is passed over when it costs more late pearls and clear bonus than it adds; when no card keeps the floor it takes the safest one. Each vote is written to the card log with every figure.",
 			}
 			local detail = UI.callout(page, "")
-			UI.note(page, "Your never list below is applied first in all three: a card on it is never voted for. Wishing Star is taken whenever it is offered, in all three.")
+			UI.note(page, "Your never list below is applied first in all of them: a card on it is never voted for. Wishing Star is taken whenever it is offered. A Take first list that is switched on decides before any strategy does.")
+			slider(page, "Go for pearls: lowest clear chance", "PearlsMinClear", 50, 99, 1, function(v)
+				return ("%d%%"):format(v)
+			end, "The chance to clear that Go for pearls will not go under by choice. Higher: fewer curses, more runs finished. Lower: a bigger multiplier, more runs lost.")
+			segmented(page, "Card log", "CardLog", { "Off", "Normal", "Full" }, "Every vote in cards.txt in your account's folder: the state of the run, each card, the decision, and what happened after. Full adds every effect and the team's damage split.")
 			local function showStrategy()
 				detail.Text = DETAIL[CardBrain.strategy()]
 			end
