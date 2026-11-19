@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v248", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v249", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -11838,7 +11838,8 @@ function CardBrain.state()
 	end
 	-- The server keeps one running total per effect (its list after every vote is keyed by
 	-- effect and damage type, amounts added up), so that is how the cards in play are read.
-	state.totals = {}
+	state.base = CardBrain.weatherTotals()
+	state.totals = table.clone(state.base)
 	for _, effect in pairs((Match.roguelike and Match.roguelike.persistent_effects) or {}) do
 		if type(effect) == "table" then
 			local key = CardBrain.key(effect)
@@ -12182,8 +12183,36 @@ end
 
 ---Kill power left with all these effects in play (1 = no cards). `effects` is the server's own
 ---list, one entry per effect with its running total.
+-- The weather a Summer Hunt runs under (level data `_weather`), from the game's own Weather
+-- table. The server does not list these among the cards in play, so every card was rated as if
+-- it were the first of its kind. USER: "on the sandstorm weather the enemies are immune to all
+-- attacks until they get a certain amount down the path." With sand's +75 magic resistance
+-- already there, Dust Devil (+40) costs a magic team 19%, not 41%, and Clear Skies (-55) gives
+-- back most of what the sand takes. `shroud`: the share of the road enemies can't be hurt on;
+-- the depth they reach is read from the end of it.
+CardBrain.WEATHER = {
+	sandstorm = { shroud = 0.2, effects = { { type = "enemy_resistance_specific", damage_type = "magic", amount = 75 }, { type = "enemy_amp_specific", damage_type = "physical", amount = 0.25 } } },
+	mana = { effects = { { type = "enemy_resistance_specific", damage_type = "physical", amount = 150 }, { type = "enemy_amp_specific", damage_type = "magic", amount = 0.25 } } },
+	rain = { effects = { { type = "enemy_speedup", amount = 0.2 } } },
+	fire = { effects = { { type = "enemy_speedup", amount = 0.5 } } },
+	windy = { effects = { { type = "weather_flying_chance", amount = 0.2 } } },
+}
+function CardBrain.weather(id)
+	return CardBrain.WEATHER[tostring(id or (Match.levelData or {})._weather)]
+end
+---The weather's own effects as running totals (a new table every call).
+function CardBrain.weatherTotals(id)
+	local totals = {}
+	local weather = CardBrain.weather(id)
+	for _, effect in ipairs(weather and weather.effects or {}) do
+		local key = CardBrain.key(effect)
+		totals[key] = (totals[key] or 0) + effect.amount
+	end
+	return totals
+end
+
 function CardBrain.stack(effects, state)
-	return (CardBrain.score({ effects = effects }, { share = state.share, totals = {}, antiAir = state.antiAir, buffer = state.buffer, spent = math.huge }))
+	return (CardBrain.score({ effects = effects }, { share = state.share, totals = state.base or {}, antiAir = state.antiAir, buffer = state.buffer, spent = math.huge }))
 end
 
 -- How much harder a wave is than the long middle of the run, for a team that is built. Read off
@@ -12360,6 +12389,13 @@ function CardBrain.situation(state)
 	-- fooled an earlier version: a run sat at full health to wave 47 with enemies already deep.
 	for w = wave - 2, wave do
 		depth = math.max(depth, (Match.depthByWave or {})[w] or 0)
+	end
+	do
+		-- Under a sandstorm nothing can be hurt on the first fifth of the road.
+		local weather = CardBrain.weather()
+		if weather and weather.shroud then
+			depth = math.max(depth - weather.shroud, 0) / (1 - weather.shroud)
+		end
 	end
 	local bleeding = Match.bleedAt ~= nil and os.clock() - Match.bleedAt < 90
 	local data = Match.levelData or {}
@@ -12913,6 +12949,10 @@ function CardBrain.logVote(options, pick, view, state)
 		end
 		table.sort(inPlay)
 		CardBrain.log("[in play] " .. (#inPlay > 0 and table.concat(inPlay, " | ") or "no cards yet"), true)
+		local weather = CardBrain.weather()
+		if weather then
+			CardBrain.log(string.format("[weather] %s: its own effects are counted under the cards above%s", tostring((Match.levelData or {})._weather), weather.shroud and string.format(" | enemies can't be hurt on the first %d%% of the road, so the depth is read from there", weather.shroud * 100) or ""))
+		end
 	end
 	for index, row in ipairs(view.rows or {}) do
 		local option = options[row.key] or {}
@@ -13139,6 +13179,13 @@ function CardBrain.selfTest()
 		local state = fresh()
 		local once, twice = CardBrain.gain("enemy_resistance_specific", nil, "magic", -55, state), CardBrain.gain("enemy_resistance_specific", nil, "magic", -110, state)
 		check("resistance below zero is a modest gain, not a multiplication", once > 1 and once < 1.5 and twice > once and twice < 2, ("x%.2f, x%.2f"):format(once, twice))
+	end
+	do
+		local plain, sand = fresh(), fresh(CardBrain.weatherTotals("sandstorm"))
+		local dust = { effects = { { type = "enemy_resistance_specific", damage_type = "magic", amount = 40 } } }
+		local skies = { effects = { { type = "enemy_resistance_specific", damage_type = "magic", amount = -55 } } }
+		local costPlain, costSand, gainSand = CardBrain.score(dust, plain), CardBrain.score(dust, sand), CardBrain.score(skies, sand)
+		check("under a sandstorm more magic resistance costs less than on a clear day, and Clear Skies is worth taking", costSand > costPlain and costSand < 1 and gainSand > 1.2 and gainSand < 1.6, ("x%.2f on a clear day, x%.2f in sand, Clear Skies x%.2f"):format(costPlain, costSand, gainSand))
 	end
 	do
 		-- v247: the multiplier's timing and the road reading.
