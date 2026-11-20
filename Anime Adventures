@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v256", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v257", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -12475,7 +12475,7 @@ function CardBrain.situation(state)
 		danger = fraction < 0.6 or (Match.leakRisk or 0) >= 0.4 or depth >= 0.8,
 		-- A stage with an end that has never been finished (the clear is what drops its portal).
 		unproven = (data._override_infinite_bound_waves ~= nil or data._infinite_bound_level ~= nil) and Match.levelId ~= nil and not AA.stageCleared(Match.levelId),
-		minClear = math.clamp((tonumber(Config.PearlsMinClear) or 80) / 100, 0.3, 0.99),
+		minClear = math.clamp((tonumber(Config.PearlsMinClear) or 80) / 100, 0, 0.99),
 		level = Match.levelId,
 	}
 	-- What a wave really pays against the level's table: the account's own bonus (measured
@@ -12885,7 +12885,7 @@ function CardBrain.decide(options, sit, state, strategy, banned, order, everyCur
 	end
 	-- Pearls (v244): the most expected pearls for the whole run, clear bonus included, among the
 	-- cards that keep the chance to clear at the floor. See CardBrain.plan.
-	local floor = math.clamp(sit.minClear or rules.pearlsFloor, 0.3, 0.99)
+	local floor = math.clamp(sit.minClear or rules.pearlsFloor, 0, 0.99)
 	local plan, noPlan = CardBrain.plan(rows, options, sit, state, banned, floor, sit.rollouts)
 	view.plan, view.floor = plan, floor
 	for _, row in ipairs(open) do
@@ -13329,7 +13329,7 @@ function CardBrain.backtest(runs, rollouts)
 	local pay = CardBrain.paySteps(data)
 	local bound = tonumber(data._override_infinite_bound_waves) or 50
 	local learned = CardBrain.m0(levelId)
-	local floor = math.clamp((tonumber(Config.PearlsMinClear) or 80) / 100, 0.3, 0.99)
+	local floor = math.clamp((tonumber(Config.PearlsMinClear) or 80) / 100, 0, 0.99)
 	local policies = { "Win", "Balanced", "PearlsV230", "PearlsStep", "Pearls" }
 	local labels = { Win = "Go for win", Balanced = "Balanced", PearlsV230 = "Pearls before (v230: a curse every vote)", PearlsStep = "Pearls before v230 (one step ahead)", Pearls = "Go for pearls now (v244)" }
 	local settings = { { "hard (margin x0.6)", learned * 0.6 }, { "as learned", learned }, { "easy (margin x1.6)", learned * 1.6 } }
@@ -13449,7 +13449,7 @@ function CardBrain.replay(maxVotes)
 				local bound = tonumber(data._override_infinite_bound_waves) or 50
 				local pay = CardBrain.paySteps(data)
 				local function sit()
-					return { wave = wave, bound = bound, health = seen.health or 1, stacked = stacked, mult = mult, pay = pay, m0 = CardBrain.m0(entry.level), every = 3, danger = (seen.health or 1) < 0.6 or (seen.depth or 0) >= 0.8, unproven = false, depth = seen.depth or 0.05, minClear = math.clamp((tonumber(Config.PearlsMinClear) or 80) / 100, 0.3, 0.99), level = entry.level, rollouts = 24 }
+					return { wave = wave, bound = bound, health = seen.health or 1, stacked = stacked, mult = mult, pay = pay, m0 = CardBrain.m0(entry.level), every = 3, danger = (seen.health or 1) < 0.6 or (seen.depth or 0) >= 0.8, unproven = false, depth = seen.depth or 0.05, minClear = math.clamp((tonumber(Config.PearlsMinClear) or 80) / 100, 0, 0.99), level = entry.level, rollouts = 24 }
 				end
 				CardBrain.roadLegacy = true
 				local okOld, pickOld = pcall(CardBrain.decide, entry.options, sit(), state, "Pearls", banned, nil)
@@ -19161,9 +19161,9 @@ do
 			}
 			local detail = UI.callout(page, "")
 			UI.note(page, "Your never list below is applied first in all of them: a card on it is never voted for, unless all three cards are on it (the game deals one anyway, so the mildest is voted for). Wishing Star is taken whenever it is offered. A Take first list that is switched on decides before any strategy does.")
-			slider(page, "Go for pearls: lowest clear chance", "PearlsMinClear", 50, 99, 1, function(v)
-				return ("%d%%"):format(v)
-			end, "The chance to clear that Go for pearls will not go under by choice. Higher: fewer curses, more runs finished. Lower: a bigger multiplier, more runs lost.")
+			slider(page, "Go for pearls: lowest clear chance", "PearlsMinClear", 0, 99, 1, function(v)
+				return v <= 0 and "no floor" or ("%d%%"):format(v)
+			end, "The chance to clear that Go for pearls will not go under by choice. Higher: fewer curses, more runs finished. Lower: a bigger multiplier, more runs lost. At 0 there is no floor: it takes whatever card it expects the most pearls from over the whole run, the lost waves of a failed run counted in.")
 			segmented(page, "Card log", "CardLog", { "Off", "Normal", "Full" }, "Every vote in cards.txt in your account's folder: the state of the run, each card, the decision, and what happened after. Full adds every effect and the team's damage split.")
 			local function showStrategy()
 				detail.Text = DETAIL[CardBrain.strategy()]
