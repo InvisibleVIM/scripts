@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v254", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v255", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -12777,7 +12777,17 @@ function CardBrain.decide(options, sit, state, strategy, banned, order, everyCur
 		return done(nil, "no cards in the vote")
 	end
 	if #open == 0 then
-		return done(nil, "Every card in this vote is on your never list: no vote cast")
+		-- With no vote the game deals one of them anyway. USER saw it: Spellproof I (x0.63),
+		-- Resistant I (x0.70) and Enemy Regen II (x0.50) at wave 20, no vote, and the game gave
+		-- Regen II, the worst of the three. So the one that hurts least is voted for.
+		local mildest
+		for _, row in ipairs(rows) do
+			if not mildest or (row.power or 0) > (mildest.power or 0) + 1e-9 or (math.abs((row.power or 0) - (mildest.power or 0)) <= 1e-9 and (row.candy or 0) > (mildest.candy or 0)) then
+				mildest = row
+			end
+		end
+		mildest.verdict = "taken: all three are on your never list and the game deals one regardless, this one costs least"
+		return done(mildest, string.format("Every card in this vote is on your never list; the game deals one anyway, so the mildest (team strength x%.2f)", mildest.power or 1))
 	end
 	---Highest `first`, ties by `second`.
 	local function top(list, first, second)
@@ -19150,7 +19160,7 @@ do
 				Pearls = "Go for pearls plays the rest of the run forward before each vote: for every card on offer it draws the votes still to come from the ones logged on this computer, answers them the same way, and adds up what every later wave and the clear bonus would pay with the chance of still being there. It takes the card with the most expected pearls among those that keep the chance to clear at or above the floor set below. A curse is passed over when it costs more late pearls and clear bonus than it adds; when no card keeps the floor it takes the safest one. Each vote is written to the card log with every figure.",
 			}
 			local detail = UI.callout(page, "")
-			UI.note(page, "Your never list below is applied first in all of them: a card on it is never voted for. Wishing Star is taken whenever it is offered. A Take first list that is switched on decides before any strategy does.")
+			UI.note(page, "Your never list below is applied first in all of them: a card on it is never voted for, unless all three cards are on it (the game deals one anyway, so the mildest is voted for). Wishing Star is taken whenever it is offered. A Take first list that is switched on decides before any strategy does.")
 			slider(page, "Go for pearls: lowest clear chance", "PearlsMinClear", 50, 99, 1, function(v)
 				return ("%d%%"):format(v)
 			end, "The chance to clear that Go for pearls will not go under by choice. Higher: fewer curses, more runs finished. Lower: a bigger multiplier, more runs lost.")
