@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v258", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v259", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -2247,9 +2247,64 @@ end
 ---2 paths that enemies follow the units should be in the best spot for those 2 paths".)
 function AA.laneDead(lane)
 	if AA.laneOpen(lane) then
-		return false
+		return AA.laneQuiet(lane)
 	end
 	return type(Match.levelData) == "table" and type(Match.levelData._portal_lanes) == "number"
+end
+---A road the game calls open that no enemy walks. (The final Sky Portal has three roads, lists
+---none as closed and carries no _portal_lanes; through wave 8 everything came down roads 1 and
+---2, 581 enemies against none in thirty seconds, and road 3 only opened around wave 10. USER: "on all the sky portal 2 road maps it should do
+---it at the first intersection between roads".) Known two ways: from this match, once enough
+---enemies have been seen on the roads' own first stretches (before a road first touches another,
+---so an enemy at a crossing is not counted for the road it crosses); and from the last match on
+---this level, which is what the first units of a match are placed by. An enemy on a road that
+---was thought quiet makes it live again at once.
+function AA.laneQuiet(lane)
+	local count = Match.laneCount or 1
+	if count <= 1 then
+		return false
+	end
+	local walked = Match.laneWalked
+	if walked and walked[lane] then
+		return false
+	end
+	local total = 0
+	for _, seen in pairs(walked or {}) do
+		total += seen
+	end
+	local wave = workspace:FindFirstChild("_wave_num") and workspace._wave_num.Value or 0
+	local id = tostring(Match.levelId)
+	if total >= 200 and wave >= 20 and not Match.quietSaved then
+		Match.quietSaved = true
+		local names = {}
+		for other = 1, count do
+			if not walked[other] then
+				table.insert(names, tostring(Match.laneNames and Match.laneNames[other] or other))
+			end
+		end
+		AA.progress.quietLanes = type(AA.progress.quietLanes) == "table" and AA.progress.quietLanes or {}
+		local list = table.concat(names, ",")
+		if AA.progress.quietLanes[id] ~= list then
+			AA.progress.quietLanes[id] = list
+			note("quietLanes", { level = id, lanes = list })
+			pcall(AA.saveProgress)
+		end
+	end
+	-- (Not from the early waves: on the final Sky Portal road 3 is empty until about wave 10
+	-- and then carries a third of the enemies. A road silent through wave 20 is quiet.)
+	if total >= 200 and wave >= 20 then
+		return true
+	end
+	local memo = type(AA.progress.quietLanes) == "table" and AA.progress.quietLanes[id]
+	if type(memo) == "string" then
+		local name = tostring(Match.laneNames and Match.laneNames[lane] or lane)
+		for entry in memo:gmatch("[^,]+") do
+			if entry == name then
+				return true
+			end
+		end
+	end
+	return false
 end
 ---How much a stretch of each road is worth to the next unit, on maps with two or three roads.
 ---A road counts for more the deeper its enemies have been getting (that is where the team, other
@@ -2365,16 +2420,17 @@ function AA.laneHub()
 		return nil
 	end
 	local data = workspace:FindFirstChild("_DATA")
-	local key = tostring(data and data:GetAttribute("closed_lanes") or "") .. "|" .. #Match.pathPoints
-	if Match.hubKey == key then
-		return Match.hub or nil
-	end
 	local live, lanes = {}, 0
+	local key = tostring(data and data:GetAttribute("closed_lanes") or "") .. "|" .. #Match.pathPoints
 	for lane = 1, count do
 		if not AA.laneDead(lane) then
 			live[lane] = true
 			lanes += 1
+			key ..= "|" .. lane
 		end
+	end
+	if Match.hubKey == key then
+		return Match.hub or nil
 	end
 	local best, bestMet, bestAt
 	if lanes >= 2 then
@@ -8416,7 +8472,7 @@ local function resetMatch()
 	Match.startVote, Match.startVotesSeen, Match.startTimeFirst = nil, nil, nil
 	pcall(AA.startPromptText)
 	Match.shieldHits, Match.shieldAt, Match.shieldMode = nil, nil, nil
-	Match.hubKey, Match.hub = nil, nil
+	Match.hubKey, Match.hub, Match.laneWalked, Match.quietSaved = nil, nil, nil, nil
 	Match.enemyMedian, Match.tankNoted, Match.shieldOn, Match.blesserId = nil, nil, nil, nil
 	Match.soaring, Match.spotScore, Match.openingDone, Match.flyShare, Match.bufferMoved = nil, nil, nil, nil, nil
 	Match.bufferMoves, Match.bufferMoveAt = nil, nil
@@ -14013,6 +14069,11 @@ local function measureLoop()
 				Match.laneDepth = Match.laneDepth or {}
 				Match.laneDepth[onRoad.lane] = Match.laneDepth[onRoad.lane] or {}
 				Match.laneDepth[onRoad.lane][wave] = math.max(Match.laneDepth[onRoad.lane][wave] or 0, reached)
+				if reached < (Match.laneJunction and Match.laneJunction[onRoad.lane] or 1) - 0.03 then
+					-- On the road's own stretch: this road is walked (AA.laneQuiet).
+					Match.laneWalked = Match.laneWalked or {}
+					Match.laneWalked[onRoad.lane] = (Match.laneWalked[onRoad.lane] or 0) + 1
+				end
 			end
 		end
 		-- How far down the road enemies get each wave: the kill margin the card picker reads.
