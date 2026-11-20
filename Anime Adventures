@@ -13129,7 +13129,7 @@ function CardBrain.selfTest()
 	power = CardBrain.score(seed["Mud"], fresh())
 	check("Mud (-25% enemy speed) is worth 1/0.75", near(power, 1 / 0.75), power)
 	power, _, candy = CardBrain.score(seed["Torrent"], fresh())
-	check("Torrent: speed and health both count (1/1.5 x 1/1.5) for +1", near(power, 1 / 1.5 / 1.5) and near(candy, 1), power)
+	check("Torrent: speed and health both count (1/1.5 x 1/1.5) for +1", math.abs(power - 1 / 1.5 / 1.5) < 0.001 and near(candy, 1), power)
 	do
 		local totals = {}
 		CardBrain.applyTotals(totals, seed["+ Enemy Health I"])
