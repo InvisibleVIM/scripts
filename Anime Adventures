@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v250", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v251", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -11932,7 +11932,14 @@ function CardBrain.gain(kind, stat, damageType, total, state)
 	elseif kind == "enemy_shield" then
 		return 1 / math.max(1 + 0.06 * total, 0.2)
 	elseif kind == "enemy_speedup" then
-		return 1 / math.max(1 + total, 0.2)
+		-- Past about +2.5 speed is not "a bit less time under fire" any more: the late bosses
+		-- (the Rider packs from wave 42) cross the whole kill zone untouched and one of them at
+		-- the base ends the run from full health. USER: "i'm losing quite a lot of my games".
+		-- 29 Go for pearls runs: speed under +2.45 lost 2 of 19, +2.45 and over lost 6 of 9,
+		-- every one of those forecast at 92-99% a few waves before, with the road looking calm
+		-- (deepest enemy 16-23%). Read as one over the speed, the tenth Enemy Speed card cost
+		-- 7% and was the cheapest curse in every vote. (The weather's own speed counts too.)
+		return 1 / math.max(1 + total, 0.2) / (1 + (math.max(total, 0) / 2.5) ^ 6)
 	elseif kind == "burst_speed" then
 		return 1 / math.max(1 + total * 0.3, 0.2)
 	elseif kind == "enemy_regen" then
@@ -13201,6 +13208,12 @@ function CardBrain.selfTest()
 		local skies = { effects = { { type = "enemy_resistance_specific", damage_type = "magic", amount = -55 } } }
 		local costPlain, costSand, gainSand = CardBrain.score(dust, plain), CardBrain.score(dust, sand), CardBrain.score(skies, sand)
 		check("under a sandstorm more magic resistance costs less than on a clear day, and Clear Skies is worth taking", costSand > costPlain and costSand < 1 and gainSand > 1.2 and gainSand < 1.6, ("x%.2f on a clear day, x%.2f in sand, Clear Skies x%.2f"):format(costPlain, costSand, gainSand))
+	end
+	do
+		local state = fresh()
+		local early = CardBrain.gain("enemy_speedup", nil, nil, 0.5, state) / CardBrain.gain("enemy_speedup", nil, nil, 0.25, state)
+		local late = CardBrain.gain("enemy_speedup", nil, nil, 2.7, state) / CardBrain.gain("enemy_speedup", nil, nil, 2.45, state)
+		check("enemy speed costs more the more of it is in play", late < early and late < 0.75, ("the second +0.25 costs x%.2f, the eleventh x%.2f"):format(early, late))
 	end
 	do
 		-- v247: the multiplier's timing and the road reading.
