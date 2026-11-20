@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v257", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v258", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -2353,6 +2353,53 @@ local function pathWithin(px, pz, reach, visit)
 	end
 end
 
+---Where the roads that enemies really walk first come together: the earliest point of a live
+---road that has every other live road within 12 studs (if no point has them all, the earliest
+---one with the most). USER: "on maps with 2 paths it should place the units at the first spot
+---they intersect." (Two-road Sky Portal: roads 1 and 3 cross at 30% / 18% of their length and
+---the team was built 160 studs on, where they run side by side into the base.) Nil with one
+---live road. Worked out again when a road opens or closes.
+function AA.laneHub()
+	local count = Match.laneCount or 1
+	if count <= 1 or not Match.pathGrid then
+		return nil
+	end
+	local data = workspace:FindFirstChild("_DATA")
+	local key = tostring(data and data:GetAttribute("closed_lanes") or "") .. "|" .. #Match.pathPoints
+	if Match.hubKey == key then
+		return Match.hub or nil
+	end
+	local live, lanes = {}, 0
+	for lane = 1, count do
+		if not AA.laneDead(lane) then
+			live[lane] = true
+			lanes += 1
+		end
+	end
+	local best, bestMet, bestAt
+	if lanes >= 2 then
+		for _, point in ipairs(Match.pathPoints) do
+			if live[point.lane] and (not best or point.progress < bestAt or bestMet < lanes - 1) then
+				local met, others = 0, {}
+				pathWithin(point.position.X, point.position.Z, 12, function(other)
+					if other.lane ~= point.lane and live[other.lane] and not others[other.lane] then
+						others[other.lane] = true
+						met += 1
+					end
+				end)
+				if met > 0 and (not best or met > bestMet or (met == bestMet and point.progress < bestAt)) then
+					best, bestMet, bestAt = point, met, point.progress
+				end
+			end
+		end
+	end
+	Match.hubKey, Match.hub = key, best and best.position or false
+	if best then
+		note("laneHub", { lane = best.lane, at = math.floor(best.progress * 100), x = math.floor(best.position.X), z = math.floor(best.position.Z), met = bestMet, live = lanes })
+	end
+	return Match.hub or nil
+end
+
 ---Closest sampled point of the road ({ position, progress }) and its distance. With `reach`,
 ---only looks that far and returns nil when the road is further away.
 local function nearestPath(position, reach)
@@ -4389,6 +4436,7 @@ local function bestSpot(data, focus, only, free)
 	-- the road for its bends dealt nothing for eleven waves while everything died before 31%.
 	-- (Known after six waves, or from the last run on this stage and map; nil = no idea yet.)
 	local multi = (Match.laneCount or 1) > 1
+	local laneHub = multi and AA.laneHub() or nil
 	local reachBand = not focus and Match.pace ~= "speed" and not multi and AA.fightBand() or nil
 	local laneWeight, openLanes = nil, Match.laneCount or 1
 	if (Match.laneCount or 1) > 1 then
@@ -4499,6 +4547,12 @@ local function bestSpot(data, focus, only, free)
 						-- Several roads: a spot that reaches all of them is worth far more than one
 						-- that leaves a road's enemies to walk past untouched.
 						score *= AA.laneShare(laneHits)
+						-- And the team stands where the live roads first cross: full weight for a
+						-- spot that reaches the crossing, fading over the next 30 studs.
+						if laneHub and not (AA.killsMode() or AA.frontForced() or AA.Order.front()) then
+							local away = math.sqrt((p.X - laneHub.X) ^ 2 + (p.Z - laneHub.Z) ^ 2) - math.max(minReach - 4, 6)
+							score *= 1 + 3 * math.clamp(1 - away / 30, 0, 1)
+						end
 					end
 					if clusterAt and score > 0 then
 						-- Long modes: keep damage units together so one buffer / aura covers them all.
@@ -8362,6 +8416,7 @@ local function resetMatch()
 	Match.startVote, Match.startVotesSeen, Match.startTimeFirst = nil, nil, nil
 	pcall(AA.startPromptText)
 	Match.shieldHits, Match.shieldAt, Match.shieldMode = nil, nil, nil
+	Match.hubKey, Match.hub = nil, nil
 	Match.enemyMedian, Match.tankNoted, Match.shieldOn, Match.blesserId = nil, nil, nil, nil
 	Match.soaring, Match.spotScore, Match.openingDone, Match.flyShare, Match.bufferMoved = nil, nil, nil, nil, nil
 	Match.bufferMoves, Match.bufferMoveAt = nil, nil
