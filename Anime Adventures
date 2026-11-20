@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v252", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v254", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -12306,7 +12306,12 @@ function CardBrain.margin(sit, power, wave, reserve)
 		-- the road until wave 27.
 		return prior
 	end
-	return seen ^ 0.65 * prior ^ 0.35
+	-- (The road counted for 0.65 until v253. It has been wrong both ways: 92-99% a few waves
+	-- before six losses to stacked speed, 15-30% for thirty waves of a run that never lost a
+	-- point of base health. The stage's own learned margin, which comes from how runs really
+	-- ended, carries the forecast now; the road nudges it.)
+	local road = CardBrain.roadLegacy and 0.65 or 0.35
+	return seen ^ road * prior ^ (1 - road)
 end
 
 -- The road, v247. USER: "achieving a massive multiplier near the end but earning only
@@ -12411,11 +12416,41 @@ function CardBrain.situation(state)
 	for w = wave - 2, wave do
 		depth = math.max(depth, (Match.depthByWave or {})[w] or 0)
 	end
+	-- How deep means nothing by itself: it depends on where the towers stand. (Downpour run,
+	-- every tower between 53% and 99% of the road: enemies died at 75% for thirty waves with the
+	-- base untouched, the script read "76% of the road" as a 15-30% clear and turned down every
+	-- multiplier from wave 11 on; x3.2 at wave 32.) What counts is how far through the towers'
+	-- own reach the enemies get, so the depth is taken from where the first tower starts to
+	-- reach to where the last one stops. (Under a sandstorm nothing can be hurt on the first
+	-- fifth of the road, wherever the towers are.)
+	local rawDepth, zoneFrom, zoneTo = depth, nil, nil
 	do
-		-- Under a sandstorm nothing can be hurt on the first fifth of the road.
+		local towers = {}
+		for _, unit in ipairs(myUnits()) do
+			local stats = unit:FindFirstChild("_stats")
+			local range, damage = stats and stats:FindFirstChild("range"), stats and stats:FindFirstChild("damage")
+			if range and damage and AA.rv(damage) > 0 then
+				local position = unit:GetPivot().Position
+				table.insert(towers, { x = position.X, z = position.Z, reach = AA.rv(range) ^ 2 })
+			end
+		end
+		for _, point in ipairs(#towers > 0 and Match.pathPoints or {}) do
+			for _, tower in ipairs(towers) do
+				if (point.position.X - tower.x) ^ 2 + (point.position.Z - tower.z) ^ 2 <= tower.reach then
+					zoneFrom = math.min(zoneFrom or 1, point.progress)
+					zoneTo = math.max(zoneTo or 0, point.progress)
+					break
+				end
+			end
+		end
 		local weather = CardBrain.weather()
-		if weather and weather.shroud then
-			depth = math.max(depth - weather.shroud, 0) / (1 - weather.shroud)
+		local shroud = weather and weather.shroud or 0
+		zoneFrom = math.max(zoneFrom or 0, shroud)
+		zoneTo = math.max(zoneTo or 1, zoneFrom)
+		if zoneTo - zoneFrom >= 0.1 then
+			depth = math.clamp((depth - zoneFrom) / (zoneTo - zoneFrom), 0, 1)
+		else
+			depth = math.max(depth - shroud, 0) / (1 - shroud)
 		end
 	end
 	local bleeding = Match.bleedAt ~= nil and os.clock() - Match.bleedAt < 90
@@ -12460,6 +12495,7 @@ function CardBrain.situation(state)
 	end
 	-- A base that has just been hit says more than the road does.
 	sit.depth = (fraction < 0.6 and 1) or ((bleeding or fraction < 0.95) and math.max(depth, 0.85)) or depth
+	sit.rawDepth, sit.zoneFrom, sit.zoneTo = rawDepth, zoneTo - zoneFrom >= 0.1 and zoneFrom or nil, zoneTo
 	return sit
 end
 
@@ -12966,7 +13002,7 @@ function CardBrain.logVote(options, pick, view, state)
 		table.insert(Match.cardVotes, { wave = sit.wave, title = chosen and chosen.title, candy = chosen and chosen.candy or 0, best = bestRow and bestRow.title, bestCandy = bestRow and bestRow.candy or 0, bestPower = bestRow and bestRow.power, bestWin = bestRow and (bestRow.win or bestRow.clear), rest = restPay + bonusPay, factor = factor, stance = view.stance })
 	end
 	CardBrain.log(string.format("== %s %s wave %d/%d | strategy %s%s ==", os.date("%m-%d %H:%M:%S"), tostring(sit.level), sit.wave, sit.bound, tostring(view.strategy), view.floor and (" | floor " .. pct(view.floor)) or ""))
-	CardBrain.log(string.format("[state] base %s | deepest enemy %s of the road | pearl multiplier x%.1f | team strength %s of an uncursed team | margin now %.2f, on the last wave %.2f (1 = just holding) | clear chance as it stands %s%s%s", pct(sit.health), pct(sit.depth), 1 + sit.mult, pct(sit.stacked), CardBrain.margin(sit, 1, sit.wave, 0), CardBrain.margin(sit, 1, sit.bound, 0), pct(standing), sit.danger and " | BASE UNDER PRESSURE" or "", view.stance and (" | " .. view.stance) or ""))
+	CardBrain.log(string.format("[state] base %s | deepest enemy %s of the road%s | pearl multiplier x%.1f | team strength %s of an uncursed team | margin now %.2f, on the last wave %.2f (1 = just holding) | clear chance as it stands %s%s%s", pct(sit.health), pct(sit.rawDepth or sit.depth), sit.zoneFrom and string.format(" = %s of the way through my towers' reach (%s to %s of the road)", pct(sit.depth), pct(sit.zoneFrom), pct(sit.zoneTo)) or "", 1 + sit.mult, pct(sit.stacked), CardBrain.margin(sit, 1, sit.wave, 0), CardBrain.margin(sit, 1, sit.bound, 0), pct(standing), sit.danger and " | BASE UNDER PRESSURE" or "", view.stance and (" | " .. view.stance) or ""))
 	-- What has changed since the vote before, against what was expected then.
 	local before = Match.cardPred
 	if before then
