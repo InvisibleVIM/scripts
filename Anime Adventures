@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v251", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v252", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -12475,7 +12475,7 @@ CardBrain.STRATEGIES = { "Win", "Balanced", "Pearls", "Secret" }
 -- Never passing on a curse came to 2% and 1726: the run ends in the low 40s, before the big
 -- multiplier has paid. 67 of the 166 votes went differently in at least one strategy. A
 -- projection, not played matches.)
-CardBrain.RULES = { freePower = 0.97, freeClear = 0.01, keepClear = 0.85, pearlsFloor = 0.8, pearlsShare = 1, pearlsEvery = 0.5, pearlsSoon = 0.25, reserve = { Win = 0, Balanced = 0.7, Pearls = 1, Secret = 0.7 } }
+CardBrain.RULES = { freePower = 0.97, freeClear = 0.01, keepClear = 0.85, pearlsFloor = 0.8, pearlsSure = 0.95, pearlsShare = 1, pearlsEvery = 0.5, pearlsSoon = 0.25, reserve = { Win = 0, Balanced = 0.7, Pearls = 1, Secret = 0.7 } }
 
 -- Go for pearls, v244 ----------------------------------------------------------------------
 -- USER (v244): "optimize total expected pearls earned per game, including the victory bonus",
@@ -12861,6 +12861,22 @@ function CardBrain.decide(options, sit, state, strategy, banned, order, everyCur
 	if #allowed > 0 then
 		pick = top(allowed, "ev", "win")
 		stance = pick.curse and (pick.win >= floor + 0.1 and "pressing: room to spare" or "pressing: at the limit") or (#curses > 0 and "holding: the curses here cost more than they pay" or "building: no curse on offer")
+		-- USER (v252): while the clear is still as good as certain, a multiplier is taken
+		-- whenever one is on offer, even a dear one. (Wave 5, clear 98% either way: Range I was
+		-- taken over Enemy Health I, +0.3 for 45 waves, because the plan expected to buy the
+		-- same +0.3 cheaper later. A multiplier in hand at wave 5 is paid on every wave.)
+		if (pick.candy or 0) <= 0 then
+			local sure = {}
+			for _, row in ipairs(allowed) do
+				if (row.candy or 0) > 0 and row.win >= math.max(rules.pearlsSure, floor) then
+					table.insert(sure, row)
+				end
+			end
+			if #sure > 0 then
+				pick = top(sure, "ev", "win")
+				stance = string.format("pressing: the clear is still %d%%, so a multiplier is taken whenever one is offered", pick.win * 100 + 0.5)
+			end
+		end
 	else
 		-- No card keeps the floor: the run is protected first, pearls break ties.
 		pick = top(open, "win", "ev")
@@ -12873,7 +12889,7 @@ function CardBrain.decide(options, sit, state, strategy, banned, order, everyCur
 		elseif #allowed > 0 and row.win < floor then
 			row.verdict = string.format("refused: even played safe from here the clear would be %d%%, under the floor of %d%%", row.win * 100 + 0.5, floor * 100 + 0.5)
 		elseif #allowed > 0 then
-			row.verdict = string.format("passed over: %d fewer pearls expected", pick.ev - row.ev + 0.5)
+			row.verdict = pick.ev >= row.ev and string.format("passed over: %d fewer pearls expected", pick.ev - row.ev + 0.5) or "passed over: no multiplier, and the clear is safe with one"
 		else
 			row.verdict = string.format("passed over: clear %d%% against %d%%", row.win * 100 + 0.5, pick.win * 100 + 0.5)
 		end
@@ -12883,7 +12899,7 @@ function CardBrain.decide(options, sit, state, strategy, banned, order, everyCur
 		table.insert(report, "no look-ahead: " .. tostring(noPlan))
 	end
 	if #allowed > 0 then
-		return done(pick, string.format("Pearls: most expected pearls for the run (%d) among the cards that leave a %d%% clear within reach (this one: %d%%), %s", pick.ev + 0.5, floor * 100 + 0.5, pick.win * 100 + 0.5, stance))
+		return done(pick, string.format("Pearls: %s (%d) among the cards that leave a %d%% clear within reach (this one: %d%%), %s", stance:find("whenever one is offered") and "the best multiplier card" or "most expected pearls for the run", pick.ev + 0.5, floor * 100 + 0.5, pick.win * 100 + 0.5, stance))
 	end
 	return done(pick, string.format("Pearls: no card keeps the clear at %d%%, so the safest one (clear %d%%)", floor * 100 + 0.5, pick.win * 100 + 0.5))
 end
@@ -13214,6 +13230,12 @@ function CardBrain.selfTest()
 		local early = CardBrain.gain("enemy_speedup", nil, nil, 0.5, state) / CardBrain.gain("enemy_speedup", nil, nil, 0.25, state)
 		local late = CardBrain.gain("enemy_speedup", nil, nil, 2.7, state) / CardBrain.gain("enemy_speedup", nil, nil, 2.45, state)
 		check("enemy speed costs more the more of it is in play", late < early and late < 0.75, ("the second +0.25 costs x%.2f, the eleventh x%.2f"):format(early, late))
+	end
+	do
+		local mine, view = decide({ "+ Enemy Health I", "+ Range I" }, situation(5, 14, 0.8, 0.3))
+		check("with the clear as good as certain, a multiplier is taken over a blessing", mine == "+ Enemy Health I", tostring(mine) .. " | " .. tostring(view and view.stance))
+		local late = decide({ "+ Enemy Health I", "+ Range I" }, situation(44, 1.2, 0.3, 5))
+		check("that rule stops where the clear is no longer safe", late == "+ Range I", tostring(late))
 	end
 	do
 		-- v247: the multiplier's timing and the road reading.
