@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v262", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v263", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -4458,6 +4458,16 @@ local function bestSpot(data, focus, only, free)
 								sum, early = sum * share, early * share
 							end
 							score = sum - spot.gap * 0.05
+							-- v263: the summoner is the first unit down and the team gathers round her,
+							-- so the crossing rule has to hold for her too. (USER: "didn't i tell you to
+							-- update the placements on 2 paths?" Elyssia went through this branch, which
+							-- never looked at AA.laneHub, and stood 170 studs past the crossing.)
+							local hubAt = summonLanes and AA.laneHub() or nil
+							if hubAt and score > 0 then
+								local away = math.sqrt((p.X - hubAt.X) ^ 2 + (p.Z - hubAt.Z) ^ 2) - math.max(range - 4, 6)
+								local pull = 1 + 3 * math.clamp(1 - away / 30, 0, 1)
+								score, early = score * pull, early * pull
+							end
 						end
 						table.insert(found, { spot = spot, early = groupFirst and 0 or early, score = score })
 					end
