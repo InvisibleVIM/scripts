@@ -31,13 +31,50 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local BeyRivals = { connections = {} }
+local BeyRivals = { connections = {}, VERSION = "legit-2" }
 
 -- Unload a previous execution before touching any game tables.
 local previousStats = shared.BeyRivals and shared.BeyRivals.stats
 if shared.BeyRivals then
 	pcall(shared.BeyRivals.detach)
 end
+
+-- Ranked arena: the spot pick and ready check arrive right after the teleport, long before the game
+-- finishes loading. Hook RankedState first thing, buffer every message, and let the handler (defined
+-- later) catch up on the latest one.
+BeyRivals.rankedBuffer = {}
+task.spawn(function()
+	for _ = 1, 600 do
+		local packets = nil
+		pcall(function()
+			packets = filtergc("table", { Keys = { "ArenaAgain", "BattleLaunch", "BattleSwap" } }, true)
+		end)
+		local packet = packets and packets.RankedState
+		if packet and packet.OnClientEvent then
+			table.insert(BeyRivals.connections, packet.OnClientEvent:Connect(function(raw)
+				table.insert(BeyRivals.rankedBuffer, raw)
+				if #BeyRivals.rankedBuffer > 40 then
+					table.remove(BeyRivals.rankedBuffer, 1)
+				end
+				pcall(function()
+					local line = os.date("%H:%M:%S") .. " " .. (type(raw) == "string" and raw or tostring(raw))
+					local path = "BeyRivals/ranked_log.txt"
+					if isfile(path) and #readfile(path) < 200000 then
+						appendfile(path, line:sub(1, 1500) .. "\n")
+					else
+						writefile(path, line:sub(1, 1500) .. "\n")
+					end
+				end)
+				if BeyRivals.onRankedState then
+					pcall(BeyRivals.onRankedState, raw)
+				end
+			end))
+			BeyRivals.rankedHooked = true
+			return
+		end
+		task.wait(0.1)
+	end
+end)
 
 -- Services.
 local playersService = game:GetService("Players")
@@ -78,6 +115,24 @@ local BODY_BOLD = Font.new("rbxasset://fonts/families/TitilliumWeb.json", Enum.F
 
 -- Config (mutated live by the UI).
 local Config = {
+	ThemeBackground = "141414",
+	ThemeMain = "1E1E1E",
+	ThemeAccent = "96D9CF",
+	ThemeOutline = "323232",
+	ThemeFont = "EBEBEB",
+	MenuKey = "RightControl",
+	HideOnExecute = false,
+	MuteNotifications = false,
+	MyMusicOn = false,
+	MyMusicShuffle = true,
+	MyMusicMuteGame = true,
+	MyMusicVolume = 50,
+	MyMusicPlaylist = "All",
+	WindowX = -1,
+	WindowY = -1,
+	UseDefaultTheme = true,
+	ThemeName = "Potent",
+	AntiAfk = true,
 	AutoBattle = false,
 	AutoLaunch = true,
 	PerfectRip = true,
@@ -106,6 +161,14 @@ local Config = {
 	LongGuardVeto = true,
 	RushGuard = true,
 	RushGuardSpeed = 22,
+	SafeCounter = true,
+	Assist = false,
+	AssistGuard = true,
+	AssistCounter = true,
+	AssistClash = true,
+	AssistRip = true,
+	AssistDodge = false,
+	AssistRim = true,
 	Spot2v2 = "1st",
 	Spot3v3 = "1st",
 	AutoReady = true,
@@ -158,6 +221,112 @@ local Config = {
 	AutoSkipReplay = false,
 	StayActive = true,
 }
+
+-- ============================================================
+--  Legit tab: every timing and chance the script plays by
+-- ============================================================
+
+-- One row per value: group, key, label, lowest, highest, step, the value the script plays flat
+-- out with ("machine"), the value Human mode sets, and the unit shown. They live in Config as
+-- Tune_<key>, so they save with the rest. Code reads them through BeyRivals.T / BeyRivals.Tspan.
+-- (The sim runs 60 ticks a second: 6 ticks = 0.1 s. Rip grades: Perfect within 5 ticks, Great 11,
+-- Good 20. Clash notes: Perfect 2.4, Great 5.5, Good 9.)
+BeyRivals.TUNE = {
+	{ "Launch", "RipPerfect", "Rip: rings hit dead on", 0, 100, 5, 100, 55, "%" },
+	{ "Launch", "RipError", "Rip: worst error on the other rings", 0, 20, 1, 0, 10, "ticks" },
+	{ "Launch", "LaunchThink", "Launch: longest search for a spot", 1, 8, 0.5, 4, 3, "s" },
+	{ "Launch", "LaunchWaitMin", "Launch: lock in no sooner than", 0, 8, 0.1, 0, 1.4, "s" },
+	{ "Launch", "LaunchWaitMax", "Launch: lock in no later than", 0, 8, 0.1, 0, 3.6, "s" },
+	{ "Launch", "LaunchPickTop", "Launch: pick among the best N spots", 1, 6, 1, 1, 3, "" },
+	{ "Launch", "LaunchAimNoise", "Launch: aim wobble", 0, 20, 1, 0, 5, "deg" },
+	{ "Fight", "SteerLag", "Steering: reaction lag", 0, 20, 1, 0, 7, "ticks" },
+	{ "Fight", "SteerHold", "Steering: shortest hold of a direction", 1, 20, 1, 1, 5, "ticks" },
+	{ "Fight", "AbilityDelay", "Abilities: reaction lag", 0, 30, 1, 0, 9, "ticks" },
+	{ "Fight", "GuardLead", "Guard: press this long before contact", 1, 6, 1, 3, 3, "ticks" },
+	{ "Fight", "GuardRate", "Guard: hits that get guarded", 0, 100, 5, 100, 75, "%" },
+	{ "Fight", "CounterRate", "Counter: windows taken", 0, 100, 5, 100, 80, "%" },
+	{ "Fight", "CounterDelayMin", "Counter: press no sooner than", 0, 40, 1, 0, 8, "ticks" },
+	{ "Fight", "CounterDelayMax", "Counter: press no later than", 0, 40, 1, 0, 18, "ticks" },
+	{ "Fight", "DodgeRate", "Dodge: rival abilities dodged", 0, 100, 5, 100, 65, "%" },
+	{ "Fight", "ClashPerfect", "Clash: notes hit dead on", 0, 100, 5, 100, 50, "%" },
+	{ "Fight", "ClashError", "Clash: worst error on the other notes", 0, 9, 1, 0, 6, "ticks" },
+	{ "Fight", "ClashMiss", "Clash: notes missed", 0, 50, 1, 0, 6, "%" },
+	{ "Between battles", "QueueWaitMin", "Next battle: wait at least", 0, 30, 0.5, 0, 2.5, "s" },
+	{ "Between battles", "QueueWaitMax", "Next battle: wait at most", 0, 30, 0.5, 0, 7, "s" },
+	{ "Between battles", "QueueRetry", "Next battle: try again every", 0.5, 10, 0.5, 1.5, 3, "s" },
+	{ "Between battles", "ReadyWaitMin", "Ranked ready: wait at least", 0.2, 10, 0.1, 0.4, 1.2, "s" },
+	{ "Between battles", "ReadyWaitMax", "Ranked ready: wait at most", 0.2, 10, 0.1, 0.4, 3.5, "s" },
+	{ "Between battles", "SpotWaitMin", "Ranked spot pick: wait at least", 0.2, 10, 0.1, 0.3, 1, "s" },
+	{ "Between battles", "SpotWaitMax", "Ranked spot pick: wait at most", 0.2, 10, 0.1, 0.3, 3, "s" },
+	{ "Between battles", "SkipWaitMin", "Skip replay: wait at least", 0.6, 10, 0.1, 0.6, 1.5, "s" },
+	{ "Between battles", "SkipWaitMax", "Skip replay: wait at most", 0.6, 10, 0.1, 0.6, 4.5, "s" },
+	{ "Rolls and draws", "TraitGapMin", "Trait rolls: gap at least", 0.2, 5, 0.1, 0.3, 0.9, "s" },
+	{ "Rolls and draws", "TraitGapMax", "Trait rolls: gap at most", 0.2, 5, 0.1, 0.3, 2.2, "s" },
+	{ "Rolls and draws", "RollGapMin", "Draws, pulls, names: gap at least", 0.3, 5, 0.1, 0.6, 1.2, "s" },
+	{ "Rolls and draws", "RollGapMax", "Draws, pulls, names: gap at most", 0.3, 5, 0.1, 0.6, 2.8, "s" },
+}
+for _, row in ipairs(BeyRivals.TUNE) do
+	Config["Tune_" .. row[2]] = row[7]
+end
+Config.Human = false
+Config.TuneBackup = ""
+
+---One tuned value.
+function BeyRivals.T(key)
+	return Config["Tune_" .. key]
+end
+---A fresh pick between a value's Min and Max (the same number when they are equal).
+function BeyRivals.Tspan(key)
+	local low, high = Config["Tune_" .. key .. "Min"], Config["Tune_" .. key .. "Max"]
+	if high < low then
+		low, high = high, low
+	end
+	return low + (high - low) * math.random()
+end
+---A yes/no that stays the same for `span` ticks, so one hit is one decision, not sixty.
+function BeyRivals.humanRoll(name, tick, span, rate)
+	if rate >= 100 then
+		return true
+	end
+	local rolls = BeyRivals.rolls or {}
+	BeyRivals.rolls = rolls
+	local roll = rolls[name]
+	if not roll or tick > roll.untilTick or tick < roll.tick then
+		roll = { yes = math.random() * 100 < rate, untilTick = tick + span, tick = tick }
+		rolls[name] = roll
+	end
+	roll.tick = tick
+	return roll.yes
+end
+---Human mode on: remember the values as they stand and set every one to its human figure.
+---Off: put the remembered values back.
+function BeyRivals.setHuman(on)
+	if on then
+		local backup = {}
+		for _, row in ipairs(BeyRivals.TUNE) do
+			backup[row[2]] = Config["Tune_" .. row[2]]
+			Config["Tune_" .. row[2]] = row[8]
+		end
+		Config.TuneBackup = httpService:JSONEncode(backup)
+	else
+		local ok, backup = pcall(function()
+			return httpService:JSONDecode(Config.TuneBackup)
+		end)
+		for _, row in ipairs(BeyRivals.TUNE) do
+			local saved = ok and type(backup) == "table" and tonumber(backup[row[2]]) or nil
+			Config["Tune_" .. row[2]] = saved and math.clamp(saved, row[4], row[5]) or row[7]
+		end
+		Config.TuneBackup = ""
+	end
+	BeyRivals.humanApplied = on
+end
+---Every value back to what the script ships with (and Human mode off).
+function BeyRivals.resetTune()
+	for _, row in ipairs(BeyRivals.TUNE) do
+		Config["Tune_" .. row[2]] = row[7]
+	end
+	Config.Human, Config.TuneBackup, BeyRivals.humanApplied = false, "", false
+end
 
 ---Serialize Config to JSON.
 ---@return string
@@ -218,7 +387,6 @@ local CLASH_BIT = Tuning.CLASH_Q_BIT
 local CLASH_NOTES = Tuning.CLASH_NOTES
 local COUNTER_BIT = Tuning.CA_BIT
 local GUARD_WINDOW = Tuning.GUARD_WIN * Tuning.GUARD_WIN_ATK_MOVE
-local GUARD_PRESS_LEAD = 3
 
 -- State.
 local pilot = nil
@@ -1410,23 +1578,67 @@ function ripBits(nextTick)
 	if not Config.PerfectRip then
 		return 0
 	end
-	local offset = nextTick - RIP_FIRST
-	if offset >= 0 and offset % RIP_BEAT == 0 and offset / RIP_BEAT <= 3 then
-		local bits = RIP_PRESS
-		if offset / RIP_BEAT == 3 and Config.TiltLaunch then
-			bits = bit32.bor(bits, BRACE_BIT)
+	-- Each ring's press is planned once a round: dead on, or off by a few ticks (Legit tab).
+	local plan = BeyRivals.ripPlan
+	if not plan or nextTick < plan.tick then
+		plan = {}
+		local perfect, worst = BeyRivals.T("RipPerfect"), BeyRivals.T("RipError")
+		for ring = 0, 3 do
+			local off = 0
+			if worst > 0 then
+				if math.random() * 100 < perfect then
+					off = math.random(-math.min(2, worst), math.min(2, worst))
+				else
+					off = math.random(math.min(3, worst), worst) * (math.random() < 0.5 and -1 or 1)
+				end
+			end
+			plan[ring] = RIP_FIRST + ring * RIP_BEAT + off
 		end
-		return bits
+		BeyRivals.ripPlan = plan
+	end
+	plan.tick = nextTick
+	for ring = 0, 3 do
+		if plan[ring] == nextTick then
+			local bits = RIP_PRESS
+			if ring == 3 and Config.TiltLaunch then
+				bits = bit32.bor(bits, BRACE_BIT)
+			end
+			return bits
+		end
 	end
 	return 0
 end
 
 ---Press on the exact tick of the next ungraded clash note.
 function clashBits(sim, bey, nextTick)
+	local worst, miss = BeyRivals.T("ClashError"), BeyRivals.T("ClashMiss")
 	for index = 1, CLASH_NOTES do
 		if Sim.clashGrade(bey, index) == 0 then
 			local note = Sim.clashNote(sim, index)
-			return note == nextTick and CLASH_BIT or 0
+			if worst <= 0 and miss <= 0 then
+				return note == nextTick and CLASH_BIT or 0
+			end
+			-- Each note of a clash is planned once: dead on, a few ticks off, or let go (Legit tab).
+			local first = Sim.clashNote(sim, 1)
+			local plan = BeyRivals.clashPlan
+			if not plan or plan.first ~= first then
+				plan = { first = first }
+				BeyRivals.clashPlan = plan
+			end
+			if plan[index] == nil then
+				if math.random() * 100 < miss then
+					plan[index] = false
+				elseif worst <= 0 or math.random() * 100 < BeyRivals.T("ClashPerfect") then
+					plan[index] = math.random(-math.min(1, worst), math.min(1, worst))
+				else
+					plan[index] = math.random(math.min(2, worst), worst) * (math.random() < 0.5 and -1 or 1)
+				end
+			end
+			if plan[index] == false then
+				-- Let go: nothing is pressed until the game has graded this note a miss.
+				return 0
+			end
+			return note + plan[index] == nextTick and CLASH_BIT or 0
 		end
 	end
 	return 0
@@ -1491,7 +1703,8 @@ end
 
 ---Brace control: tap right before contact for a perfect guard (or a harder hit); never waste charges.
 ---@return number brace bits to OR into the input
-local function guardBits(sim, slot, bey, input)
+function BeyRivals.guardExact(sim, slot, bey, input)
+	local GUARD_PRESS_LEAD = BeyRivals.T("GuardLead")
 	if (bey.guardN or 0) <= 0 or (bey.gbT or 0) > 0 or (bey.braceT or 99) < GUARD_WINDOW then
 		return 0
 	end
@@ -1542,6 +1755,46 @@ local function guardBits(sim, slot, bey, input)
 		return 0
 	end
 	return BRACE_BIT
+end
+
+---The guard as the script would press it, then the Legit tab's say: only so many hits get one.
+local function guardBits(sim, slot, bey, input)
+	local bits = BeyRivals.guardExact(sim, slot, bey, input)
+	if bits ~= 0 and not BeyRivals.humanRoll("guard", sim.tick, 24, BeyRivals.T("GuardRate")) then
+		return 0
+	end
+	return bits
+end
+
+---Near our burst point a counter into a guard-ready player is a coin flip we can't afford: if they guard
+---it we're the one left open. 11-08 Longinox/Six/Reboot: perfect guard at 99%, counter at 2288, they
+---guarded it at 2290 -> teeter -> burst. (The Spriggan loss ended the same way.)
+function BeyRivals.counterRisky(sim, slot, bey)
+	if not Config.SafeCounter or BeyRivals.vsAI(sim, slot) or burstRatio(bey) < 0.85 then
+		return false
+	end
+	local _, foes = sidesOf(sim, slot)
+	for _, foe in ipairs(foes) do
+		if not foe.out and (foe.guardN or 0) > 0 and (foe.gbT or 0) <= 0 then
+			return true
+		end
+	end
+	return false
+end
+
+---Legit tab: is this counter window taken, and has the reaction time passed?
+function BeyRivals.humanCounter(sim, window)
+	if not window then
+		return true
+	end
+	if window.humanAt == nil then
+		window.humanAt = window.start + math.floor(BeyRivals.Tspan("CounterDelay") + 0.5)
+		window.humanTake = math.random() * 100 < BeyRivals.T("CounterRate")
+		if not window.humanTake then
+			window.outcome = "let go (Legit tab)"
+		end
+	end
+	return window.humanTake and sim.tick >= window.humanAt
 end
 
 ---Counter attack: the window opens after a perfect guard (caT > 0); the game's AI only takes it ~40% of the time.
@@ -1625,7 +1878,7 @@ local function autoInput(battle)
 		return { sx = 0, sz = 0, b = bey.ripTick == 0 and ripBits(nextTick) or 0, t = 0 }
 	end
 
-	if Config.DeepFinish and Config.Lookahead and BeyRivals.vsAI(sim, slot) then
+	if Config.DeepFinish and not Config.Human and Config.Lookahead and BeyRivals.vsAI(sim, slot) then
 		local ok, deepInput, d = pcall(BeyRivals.deepStep, sim, slot, bey)
 		if ok and deepInput then
 			if d and d.mode == "exec" and d.finishAt then
@@ -1667,7 +1920,7 @@ local function autoInput(battle)
 	-- (11-06: the dodge search ran last, ran out of budget, and an ability hit took 71% -> 100%).
 	do
 		local dodge = BeyRivals.sweepDodge(sim, slot, bey, input)
-		if dodge then
+		if dodge and BeyRivals.humanRoll("dodge", sim.tick, 45, BeyRivals.T("DodgeRate")) then
 			status = "Dodging ability"
 			planUntil = sim.tick
 			return dodge
@@ -1698,15 +1951,19 @@ local function autoInput(battle)
 			counterWindow.lastTick = sim.tick
 		end
 		if press == true then
-			if counterIsSafe(sim, slot, input, counterWindow.start) then
+			if not BeyRivals.humanCounter(sim, counterWindow) then
+				-- Legit tab: not yet (reaction time), or this window is let go.
+				input.b = bit32.band(input.b, bit32.bnot(COUNTER_BIT))
+			elseif not BeyRivals.counterRisky(sim, slot, bey) and counterIsSafe(sim, slot, input, counterWindow.start) then
 				status = "Counter!"
 				counterWindow.outcome = "pressed"
 				input.b = bit32.bor(input.b, COUNTER_BIT)
 				return input
+			else
+				counterWindow.vetoes = counterWindow.vetoes + 1
+				counterWindow.outcome = "skipped (would ring us out)"
+				input.b = bit32.band(input.b, bit32.bnot(COUNTER_BIT))
 			end
-			counterWindow.vetoes = counterWindow.vetoes + 1
-			counterWindow.outcome = "skipped (would ring us out)"
-			input.b = bit32.band(input.b, bit32.bnot(COUNTER_BIT))
 		elseif press == false then
 			if counterWindow.outcome == "open" then
 				counterWindow.outcome = "waiting (stunned/airborne)"
@@ -2132,13 +2389,131 @@ function BeyRivals.ridgeSafe(sim, slot, bey, input)
 	return { sx = tx, sz = tz, b = bit32.band(input.b, bit32.bor(BRACE_BIT, COUNTER_BIT)), t = 0 }
 end
 
+---Assist mode (auto battle off): the player steers and plays; we only add timing help on top of their
+---input. Movement is theirs except during an auto-dodge (if they turn that on).
+function BeyRivals.assistInput(battle, user)
+	local round = battle.round
+	local sim = round and round.sim
+	if not sim or battle.watch or round.phase ~= "Battle" or sim.done then
+		return nil
+	end
+	local slot = battle.mySlot
+	local bey = sim.beys[slot]
+	if not bey or bey.out or type(user) ~= "table" then
+		return nil
+	end
+	BeyRivals.frameStart = os.clock()
+	local input = { sx = user.sx or 0, sz = user.sz or 0, b = user.b or 0, t = user.t or 0 }
+	local nextTick = sim.tick + 1
+	if not bey.launched then
+		-- Perfect rip: replace the rip timing, keep the player's aim.
+		if Config.AssistRip and bey.ripTick == 0 then
+			input.b = ripBits(nextTick)
+			status = "Assist: rip"
+		end
+		return input
+	end
+	if Config.AssistClash and inClash(sim, slot) then
+		input.b = bit32.bor(bit32.band(input.b, bit32.bnot(CLASH_BIT)), clashBits(sim, bey, nextTick))
+		status = "Assist: clash"
+		return input
+	end
+	if Config.AssistRim and Tuning.RIM_ON and (bey.rimT or 0) > 0 and bey.rimT + 1 == RIM_CALL then
+		input.b = bit32.bor(input.b, RIP_PRESS)
+		status = "Assist: rim save"
+	end
+	if Config.AssistDodge then
+		local ok, dodge = pcall(BeyRivals.sweepDodge, sim, slot, bey, input)
+		if ok and dodge then
+			status = "Assist: dodging"
+			-- Keep any guard/counter the player is pressing.
+			dodge.b = bit32.bor(dodge.b or 0, bit32.band(input.b, bit32.bor(BRACE_BIT, COUNTER_BIT)))
+			return dodge
+		end
+	end
+	if Config.AssistGuard then
+		local ok, brace = pcall(guardBits, sim, slot, bey, input)
+		if ok and brace and brace ~= 0 then
+			input.b = bit32.bor(input.b, brace)
+			status = "Assist: guard"
+		end
+	end
+	if Config.AssistCounter then
+		local press = counterPress(bey)
+		if press == true then
+			if not BeyRivals.counterRisky(sim, slot, bey) then
+				input.b = bit32.bor(input.b, COUNTER_BIT)
+				status = "Assist: counter"
+			end
+		elseif press == false then
+			input.b = bit32.band(input.b, bit32.bnot(COUNTER_BIT))
+		end
+	end
+	return input
+end
+
+---Legit tab: steering and ability presses reach the game the way a hand delivers them, a
+---little late and not changed every tick. Guard, counter, rip and clash presses are timed by
+---their own values and pass through untouched.
+function BeyRivals.humanize(battle, input)
+	local lag, hold, late = BeyRivals.T("SteerLag"), BeyRivals.T("SteerHold"), BeyRivals.T("AbilityDelay")
+	if lag <= 0 and hold <= 1 and late <= 0 then
+		return input
+	end
+	local sim = battle.round and battle.round.sim
+	local bey = sim and sim.beys and sim.beys[battle.mySlot]
+	if not (bey and bey.launched) or bey.out or inClash(sim, battle.mySlot) or (bey.rimT or 0) > 0 then
+		BeyRivals.hand = nil
+		return input
+	end
+	local hand = BeyRivals.hand
+	if not hand or hand.token ~= battle.token or sim.tick < hand.tick or sim.tick - hand.tick > 30 then
+		hand = { token = battle.token, steer = {}, presses = {}, sx = input.sx or 0, sz = input.sz or 0, dash = 0, changeAt = 0 }
+		BeyRivals.hand = hand
+	end
+	hand.tick = sim.tick
+	local DASH, ABILITIES = 1, 232
+	-- Steering (and the dash that goes with it), `lag` ticks late.
+	table.insert(hand.steer, { input.sx or 0, input.sz or 0, bit32.band(input.b, DASH) })
+	while #hand.steer > lag + 1 do
+		table.remove(hand.steer, 1)
+	end
+	local want = hand.steer[1]
+	if (want[1] ~= hand.sx or want[2] ~= hand.sz) and sim.tick >= hand.changeAt then
+		hand.sx, hand.sz = want[1], want[2]
+		hand.changeAt = sim.tick + hold + (hold > 1 and math.random(0, math.floor(hold / 2)) or 0)
+	end
+	-- Ability presses, `late` ticks late (held presses stay held for as long).
+	table.insert(hand.presses, bit32.band(input.b, ABILITIES))
+	while #hand.presses > late + 1 do
+		table.remove(hand.presses, 1)
+	end
+	local bits = bit32.band(input.b, bit32.bnot(bit32.bor(DASH, ABILITIES)))
+	bits = bit32.bor(bits, want[3], hand.presses[1])
+	return { sx = hand.sx, sz = hand.sz, b = bits, t = input.t or 0 }
+end
+
 local function sampleHook(origin, ...)
+	if not Config.AutoBattle and Config.Assist then
+		local user = originalSample(origin, ...)
+		local battle = currentBattle()
+		if battle then
+			local ok, input = pcall(BeyRivals.assistInput, battle, user)
+			if ok and input then
+				return input
+			elseif not ok then
+				warn("[Bey Rivals assist] " .. tostring(input))
+			end
+		end
+		return user
+	end
 	if Config.AutoBattle then
 		local battle = currentBattle()
 		if battle then
 			local ok, input = pcall(autoInput, battle)
 			if ok and input then
-				return input
+				local fine, shaped = pcall(BeyRivals.humanize, battle, input)
+				return fine and shaped or input
 			elseif not ok then
 				warn("[Bey Rivals] " .. tostring(input))
 			end
@@ -2156,12 +2531,6 @@ local function syncAimAssist()
 		localPlayer:SetAttribute("AimAssist", false)
 	else
 		localPlayer:SetAttribute("AimAssist", hadAimAssist)
-	for _, packet in pairs(hookedPackets) do
-		rawset(packet, "Fire", nil)
-	end
-	if originalShow and RivalsResults.show ~= originalShow then
-		RivalsResults.show = originalShow
-	end
 	end
 end
 
@@ -2242,10 +2611,12 @@ local function planAndLaunch(battle)
 	local defaultAngle = typeof(defaultAim) == "Vector2" and math.atan2(defaultAim.Y, defaultAim.X) or 0
 
 	local best = { a = defaultAngle, d = 0.55 }
+	local openedAt = os.clock()
+	local scored = {}
 	if Config.PlanLaunch then
 		status = "Planning launch"
 		local candidates = launchCandidates(defaultAngle)
-		local deadline = os.clock() + (4)
+		local deadline = os.clock() + BeyRivals.T("LaunchThink")
 		launchFrameStart = os.clock()
 		local bestScore, tried = -math.huge, 0
 
@@ -2259,12 +2630,34 @@ local function planAndLaunch(battle)
 			if ok and (score > bestScore + (candidate.default and 0 or 0.5)) then
 				bestScore, best = score, candidate
 			end
+			if ok then
+				table.insert(scored, { score = score, spot = candidate })
+			end
 			if (os.clock() - launchFrameStart) * 1000 > LAUNCH_FRAME_MS then
 				task.wait()
 				launchFrameStart = os.clock()
 			end
 		end
 		status = string.format("Launch picked (%d spots)", tried)
+	end
+	-- Legit tab: any of the best few spots, a little off the mark, after a moment's thought.
+	do
+		local top = BeyRivals.T("LaunchPickTop")
+		if top > 1 and #scored > 1 then
+			table.sort(scored, function(a, b)
+				return a.score > b.score
+			end)
+			best = scored[math.random(1, math.min(top, #scored))].spot
+		end
+		local wobble = math.rad(BeyRivals.T("LaunchAimNoise"))
+		if wobble > 0 then
+			best = { a = best.a + (math.random() * 2 - 1) * wobble, d = math.clamp(best.d + (math.random() * 2 - 1) * wobble * 0.5, 0.1, 0.85) }
+		end
+		local lockAt = openedAt + BeyRivals.Tspan("LaunchWait")
+		while os.clock() < lockAt and currentBattle() == battle and not battle.ready and round.phase == "Launch" do
+			status = "Lining up the launch"
+			task.wait(0.05)
+		end
 	end
 
 	if currentBattle() ~= battle or battle.ready or round.phase ~= "Launch" then
@@ -2533,6 +2926,18 @@ local function joinNextBattle(endedToken)
 		return
 	end
 
+	-- Legit tab: a pause before asking for the next battle.
+	do
+		local resumeAt = os.clock() + BeyRivals.Tspan("QueueWait")
+		while os.clock() < resumeAt do
+			if run ~= queueRun or not Config.AutoQueue or inNewBattle(endedToken) or BeyRivals.detached then
+				return
+			end
+			status = string.format("Next battle in %.0f s", math.max(resumeAt - os.clock(), 0))
+			task.wait(0.25)
+		end
+	end
+
 	local result = lastResultAt >= endedAt and lastResult or nil
 	local label, attempt = nextJoin(result)
 	local giveUp = os.clock() + (90)
@@ -2551,7 +2956,7 @@ local function joinNextBattle(endedToken)
 		if type(reason) == "string" and reason ~= "" then
 			status = label .. ": " .. reason
 		end
-		task.wait((1.5))
+		task.wait(BeyRivals.T("QueueRetry"))
 	end
 	if run == queueRun and not inNewBattle(endedToken) then
 		status = "Couldn't join the next battle"
@@ -2588,7 +2993,7 @@ local function queueAfter(battle)
 end
 
 ---Ranked state from the server (JSON): queue -> found -> spot pick (order) -> ready -> play ... -> home.
-BeyRivals.RANKED_LIVE = { found = true, play = true, waiting = true, here = true, ready = true, wait = true }
+BeyRivals.RANKED_LIVE = { found = true, play = true, waiting = true, here = true, ready = true, wait = true, battle = true, order = true, pick = true, series = true }
 function BeyRivals.rankedSeriesLive()
 	local r = BeyRivals.ranked
 	return r ~= nil and BeyRivals.RANKED_LIVE[r.state] == true and os.clock() - (BeyRivals.rankedAt or 0) < 900
@@ -2605,57 +3010,57 @@ function BeyRivals.onRankedState(raw)
 	if type(data.mode) == "string" and data.mode:match("^%dv%d$") then
 		BeyRivals.rankedMode = data.mode
 	end
-	-- Pick your spot (2v2/3v3): our preferred turn, else the next free one.
-	local order = data.order
-	local size = type(order) == "table" and (tonumber(order.size) or (data.mode == "3v3" and 3 or 2)) or 0
-	local choice = size == 3 and Config.Spot3v3 or Config.Spot2v2
-	local want = ({ ["1st"] = 1, ["2nd"] = 2, ["3rd"] = 3 })[tostring(choice)]
-	if want and type(order) == "table" and order.mine == nil then
-		want = math.clamp(want, 1, size)
-		local taken = type(order.taken) == "table" and order.taken or {}
-		local function free(spot)
-			return not (taken[spot] or taken[tostring(spot)])
-		end
-		local pick = nil
-		for offset = 0, size - 1 do
-			local spot = (want - 1 + offset) % size + 1
-			if free(spot) then
-				pick = spot
-				break
+	-- Pick your spot (2v2/3v3). Server sends a top-level {"state":"order","size":2,"taken":{"2":"name"},
+	-- "ends":t} and adds "mine":n once we've picked. Our preferred turn, else the next free one.
+	if data.state == "order" and data.mine == nil then
+		local size = tonumber(data.size) or (data.mode == "3v3" and 3 or 2)
+		local choice = size == 3 and Config.Spot3v3 or Config.Spot2v2
+		local want = ({ ["1st"] = 1, ["2nd"] = 2, ["3rd"] = 3 })[tostring(choice)]
+		if want then
+			want = math.clamp(want, 1, size)
+			local taken = type(data.taken) == "table" and data.taken or {}
+			local pick = nil
+			for offset = 0, size - 1 do
+				local spot = (want - 1 + offset) % size + 1
+				if not (taken[spot] or taken[tostring(spot)]) then
+					pick = spot
+					break
+				end
+			end
+			local key = tostring(data.ends or game.JobId) .. ":" .. tostring(pick)
+			if pick and BeyRivals.spotKey ~= key then
+				BeyRivals.spotKey = key
+				task.delay(BeyRivals.Tspan("SpotWait"), function()
+					firePacket("RankedOrder", pick)
+					status = "Picked spot " .. pick
+				end)
 			end
 		end
-		local key = tostring(data.since or "") .. ":" .. tostring(pick)
-		if pick and BeyRivals.spotKey ~= key then
-			BeyRivals.spotKey = key
-			task.delay(0.4, function()
-				firePacket("RankedOrder", pick)
-				status = "Picked spot " .. pick
-			end)
-		end
 	end
-	-- Ready check.
-	if Config.AutoReady and (data.state == "ready" or data.need ~= nil) and not data.here then
-		local key = "ready:" .. tostring(data.since or "")
+	-- Ready check: {"state":"waiting","here":4,"need":4,"ready":n}. Once per arena.
+	if Config.AutoReady and data.state == "waiting" and tonumber(data.need) and (tonumber(data.ready) or 0) < tonumber(data.need) then
+		local key = "ready:" .. game.JobId
 		if BeyRivals.readyKey ~= key then
 			BeyRivals.readyKey = key
-			task.delay(0.6, function()
+			task.delay(BeyRivals.Tspan("ReadyWait"), function()
 				firePacket("RankedReady")
+				status = "Ranked: ready"
 			end)
 		end
 	end
 end
 
-if Packets and Packets.RankedState and Packets.RankedState.OnClientEvent then
-	pcall(function()
-		table.insert(BeyRivals.connections, Packets.RankedState.OnClientEvent:Connect(function(raw)
-			pcall(BeyRivals.onRankedState, raw)
-		end))
-	end)
+-- Catch up on whatever arrived while we were loading (the spot pick / ready check after a teleport).
+do
+	local buffered = BeyRivals.rankedBuffer
+	if #buffered > 0 then
+		pcall(BeyRivals.onRankedState, buffered[#buffered])
+	end
 end
 
 -- Survive teleports (ranked and event servers): reload this script in the next server.
 pcall(function()
-	if queue_on_teleport and isfile(SETTINGS_FOLDER .. "/BeyRivals.lua") then
+	if not getgenv().PotentHub and queue_on_teleport and isfile(SETTINGS_FOLDER .. "/BeyRivals.lua") then
 		queue_on_teleport('getgenv().BeyRivalsTeleported = true if isfile("BeyRivals/BeyRivals.lua") then loadstring(readfile("BeyRivals/BeyRivals.lua"))() end')
 	end
 end)
@@ -2752,7 +3157,7 @@ table.insert(BeyRivals.connections, runService.Heartbeat:Connect(function()
 	if skippedReplay == active then
 		return
 	end
-	skipAt = skipAt or (os.clock() + (0.6))
+	skipAt = skipAt or (os.clock() + math.max(BeyRivals.Tspan("SkipWait"), 0.6))
 	if os.clock() < skipAt then
 		return
 	end
@@ -3015,479 +3420,1764 @@ end
 --  Interface
 -- ============================================================
 
-local function create(class, props, children)
-	local instance = Instance.new(class)
-	for key, value in pairs(props or {}) do
-		instance[key] = value
-	end
-	for _, child in ipairs(children or {}) do
-		child.Parent = instance
-	end
-	return instance
-end
+-- ============================================================
+--  Interface (Potent Hub)
+-- ============================================================
 
-local function corner(radius)
-	return create("UICorner", { CornerRadius = UDim.new(0, radius) })
-end
+-- One look for every Potent script: a two-column window with tabs, group boxes with an accent
+-- line, square checkboxes, outlined buttons, and a Misc tab that always ends with the menu
+-- settings (anti-AFK, menu bind, hide on execute, unload) and a live theme editor.
+local UI = { order = {}, current = {}, columns = {}, refreshers = {}, capturing = false }
+BeyRivals.ui = UI
 
-local function tween(instance, props, duration)
-	tweenService:Create(instance, TweenInfo.new(duration or 0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props):Play()
-end
-
-local guiParent = (gethui and gethui()) or game:GetService("CoreGui")
-local oldGui = guiParent:FindFirstChild("BeyRivalsUI")
-if oldGui then
-	oldGui:Destroy()
-end
-
-local screenGui = create("ScreenGui", {
-	Name = "BeyRivalsUI",
-	ResetOnSpawn = false,
-	IgnoreGuiInset = true,
-	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
-	DisplayOrder = 50,
-})
-BeyRivals.gui = screenGui
-
-local panel = create("Frame", {
-	Name = "Panel",
-	AnchorPoint = Vector2.new(0, 0.5),
-	Position = UDim2.new(0, 28, 0.5, 0),
-	Size = UDim2.fromOffset(304, 488),
-	BackgroundColor3 = PANEL,
-	BorderSizePixel = 0,
-	ClipsDescendants = false,
-	Parent = screenGui,
-}, {
-	corner(10),
-	create("UIStroke", { Color = LINE, Thickness = 1 }),
-})
-BeyRivals.panel = panel
-
--- The cable the panel hangs from, with its carabiner.
-create("Frame", {
-	Name = "Cable",
-	Position = UDim2.new(0, 38, 0, -1),
-	Size = UDim2.new(1, -48, 0, 2),
-	BackgroundColor3 = GOLD,
-	BorderSizePixel = 0,
-	ZIndex = 3,
-	Parent = panel,
-})
-local beyMark = create("Frame", {
-	Name = "Bey",
-	AnchorPoint = Vector2.new(0.5, 0.5),
-	Position = UDim2.new(0, 26, 0, 0),
-	Size = UDim2.fromOffset(22, 22),
-	BackgroundColor3 = PANEL,
-	BorderSizePixel = 0,
-	ZIndex = 4,
-	Parent = panel,
-}, {
-	corner(11),
-	create("UIStroke", { Color = GOLD, Thickness = 2.5 }),
-	create("Frame", {
-		Name = "Blade",
-		AnchorPoint = Vector2.new(0.5, 0.5),
-		Position = UDim2.fromScale(0.5, 0.5),
-		Size = UDim2.fromOffset(12, 3),
-		BackgroundColor3 = GOLD,
-		BorderSizePixel = 0,
-		ZIndex = 5,
-	}, { corner(2) }),
-	create("Frame", {
-		Name = "Tip",
-		AnchorPoint = Vector2.new(0.5, 0.5),
-		Position = UDim2.fromScale(0.5, 0.5),
-		Size = UDim2.fromOffset(4, 4),
-		BackgroundColor3 = PANEL,
-		BorderSizePixel = 0,
-		ZIndex = 6,
-	}, { corner(2) }),
-})
-
-local header = create("Frame", {
-	Name = "Header",
-	Size = UDim2.new(1, 0, 0, 62),
-	BackgroundTransparency = 1,
-	Parent = panel,
-})
-create("TextLabel", {
-	Name = "Title",
-	Position = UDim2.fromOffset(18, 18),
-	Size = UDim2.new(1, -36, 0, 26),
-	BackgroundTransparency = 1,
-	FontFace = DISPLAY_FONT,
-	Text = "Bey Rivals",
-	TextColor3 = TEXT,
-	TextSize = 25,
-	TextXAlignment = Enum.TextXAlignment.Left,
-	Parent = header,
-})
-local statusLabel = create("TextLabel", {
-	Name = "Status",
-	AnchorPoint = Vector2.new(1, 0),
-	Position = UDim2.new(1, -18, 0, 24),
-	Size = UDim2.fromOffset(260, 18),
-	BackgroundTransparency = 1,
-	FontFace = BODY_FONT,
-	Text = "",
-	TextColor3 = MUTED,
-	TextSize = 14,
-	TextXAlignment = Enum.TextXAlignment.Right,
-	TextTruncate = Enum.TextTruncate.AtEnd,
-	Parent = header,
-})
-
--- Drag by the header.
 do
-	local dragging, dragStart, startPosition = false, nil, nil
-	header.InputBegan:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-			dragging, dragStart, startPosition = true, input.Position, panel.Position
+	local THEME = {
+		{ role = "Background", key = "ThemeBackground", default = "111111" },
+		{ role = "Main", key = "ThemeMain", default = "1A1A1A" },
+		{ role = "Accent", key = "ThemeAccent", default = "96D9CF" },
+		{ role = "Outline", key = "ThemeOutline", default = "2E2E2E" },
+		{ role = "Font", key = "ThemeFont", default = "EBEBEB" },
+	}
+	UI.THEME = THEME
+	local CODE = Font.fromEnum(Enum.Font.Code)
+	local CODE_BOLD = Font.new("rbxasset://fonts/families/Inconsolata.json", Enum.FontWeight.Bold)
+	local TEXT_SIZE = 14
+
+	local function readColor(key, default)
+		local ok, color = pcall(Color3.fromHex, tostring(Config[key] or default))
+		if not ok then
+			Config[key] = default
+			return Color3.fromHex(default)
 		end
-	end)
-	table.insert(BeyRivals.connections, userInputService.InputChanged:Connect(function(input)
-		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-			local delta = input.Position - dragStart
-			panel.Position = UDim2.new(startPosition.X.Scale, startPosition.X.Offset + delta.X, startPosition.Y.Scale, startPosition.Y.Offset + delta.Y)
-		end
-	end))
-	table.insert(BeyRivals.connections, userInputService.InputEnded:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-			dragging = false
-		end
-	end))
-end
-
--- Tabs.
-local tabBar = create("Frame", {
-	Name = "Tabs",
-	Position = UDim2.fromOffset(18, 62),
-	Size = UDim2.new(1, -36, 0, 30),
-	BackgroundTransparency = 1,
-	Parent = panel,
-})
-create("Frame", {
-	Name = "Rule",
-	Position = UDim2.new(0, 0, 1, -1),
-	Size = UDim2.new(1, 0, 0, 1),
-	BackgroundColor3 = LINE,
-	BorderSizePixel = 0,
-	Parent = tabBar,
-})
-local tabUnderline = create("Frame", {
-	Name = "Underline",
-	Position = UDim2.new(0, 0, 1, -2),
-	Size = UDim2.fromOffset(34, 2),
-	BackgroundColor3 = GOLD,
-	BorderSizePixel = 0,
-	ZIndex = 2,
-	Parent = tabBar,
-})
-
-local pages, tabButtons = {}, {}
-
-local function makePage(name)
-	local page = create("ScrollingFrame", {
-		Name = name,
-		Position = UDim2.fromOffset(0, 98),
-		Size = UDim2.new(1, 0, 1, -98 - 40),
-		BackgroundTransparency = 1,
-		BorderSizePixel = 0,
-		ScrollBarThickness = 3,
-		ScrollBarImageColor3 = LINE,
-		CanvasSize = UDim2.new(),
-		AutomaticCanvasSize = Enum.AutomaticSize.Y,
-		Visible = false,
-		Parent = panel,
-	}, {
-		create("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 12), PaddingBottom = UDim.new(0, 8) }),
-		create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 2) }),
-	})
-	pages[name] = page
-	return page
-end
-
-local function selectTab(name)
-	for pageName, page in pairs(pages) do
-		page.Visible = pageName == name
+		return color
 	end
-	for buttonName, button in pairs(tabButtons) do
-		local active = buttonName == name
-		button.TextColor3 = active and TEXT or MUTED
-		if active then
-			tween(tabUnderline, {
-				Position = UDim2.new(0, button.Position.X.Offset, 1, -2),
-				Size = UDim2.fromOffset(button.TextBounds.X, 2),
-			}, 0.18)
+
+	local function computeRoles()
+		local roles = {}
+		for _, entry in ipairs(THEME) do
+			roles[entry.role] = readColor(entry.key, entry.default)
 		end
+		roles.Control = roles.Main:Lerp(roles.Font, 0.06)
+		roles.Muted = roles.Font:Lerp(roles.Main, 0.42)
+		return roles
 	end
-end
+	UI.roles = computeRoles()
 
-local function makeTab(name, x)
-	local button = create("TextButton", {
-		Name = name,
-		Position = UDim2.fromOffset(x, 0),
-		Size = UDim2.new(0, 70, 1, -4),
-		AutomaticSize = Enum.AutomaticSize.X,
-		BackgroundTransparency = 1,
-		FontFace = TAB_FONT,
-		Text = name,
-		TextColor3 = MUTED,
-		TextSize = 17,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		AutoButtonColor = false,
-		Parent = tabBar,
-	})
-	button.Size = UDim2.new(0, 0, 1, -4)
-	tabButtons[name] = button
-	button.MouseButton1Click:Connect(function()
-		selectTab(name)
-	end)
-	return button
-end
-
--- Control builders.
-local layoutOrder = 0
-local function nextOrder()
-	layoutOrder = layoutOrder + 1
-	return layoutOrder
-end
-
-local function rowBase(page, height, clickable)
-	local row = create(clickable and "TextButton" or "Frame", {
-		Size = UDim2.new(1, 0, 0, height),
-		BackgroundColor3 = RAISED,
-		BackgroundTransparency = 1,
-		BorderSizePixel = 0,
-		LayoutOrder = nextOrder(),
-		Parent = page,
-	}, { corner(6) })
-	if clickable then
-		row.Text = ""
-		row.AutoButtonColor = false
-	end
-	row.MouseEnter:Connect(function()
-		tween(row, { BackgroundTransparency = 0.35 }, 0.1)
-	end)
-	row.MouseLeave:Connect(function()
-		tween(row, { BackgroundTransparency = 1 }, 0.1)
-	end)
-	return row
-end
-
-local function rowLabel(row, text, y)
-	return create("TextLabel", {
-		Position = UDim2.fromOffset(8, y or 0),
-		Size = UDim2.new(1, -120, 0, y and 20 or row.Size.Y.Offset),
-		BackgroundTransparency = 1,
-		FontFace = BODY_FONT,
-		Text = text,
-		TextColor3 = TEXT,
-		TextSize = 15,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		Parent = row,
-	})
-end
-
-local function heading(page, text)
-	create("TextLabel", {
-		Size = UDim2.new(1, 0, 0, 30),
-		BackgroundTransparency = 1,
-		FontFace = BODY_BOLD,
-		Text = text,
-		TextColor3 = MUTED,
-		TextSize = 13,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		TextYAlignment = Enum.TextYAlignment.Bottom,
-		LayoutOrder = nextOrder(),
-		Parent = page,
-	}, { create("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingBottom = UDim.new(0, 4) }) })
-end
-
----Square latch: gold with a check when on.
-local function toggle(page, text, key)
-	local row = rowBase(page, 34, true)
-	rowLabel(row, text)
-	local latch = create("Frame", {
-		AnchorPoint = Vector2.new(1, 0.5),
-		Position = UDim2.new(1, -8, 0.5, 0),
-		Size = UDim2.fromOffset(20, 20),
-		BackgroundColor3 = GOLD,
-		BackgroundTransparency = 1,
-		BorderSizePixel = 0,
-		Parent = row,
-	}, { corner(5) })
-	local latchStroke = create("UIStroke", { Color = LINE, Thickness = 1.5, Parent = latch })
-	local check = create("TextLabel", {
-		Size = UDim2.fromScale(1, 1),
-		BackgroundTransparency = 1,
-		FontFace = BODY_BOLD,
-		Text = "✓",
-		TextColor3 = PANEL,
-		TextSize = 15,
-		TextTransparency = 1,
-		Parent = latch,
-	})
-
-	local function refresh()
-		local on = Config[key]
-		tween(latch, { BackgroundTransparency = on and 0 or 1 })
-		tween(check, { TextTransparency = on and 0 or 1 })
-		tween(latchStroke, { Color = on and GOLD or LINE })
-	end
-	row.MouseButton1Click:Connect(function()
-		Config[key] = not Config[key]
-		refresh()
-	end)
-	refresh()
-end
-
----Thin cable-style slider.
-local function slider(page, text, key, minValue, maxValue, step, format)
-	local row = rowBase(page, 48, false)
-	rowLabel(row, text, 4)
-	local valueLabel = create("TextLabel", {
-		AnchorPoint = Vector2.new(1, 0),
-		Position = UDim2.new(1, -8, 0, 4),
-		Size = UDim2.fromOffset(90, 20),
-		BackgroundTransparency = 1,
-		FontFace = BODY_BOLD,
-		TextColor3 = GOLD,
-		TextSize = 15,
-		TextXAlignment = Enum.TextXAlignment.Right,
-		Parent = row,
-	})
-	local track = create("TextButton", {
-		Position = UDim2.new(0, 8, 0, 30),
-		Size = UDim2.new(1, -16, 0, 12),
-		BackgroundTransparency = 1,
-		Text = "",
-		AutoButtonColor = false,
-		Parent = row,
-	})
-	create("Frame", {
-		AnchorPoint = Vector2.new(0, 0.5),
-		Position = UDim2.fromScale(0, 0.5),
-		Size = UDim2.new(1, 0, 0, 2),
-		BackgroundColor3 = LINE,
-		BorderSizePixel = 0,
-		Parent = track,
-	})
-	local fill = create("Frame", {
-		AnchorPoint = Vector2.new(0, 0.5),
-		Position = UDim2.fromScale(0, 0.5),
-		Size = UDim2.new(0, 0, 0, 2),
-		BackgroundColor3 = GOLD,
-		BorderSizePixel = 0,
-		Parent = track,
-	})
-	local knob = create("Frame", {
-		AnchorPoint = Vector2.new(0.5, 0.5),
-		Position = UDim2.fromScale(0, 0.5),
-		Size = UDim2.fromOffset(12, 12),
-		BackgroundColor3 = GOLD,
-		BorderSizePixel = 0,
-		ZIndex = 2,
-		Parent = track,
-	}, { corner(6), create("UIStroke", { Color = PANEL, Thickness = 2 }) })
-
-	local function refresh()
-		local fraction = (Config[key] - minValue) / (maxValue - minValue)
-		fill.Size = UDim2.new(fraction, 0, 0, 2)
-		knob.Position = UDim2.fromScale(fraction, 0.5)
-		valueLabel.Text = format(Config[key])
-	end
-	local dragging = false
-	local function setFromX(x)
-		local fraction = math.clamp((x - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
-		local value = minValue + fraction * (maxValue - minValue)
-		Config[key] = math.clamp(math.floor(value / step + 0.5) * step, minValue, maxValue)
-		refresh()
-	end
-	track.InputBegan:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-			dragging = true
-			setFromX(input.Position.X)
-		end
-	end)
-	table.insert(BeyRivals.connections, userInputService.InputChanged:Connect(function(input)
-		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-			setFromX(input.Position.X)
-		end
-	end))
-	table.insert(BeyRivals.connections, userInputService.InputEnded:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-			dragging = false
-		end
-	end))
-	refresh()
-end
-
----Segmented choice for short option sets.
-local function segmented(page, text, key, options)
-	local row = rowBase(page, 34, false)
-	rowLabel(row, text)
-	local group = create("Frame", {
-		AnchorPoint = Vector2.new(1, 0.5),
-		Position = UDim2.new(1, -6, 0.5, 0),
-		Size = UDim2.fromOffset(0, 24),
-		AutomaticSize = Enum.AutomaticSize.X,
-		BackgroundColor3 = STEEL,
-		BorderSizePixel = 0,
-		Parent = row,
-	}, {
-		corner(6),
-		create("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 2) }),
-		create("UIPadding", { PaddingLeft = UDim.new(0, 2), PaddingRight = UDim.new(0, 2), PaddingTop = UDim.new(0, 2), PaddingBottom = UDim.new(0, 2) }),
-	})
-	local buttons = {}
-	local function refresh()
-		for option, button in pairs(buttons) do
-			local active = Config[key] == option
-			tween(button, { BackgroundTransparency = active and 0 or 1, TextColor3 = active and GOLD or MUTED }, 0.12)
-		end
-	end
-	for index, option in ipairs(options) do
-		local button = create("TextButton", {
-			Size = UDim2.fromOffset(0, 20),
-			AutomaticSize = Enum.AutomaticSize.X,
-			BackgroundColor3 = RAISED,
-			BackgroundTransparency = 1,
-			BorderSizePixel = 0,
-			FontFace = BODY_FONT,
-			Text = option,
-			TextColor3 = MUTED,
-			TextSize = 13,
-			AutoButtonColor = false,
-			LayoutOrder = index,
-			Parent = group,
-		}, { corner(4), create("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8) }) })
-		buttons[option] = button
-		button.MouseButton1Click:Connect(function()
-			Config[key] = option
-			refresh()
+	-- Start on the shared default theme unless this script's colors were changed by hand.
+	if Config.UseDefaultTheme ~= false then
+		pcall(function()
+			if isfile("PotentHub/default_theme.json") then
+				local theme = httpService:JSONDecode(readfile("PotentHub/default_theme.json"))
+				for _, entry in ipairs(THEME) do
+					if type(theme[entry.key]) == "string" and pcall(Color3.fromHex, theme[entry.key]) then
+						Config[entry.key] = theme[entry.key]
+					end
+				end
+				UI.roles = computeRoles()
+			end
 		end)
 	end
-	refresh()
-end
 
+	-- The scripts' own custom rows use the palette constants: point them at the theme.
+	local function syncConstants()
+		local roles = UI.roles
+		STEEL, PANEL, RAISED, LINE, TEXT, MUTED, GOLD = roles.Background, roles.Main, roles.Control, roles.Outline, roles.Font, roles.Muted, roles.Accent
+		DISPLAY_FONT, TAB_FONT, BODY_FONT, BODY_BOLD = CODE, CODE, CODE, CODE_BOLD
+	end
+	syncConstants()
 
----Muted one-line hint under a control.
-local function hint(page, text)
-	create("TextLabel", {
-		Size = UDim2.new(1, 0, 0, 22),
+	local function create(class, props, children)
+		local instance = Instance.new(class)
+		for key, value in pairs(props or {}) do
+			instance[key] = value
+		end
+		for _, child in ipairs(children or {}) do
+			child.Parent = instance
+		end
+		return instance
+	end
+	UI.create = create
+
+	UI.corner = function(radius)
+		return create("UICorner", { CornerRadius = UDim.new(0, math.min(radius or 0, 2)) })
+	end
+
+	local function tween(instance, props, duration)
+		tweenService:Create(instance, TweenInfo.new(duration or 0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props):Play()
+	end
+	UI.tween = tween
+
+	local function stroke(parent, role)
+		return create("UIStroke", { Color = UI.roles[role or "Outline"], Thickness = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Parent = parent })
+	end
+
+	local function label(props)
+		props.BackgroundTransparency = 1
+		props.FontFace = props.FontFace or CODE
+		props.TextSize = props.TextSize or TEXT_SIZE
+		props.TextColor3 = props.TextColor3 or UI.roles.Font
+		props.TextXAlignment = props.TextXAlignment or Enum.TextXAlignment.Left
+		return create("TextLabel", props)
+	end
+
+	-- Custom fonts (Fishstrap etc.) are wider: fixed-size text scales down to fit.
+	function UI.fitText(object)
+		if not (object:IsA("TextLabel") or object:IsA("TextButton") or object:IsA("TextBox")) then
+			return
+		end
+		if object.AutomaticSize ~= Enum.AutomaticSize.None or object.TextScaled or object.TextWrapped or object:FindFirstChildOfClass("UITextSizeConstraint") then
+			return
+		end
+		local designed = object.TextSize
+		object.TextScaled = true
+		create("UITextSizeConstraint", { MaxTextSize = designed, MinTextSize = 7, Parent = object })
+	end
+
+	-- Window.
+	local guiParent = (gethui and gethui()) or game:GetService("CoreGui")
+	local old = guiParent:FindFirstChild("BeyRivalsUI")
+	if old then
+		old:Destroy()
+	end
+	local screenGui = create("ScreenGui", {
+		Name = "BeyRivalsUI",
+		ResetOnSpawn = false,
+		IgnoreGuiInset = true,
+		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+		DisplayOrder = 50,
+	})
+	UI.screenGui, UI.guiParent = screenGui, guiParent
+	BeyRivals.gui = screenGui
+	table.insert(BeyRivals.connections, screenGui.DescendantAdded:Connect(function(object)
+		task.defer(function()
+			pcall(UI.fitText, object)
+			pcall(UI.classify, object)
+		end)
+	end))
+
+	-- First run: centered. After that: wherever it was last dragged to (kept on screen).
+	local position = UDim2.new(0.5, -290, 0.5, -300)
+	if type(Config.WindowX) == "number" and type(Config.WindowY) == "number" and Config.WindowX >= 0 and Config.WindowY >= 0 then
+		local viewport = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1920, 1080)
+		position = UDim2.fromOffset(math.clamp(Config.WindowX, 0, math.max(viewport.X - 120, 0)), math.clamp(Config.WindowY, 0, math.max(viewport.Y - 60, 0)))
+	end
+	local panel = create("Frame", {
+		Name = "Panel",
+		Position = position,
+		Size = UDim2.fromOffset(580, 600),
+		BackgroundColor3 = UI.roles.Background,
+		BorderSizePixel = 0,
+		Parent = screenGui,
+	})
+	stroke(panel, "Accent")
+	UI.panel = panel
+	BeyRivals.panel = panel
+
+	local titleBar = create("Frame", { Size = UDim2.new(1, 0, 0, 26), BackgroundTransparency = 1, Parent = panel })
+	label({ Position = UDim2.fromOffset(9, 3), Size = UDim2.new(1, -150, 0, 20), Text = "Potent Hub | Bey Rivals", Parent = titleBar })
+	UI.statusLabel = label({
+		AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, -9, 0, 3),
+		Size = UDim2.fromOffset(150, 20),
+		Text = "",
+		TextColor3 = UI.roles.Muted,
+		TextXAlignment = Enum.TextXAlignment.Right,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Parent = titleBar,
+	})
+	-- Old spinning marks are gone; scripts that still rotate one get an invisible frame.
+	UI.mark = create("Frame", { Visible = false, Parent = panel })
+
+	do
+		local dragging, dragStart, startPosition = false, nil, nil
+		titleBar.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+				dragging, dragStart, startPosition = true, input.Position, panel.Position
+			end
+		end)
+		table.insert(BeyRivals.connections, userInputService.InputChanged:Connect(function(input)
+			if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+				local delta = input.Position - dragStart
+				panel.Position = UDim2.new(startPosition.X.Scale, startPosition.X.Offset + delta.X, startPosition.Y.Scale, startPosition.Y.Offset + delta.Y)
+			end
+		end))
+		table.insert(BeyRivals.connections, userInputService.InputEnded:Connect(function(input)
+			if (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) and dragging then
+				dragging = false
+				-- AbsolutePosition is measured under the top bar; the window ignores the inset.
+				local inset = game:GetService("GuiService"):GetGuiInset()
+				Config.WindowX = math.floor(panel.AbsolutePosition.X + inset.X)
+				Config.WindowY = math.floor(panel.AbsolutePosition.Y + inset.Y)
+			end
+		end))
+	end
+
+	local holder = create("Frame", {
+		Position = UDim2.fromOffset(8, 28),
+		Size = UDim2.new(1, -16, 1, -36),
+		BackgroundColor3 = UI.roles.Main,
+		BorderSizePixel = 0,
+		Parent = panel,
+	})
+	stroke(holder, "Outline")
+	-- Accent line along the top of the inner frame, right above the tabs.
+	create("Frame", { Size = UDim2.new(1, 0, 0, 1), BackgroundColor3 = UI.roles.Accent, BorderSizePixel = 0, ZIndex = 2, Parent = holder })
+	local tabBar = create("Frame", {
+		Position = UDim2.fromOffset(6, 6),
+		Size = UDim2.new(1, -12, 0, 22),
 		BackgroundTransparency = 1,
-		FontFace = BODY_FONT,
-		Text = text,
-		TextColor3 = MUTED,
-		TextSize = 13,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		LayoutOrder = nextOrder(),
-		Parent = page,
-	}, { create("UIPadding", { PaddingLeft = UDim.new(0, 8) }) })
+		Parent = holder,
+	}, { create("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 2) }) })
+	local content = create("Frame", {
+		Position = UDim2.fromOffset(6, 28),
+		Size = UDim2.new(1, -12, 1, -34),
+		BackgroundColor3 = UI.roles.Background,
+		BorderSizePixel = 0,
+		Parent = holder,
+	})
+	stroke(content, "Outline")
+
+	local pages, tabButtons = {}, {}
+	UI.pages, UI.tabButtons = pages, tabButtons
+
+	local layoutOrder = 0
+	function UI.nextOrder()
+		layoutOrder += 1
+		return layoutOrder
+	end
+
+	---A group box in one column of a page. Title is optional (the first box often has none).
+	local function newBox(page, title, side)
+		local columns = UI.columns[page]
+		if side ~= "left" and side ~= "right" then
+			side = columns.height.left <= columns.height.right and "left" or "right"
+		end
+		local box = create("Frame", {
+			Size = UDim2.new(1, 0, 0, 0),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			BackgroundColor3 = UI.roles.Main,
+			BorderSizePixel = 0,
+			LayoutOrder = UI.nextOrder(),
+			Parent = columns[side],
+		})
+		stroke(box, "Outline")
+		create("Frame", { Size = UDim2.new(1, 0, 0, 2), BackgroundColor3 = UI.roles.Accent, BorderSizePixel = 0, Parent = box })
+		local body = create("Frame", {
+			Position = UDim2.fromOffset(0, 2),
+			Size = UDim2.new(1, 0, 0, 0),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			BackgroundTransparency = 1,
+			Parent = box,
+		}, {
+			create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 4) }),
+			create("UIPadding", { PaddingTop = UDim.new(0, 6), PaddingBottom = UDim.new(0, 7), PaddingLeft = UDim.new(0, 6), PaddingRight = UDim.new(0, 6) }),
+		})
+		columns.height[side] += 20
+		UI.current[page] = { body = body, side = side }
+		if title and title ~= "" then
+			label({ Size = UDim2.new(1, 0, 0, 16), Text = title, LayoutOrder = UI.nextOrder(), Parent = body })
+			columns.height[side] += 20
+		end
+		return body
+	end
+
+	---Where the next control on this page goes (a new untitled box if none is open).
+	local function slot(page, height)
+		local current = UI.current[page] or { body = newBox(page) }
+		current = UI.current[page]
+		UI.columns[page].height[current.side] += (height or 18) + 4
+		return current.body
+	end
+	UI.slot = slot
+
+	function UI.makePage(name)
+		local page = create("ScrollingFrame", {
+			Name = name,
+			Position = UDim2.fromOffset(6, 7),
+			Size = UDim2.new(1, -12, 1, -13),
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			ScrollBarThickness = 3,
+			ScrollBarImageColor3 = UI.roles.Outline,
+			CanvasSize = UDim2.new(),
+			AutomaticCanvasSize = Enum.AutomaticSize.Y,
+			Visible = false,
+			Parent = content,
+		})
+		local function column(x)
+			return create("Frame", {
+				Position = UDim2.new(x, x == 0 and 0 or 4, 0, 0),
+				Size = UDim2.new(0.5, -6, 0, 0),
+				AutomaticSize = Enum.AutomaticSize.Y,
+				BackgroundTransparency = 1,
+				Parent = page,
+			}, { create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 8) }) })
+		end
+		local left, right = column(0), column(0.5)
+		UI.columns[page] = { left = left, right = right, height = { left = 0, right = 0 } }
+		-- Custom rows that a script parents straight to the page land in the open box.
+		page.ChildAdded:Connect(function(child)
+			if child ~= left and child ~= right and child:IsA("GuiObject") then
+				task.defer(function()
+					if child.Parent == page then
+						child.Parent = slot(page, child.AbsoluteSize.Y > 0 and child.AbsoluteSize.Y or 22)
+					end
+				end)
+			end
+		end)
+		pages[name] = page
+		table.insert(UI.order, name)
+		return page
+	end
+
+	function UI.selectTab(name)
+		for pageName, page in pairs(pages) do
+			page.Visible = pageName == name
+		end
+		for buttonName, tabButton in pairs(tabButtons) do
+			local active = buttonName == name
+			tabButton.BackgroundColor3 = active and UI.roles.Background or UI.roles.Main
+			tabButton.TextColor3 = active and UI.roles.Font or UI.roles.Muted
+			tabButton.UIStroke.Color = UI.roles.Outline
+			tabButton.ZIndex = active and 3 or 2
+		end
+		UI.activeTab = name
+	end
+
+	function UI.makeTab(name, order)
+		local tabButton = create("TextButton", {
+			Name = name,
+			Size = UDim2.fromOffset(0, 22),
+			AutomaticSize = Enum.AutomaticSize.X,
+			BackgroundColor3 = UI.roles.Main,
+			BorderSizePixel = 0,
+			FontFace = CODE,
+			Text = name,
+			TextSize = TEXT_SIZE,
+			TextColor3 = UI.roles.Muted,
+			AutoButtonColor = false,
+			LayoutOrder = order or 0,
+			Parent = tabBar,
+		}, { create("UIPadding", { PaddingLeft = UDim.new(0, 7), PaddingRight = UDim.new(0, 7) }) })
+		stroke(tabButton, "Outline")
+		tabButtons[name] = tabButton
+		tabButton.MouseButton1Click:Connect(function()
+			UI.selectTab(name)
+		end)
+		return tabButton
+	end
+
+	-- Controls. Every builder takes the page; heading() opens a new group box.
+	function UI.heading(page, text, side)
+		newBox(page, text, side)
+	end
+
+	function UI.rowBase(page, height, clickable)
+		local row = create(clickable and "TextButton" or "Frame", {
+			Size = UDim2.new(1, 0, 0, height),
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			LayoutOrder = UI.nextOrder(),
+			Parent = slot(page, height),
+		})
+		if clickable then
+			row.Text = ""
+			row.AutoButtonColor = false
+		end
+		return row
+	end
+
+	function UI.rowLabel(row, text, y, width)
+		return label({
+			Position = UDim2.fromOffset(0, y or 0),
+			Size = width or UDim2.new(1, -110, 0, y and 18 or row.Size.Y.Offset),
+			Text = text,
+			Parent = row,
+		})
+	end
+
+	function UI.toggle(page, text, key)
+		local row = UI.rowBase(page, 18, true)
+		local box = create("Frame", {
+			Position = UDim2.fromOffset(0, 3),
+			Size = UDim2.fromOffset(12, 12),
+			BackgroundColor3 = UI.roles.Control,
+			BorderSizePixel = 0,
+			Parent = row,
+		})
+		stroke(box, "Outline")
+		label({ Position = UDim2.fromOffset(19, 0), Size = UDim2.new(1, -19, 1, 0), Text = text, Parent = row })
+		local function refresh()
+			box.BackgroundColor3 = Config[key] and UI.roles.Accent or UI.roles.Control
+		end
+		row.MouseButton1Click:Connect(function()
+			Config[key] = not Config[key]
+			refresh()
+		end)
+		table.insert(UI.refreshers, refresh)
+		if type(BeyRivals.toggleRefreshers) == "table" then
+			table.insert(BeyRivals.toggleRefreshers, refresh)
+		end
+		refresh()
+		return row
+	end
+
+	function UI.slider(page, text, key, minValue, maxValue, step, format)
+		local row = UI.rowBase(page, 34, false)
+		label({ Size = UDim2.new(1, -70, 0, 16), Text = text, Parent = row })
+		local valueLabel = label({
+			AnchorPoint = Vector2.new(1, 0),
+			Position = UDim2.new(1, 0, 0, 0),
+			Size = UDim2.fromOffset(70, 16),
+			TextXAlignment = Enum.TextXAlignment.Right,
+			TextColor3 = UI.roles.Muted,
+			Text = "",
+			Parent = row,
+		})
+		local track = create("TextButton", {
+			Position = UDim2.fromOffset(0, 19),
+			Size = UDim2.new(1, 0, 0, 13),
+			BackgroundColor3 = UI.roles.Control,
+			BorderSizePixel = 0,
+			Text = "",
+			AutoButtonColor = false,
+			Parent = row,
+		})
+		stroke(track, "Outline")
+		local fill = create("Frame", { Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = UI.roles.Accent, BorderSizePixel = 0, Parent = track })
+		local function refresh()
+			local fraction = math.clamp((Config[key] - minValue) / (maxValue - minValue), 0, 1)
+			fill.Size = UDim2.new(fraction, 0, 1, 0)
+			valueLabel.Text = format(Config[key])
+		end
+		local dragging = false
+		local function setFromX(x)
+			local fraction = math.clamp((x - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
+			local value = minValue + fraction * (maxValue - minValue)
+			Config[key] = math.clamp(math.floor(value / step + 0.5) * step, minValue, maxValue)
+			refresh()
+		end
+		track.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+				dragging = true
+				setFromX(input.Position.X)
+			end
+		end)
+		table.insert(BeyRivals.connections, userInputService.InputChanged:Connect(function(input)
+			if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+				setFromX(input.Position.X)
+			end
+		end))
+		table.insert(BeyRivals.connections, userInputService.InputEnded:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+				dragging = false
+			end
+		end))
+		table.insert(UI.refreshers, refresh)
+		refresh()
+		return row
+	end
+
+	function UI.segmented(page, text, key, options)
+		local hasLabel = text ~= nil and text ~= ""
+		local row = UI.rowBase(page, hasLabel and 38 or 20, false)
+		if hasLabel then
+			label({ Size = UDim2.new(1, 0, 0, 16), Text = text, Parent = row })
+		end
+		local group = create("Frame", {
+			Position = UDim2.fromOffset(0, hasLabel and 18 or 0),
+			Size = UDim2.new(1, 0, 0, 20),
+			BackgroundTransparency = 1,
+			Parent = row,
+		}, { create("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 3) }) })
+		local buttons = {}
+		local function refresh()
+			for option, optionButton in pairs(buttons) do
+				local active = Config[key] == option
+				optionButton.TextColor3 = active and UI.roles.Accent or UI.roles.Muted
+				optionButton.UIStroke.Color = active and UI.roles.Accent or UI.roles.Outline
+			end
+		end
+		for index, option in ipairs(options) do
+			local optionButton = create("TextButton", {
+				Size = UDim2.new(1 / #options, -3 + 3 / #options, 1, 0),
+				BackgroundColor3 = UI.roles.Control,
+				BorderSizePixel = 0,
+				FontFace = CODE,
+				Text = tostring(option),
+				TextSize = 13,
+				TextColor3 = UI.roles.Muted,
+				AutoButtonColor = false,
+				LayoutOrder = index,
+				Parent = group,
+			})
+			stroke(optionButton, "Outline")
+			buttons[option] = optionButton
+			optionButton.MouseButton1Click:Connect(function()
+				Config[key] = option
+				for _, other in ipairs(UI.refreshers) do
+					other()
+				end
+			end)
+		end
+		table.insert(UI.refreshers, refresh)
+		if type(BeyRivals.segmentRefreshers) == "table" then
+			table.insert(BeyRivals.segmentRefreshers, refresh)
+		end
+		refresh()
+		return row
+	end
+
+	function UI.hint(page, text)
+		local hintLabel = label({
+			Size = UDim2.new(1, 0, 0, 14),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			Text = text,
+			TextSize = 13,
+			TextColor3 = UI.roles.Muted,
+			TextWrapped = true,
+			LayoutOrder = UI.nextOrder(),
+			Parent = slot(page, 14),
+		})
+		return hintLabel
+	end
+
+	function UI.infoLine(page, height)
+		return label({
+			Size = UDim2.new(1, 0, 0, height or 18),
+			Text = "",
+			TextSize = 13,
+			TextWrapped = (height or 18) > 18,
+			TextYAlignment = Enum.TextYAlignment.Top,
+			LayoutOrder = UI.nextOrder(),
+			Parent = slot(page, height or 18),
+		})
+	end
+
+	---Unfolding option list under a row (scrolls past 9 options).
+	local function optionList(row, onChoose)
+		local list = create("ScrollingFrame", {
+			Size = UDim2.new(1, 0, 0, 0),
+			BackgroundColor3 = UI.roles.Control,
+			BorderSizePixel = 0,
+			ScrollBarThickness = 3,
+			ScrollBarImageColor3 = UI.roles.Outline,
+			CanvasSize = UDim2.new(),
+			AutomaticCanvasSize = Enum.AutomaticSize.Y,
+			Visible = false,
+			LayoutOrder = UI.nextOrder(),
+			Parent = row.Parent,
+		}, { create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder }) })
+		stroke(list, "Outline")
+		local function fill(entries)
+			for _, child in ipairs(list:GetChildren()) do
+				if child:IsA("TextButton") then
+					child:Destroy()
+				end
+			end
+			for index, entry in ipairs(entries) do
+				local item = create("TextButton", {
+					Size = UDim2.new(1, -4, 0, 18),
+					BackgroundColor3 = UI.roles.Main,
+					BackgroundTransparency = 1,
+					BorderSizePixel = 0,
+					FontFace = CODE,
+					Text = "  " .. tostring(entry.text),
+					TextSize = 13,
+					TextColor3 = entry.current and UI.roles.Accent or UI.roles.Font,
+					TextXAlignment = Enum.TextXAlignment.Left,
+					TextTruncate = Enum.TextTruncate.AtEnd,
+					AutoButtonColor = false,
+					LayoutOrder = index,
+					Parent = list,
+				})
+				item.MouseEnter:Connect(function()
+					item.BackgroundTransparency = 0
+				end)
+				item.MouseLeave:Connect(function()
+					item.BackgroundTransparency = 1
+				end)
+				item.MouseButton1Click:Connect(function()
+					list.Visible = false
+					onChoose(entry.value)
+				end)
+			end
+			list.Size = UDim2.new(1, 0, 0, math.min(#entries, 9) * 18 + 2)
+		end
+		return list, fill
+	end
+
+	local function valueBox(row, y)
+		local box = create("TextButton", {
+			Position = UDim2.fromOffset(0, y),
+			Size = UDim2.new(1, 0, 0, 20),
+			BackgroundColor3 = UI.roles.Control,
+			BorderSizePixel = 0,
+			Text = "",
+			AutoButtonColor = false,
+			Parent = row,
+		})
+		stroke(box, "Outline")
+		local value = label({ Position = UDim2.fromOffset(6, 0), Size = UDim2.new(1, -24, 1, 0), Text = "", TextSize = 13, TextTruncate = Enum.TextTruncate.AtEnd, Parent = box })
+		label({ AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -6, 0, 0), Size = UDim2.fromOffset(12, 20), Text = "v", TextColor3 = UI.roles.Muted, TextXAlignment = Enum.TextXAlignment.Right, Parent = box })
+		return box, value
+	end
+
+	---Pick-one drop-down for lists of option tables ({ ..., name =, current = }).
+	function UI.cycler(page, text, getOptions, getLabel, onPick)
+		local row = UI.rowBase(page, 38, false)
+		label({ Size = UDim2.new(1, 0, 0, 16), Text = text, Parent = row })
+		local box, value = valueBox(row, 18)
+		local function refresh()
+			value.Text = tostring(getLabel())
+		end
+		local list, fill = optionList(row, function(option)
+			onPick(option)
+			refresh()
+		end)
+		box.MouseButton1Click:Connect(function()
+			list.Visible = not list.Visible
+			if list.Visible then
+				local entries = {}
+				for _, option in ipairs(getOptions()) do
+					local name = option.name or option.label or option.id or option.uid or option.slot
+					table.insert(entries, { text = (name == "" or name == nil) and "--" or name, value = option, current = option.current })
+				end
+				fill(entries)
+			end
+		end)
+		table.insert(UI.refreshers, refresh)
+		refresh()
+		return refresh
+	end
+
+	function UI.button(page, text, action)
+		local buttonFrame = create("TextButton", {
+			Size = UDim2.new(1, 0, 0, 22),
+			BackgroundColor3 = UI.roles.Control,
+			BorderSizePixel = 0,
+			FontFace = CODE,
+			Text = text,
+			TextSize = TEXT_SIZE,
+			TextColor3 = UI.roles.Font,
+			AutoButtonColor = false,
+			LayoutOrder = UI.nextOrder(),
+			Parent = slot(page, 22),
+		})
+		local outline = stroke(buttonFrame, "Outline")
+		buttonFrame.MouseEnter:Connect(function()
+			outline.Color = UI.roles.Accent
+		end)
+		buttonFrame.MouseLeave:Connect(function()
+			outline.Color = UI.roles.Outline
+		end)
+		buttonFrame.MouseButton1Click:Connect(function()
+			if not action then
+				return
+			end
+			task.spawn(function()
+				buttonFrame.Text = "..."
+				local ok, message = pcall(action)
+				pcall(function()
+					buttonFrame.Text = (ok and message) and tostring(message) or text
+				end)
+				task.wait(1.5)
+				pcall(function()
+					buttonFrame.Text = text
+				end)
+			end)
+		end)
+		return buttonFrame
+	end
+
+	local SHORT_KEYS = { RightControl = "RCtrl", LeftControl = "LCtrl", RightShift = "RShift", LeftShift = "LShift", RightAlt = "RAlt", LeftAlt = "LAlt", Insert = "Ins", Delete = "Del" }
+	function UI.keybind(page, text, key)
+		local row = UI.rowBase(page, 18, false)
+		label({ Size = UDim2.new(1, -60, 1, 0), Text = text, Parent = row })
+		local box = create("TextButton", {
+			AnchorPoint = Vector2.new(1, 0),
+			Position = UDim2.new(1, 0, 0, 0),
+			Size = UDim2.fromOffset(54, 18),
+			BackgroundColor3 = UI.roles.Control,
+			BorderSizePixel = 0,
+			FontFace = CODE,
+			TextSize = 13,
+			TextColor3 = UI.roles.Font,
+			AutoButtonColor = false,
+			Parent = row,
+		})
+		stroke(box, "Outline")
+		local function refresh()
+			box.Text = SHORT_KEYS[Config[key]] or tostring(Config[key])
+		end
+		box.MouseButton1Click:Connect(function()
+			UI.capturing = true
+			box.Text = "..."
+			local connection
+			connection = userInputService.InputBegan:Connect(function(input)
+				if input.UserInputType ~= Enum.UserInputType.Keyboard then
+					return
+				end
+				connection:Disconnect()
+				if input.KeyCode ~= Enum.KeyCode.Escape then
+					Config[key] = input.KeyCode.Name
+				end
+				refresh()
+				task.defer(function()
+					UI.capturing = false
+				end)
+			end)
+		end)
+		refresh()
+		return row
+	end
+
+	-- Theme registry: every element remembers which theme role each of its colors belongs to
+	-- (decided once, when it is created), so recoloring never confuses two roles that happen to
+	-- share a color. Elements built by the scripts themselves are classified the same way.
+	local PROPERTIES = { "BackgroundColor3", "TextColor3", "Color", "ScrollBarImageColor3", "PlaceholderColor3", "ImageColor3" }
+	local ROLE_ORDER = { "Accent", "Font", "Muted", "Outline", "Control", "Main", "Background" }
+	-- Strong keys on purpose: Instance proxies in a weak table get collected while the
+	-- instance still exists, which silently drops them from the theme.
+	local painted = {}
+	UI.painted = painted
+	local function same(a, b)
+		return math.abs(a.R - b.R) < 0.004 and math.abs(a.G - b.G) < 0.004 and math.abs(a.B - b.B) < 0.004
+	end
+	function UI.classify(object)
+		if painted[object] ~= nil or object:GetAttribute("NoTheme") or (object.Parent and object.Parent:GetAttribute("NoTheme")) then
+			return
+		end
+		local entry = nil
+		for _, property in ipairs(PROPERTIES) do
+			local ok, value = pcall(function()
+				return object[property]
+			end)
+			if ok and typeof(value) == "Color3" then
+				for _, role in ipairs(ROLE_ORDER) do
+					if same(value, UI.roles[role]) then
+						entry = entry or {}
+						entry[property] = role
+						break
+					end
+				end
+			end
+		end
+		painted[object] = entry or false
+	end
+
+	function UI.applyTheme()
+		UI.roles = computeRoles()
+		syncConstants()
+		for object, entry in pairs(painted) do
+			if not object.Parent then
+				painted[object] = nil
+			elseif entry then
+				for property, role in pairs(entry) do
+					pcall(function()
+						object[property] = UI.roles[role]
+					end)
+				end
+			end
+		end
+		for _, refresh in ipairs(UI.refreshers) do
+			pcall(refresh)
+		end
+		for _, refresh in ipairs(UI.colorRefreshers) do
+			pcall(refresh)
+		end
+		if UI.activeTab then
+			UI.selectTab(UI.activeTab)
+		end
+	end
+	UI.colorRefreshers = {}
+
+	-- Color picker: a saturation / brightness square with the hue bar on its right.
+	local picker = {}
+	do
+		local frame = create("Frame", {
+			Name = "PotentPicker",
+			Size = UDim2.fromOffset(222, 206),
+			BackgroundColor3 = UI.roles.Background,
+			BorderSizePixel = 0,
+			Visible = false,
+			ZIndex = 50,
+			Parent = screenGui,
+		})
+		create("UIStroke", { Color = UI.roles.Outline, Parent = frame })
+		local title = label({ Position = UDim2.fromOffset(8, 4), Size = UDim2.new(1, -16, 0, 16), Text = "", ZIndex = 51, Parent = frame })
+		local square = create("TextButton", {
+			Position = UDim2.fromOffset(8, 24),
+			Size = UDim2.fromOffset(178, 150),
+			BorderSizePixel = 0,
+			Text = "",
+			AutoButtonColor = false,
+			ZIndex = 51,
+			Parent = frame,
+		})
+		create("UICorner", { CornerRadius = UDim.new(0, 4), Parent = square })
+		local white = create("Frame", { Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0, ZIndex = 52, Parent = square }, {
+			create("UICorner", { CornerRadius = UDim.new(0, 4) }),
+			create("UIGradient", { Transparency = NumberSequence.new(0, 1) }),
+		})
+		create("Frame", { Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.new(0, 0, 0), BorderSizePixel = 0, ZIndex = 53, Parent = square }, {
+			create("UICorner", { CornerRadius = UDim.new(0, 4) }),
+			create("UIGradient", { Rotation = 90, Transparency = NumberSequence.new(1, 0) }),
+		})
+		local dot = create("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Size = UDim2.fromOffset(12, 12),
+			BackgroundColor3 = Color3.new(1, 1, 1),
+			BorderSizePixel = 0,
+			ZIndex = 55,
+			Parent = square,
+		}, { create("UICorner", { CornerRadius = UDim.new(1, 0) }), create("UIStroke", { Color = Color3.new(1, 1, 1), Thickness = 2 }) })
+		local hueKeys = {}
+		for i = 0, 6 do
+			table.insert(hueKeys, ColorSequenceKeypoint.new(i / 6, Color3.fromHSV(i / 6 % 1, 1, 1)))
+		end
+		local hueBar = create("TextButton", {
+			Position = UDim2.fromOffset(196, 24),
+			Size = UDim2.fromOffset(16, 150),
+			BackgroundColor3 = Color3.new(1, 1, 1),
+			BorderSizePixel = 0,
+			Text = "",
+			AutoButtonColor = false,
+			ZIndex = 51,
+			Parent = frame,
+		}, { create("UICorner", { CornerRadius = UDim.new(0, 8) }), create("UIGradient", { Rotation = 90, Color = ColorSequence.new(hueKeys) }) })
+		local hueKnob = create("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromScale(0.5, 0),
+			Size = UDim2.fromOffset(14, 14),
+			BorderSizePixel = 0,
+			ZIndex = 55,
+			Parent = hueBar,
+		}, { create("UICorner", { CornerRadius = UDim.new(1, 0) }), create("UIStroke", { Color = Color3.new(1, 1, 1), Thickness = 2 }) })
+		local preview = create("Frame", { Position = UDim2.fromOffset(8, 182), Size = UDim2.fromOffset(20, 16), BorderSizePixel = 0, ZIndex = 51, Parent = frame })
+		create("UIStroke", { Color = UI.roles.Outline, Parent = preview })
+		local hexBox = create("TextBox", {
+			Position = UDim2.fromOffset(34, 182),
+			Size = UDim2.fromOffset(90, 16),
+			BackgroundColor3 = UI.roles.Control,
+			BorderSizePixel = 0,
+			FontFace = CODE,
+			TextSize = 13,
+			TextColor3 = UI.roles.Font,
+			Text = "",
+			ClearTextOnFocus = false,
+			ZIndex = 51,
+			Parent = frame,
+		})
+		create("UIStroke", { Color = UI.roles.Outline, Parent = hexBox })
+		local done = create("TextButton", {
+			Position = UDim2.fromOffset(132, 182),
+			Size = UDim2.fromOffset(80, 16),
+			BackgroundColor3 = UI.roles.Control,
+			BorderSizePixel = 0,
+			FontFace = CODE,
+			TextSize = 13,
+			TextColor3 = UI.roles.Font,
+			Text = "Done",
+			AutoButtonColor = false,
+			ZIndex = 51,
+			Parent = frame,
+		})
+		create("UIStroke", { Color = UI.roles.Outline, Parent = done })
+		picker.frame = frame
+		for _, object in ipairs({ square, white, dot, hueBar, hueKnob, preview }) do
+			object:SetAttribute("NoTheme", true)
+		end
+		for _, object in ipairs(square:GetChildren()) do
+			object:SetAttribute("NoTheme", true)
+		end
+
+		local h, s, v, key, anchor = 0, 0, 1, nil, nil
+		local function show()
+			local color = Color3.fromHSV(h, s, v)
+			square.BackgroundColor3 = Color3.fromHSV(h, 1, 1)
+			dot.Position = UDim2.fromScale(s, 1 - v)
+			dot.BackgroundColor3 = color
+			hueKnob.Position = UDim2.fromScale(0.5, h)
+			hueKnob.BackgroundColor3 = Color3.fromHSV(h, 1, 1)
+			preview.BackgroundColor3 = color
+			if not hexBox:IsFocused() then
+				hexBox.Text = "#" .. color:ToHex():upper()
+			end
+		end
+		local function commit()
+			if key then
+				Config[key] = Color3.fromHSV(h, s, v):ToHex():upper()
+				Config.UseDefaultTheme = false
+				UI.applyTheme()
+			end
+			show()
+		end
+		local dragging = nil
+		local function update(position)
+			if dragging == "square" then
+				s = math.clamp((position.X - square.AbsolutePosition.X) / square.AbsoluteSize.X, 0, 1)
+				v = 1 - math.clamp((position.Y - square.AbsolutePosition.Y) / square.AbsoluteSize.Y, 0, 1)
+			elseif dragging == "hue" then
+				h = math.clamp((position.Y - hueBar.AbsolutePosition.Y) / hueBar.AbsoluteSize.Y, 0, 0.999)
+			end
+			commit()
+		end
+		for target, name in pairs({ [square] = "square", [hueBar] = "hue" }) do
+			target.InputBegan:Connect(function(input)
+				if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+					dragging = name
+					update(input.Position)
+				end
+			end)
+		end
+		table.insert(BeyRivals.connections, userInputService.InputChanged:Connect(function(input)
+			if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+				update(input.Position)
+			end
+		end))
+		table.insert(BeyRivals.connections, userInputService.InputEnded:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+				dragging = nil
+			end
+		end))
+		-- Close when clicking anywhere outside the picker (or on Done).
+		table.insert(BeyRivals.connections, userInputService.InputBegan:Connect(function(input)
+			if frame.Visible and input.UserInputType == Enum.UserInputType.MouseButton1 then
+				local p, a, z = input.Position, frame.AbsolutePosition, frame.AbsoluteSize
+				local inside = p.X >= a.X and p.X <= a.X + z.X and p.Y >= a.Y and p.Y <= a.Y + z.Y
+				local onAnchor = false
+				if anchor then
+					local b, w = anchor.AbsolutePosition, anchor.AbsoluteSize
+					onAnchor = p.X >= b.X and p.X <= b.X + w.X and p.Y >= b.Y and p.Y <= b.Y + w.Y
+				end
+				if not inside and not onAnchor then
+					frame.Visible = false
+				end
+			end
+		end))
+		done.MouseButton1Click:Connect(function()
+			frame.Visible = false
+		end)
+		hexBox.FocusLost:Connect(function()
+			local ok, color = pcall(Color3.fromHex, (hexBox.Text:gsub("#", "")))
+			if ok then
+				h, s, v = color:ToHSV()
+				commit()
+			else
+				show()
+			end
+		end)
+
+		function picker.open(forKey, text, swatch)
+			if frame.Visible and key == forKey then
+				frame.Visible = false
+				return
+			end
+			key, anchor = forKey, swatch
+			local ok, color = pcall(Color3.fromHex, Config[forKey])
+			h, s, v = (ok and color or Color3.new(1, 1, 1)):ToHSV()
+			title.Text = text
+			-- Beside the window (right side if there's room, else left), level with the swatch.
+			local at = swatch.AbsolutePosition
+			local viewport = screenGui.AbsoluteSize
+			local left, width = panel.AbsolutePosition.X, panel.AbsoluteSize.X
+			local x = left + width + 6
+			if x + 222 > viewport.X then
+				x = left - 228
+			end
+			x = math.clamp(x, 0, math.max(viewport.X - 222, 0))
+			local y = math.clamp(at.Y - 90, 0, math.max(viewport.Y - 206, 0))
+			frame.Position = UDim2.fromOffset(x, y)
+			frame.BackgroundColor3, title.TextColor3 = UI.roles.Background, UI.roles.Font
+			frame.Visible = true
+			show()
+		end
+	end
+
+	---Theme color row: the swatch opens the color picker.
+	function UI.colorRow(page, text, key)
+		local row = UI.rowBase(page, 18, true)
+		label({ Size = UDim2.new(1, -44, 1, 0), Text = text, Parent = row })
+		local swatch = create("Frame", {
+			AnchorPoint = Vector2.new(1, 0),
+			Position = UDim2.new(1, 0, 0, 2),
+			Size = UDim2.fromOffset(36, 14),
+			BorderSizePixel = 0,
+			Parent = row,
+		})
+		swatch:SetAttribute("NoTheme", true)
+		stroke(swatch, "Outline")
+		local function refresh()
+			local ok, color = pcall(Color3.fromHex, Config[key])
+			swatch.BackgroundColor3 = ok and color or Color3.new(1, 1, 1)
+		end
+		row.MouseButton1Click:Connect(function()
+			picker.open(key, text, swatch)
+		end)
+		table.insert(UI.colorRefreshers, refresh)
+		refresh()
+		return row
+	end
+
+	---Drop-down over plain string options.
+	function UI.dropdown(page, text, getOptions, getValue, onPick)
+		local row = UI.rowBase(page, 38, false)
+		label({ Size = UDim2.new(1, 0, 0, 16), Text = text, Parent = row })
+		local box, value = valueBox(row, 18)
+		local function refresh()
+			value.Text = tostring(getValue() or "--")
+		end
+		local list, fill = optionList(row, function(option)
+			onPick(option)
+			refresh()
+		end)
+		box.MouseButton1Click:Connect(function()
+			list.Visible = not list.Visible
+			if list.Visible then
+				local entries = {}
+				for _, option in ipairs(getOptions()) do
+					table.insert(entries, { text = option, value = option, current = option == getValue() })
+				end
+				fill(entries)
+			end
+		end)
+		table.insert(UI.refreshers, refresh)
+		refresh()
+		return refresh
+	end
+
+	function UI.textbox(page, text, placeholder)
+		local row = UI.rowBase(page, 38, false)
+		label({ Size = UDim2.new(1, 0, 0, 16), Text = text, Parent = row })
+		local box = create("TextBox", {
+			Position = UDim2.fromOffset(0, 18),
+			Size = UDim2.new(1, 0, 0, 20),
+			BackgroundColor3 = UI.roles.Control,
+			BorderSizePixel = 0,
+			FontFace = CODE,
+			TextSize = 13,
+			TextColor3 = UI.roles.Font,
+			PlaceholderText = placeholder or "",
+			PlaceholderColor3 = UI.roles.Muted,
+			Text = "",
+			ClearTextOnFocus = false,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			Parent = row,
+		}, { create("UIPadding", { PaddingLeft = UDim.new(0, 6) }) })
+		stroke(box, "Outline")
+		return box
+	end
+
+	---Two buttons side by side in one row.
+	function UI.buttonPair(page, leftText, leftAction, rightText, rightAction)
+		local row = UI.rowBase(page, 22, false)
+		local function half(text, action, x)
+			local half = create("TextButton", {
+				Position = UDim2.new(x, x > 0 and 2 or 0, 0, 0),
+				Size = UDim2.new(0.5, -2, 1, 0),
+				BackgroundColor3 = UI.roles.Control,
+				BorderSizePixel = 0,
+				FontFace = CODE,
+				Text = text,
+				TextSize = TEXT_SIZE,
+				TextColor3 = UI.roles.Font,
+				AutoButtonColor = false,
+				Parent = row,
+			})
+			local outline = stroke(half, "Outline")
+			half.MouseEnter:Connect(function()
+				outline.Color = UI.roles.Accent
+			end)
+			half.MouseLeave:Connect(function()
+				outline.Color = UI.roles.Outline
+			end)
+			half.MouseButton1Click:Connect(function()
+				task.spawn(function()
+					local ok, message = pcall(action)
+					half.Text = (ok and message) and tostring(message) or text
+					task.wait(1.5)
+					half.Text = text
+				end)
+			end)
+		end
+		half(leftText, leftAction, 0)
+		half(rightText, rightAction, 0.5)
+		return row
+	end
+
+	-- Themes: built-in presets, your own saved themes (shared by every Potent script), and a
+	-- default theme every script starts with.
+	local THEME_FOLDER = "PotentHub/themes"
+	local DEFAULT_FILE = "PotentHub/default_theme.json"
+	UI.PRESETS = {
+		{ "Potent", "111111", "1A1A1A", "96D9CF", "2E2E2E", "EBEBEB" },
+		{ "Crimson", "0A0707", "130E0F", "E2323C", "3B1A1D", "F4E9E9" },
+		{ "Mint", "0D1210", "141B18", "4FE0A0", "26332E", "E6F2EC" },
+		{ "Ocean", "0B0F16", "121823", "4A8CFF", "22304A", "E4EAF5" },
+		{ "Amethyst", "0F0D14", "18141F", "A57BF7", "30283F", "ECE6F5" },
+		{ "Gold", "110F0B", "1A1712", "E8AE3C", "3A3226", "F2EDE4" },
+		{ "Steel", "141D24", "1A2731", "F2B33D", "2F4757", "E9EEF0" },
+		{ "Mono", "0E0E0E", "171717", "F0F0F0", "2F2F2F", "D8D8D8" },
+	}
+	local function currentTheme()
+		local theme = {}
+		for _, entry in ipairs(THEME) do
+			theme[entry.key] = Config[entry.key]
+		end
+		return theme
+	end
+	local function useTheme(theme)
+		for _, entry in ipairs(THEME) do
+			local value = theme[entry.key]
+			if type(value) == "string" and pcall(Color3.fromHex, value) then
+				Config[entry.key] = value:upper()
+			end
+		end
+		UI.applyTheme()
+	end
+	UI.useTheme = useTheme
+	local function ensureFolder()
+		pcall(function()
+			if not isfolder("PotentHub") then
+				makefolder("PotentHub")
+			end
+			if not isfolder(THEME_FOLDER) then
+				makefolder(THEME_FOLDER)
+			end
+		end)
+	end
+	local function customThemes()
+		local names = {}
+		pcall(function()
+			for _, path in ipairs(listfiles(THEME_FOLDER)) do
+				local name = tostring(path):match("([^/\\]+)%.json$")
+				if name then
+					table.insert(names, name)
+				end
+			end
+		end)
+		table.sort(names)
+		return names
+	end
+	function UI.themeSection(page)
+		UI.heading(page, "Themes", "left")
+		UI.colorRow(page, "Background color", "ThemeBackground")
+		UI.colorRow(page, "Main color", "ThemeMain")
+		UI.colorRow(page, "Accent color", "ThemeAccent")
+		UI.colorRow(page, "Outline color", "ThemeOutline")
+		UI.colorRow(page, "Font color", "ThemeFont")
+		UI.dropdown(page, "Theme list", function()
+			local names = {}
+			for _, preset in ipairs(UI.PRESETS) do
+				table.insert(names, preset[1])
+			end
+			return names
+		end, function()
+			return Config.ThemeName ~= "" and Config.ThemeName or "--"
+		end, function(name)
+			for _, preset in ipairs(UI.PRESETS) do
+				if preset[1] == name then
+					Config.ThemeName = name
+					Config.UseDefaultTheme = false
+					useTheme({ ThemeBackground = preset[2], ThemeMain = preset[3], ThemeAccent = preset[4], ThemeOutline = preset[5], ThemeFont = preset[6] })
+				end
+			end
+		end)
+		UI.button(page, "Set as default", function()
+			ensureFolder()
+			writefile(DEFAULT_FILE, httpService:JSONEncode(currentTheme()))
+			Config.UseDefaultTheme = true
+			return "Default for every script"
+		end)
+		local nameBox = UI.textbox(page, "Custom theme name", "Type a name")
+		local selected = nil
+		local refreshCustom = UI.dropdown(page, "Custom themes", customThemes, function()
+			return selected or "--"
+		end, function(name)
+			selected = name
+			nameBox.Text = name
+		end)
+		UI.buttonPair(page, "Save theme", function()
+			local name = (nameBox.Text:gsub("[^%w%s%-_]", "")):sub(1, 30)
+			if name == "" then
+				return "Name it first"
+			end
+			ensureFolder()
+			writefile(THEME_FOLDER .. "/" .. name .. ".json", httpService:JSONEncode(currentTheme()))
+			selected = name
+			refreshCustom()
+			return "Saved"
+		end, "Load theme", function()
+			local name = selected or nameBox.Text
+			local path = THEME_FOLDER .. "/" .. name .. ".json"
+			if name == "" or not isfile(path) then
+				return "Pick a theme"
+			end
+			Config.ThemeName = name
+			Config.UseDefaultTheme = false
+			useTheme(httpService:JSONDecode(readfile(path)))
+			return "Loaded"
+		end)
+		UI.button(page, "Refresh list", function()
+			refreshCustom()
+			return "Refreshed"
+		end)
+		UI.button(page, "Reset theme", function()
+			Config.ThemeName = "Potent"
+			Config.UseDefaultTheme = false
+			local preset = UI.PRESETS[1]
+			useTheme({ ThemeBackground = preset[2], ThemeMain = preset[3], ThemeAccent = preset[4], ThemeOutline = preset[5], ThemeFont = preset[6] })
+			return "Reset"
+		end)
+	end
+
+	-- (Own function scope: the scripts sit close to Luau's 200-local limit.)
+	;(function()
+	-- My songs: your own files in Potent/music/<Playlist>/ (shared by every Potent script).
+	-- One player for every game: playlist filter, search, shuffle, and the playing song lit up.
+	local MUSIC_ROOT = "Potent/music"
+	local Player = { queue = {}, index = 0, rows = {}, cache = {} }
+	UI.player = Player
+
+	local function fileName(path)
+		return tostring(path):match("([^/\\]+)$") or tostring(path)
+	end
+
+	function Player.playlists()
+		local names = {}
+		pcall(function()
+			if not isfolder(MUSIC_ROOT) then
+				makefolder(MUSIC_ROOT)
+			end
+			for _, path in ipairs(listfiles(MUSIC_ROOT)) do
+				if isfolder(path) then
+					table.insert(names, fileName(path))
+				end
+			end
+		end)
+		table.sort(names)
+		return names
+	end
+
+	---Songs in one playlist (or "All", duplicates dropped). "Artist - Title.mp3" splits into both.
+	function Player.songs(playlist, refresh)
+		if playlist ~= "All" and Player.cache[playlist] and not refresh then
+			return Player.cache[playlist]
+		end
+		if playlist == "All" then
+			local list, seen = {}, {}
+			for _, name in ipairs(Player.playlists()) do
+				for _, song in ipairs(Player.songs(name, refresh)) do
+					local key = (song.artist .. "|" .. song.title):lower()
+					if not seen[key] then
+						seen[key] = true
+						table.insert(list, song)
+					end
+				end
+			end
+			table.sort(list, function(a, b)
+				return a.label:lower() < b.label:lower()
+			end)
+			return list
+		end
+		local list = {}
+		pcall(function()
+			for _, path in ipairs(listfiles(MUSIC_ROOT .. "/" .. playlist)) do
+				local file = fileName(path)
+				local base, ext = file:match("^(.+)%.(%w+)$")
+				ext = ext and ext:lower()
+				if base and (ext == "mp3" or ext == "ogg" or ext == "wav" or ext == "flac") then
+					local artist, title = base:match("^(.-) %- (.+)$")
+					table.insert(list, {
+						path = MUSIC_ROOT .. "/" .. playlist .. "/" .. file,
+						title = title or base,
+						artist = artist or "",
+						playlist = playlist,
+						label = title and (title .. "  -  " .. artist) or base,
+					})
+				end
+			end
+		end)
+		table.sort(list, function(a, b)
+			return a.label:lower() < b.label:lower()
+		end)
+		Player.cache[playlist] = list
+		return list
+	end
+
+	---What the list shows: the picked playlist, narrowed by the search text.
+	function Player.visible()
+		local list = Player.songs(Config.MyMusicPlaylist or "All")
+		local query = (Player.query or ""):lower()
+		if query == "" then
+			return list
+		end
+		local found = {}
+		for _, song in ipairs(list) do
+			if song.label:lower():find(query, 1, true) then
+				table.insert(found, song)
+			end
+		end
+		return found
+	end
+
+	local function shuffled(list, first)
+		local copy = table.clone(list)
+		for i = #copy, 2, -1 do
+			local j = math.random(i)
+			copy[i], copy[j] = copy[j], copy[i]
+		end
+		if first then
+			for i, song in ipairs(copy) do
+				if song.path == first.path then
+					table.remove(copy, i)
+					break
+				end
+			end
+			table.insert(copy, 1, first)
+		end
+		return copy
+	end
+
+	local function soundObject()
+		if not (Player.sound and Player.sound.Parent) then
+			Player.sound = create("Sound", { Name = "PotentMyMusic", Looped = false, Parent = game:GetService("SoundService") })
+			Player.sound.Ended:Connect(function()
+				task.defer(Player.next, 1)
+			end)
+		end
+		return Player.sound
+	end
+
+	function Player.play(song)
+		if not song then
+			return
+		end
+		local ok, asset = pcall(getcustomasset, song.path)
+		if not ok then
+			Player.status = "Can't open " .. song.title
+			return
+		end
+		local sound = soundObject()
+		Player.current = song
+		Player.paused = false
+		sound.SoundId = asset
+		sound.Volume = (Config.MyMusicVolume or 50) / 100
+		sound.TimePosition = 0
+		sound:Play()
+		Player.startedAt = os.clock()
+		Player.highlight()
+	end
+
+	---Start a queue from a list; with shuffle on it's shuffled (the clicked song still plays first).
+	function Player.start(list, song)
+		if #list == 0 then
+			return
+		end
+		if Config.MyMusicShuffle then
+			Player.queue = shuffled(list, song)
+			Player.index = 1
+		else
+			Player.queue, Player.index = list, 1
+			for i, entry in ipairs(list) do
+				if song and entry.path == song.path then
+					Player.index = i
+				end
+			end
+		end
+		Config.MyMusicOn = true
+		Player.play(Player.queue[Player.index])
+	end
+
+	function Player.next(step)
+		if not Config.MyMusicOn then
+			return
+		end
+		if #Player.queue == 0 then
+			Player.start(Player.visible())
+			return
+		end
+		Player.index = (Player.index - 1 + (step or 1)) % #Player.queue + 1
+		if Player.index == 1 and (step or 1) > 0 and Config.MyMusicShuffle then
+			Player.queue = shuffled(Player.queue)
+		end
+		Player.play(Player.queue[Player.index])
+	end
+
+	function Player.togglePause()
+		local sound = Player.sound
+		if not (sound and Player.current) then
+			Player.start(Player.visible())
+			return "Playing"
+		end
+		if Player.paused then
+			sound:Resume()
+			Player.paused = false
+			return "Playing"
+		end
+		sound:Pause()
+		Player.paused = true
+		return "Paused"
+	end
+
+	function Player.stop()
+		if Player.sound then
+			Player.sound:Stop()
+		end
+		Player.current, Player.paused = nil, false
+		Player.highlight()
+	end
+
+	---Quiet the game's own long tracks while your song plays (effects stay).
+	-- Quiet the game's own long tracks while our music plays (effects stay). Lobby/map music
+	-- scripts fade their volume back up, so each muted track is held at 0 by a Volume watcher
+	-- (the game's latest volume is kept for when it's given back). One muter per music engine.
+	function UI.makeMuter()
+		local muted, groupVolume, scanAt = {}, nil, 0
+		local function check(sound)
+			if sound:IsA("Sound") and sound.Name ~= "PotentMusic" and sound.Name ~= "PotentMyMusic"
+				and sound.TimeLength > 40 and not muted[sound] and (sound.IsPlaying or sound.Volume > 0) then
+				local record = { volume = sound.Volume }
+				record.connection = sound:GetPropertyChangedSignal("Volume"):Connect(function()
+					if sound.Volume > 0 then
+						record.volume = sound.Volume
+						sound.Volume = 0
+					end
+				end)
+				muted[sound] = record
+				sound.Volume = 0
+			end
+		end
+		return function(mute)
+			local group = game:GetService("SoundService"):FindFirstChild("Music")
+			group = group and group:IsA("SoundGroup") and group or nil
+			if not mute then
+				for sound, record in pairs(muted) do
+					record.connection:Disconnect()
+					pcall(function()
+						sound.Volume = record.volume
+					end)
+				end
+				table.clear(muted)
+				if group and groupVolume then
+					group.Volume = groupVolume
+				end
+				groupVolume, scanAt = nil, 0
+				return
+			end
+			if group then
+				groupVolume = groupVolume or group.Volume
+				group.Volume = 0
+			end
+			if os.clock() - scanAt < 3 then
+				return
+			end
+			scanAt = os.clock()
+			for _, sound in ipairs(game:GetService("SoundService"):GetDescendants()) do
+				check(sound)
+			end
+			for _, child in ipairs(workspace:GetChildren()) do
+				if child:IsA("Sound") then
+					check(child)
+				elseif child:IsA("Folder") or child:IsA("Configuration") then
+					for _, sound in ipairs(child:GetDescendants()) do
+						check(sound)
+					end
+				end
+			end
+			local playerGui = localPlayer:FindFirstChildOfClass("PlayerGui")
+			for _, sound in ipairs(playerGui and playerGui:GetDescendants() or {}) do
+				check(sound)
+			end
+			for sound, record in pairs(muted) do
+				if not sound.Parent then
+					record.connection:Disconnect()
+					muted[sound] = nil
+				end
+			end
+		end
+	end
+	Player.muteGame = UI.makeMuter()
+
+	local function clock(seconds)
+		seconds = math.max(0, math.floor(seconds or 0))
+		return string.format("%d:%02d", seconds // 60, seconds % 60)
+	end
+
+	-- The playing song's row: accent bar on the left, accent text, "> " in front.
+	function Player.highlight()
+		for _, row in ipairs(Player.rows) do
+			local playing = Player.current ~= nil and row.song.path == Player.current.path
+			row.button.BackgroundColor3 = playing and UI.roles.Accent or UI.roles.Main
+			row.button.BackgroundTransparency = playing and 0.82 or 1
+			row.button.TextColor3 = playing and UI.roles.Accent or UI.roles.Font
+			row.button.Text = (playing and (Player.paused and "  || " or "  > ") or "    ") .. row.song.label
+			row.bar.Visible = playing
+			row.bar.BackgroundColor3 = UI.roles.Accent
+		end
+	end
+	table.insert(UI.colorRefreshers, function()
+		Player.highlight()
+	end)
+
+	function UI.musicSection(page)
+		UI.heading(page, "My songs", "left")
+		UI.toggle(page, "Play my songs", "MyMusicOn")
+		UI.toggle(page, "Shuffle", "MyMusicShuffle")
+		UI.toggle(page, "Mute the game's music", "MyMusicMuteGame")
+		UI.slider(page, "Volume", "MyMusicVolume", 0, 100, 5, function(v)
+			return v .. "%"
+		end)
+		local nowLine = UI.infoLine(page, 32)
+		nowLine.TextTruncate = Enum.TextTruncate.AtEnd
+		UI.buttonPair(page, "Prev", function()
+			Player.next(-1)
+		end, "Next", function()
+			Player.next(1)
+		end)
+		UI.buttonPair(page, "Shuffle play", function()
+			Config.MyMusicShuffle = true
+			for _, refresh in ipairs(UI.refreshers) do
+				pcall(refresh)
+			end
+			Player.start(Player.visible())
+			return "Shuffled"
+		end, "Pause / play", function()
+			return Player.togglePause()
+		end)
+		UI.button(page, "Play in order", function()
+			local was = Config.MyMusicShuffle
+			Config.MyMusicShuffle = false
+			Player.start(Player.visible())
+			Config.MyMusicShuffle = was
+			return "Playing"
+		end)
+		UI.hint(page, "Add songs: put files in workspace/" .. MUSIC_ROOT .. "/<Playlist>/, then Rescan.")
+
+		UI.heading(page, "Playlist", "right")
+		local fillList
+		UI.dropdown(page, "Playlist", function()
+			local options = { "All" }
+			for _, name in ipairs(Player.playlists()) do
+				table.insert(options, name)
+			end
+			return options
+		end, function()
+			return Config.MyMusicPlaylist
+		end, function(name)
+			Config.MyMusicPlaylist = name
+			fillList()
+		end)
+		local search = UI.textbox(page, "Search", "Song or artist")
+		search:GetPropertyChangedSignal("Text"):Connect(function()
+			Player.query = search.Text
+			fillList()
+		end)
+		local countLine = UI.infoLine(page, 16)
+		countLine.TextColor3 = UI.roles.Muted
+		local scroller = create("ScrollingFrame", {
+			Size = UDim2.new(1, 0, 0, 300),
+			BackgroundColor3 = UI.roles.Background,
+			BorderSizePixel = 0,
+			ScrollBarThickness = 3,
+			ScrollBarImageColor3 = UI.roles.Outline,
+			CanvasSize = UDim2.new(),
+			AutomaticCanvasSize = Enum.AutomaticSize.Y,
+			LayoutOrder = UI.nextOrder(),
+			Parent = slot(page, 300),
+		}, { create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder }) })
+		stroke(scroller, "Outline")
+		UI.button(page, "Rescan files", function()
+			table.clear(Player.cache)
+			fillList()
+			return #Player.visible() .. " songs"
+		end)
+
+		fillList = function()
+			for _, row in ipairs(Player.rows) do
+				row.button:Destroy()
+			end
+			table.clear(Player.rows)
+			local list = Player.visible()
+			countLine.Text = #list .. " songs" .. ((Config.MyMusicPlaylist or "All") ~= "All" and ("  |  " .. Config.MyMusicPlaylist) or "")
+			for index, song in ipairs(list) do
+				local button = create("TextButton", {
+					Size = UDim2.new(1, -4, 0, 20),
+					BackgroundColor3 = UI.roles.Main,
+					BackgroundTransparency = 1,
+					BorderSizePixel = 0,
+					FontFace = CODE,
+					Text = "    " .. song.label,
+					TextSize = 13,
+					TextColor3 = UI.roles.Font,
+					TextXAlignment = Enum.TextXAlignment.Left,
+					TextTruncate = Enum.TextTruncate.AtEnd,
+					AutoButtonColor = false,
+					LayoutOrder = index,
+					Parent = scroller,
+				})
+				button:SetAttribute("NoTheme", true)
+				local bar = create("Frame", { Size = UDim2.new(0, 2, 1, 0), BackgroundColor3 = UI.roles.Accent, BorderSizePixel = 0, Visible = false, Parent = button })
+				bar:SetAttribute("NoTheme", true)
+				local row = { button = button, bar = bar, song = song }
+				button.MouseEnter:Connect(function()
+					if not (Player.current and Player.current.path == song.path) then
+						button.BackgroundTransparency = 0.6
+					end
+				end)
+				button.MouseLeave:Connect(function()
+					Player.highlight()
+				end)
+				button.MouseButton1Click:Connect(function()
+					Player.start(Player.visible(), song)
+					for _, refresh in ipairs(UI.refreshers) do
+						pcall(refresh)
+					end
+				end)
+				table.insert(Player.rows, row)
+			end
+			Player.highlight()
+		end
+		task.defer(fillList)
+
+		-- Player loop: next song at the end, skip files that won't load, keep the game's music
+		-- quiet, and give way to the script's own music mode (if it has one).
+		task.spawn(function()
+			local wasOn, otherWas = false, Config.MusicOn
+			-- The window is parented at the end of finish(); wait for it before watching it.
+			local waited = os.clock()
+			while not screenGui.Parent and os.clock() - waited < 15 do
+				task.wait(0.2)
+			end
+			while screenGui.Parent do
+				pcall(function()
+					if Config.MusicOn ~= nil and Config.MusicOn ~= otherWas then
+						otherWas = Config.MusicOn
+						if Config.MusicOn and Config.MyMusicOn then
+							Config.MyMusicOn = false
+							for _, refresh in ipairs(UI.refreshers) do
+								pcall(refresh)
+							end
+						end
+					end
+					if Config.MyMusicOn and not wasOn and Config.MusicOn then
+						Config.MusicOn, otherWas = false, false
+						for _, refresh in ipairs(UI.refreshers) do
+							pcall(refresh)
+						end
+					end
+					local sound = Player.sound
+					if Config.MyMusicOn then
+						if not wasOn then
+							wasOn = true
+							if not Player.current then
+								Player.start(Player.visible())
+							elseif sound and Player.paused == false then
+								sound:Resume()
+							end
+						end
+						if sound then
+							sound.Volume = (Config.MyMusicVolume or 50) / 100
+							if not Player.paused and not sound.IsLoaded and os.clock() - (Player.startedAt or 0) > 12 then
+								Player.next(1)
+							elseif not Player.paused and sound.IsLoaded and not sound.IsPlaying and os.clock() - (Player.startedAt or 0) > 3 then
+								Player.next(1)
+							end
+						end
+						Player.muteGame(Config.MyMusicMuteGame and sound ~= nil and sound.IsPlaying)
+						local current = Player.current
+						if current and sound then
+							nowLine.Text = (Player.paused and "Paused: " or "Now: ") .. current.title .. (current.artist ~= "" and (" - " .. current.artist) or "") .. "\n" .. clock(sound.TimePosition) .. " / " .. clock(sound.TimeLength) .. "   " .. current.playlist .. ((Config.MyMusicShuffle and "   shuffle") or "")
+						else
+							nowLine.Text = Player.status or "No songs found"
+						end
+					else
+						if wasOn then
+							wasOn = false
+							if sound then
+								sound:Pause()
+							end
+							Player.muteGame(false)
+							Player.highlight()
+						end
+						nowLine.Text = Player.current and ("Off  (last: " .. Player.current.title .. ")") or "Off"
+					end
+				end)
+				task.wait(0.5)
+			end
+			Player.muteGame(false)
+			if Player.sound then
+				Player.sound:Destroy()
+			end
+		end)
+	end
+	end)()
+
+	---Last step of every script: Misc tab settings, tabs, menu key, anti-AFK, hide on execute.
+	function UI.finish(firstTab)
+		UI.musicSection(pages.Music or UI.makePage("Music"))
+		local page = pages.Misc or UI.makePage("Misc")
+		UI.heading(page, "Menu", "right")
+		UI.current[page].body.Parent.LayoutOrder = -100 -- top of the right column
+		UI.toggle(page, "Anti-AFK", "AntiAfk")
+		UI.keybind(page, "Menu bind", "MenuKey")
+		UI.toggle(page, "Hide UI when executed", "HideOnExecute")
+		UI.toggle(page, "Mute notifications", "MuteNotifications")
+		local unload = UI.button(page, "Unload", nil)
+		UI.themeSection(page)
+		-- Misc goes last.
+		for index, name in ipairs(UI.order) do
+			if name == "Misc" then
+				table.remove(UI.order, index)
+				break
+			end
+		end
+		table.insert(UI.order, "Misc")
+		-- Fixed order: each tab's LayoutOrder is its place in the list (ties let the layout shuffle them).
+		for index, name in ipairs(UI.order) do
+			UI.makeTab(name, index)
+		end
+
+		screenGui.Parent = guiParent
+		for _, object in ipairs(screenGui:GetDescendants()) do
+			pcall(UI.fitText, object)
+			pcall(UI.classify, object)
+		end
+		UI.selectTab(firstTab or UI.order[1])
+		panel.Visible = not Config.HideOnExecute
+
+		table.insert(BeyRivals.connections, userInputService.InputBegan:Connect(function(input)
+			if UI.capturing or userInputService:GetFocusedTextBox() then
+				return
+			end
+			if input.KeyCode.Name == Config.MenuKey then
+				panel.Visible = not panel.Visible
+			end
+		end))
+		table.insert(BeyRivals.connections, localPlayer.Idled:Connect(function()
+			if Config.AntiAfk then
+				local virtualUser = game:GetService("VirtualUser")
+				virtualUser:CaptureController()
+				virtualUser:ClickButton2(Vector2.new())
+			end
+		end))
+		if Config.HideOnExecute and not Config.MuteNotifications then
+			pcall(function()
+				game:GetService("StarterGui"):SetCore("SendNotification", {
+					Title = "Potent Hub",
+					Text = "Bey Rivals loaded. " .. tostring(Config.MenuKey) .. " opens the menu.",
+					Duration = 5,
+				})
+			end)
+		end
+		return unload
+	end
 end
+
+local create, statusLabel, panel, nextOrder, makePage, rowBase, rowLabel, heading, toggle, slider, segmented, hint, cycler, button = UI.create, UI.statusLabel, UI.panel, UI.nextOrder, UI.makePage, UI.rowBase, UI.rowLabel, UI.heading, UI.toggle, UI.slider, UI.segmented, UI.hint, UI.cycler, UI.button
+local mark = UI.mark
+local beyMark = UI.mark
 
 -- Battle page.
 local battlePage = makePage("Battle")
@@ -3520,6 +5210,7 @@ segmented(battlePage, "Play style", "PlayStyle", { "Auto", "Attack", "Balance", 
 toggle(battlePage, "No ability starts on the rim next to a pocket", "RimAbilityGuard")
 toggle(battlePage, "Vs Spriggan: don't attack into its ready guard", "LongGuardVeto")
 toggle(battlePage, "Guard incoming rushes (physics check vs players)", "RushGuard")
+toggle(battlePage, "No counter-attack near burst into a ready guard", "SafeCounter")
 slider(battlePage, "Deep search time per frame", "DeepMs", 2, 10, 1, function(v) return v .. " ms" end)
 toggle(battlePage, "Brace for hits at the rim", "RimBrace")
 toggle(battlePage, "Dodge rival abilities (sweeps, AoE, waves)", "SweepDodge")
@@ -3535,6 +5226,11 @@ hint(battlePage, "Higher presses the rival and pushes them to the rim harder")
 heading(battlePage, "Next battle")
 toggle(battlePage, "Auto queue after each battle", "AutoQueue")
 segmented(battlePage, "Join by", "QueueMode", { "Queue", "Rematch" })
+for _, key in ipairs({ "Spot2v2", "Spot3v3" }) do
+	if type(Config[key]) == "number" then
+		Config[key] = ({ "1st", "2nd", "3rd" })[Config[key]] or "None"
+	end
+end
 segmented(battlePage, "2v2 auto spot", "Spot2v2", { "None", "1st", "2nd" })
 segmented(battlePage, "3v3 auto spot", "Spot3v3", { "None", "1st", "2nd", "3rd" })
 toggle(battlePage, "Ranked: auto ready up", "AutoReady")
@@ -3679,64 +5375,39 @@ local function startRolling()
 					return stopRolling(string.format("Got %s on slot %d after %d rolls (%d with coins)", traitName(rolled), slot, rolls, coinRolls))
 				end
 			end
-			task.wait((0.3))
+			task.wait(BeyRivals.Tspan("TraitGap"))
 		end
 	end)
 end
 
 -- Traits page.
+-- Assist page: you play, the script only times guards / counters / clashes / rips for you.
+do
+	local assistPage = makePage("Assist")
+	heading(assistPage, "Assist mode")
+	toggle(assistPage, "Assist (when Auto battle is off)", "Assist")
+	hint(assistPage, "You steer and play; these fire on top of your inputs")
+	heading(assistPage, "Help")
+	toggle(assistPage, "Perfect guard before hits", "AssistGuard")
+	toggle(assistPage, "Counter-attack after perfect guards", "AssistCounter")
+	toggle(assistPage, "Perfect clash notes", "AssistClash")
+	toggle(assistPage, "Perfect rip on launch", "AssistRip")
+	toggle(assistPage, "Rim save hops", "AssistRim")
+	toggle(assistPage, "Auto-dodge abilities (takes steering briefly)", "AssistDodge")
+	hint(assistPage, "Auto battle on overrides all of this")
+end
+
 local traitsPage = makePage("Traits")
 
----Row that shows a value and cycles through options on click (right click goes back).
-local function cycler(page, text, getOptions, getLabel, onPick)
-	local row = rowBase(page, 34, true)
-	rowLabel(row, text)
-	local value = create("TextLabel", {
-		AnchorPoint = Vector2.new(1, 0.5),
-		Position = UDim2.new(1, -8, 0.5, 0),
-		Size = UDim2.fromOffset(190, 20),
-		BackgroundTransparency = 1,
-		FontFace = BODY_BOLD,
-		TextColor3 = GOLD,
-		TextSize = 14,
-		TextTruncate = Enum.TextTruncate.AtEnd,
-		TextXAlignment = Enum.TextXAlignment.Right,
-		Parent = row,
-	})
-	local function refresh()
-		value.Text = getLabel()
-	end
-	local function step(direction)
-		local options = getOptions()
-		if #options == 0 then
-			return refresh()
-		end
-		local index = 0
-		for i, option in ipairs(options) do
-			if option.current then
-				index = i
-			end
-		end
-		index = (index - 1 + direction) % #options + 1
-		onPick(options[index])
-		refresh()
-	end
-	row.MouseButton1Click:Connect(function()
-		step(1)
-	end)
-	row.MouseButton2Click:Connect(function()
-		step(-1)
-	end)
-	refresh()
-	return refresh
-end
 
 heading(traitsPage, "Item")
 local refreshSlot
-local refreshItem = cycler(traitsPage, "Equipped part (click to change)", function()
+local refreshItem = cycler(traitsPage, "Equipped part", function()
 	local options = {}
 	for _, entry in ipairs(traitItems()) do
-		table.insert(options, { uid = entry.uid, current = entry.uid == Config.TraitItem })
+		local data = playerData()
+		local item = data and data.Items and data.Items[entry.uid]
+		table.insert(options, { uid = entry.uid, name = item and itemName(item) or tostring(entry.uid), current = entry.uid == Config.TraitItem })
 	end
 	return options
 end, function()
@@ -3755,7 +5426,7 @@ refreshSlot = cycler(traitsPage, "Slot", function()
 	local item = data and data.Items[Config.TraitItem]
 	local options = {}
 	for slot = 1, item and slotsOf(item) or 0 do
-		table.insert(options, { slot = slot, current = slot == Config.TraitSlot })
+		table.insert(options, { slot = slot, name = "Slot " .. slot, current = slot == Config.TraitSlot })
 	end
 	return options
 end, function()
@@ -3932,7 +5603,7 @@ do
 					if not keepGoing then
 						break
 					end
-					task.wait(ROLL_GAP)
+					task.wait(BeyRivals.Tspan("RollGap"))
 				end
 				state.running = false
 			end)
@@ -3947,7 +5618,8 @@ do
 	local rollsPage = makePage("Rolls")
 
 	-- Halloween soul draw.
-	if Halloween and Halloween.POOL then
+	-- (Only while the event runs: the module stays in the game after it ends.)
+	if Halloween and Halloween.POOL and workspace:GetAttribute("Halloween") == true then
 		heading(rollsPage, "Halloween soul draw")
 		segmented(rollsPage, "Draw size", "DrawSize", { "x1", "x10" })
 		slider(rollsPage, "Keep at least (tickets)", "DrawKeep", 0, 1500, 10, function(v) return tostring(v) end)
@@ -4164,6 +5836,50 @@ do
 	end)
 end
 
+-- Legit page: Human mode and every timing and chance the script plays by.
+do
+	local legitPage = makePage("Legit")
+	heading(legitPage, "Human mode")
+	toggle(legitPage, "Human / legit mode", "Human")
+	hint(legitPage, "On: every value on this tab goes to a human figure (late, uneven, sometimes wrong) and the deep finish search stops. Off: the values you had come back. You can still move any slider while it is on.")
+	button(legitPage, "Reset every value to the script's own", function()
+		BeyRivals.resetTune()
+		for _, refresh in ipairs(UI.refreshers) do
+			pcall(refresh)
+		end
+		return "Reset"
+	end)
+	hint(legitPage, "60 ticks are one second. A rip ring is Perfect within 5 ticks, Great within 11, Good within 20. A clash note is Perfect within 2, Great within 5, Good within 9.")
+	local group = nil
+	for _, row in ipairs(BeyRivals.TUNE) do
+		if row[1] ~= group then
+			group = row[1]
+			heading(legitPage, group)
+		end
+		local unit, step = row[9], row[6]
+		slider(legitPage, row[3], "Tune_" .. row[2], row[4], row[5], step, function(value)
+			if unit == "ticks" then
+				return string.format("%d (%d ms)", value, value / 60 * 1000 + 0.5)
+			elseif unit == "%" then
+				return string.format("%d%%", value)
+			elseif unit == "" then
+				return string.format("%d", value)
+			end
+			return string.format(step < 1 and "%.1f %s" or "%d %s", value, unit)
+		end)
+	end
+	-- The toggle only flips Config.Human: apply it here, and keep a saved "on" as it was saved.
+	BeyRivals.humanApplied = Config.Human == true
+	table.insert(BeyRivals.connections, runService.Heartbeat:Connect(function()
+		if (Config.Human == true) ~= (BeyRivals.humanApplied == true) then
+			BeyRivals.setHuman(Config.Human == true)
+			for _, refresh in ipairs(UI.refreshers) do
+				pcall(refresh)
+			end
+		end
+	end))
+end
+
 -- Stats page.
 local statsPage = makePage("Stats")
 heading(statsPage, "This session")
@@ -4271,60 +5987,7 @@ do
 end
 
 -- Footer.
-local footer = create("Frame", {
-	Name = "Footer",
-	Position = UDim2.new(0, 0, 1, -40),
-	Size = UDim2.new(1, 0, 0, 40),
-	BackgroundColor3 = STEEL,
-	BorderSizePixel = 0,
-	Parent = panel,
-}, { corner(10) })
-create("Frame", {
-	Size = UDim2.new(1, 0, 0, 10),
-	BackgroundColor3 = STEEL,
-	BorderSizePixel = 0,
-	Parent = footer,
-})
-create("TextLabel", {
-	Position = UDim2.fromOffset(18, 0),
-	Size = UDim2.new(1, -120, 1, 0),
-	BackgroundTransparency = 1,
-	FontFace = BODY_FONT,
-	Text = "Right Ctrl hides this panel",
-	TextColor3 = MUTED,
-	TextSize = 13,
-	TextXAlignment = Enum.TextXAlignment.Left,
-	ZIndex = 2,
-	Parent = footer,
-})
-local unloadButton = create("TextButton", {
-	AnchorPoint = Vector2.new(1, 0.5),
-	Position = UDim2.new(1, -12, 0.5, 0),
-	Size = UDim2.fromOffset(72, 26),
-	BackgroundColor3 = RAISED,
-	BorderSizePixel = 0,
-	FontFace = BODY_BOLD,
-	Text = "Unload",
-	TextColor3 = TEXT,
-	TextSize = 13,
-	AutoButtonColor = true,
-	ZIndex = 2,
-	Parent = footer,
-}, { corner(6) })
-
-makeTab("Battle", 0)
-makeTab("Traits", 72)
-makeTab("Rolls", 140)
-makeTab("Stats", 200)
-screenGui.Parent = guiParent
-task.defer(selectTab, "Battle")
-
--- Right Ctrl toggles the panel.
-table.insert(BeyRivals.connections, userInputService.InputBegan:Connect(function(input)
-	if input.KeyCode == Enum.KeyCode.RightControl and not userInputService:GetFocusedTextBox() then
-		panel.Visible = not panel.Visible
-	end
-end))
+local unloadButton = UI.finish("Battle")
 
 -- Autosave whenever a setting changes.
 do
@@ -4394,6 +6057,13 @@ function BeyRivals.detach()
 		BattleInput.sample = originalSample
 	end
 	localPlayer:SetAttribute("AimAssist", hadAimAssist)
+	-- Hand the game back its own packet senders and results screen.
+	for _, packet in pairs(hookedPackets) do
+		rawset(packet, "Fire", nil)
+	end
+	if originalShow and RivalsResults.show ~= originalShow then
+		RivalsResults.show = originalShow
+	end
 	for _, connection in ipairs(BeyRivals.connections) do
 		connection:Disconnect()
 	end
@@ -4407,6 +6077,7 @@ end
 
 unloadButton.MouseButton1Click:Connect(BeyRivals.detach)
 
+BeyRivals.test = { currentBattle = currentBattle, firePacket = firePacket, status = function() return status end }
 shared.BeyRivals = BeyRivals
 getgenv().BeyRivalsConfig = Config
 
