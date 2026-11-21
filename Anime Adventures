@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v261", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v262", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -265,6 +265,9 @@ local Config = {
 	PearlsOnlyCurses = false,
 	-- Go for pearls: the lowest chance to clear it will accept by choice (per cent).
 	PearlsMinClear = 80,
+	-- Dungeon shrines (v262): take them at all, and walk past the ones cursed with enemy regen.
+	DungeonShrines = true,
+	DungeonShrineNoRegen = true,
 	-- How much the card log (accounts/<id>/cards.txt) writes: Off, Normal or Full.
 	CardLog = "Normal",
 	MenuFont = "Own",
@@ -10403,7 +10406,6 @@ end
 -- walked past held the Shimmering Moon Fragment (+1 Star Remnant from every chest opened) and a
 -- chest. A shrine whose gift is loot is always taken, whatever the curse; the curse list below
 -- only decides shrines that give a combat item.
-local DUNGEON_SHRINE_LOOT = { moon_fragment = true, chest_mock_item = true, philospher_stone = true, genie_lamp = true, hook = true, hook2 = true }
 local DUNGEON_SHRINE_SKIP = { _curse_super_chaos = true, _curse_super_speed = true, _curse_super_regen = true, _curse_super_armored = false, _curse_super_burst = false, _curse_super_explode = false, _curse_super_health = false }
 
 local function dungeonKeys()
@@ -10593,13 +10595,10 @@ function AA.dungeonStep()
 				end
 			end
 			scan(room, 0)
-			local loot = false
-			for _, id in ipairs(gifts) do
-				if DUNGEON_SHRINE_LOOT[id] or id:find("remnant") or id:find("treasure") then
-					loot = true
-				end
-			end
-			local decline = curse and DUNGEON_SHRINE_SKIP[curse] and not loot
+			-- USER (v262): two switches decide it. Shrines are taken unless Take shrines is off, or
+			-- the curse is enemy regen and that switch is on (even when the gift is loot).
+			local regen = type(curse) == "string" and curse:find("regen") ~= nil
+			local decline = Config.DungeonShrines == false or (regen and Config.DungeonShrineNoRegen ~= false)
 			if decline then
 				status = "Dungeon: shrine skipped"
 			else
@@ -19064,7 +19063,11 @@ do
 			toggle(page, "Infinity Mansion", "MatchCastle")
 
 			heading(page, "Mode settings", "right")
-			only({ "Cursed Womb", "Tournament", "Dungeon", "None" }, UI.note(page, "This mode has no settings of its own."))
+			only({ "Cursed Womb", "Tournament", "None" }, UI.note(page, "This mode has no settings of its own."))
+			toggle(page, "Take shrines", "DungeonShrines", "A shrine gives an item together with a strong curse. Off: every shrine is walked past.")
+			only({ "Dungeon" })
+			toggle(page, "Skip shrines that add enemy regen", "DungeonShrineNoRegen", "On: a shrine cursed with enemy regen is left alone, whatever it gives. Off: it is taken like any other.")
+			only({ "Dungeon" })
 			do
 				local row = UI.note(page, "Summer Hunt has its own page: the voting strategy, your never list and the pearl shop are there.")
 				only({ "Summer" }, row)
