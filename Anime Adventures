@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v259", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v260", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -3934,7 +3934,7 @@ local function bestSpot(data, focus, only, free)
 			elseif allyData and (unitStatsAt(allyData, 0).damage > 0 or activeBuff and placedIds[allyId] and AA.isSummoner(allyId)) and (not activeBuff or AA.buffMatches(activeBuff, allyData))
 				and (not aura or (allyId ~= data.id and aura.matches(allyId, allyData))) then
 				local weight = activeBuff and math.max(copyPower(allyData, ownedOf(unit), unit._stats.upgrade.Value) * AA.measureFactor(allyId), 1) or 1
-				table.insert(allies, { position = unit:GetPivot().Position, weight = weight })
+				table.insert(allies, { position = unit:GetPivot().Position, weight = weight, id = allyId })
 				if activeBuff and placedIds[allyId] and not AA.buffInfo(allyData) then
 					table.insert(anchors, unit:GetPivot().Position)
 				end
@@ -4181,12 +4181,19 @@ local function bestSpot(data, focus, only, free)
 				end
 			end
 		end
+		Match.bufferPlan = activeBuff and { only = only, score = bestScore, allies = allies, partners = #partners, chain = chainOpen, core = #core, range = range, at = best and best.position } or Match.bufferPlan
 		if best and (activeBuff and (bestScore >= 0.2 or #partners > 0) or aura and bestScore >= 0.99 or not (activeBuff or aura)) then
 			Match.spotScore = bestScore
 			return best
 		end
-		if activeBuff and #partners > 0 then
+		if activeBuff and (#partners > 0 or #allies > 0) then
 			-- No free ground inside the chain's range: better no copy than one that can't link up.
+			-- And a first copy that would reach under a fifth of the damage gets no spot HERE
+			-- either. (It used to fall through to the road scoring below, whose scores run in
+			-- the tens: asked for the best hill spot, an Elfy that reached nothing worth having
+			-- up there came back with "score 40", beat the ground spot next to Elyssia at 0.99,
+			-- and all six Elfys were built 50 studs from the unit doing 95% of the damage.
+			-- USER: "it just placed all of my elfies away from my elyssia??")
 			return nil
 		end
 	end
@@ -6533,7 +6540,9 @@ local function matchStep()
 				end
 			end
 			local victim, why
-			if count >= 3 and #group.copies == 1 and group.copies[1].inside < total * 0.34 then
+			-- (A copy that has only just landed reads a range of 0 for a moment and "reaches
+			-- nothing": it was sold 0.3 s after it was placed.)
+			if count >= 3 and #group.copies == 1 and group.copies[1].reach > 1 and group.copies[1].inside < total * 0.34 then
 				victim, why = group.copies[1], "alone"
 			elseif count >= 1 and #group.copies >= 2 then
 				for _, copy in ipairs(group.copies) do
@@ -21122,7 +21131,7 @@ end
 
 AA.Config = Config
 AA.bestSpot = bestSpot
-AA.test = { copyPower = copyPower, planAction = planAction, unitPower = unitPower, claimRewards = claimRewards, summonStep = summonStep, joinGame = joinGame, chooseTarget = chooseTarget, equipBest = equipBest, useAbilities = useAbilities, invoke = invoke, scanField = scanField, spawnCost = spawnCost, upgradeCost = upgradeCost, statMul = statMul, enemyState = enemyState, pathProgress = pathProgress, equippedUnits = equippedUnits, matchKind = matchKind, gameCall = gameCall }
+AA.test = { bestSpot = bestSpot, copyPower = copyPower, planAction = planAction, unitPower = unitPower, claimRewards = claimRewards, summonStep = summonStep, joinGame = joinGame, chooseTarget = chooseTarget, equipBest = equipBest, useAbilities = useAbilities, invoke = invoke, scanField = scanField, spawnCost = spawnCost, upgradeCost = upgradeCost, statMul = statMul, enemyState = enemyState, pathProgress = pathProgress, equippedUnits = equippedUnits, matchKind = matchKind, gameCall = gameCall }
 AA.Stats = Stats
 AA.getStatus = function()
 	return status
