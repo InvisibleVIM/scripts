@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v260", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v261", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -10390,14 +10390,20 @@ end
 -- out of it (treasure 5 + curse -6 used to lose to a bare shop). Type 6 is the game's Open
 -- Treasure screen, where the chests collected on the way are opened (USER: that comes with
 -- finishing the dungeon); it never outranks a room that gives a chest.
-local ROOM_VALUE = { ["3"] = 200, ["4"] = 100, ["6"] = 4, ["2"] = 3, ["5"] = 3, ["7"] = 2, ["1"] = 1, ["0"] = -6 }
+-- v261: a shrine can hand over a chest or the Moon Fragment, so it now outranks a money room.
+local ROOM_VALUE = { ["3"] = 200, ["4"] = 100, ["7"] = 6, ["6"] = 4, ["2"] = 3, ["5"] = 3, ["1"] = 1, ["0"] = -6 }
 
 -- Shop order (lower buys first): loot and luck, cheaper units, then damage.
 local DUNGEON_SHOP_RANK = {}
-for rank, id in ipairs({ "gold_shroom", "gold_mask", "genie_lamp", "moon_fragment", "philospher_stone", "gold_branch", "hook2", "hook", "deathcap", "tome", "sword3", "frost_axe", "icebane", "bow_legendary", "stormbringer", "mage_coat", "sword2", "bow3", "bow2", "bow1", "scythe", "boots", "sword1", "belt", "cloak", "hammer_legendary", "fire_axe", "axe", "axe_legendary", "celestial_blade" }) do
+for rank, id in ipairs({ "genie_lamp", "gold_shroom", "gold_mask", "philospher_stone", "gold_branch", "hook2", "hook", "deathcap", "tome", "sword3", "frost_axe", "icebane", "bow_legendary", "stormbringer", "mage_coat", "sword2", "bow3", "bow2", "bow1", "scythe", "boots", "sword1", "belt", "cloak", "hammer_legendary", "fire_axe", "axe", "axe_legendary", "celestial_blade" }) do
 	DUNGEON_SHOP_RANK[id] = rank
 end
 -- Shrine curses: true = leave it.
+-- USER (v261): "it didn't accept the shrine? star remnants are also important". The shrine it
+-- walked past held the Shimmering Moon Fragment (+1 Star Remnant from every chest opened) and a
+-- chest. A shrine whose gift is loot is always taken, whatever the curse; the curse list below
+-- only decides shrines that give a combat item.
+local DUNGEON_SHRINE_LOOT = { moon_fragment = true, chest_mock_item = true, philospher_stone = true, genie_lamp = true, hook = true, hook2 = true }
 local DUNGEON_SHRINE_SKIP = { _curse_super_chaos = true, _curse_super_speed = true, _curse_super_regen = true, _curse_super_armored = false, _curse_super_burst = false, _curse_super_explode = false, _curse_super_health = false }
 
 local function dungeonKeys()
@@ -10536,6 +10542,9 @@ function AA.dungeonStep()
 						local rank = DUNGEON_SHOP_RANK[offer.id] or 50
 						if offer.id == "philospher_stone" then
 							rank = plain >= 2 and -2 or (plain >= 1 and 0.5 or 60)
+						elseif offer.id == "moon_fragment" then
+							-- +1 Star Remnant from every chest opened (v261): the best thing a shop sells.
+							rank = -3
 						elseif offer.id == "chest_mock_item" then
 							rank = -1
 						end
@@ -10584,15 +10593,22 @@ function AA.dungeonStep()
 				end
 			end
 			scan(room, 0)
-			if curse and DUNGEON_SHRINE_SKIP[curse] then
+			local loot = false
+			for _, id in ipairs(gifts) do
+				if DUNGEON_SHRINE_LOOT[id] or id:find("remnant") or id:find("treasure") then
+					loot = true
+				end
+			end
+			local decline = curse and DUNGEON_SHRINE_SKIP[curse] and not loot
+			if decline then
 				status = "Dungeon: shrine skipped"
 			else
 				status = "Dungeon: shrine"
 				invoke("dungeon_shrine_accept")
 			end
-			pcall(note, "shrine", { c = tostring(curse), gifts = table.concat(gifts, ","), took = not (curse and DUNGEON_SHRINE_SKIP[curse]) })
+			pcall(note, "shrine", { c = tostring(curse), gifts = table.concat(gifts, ","), took = not decline })
 			pcall(function()
-				AA.appendLog(ACCOUNT_FOLDER .. "/dungeon.txt", os.date("%m-%d %H:%M:%S") .. " shrine: " .. ((curse and DUNGEON_SHRINE_SKIP[curse]) and "declined" or "accepted") .. " " .. table.concat(gifts, ",") .. " with " .. tostring(curse) .. "\n")
+				AA.appendLog(ACCOUNT_FOLDER .. "/dungeon.txt", os.date("%m-%d %H:%M:%S") .. " shrine: " .. (decline and "declined" or "accepted") .. " " .. table.concat(gifts, ",") .. " with " .. tostring(curse) .. "\n")
 			end)
 			task.wait(0.6)
 		end
