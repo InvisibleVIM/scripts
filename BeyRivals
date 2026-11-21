@@ -31,7 +31,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local BeyRivals = { connections = {}, VERSION = "legit-2" }
+local BeyRivals = { connections = {}, toggleRefreshers = {}, segmentRefreshers = {}, VERSION = "dusk-2" }
 
 -- Unload a previous execution before touching any game tables.
 local previousStats = shared.BeyRivals and shared.BeyRivals.stats
@@ -124,6 +124,9 @@ local Config = {
 	HideOnExecute = false,
 	MuteNotifications = false,
 	MyMusicOn = false,
+	MenuFont = "Own",
+	UiLook = "",
+	MusicOn = false,
 	MyMusicShuffle = true,
 	MyMusicMuteGame = true,
 	MyMusicVolume = 50,
@@ -360,6 +363,10 @@ local function loadSettings()
 end
 
 loadSettings()
+-- The menu changed shape (the Anime Adventures look, a wider window): open it centered once.
+if Config.UiLook ~= "dusk" then
+	Config.UiLook, Config.WindowX, Config.WindowY = "dusk", -1, -1
+end
 
 -- ============================================================
 --  Game modules (the live instances the game itself uses)
@@ -3424,24 +3431,98 @@ end
 --  Interface (Potent Hub)
 -- ============================================================
 
--- One look for every Potent script: a two-column window with tabs, group boxes with an accent
--- line, square checkboxes, outlined buttons, and a Misc tab that always ends with the menu
--- settings (anti-AFK, menu bind, hide on execute, unload) and a live theme editor.
-local UI = { order = {}, current = {}, columns = {}, refreshers = {}, capturing = false }
+-- The window: the list of pages down the left side, a strip across the top that says what the
+-- script is doing, and the page under it. A page is an introduction, optional full-width blocks,
+-- and two columns of cards; every card says on which side it goes, so related settings stay
+-- together. Rows read "name, short note, control on the right".
+local UI = { order = {}, current = {}, columns = {}, refreshers = {}, capturing = false, groups = {} }
 BeyRivals.ui = UI
 
-do
+-- (In a function of its own, like the pages: the main chunk has no registers to spare.)
+;(function()
 	local THEME = {
-		{ role = "Background", key = "ThemeBackground", default = "111111" },
-		{ role = "Main", key = "ThemeMain", default = "1A1A1A" },
-		{ role = "Accent", key = "ThemeAccent", default = "96D9CF" },
-		{ role = "Outline", key = "ThemeOutline", default = "2E2E2E" },
-		{ role = "Font", key = "ThemeFont", default = "EBEBEB" },
+		-- Dusk: ink-blue night with a gold accent (the Anime Adventures menu's own look).
+		{ role = "Background", key = "ThemeBackground", default = "11141D" },
+		{ role = "Main", key = "ThemeMain", default = "191E2B" },
+		{ role = "Accent", key = "ThemeAccent", default = "F2B33D" },
+		{ role = "Outline", key = "ThemeOutline", default = "2A3145" },
+		{ role = "Font", key = "ThemeFont", default = "E8EBF3" },
 	}
 	UI.THEME = THEME
-	local CODE = Font.fromEnum(Enum.Font.Code)
-	local CODE_BOLD = Font.new("rbxasset://fonts/families/Inconsolata.json", Enum.FontWeight.Bold)
-	local TEXT_SIZE = 14
+
+	-- Type. The menu carries its own typeface instead of using one of Roblox's built-in families:
+	-- Fishstrap (and Bloxstrap) replace the font files those families point at, so every
+	-- "rbxasset://fonts/families/..." name renders in the user's custom font (measured on this
+	-- client: Oswald, Arcade, Source Sans and Builder Sans all came out the same 279 px wide).
+	-- Families from the Creator Store are fetched by asset id and are not touched by that
+	-- (Barlow 170 px, Inter 194 px for the same line).
+	-- Barlow: built for road signs and dashboards, narrow enough that a setting's full name fits
+	-- a column, with clear numerals. Inter is the stand-in if Barlow can't be fetched; if neither
+	-- loads, the menu falls back to a built-in family and shrinks its text to the same widths.
+	local Type = { own = false, scale = 1, name = "Builder Sans", family = "rbxasset://fonts/families/BuilderSans.json" }
+	UI.type = Type
+	do
+		local textService = game:GetService("TextService")
+		local REFERENCE = "Place units 0123456789"
+		local WEIGHTS = { Enum.FontWeight.Regular, Enum.FontWeight.Medium, Enum.FontWeight.SemiBold, Enum.FontWeight.Bold }
+		---Width of the reference line at 20 px, or nil if the family didn't load in time.
+		local function width(family, weight, seconds)
+			local result
+			task.spawn(function()
+				local ok, bounds = pcall(function()
+					local params = Instance.new("GetTextBoundsParams")
+					params.Text, params.Size, params.Width = REFERENCE, 20, 4000
+					params.Font = Font.new(family, weight)
+					return textService:GetTextBoundsAsync(params)
+				end)
+				result = ok and bounds.X or false
+			end)
+			local started = os.clock()
+			while result == nil and os.clock() - started < seconds do
+				task.wait(0.05)
+			end
+			return result or nil
+		end
+		-- { name, family, expected width of the reference line in Regular }
+		local CANDIDATES = {
+			{ "Barlow", "rbxassetid://12187372847", 170 },
+			{ "Inter", "rbxassetid://12187365364", 194 },
+		}
+		Type.tried = {}
+		if Config.MenuFont ~= "Roblox" then
+			for _, candidate in ipairs(CANDIDATES) do
+				local measured = width(candidate[2], WEIGHTS[1], 6)
+				Type.tried[candidate[1]] = measured or "no answer"
+				-- The right width means the real file arrived (a family that was swapped out or
+				-- failed to load measures like the fallback).
+				if measured and math.abs(measured - candidate[3]) / candidate[3] < 0.05 then
+					for index = 2, #WEIGHTS do
+						width(candidate[2], WEIGHTS[index], 4)
+					end
+					Type.own, Type.name, Type.family = true, candidate[1], candidate[2]
+					break
+				end
+			end
+		end
+		if not Type.own then
+			local measured = width(Type.family, WEIGHTS[1], 3)
+			Type.tried.builtIn = measured or "no answer"
+			Type.scale = measured and math.clamp(CANDIDATES[1][3] / measured, 0.72, 1) or 1
+		end
+	end
+	local CODE = Font.new(Type.family, Enum.FontWeight.Regular)
+	local CODE_MEDIUM = Font.new(Type.family, Enum.FontWeight.Medium)
+	local CODE_BOLD = Font.new(Type.family, Enum.FontWeight.SemiBold)
+	---A text size from the scale below, shrunk when the fallback font is wider than the design.
+	local function px(size)
+		return math.max(math.floor(size * Type.scale + 0.5), 9)
+	end
+	-- Type scale: 12 small print, 13 notes, 14 values, 15 names, 16 card titles, 19 status,
+	-- 22 page titles, 24 figures. Notes and wrapped text sit at a line height of 1.2.
+	local TEXT_SIZE = px(15)
+	-- Spacing (px): 4 inside a control, 8 between a name and its control, 12 between rows,
+	-- 16 inside a card, 20 around the page. Corners: 14 window, 10 cards, 7 controls.
+	local WINDOW_WIDTH, WINDOW_HEIGHT, SIDEBAR, HEADER, GUTTER = 900, 640, 172, 70, 20
 
 	local function readColor(key, default)
 		local ok, color = pcall(Color3.fromHex, tostring(Config[key] or default))
@@ -3457,11 +3538,24 @@ do
 		for _, entry in ipairs(THEME) do
 			roles[entry.role] = readColor(entry.key, entry.default)
 		end
-		roles.Control = roles.Main:Lerp(roles.Font, 0.06)
+		roles.Control = roles.Main:Lerp(roles.Font, 0.07)
+		roles.Raised = roles.Main:Lerp(roles.Font, 0.13)
 		roles.Muted = roles.Font:Lerp(roles.Main, 0.42)
 		return roles
 	end
 	UI.roles = computeRoles()
+	---Text / knob color that reads on top of the accent, whatever accent the theme picks.
+	function UI.onAccent()
+		local accent = UI.roles.Accent
+		return (0.299 * accent.R + 0.587 * accent.G + 0.114 * accent.B) > 0.5 and UI.roles.Background or UI.roles.Font
+	end
+
+	-- The scripts' own custom rows use the palette constants: point them at the theme.
+	local function syncConstants()
+		local roles = UI.roles
+		STEEL, PANEL, RAISED, LINE, TEXT, MUTED, GOLD = roles.Background, roles.Main, roles.Control, roles.Outline, roles.Font, roles.Muted, roles.Accent
+		DISPLAY_FONT, TAB_FONT, BODY_FONT, BODY_BOLD = CODE_BOLD, CODE_MEDIUM, CODE, CODE_BOLD
+	end
 
 	-- Start on the shared default theme unless this script's colors were changed by hand.
 	if Config.UseDefaultTheme ~= false then
@@ -3476,13 +3570,6 @@ do
 				UI.roles = computeRoles()
 			end
 		end)
-	end
-
-	-- The scripts' own custom rows use the palette constants: point them at the theme.
-	local function syncConstants()
-		local roles = UI.roles
-		STEEL, PANEL, RAISED, LINE, TEXT, MUTED, GOLD = roles.Background, roles.Main, roles.Control, roles.Outline, roles.Font, roles.Muted, roles.Accent
-		DISPLAY_FONT, TAB_FONT, BODY_FONT, BODY_BOLD = CODE, CODE, CODE, CODE_BOLD
 	end
 	syncConstants()
 
@@ -3499,11 +3586,14 @@ do
 	UI.create = create
 
 	UI.corner = function(radius)
-		return create("UICorner", { CornerRadius = UDim.new(0, math.min(radius or 0, 2)) })
+		return create("UICorner", { CornerRadius = UDim.new(0, radius or 7) })
+	end
+	local function round(parent, radius)
+		return create("UICorner", { CornerRadius = UDim.new(0, radius or 7), Parent = parent })
 	end
 
 	local function tween(instance, props, duration)
-		tweenService:Create(instance, TweenInfo.new(duration or 0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props):Play()
+		tweenService:Create(instance, TweenInfo.new(duration or 0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props):Play()
 	end
 	UI.tween = tween
 
@@ -3519,10 +3609,21 @@ do
 		props.TextXAlignment = props.TextXAlignment or Enum.TextXAlignment.Left
 		return create("TextLabel", props)
 	end
+	UI.label, UI.px = label, px
+	---Text that wraps and grows downwards instead of being cut off.
+	local function wrapped(props)
+		props.AutomaticSize = Enum.AutomaticSize.Y
+		props.TextWrapped = true
+		props.LineHeight = props.LineHeight or 1.2
+		props.TextYAlignment = Enum.TextYAlignment.Top
+		return label(props)
+	end
+	UI.wrapped = wrapped
 
-	-- Custom fonts (Fishstrap etc.) are wider: fixed-size text scales down to fit.
+	-- Only with the fallback font (a custom one may be much wider than the design): one-line
+	-- text that doesn't fit its box scales down instead of being cut.
 	function UI.fitText(object)
-		if not (object:IsA("TextLabel") or object:IsA("TextButton") or object:IsA("TextBox")) then
+		if Type.own or not (object:IsA("TextLabel") or object:IsA("TextButton") or object:IsA("TextBox")) then
 			return
 		end
 		if object.AutomaticSize ~= Enum.AutomaticSize.None or object.TextScaled or object.TextWrapped or object:FindFirstChildOfClass("UITextSizeConstraint") then
@@ -3530,14 +3631,58 @@ do
 		end
 		local designed = object.TextSize
 		object.TextScaled = true
-		create("UITextSizeConstraint", { MaxTextSize = designed, MinTextSize = 7, Parent = object })
+		create("UITextSizeConstraint", { MaxTextSize = designed, MinTextSize = 8, Parent = object })
 	end
 
-	-- Window.
+	-- Small marks drawn from bars, so no glyph depends on what a font happens to carry.
+	---kind: "down", "up", "cross", "check". Returns the holder; recolor with UI.tint(holder, color).
+	local function icon(parent, kind, size, color, props)
+		local holder = create("Frame", { Size = UDim2.fromOffset(size, size), BackgroundTransparency = 1, Parent = parent })
+		for key, value in pairs(props or {}) do
+			holder[key] = value
+		end
+		local function bar(length, angle, x, y)
+			local line = create("Frame", {
+				AnchorPoint = Vector2.new(0.5, 0.5),
+				Position = UDim2.fromScale(x, y),
+				Size = UDim2.fromOffset(math.floor(length * size + 0.5), 2),
+				Rotation = angle,
+				BackgroundColor3 = color,
+				BorderSizePixel = 0,
+				Parent = holder,
+			})
+			round(line, 1)
+		end
+		if kind == "cross" then
+			bar(0.8, 45, 0.5, 0.5)
+			bar(0.8, -45, 0.5, 0.5)
+		elseif kind == "down" then
+			bar(0.5, 45, 0.34, 0.5)
+			bar(0.5, -45, 0.66, 0.5)
+		elseif kind == "up" then
+			bar(0.5, -45, 0.34, 0.5)
+			bar(0.5, 45, 0.66, 0.5)
+		elseif kind == "check" then
+			bar(0.38, 45, 0.3, 0.62)
+			bar(0.7, -50, 0.62, 0.48)
+		end
+		return holder
+	end
+	UI.icon = icon
+	function UI.tint(holder, color)
+		for _, child in ipairs(holder:GetChildren()) do
+			if child:IsA("Frame") then
+				child.BackgroundColor3 = color
+			end
+		end
+	end
+
 	local guiParent = (gethui and gethui()) or game:GetService("CoreGui")
-	local old = guiParent:FindFirstChild("BeyRivalsUI")
-	if old then
-		old:Destroy()
+	do
+		local old = guiParent:FindFirstChild("BeyRivalsUI")
+		if old then
+			old:Destroy()
+		end
 	end
 	local screenGui = create("ScreenGui", {
 		Name = "BeyRivalsUI",
@@ -3555,87 +3700,163 @@ do
 		end)
 	end))
 
-	-- First run: centered. After that: wherever it was last dragged to (kept on screen).
-	local position = UDim2.new(0.5, -290, 0.5, -300)
-	if type(Config.WindowX) == "number" and type(Config.WindowY) == "number" and Config.WindowX >= 0 and Config.WindowY >= 0 then
-		local viewport = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1920, 1080)
-		position = UDim2.fromOffset(math.clamp(Config.WindowX, 0, math.max(viewport.X - 120, 0)), math.clamp(Config.WindowY, 0, math.max(viewport.Y - 60, 0)))
-	end
-	local panel = create("Frame", {
-		Name = "Panel",
-		Position = position,
-		Size = UDim2.fromOffset(580, 600),
-		BackgroundColor3 = UI.roles.Background,
-		BorderSizePixel = 0,
-		Parent = screenGui,
-	})
-	stroke(panel, "Accent")
-	UI.panel = panel
-	BeyRivals.panel = panel
-
-	local titleBar = create("Frame", { Size = UDim2.new(1, 0, 0, 26), BackgroundTransparency = 1, Parent = panel })
-	label({ Position = UDim2.fromOffset(9, 3), Size = UDim2.new(1, -150, 0, 20), Text = "Potent Hub | Bey Rivals", Parent = titleBar })
-	UI.statusLabel = label({
-		AnchorPoint = Vector2.new(1, 0),
-		Position = UDim2.new(1, -9, 0, 3),
-		Size = UDim2.fromOffset(150, 20),
-		Text = "",
-		TextColor3 = UI.roles.Muted,
-		TextXAlignment = Enum.TextXAlignment.Right,
-		TextTruncate = Enum.TextTruncate.AtEnd,
-		Parent = titleBar,
-	})
-	-- Old spinning marks are gone; scripts that still rotate one get an invisible frame.
-	UI.mark = create("Frame", { Visible = false, Parent = panel })
-
+	local panel, tabBar, content
 	do
-		local dragging, dragStart, startPosition = false, nil, nil
-		titleBar.InputBegan:Connect(function(input)
-			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-				dragging, dragStart, startPosition = true, input.Position, panel.Position
-			end
-		end)
-		table.insert(BeyRivals.connections, userInputService.InputChanged:Connect(function(input)
-			if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-				local delta = input.Position - dragStart
-				panel.Position = UDim2.new(startPosition.X.Scale, startPosition.X.Offset + delta.X, startPosition.Y.Scale, startPosition.Y.Offset + delta.Y)
-			end
-		end))
-		table.insert(BeyRivals.connections, userInputService.InputEnded:Connect(function(input)
-			if (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) and dragging then
-				dragging = false
-				-- AbsolutePosition is measured under the top bar; the window ignores the inset.
-				local inset = game:GetService("GuiService"):GetGuiInset()
-				Config.WindowX = math.floor(panel.AbsolutePosition.X + inset.X)
-				Config.WindowY = math.floor(panel.AbsolutePosition.Y + inset.Y)
-			end
-		end))
-	end
+		local viewport = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1920, 1080)
+		-- Small screens: the whole window scales down instead of hanging off the edge.
+		local windowScale = math.clamp(math.min((viewport.X - 24) / WINDOW_WIDTH, (viewport.Y - 24) / WINDOW_HEIGHT), 0.6, 1)
+		-- First run: centered. After that: wherever it was last dragged to (kept on screen).
+		local position = UDim2.new(0.5, -WINDOW_WIDTH * windowScale / 2, 0.5, -WINDOW_HEIGHT * windowScale / 2)
+		if type(Config.WindowX) == "number" and type(Config.WindowY) == "number" and Config.WindowX >= 0 and Config.WindowY >= 0 then
+			position = UDim2.fromOffset(math.clamp(Config.WindowX, 0, math.max(viewport.X - 160, 0)), math.clamp(Config.WindowY, 0, math.max(viewport.Y - 80, 0)))
+		end
+		panel = create("Frame", {
+			Name = "Panel",
+			Position = position,
+			Size = UDim2.fromOffset(WINDOW_WIDTH, WINDOW_HEIGHT),
+			BackgroundColor3 = UI.roles.Background,
+			BorderSizePixel = 0,
+			ClipsDescendants = true,
+			Parent = screenGui,
+		}, { create("UIScale", { Scale = windowScale }) })
+		round(panel, 14)
+		stroke(panel, "Outline")
+		UI.panel = panel
+		BeyRivals.panel = panel
+		-- Old spinning marks are gone; scripts that still rotate one get an invisible frame.
+		UI.mark = create("Frame", { Visible = false, Parent = panel })
 
-	local holder = create("Frame", {
-		Position = UDim2.fromOffset(8, 28),
-		Size = UDim2.new(1, -16, 1, -36),
-		BackgroundColor3 = UI.roles.Main,
-		BorderSizePixel = 0,
-		Parent = panel,
-	})
-	stroke(holder, "Outline")
-	-- Accent line along the top of the inner frame, right above the tabs.
-	create("Frame", { Size = UDim2.new(1, 0, 0, 1), BackgroundColor3 = UI.roles.Accent, BorderSizePixel = 0, ZIndex = 2, Parent = holder })
-	local tabBar = create("Frame", {
-		Position = UDim2.fromOffset(6, 6),
-		Size = UDim2.new(1, -12, 0, 22),
-		BackgroundTransparency = 1,
-		Parent = holder,
-	}, { create("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 2) }) })
-	local content = create("Frame", {
-		Position = UDim2.fromOffset(6, 28),
-		Size = UDim2.new(1, -12, 1, -34),
-		BackgroundColor3 = UI.roles.Background,
-		BorderSizePixel = 0,
-		Parent = holder,
-	})
-	stroke(content, "Outline")
+		-- Left side: what this is, then the pages in three groups.
+		local side = create("Frame", { Name = "Side", Size = UDim2.new(0, SIDEBAR, 1, 0), BackgroundTransparency = 1, Parent = panel })
+		create("Frame", { Position = UDim2.new(1, 0, 0, 0), Size = UDim2.new(0, 1, 1, 0), BackgroundColor3 = UI.roles.Outline, BorderSizePixel = 0, Parent = side })
+		local brand = create("Frame", { Size = UDim2.new(1, 0, 0, HEADER), BackgroundTransparency = 1, Parent = side })
+		label({ Position = UDim2.fromOffset(GUTTER, 17), Size = UDim2.new(1, -GUTTER - 8, 0, 20), Text = "Bey Rivals", FontFace = CODE_BOLD, TextSize = px(16), TextTruncate = Enum.TextTruncate.AtEnd, Parent = brand })
+		label({ Position = UDim2.fromOffset(GUTTER, 38), Size = UDim2.new(1, -GUTTER - 8, 0, 16), Text = "Potent Hub " .. tostring(BeyRivals.VERSION), TextSize = px(12), TextColor3 = UI.roles.Muted, TextTruncate = Enum.TextTruncate.AtEnd, Parent = brand })
+		tabBar = create("Frame", {
+			Position = UDim2.fromOffset(10, HEADER),
+			Size = UDim2.new(1, -20, 1, -HEADER - 44),
+			BackgroundTransparency = 1,
+			Parent = side,
+		}, { create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 2) }) })
+		UI.keyHint = label({
+			AnchorPoint = Vector2.new(0, 1),
+			Position = UDim2.new(0, GUTTER, 1, -14),
+			Size = UDim2.new(1, -GUTTER - 8, 0, 16),
+			Text = "",
+			TextSize = px(12),
+			TextColor3 = UI.roles.Muted,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+			Parent = side,
+		})
+
+		-- Top strip: the one place that answers "what is it doing?". Big line = the script's
+		-- status; under it the level and wave (or what it will join next); on the right two
+		-- figures for the session; along its bottom edge the base's health during a match.
+		local now = create("Frame", {
+			Name = "Now",
+			Position = UDim2.fromOffset(SIDEBAR + 1, 0),
+			Size = UDim2.new(1, -SIDEBAR - 1, 0, HEADER),
+			BackgroundTransparency = 1,
+			Parent = panel,
+		})
+		create("Frame", { AnchorPoint = Vector2.new(0, 1), Position = UDim2.fromScale(0, 1), Size = UDim2.new(1, 0, 0, 1), BackgroundColor3 = UI.roles.Outline, BorderSizePixel = 0, Parent = now })
+		local nowDot = create("Frame", { Position = UDim2.fromOffset(GUTTER, 22), Size = UDim2.fromOffset(8, 8), BackgroundColor3 = UI.roles.Muted, BorderSizePixel = 0, Parent = now })
+		round(nowDot, 4)
+		UI.statusLabel = label({
+			Position = UDim2.fromOffset(GUTTER + 18, 13),
+			Size = UDim2.new(1, -GUTTER - 18 - 250, 0, 26),
+			Text = "",
+			FontFace = CODE_BOLD,
+			TextSize = px(19),
+			TextTruncate = Enum.TextTruncate.AtEnd,
+			Parent = now,
+		})
+		local nowSub = label({
+			Position = UDim2.fromOffset(GUTTER + 18, 39),
+			Size = UDim2.new(1, -GUTTER - 18 - 250, 0, 18),
+			Text = "",
+			TextSize = px(13),
+			TextColor3 = UI.roles.Muted,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+			Parent = now,
+		})
+		local function nowStat(offset)
+			local value = label({
+				AnchorPoint = Vector2.new(1, 0),
+				Position = UDim2.new(1, -offset, 0, 13),
+				Size = UDim2.fromOffset(110, 26),
+				Text = "0",
+				FontFace = CODE_BOLD,
+				TextSize = px(19),
+				TextXAlignment = Enum.TextXAlignment.Right,
+				Parent = now,
+			})
+			local caption = label({
+				AnchorPoint = Vector2.new(1, 0),
+				Position = UDim2.new(1, -offset, 0, 39),
+				Size = UDim2.fromOffset(110, 18),
+				Text = "",
+				TextSize = px(13),
+				TextColor3 = UI.roles.Muted,
+				TextXAlignment = Enum.TextXAlignment.Right,
+				Parent = now,
+			})
+			return value, caption
+		end
+		local statB, captionB = nowStat(GUTTER)
+		local statA, captionA = nowStat(GUTTER + 120)
+		local healthTrack = create("Frame", { AnchorPoint = Vector2.new(0, 1), Position = UDim2.fromScale(0, 1), Size = UDim2.new(1, 0, 0, 3), BackgroundColor3 = UI.roles.Control, BorderSizePixel = 0, Visible = false, Parent = now })
+		local healthFill = create("Frame", { Size = UDim2.fromScale(1, 1), BackgroundColor3 = UI.roles.Accent, BorderSizePixel = 0, Parent = healthTrack })
+		---Feed the strip. info: sub, busy, health (base health fraction, nil outside a match),
+		---figures = { { value, caption }, { value, caption } }.
+		function UI.setNow(info)
+			nowSub.Text = info.sub or ""
+			nowDot.BackgroundColor3 = info.busy and UI.roles.Accent or UI.roles.Muted
+			local figures = info.figures or {}
+			statA.Text, captionA.Text = tostring(figures[1] and figures[1][1] or ""), tostring(figures[1] and figures[1][2] or "")
+			statB.Text, captionB.Text = tostring(figures[2] and figures[2][1] or ""), tostring(figures[2] and figures[2][2] or "")
+			healthTrack.Visible = info.health ~= nil
+			if info.health then
+				healthFill.Size = UDim2.fromScale(math.clamp(info.health, 0, 1), 1)
+			end
+		end
+
+		-- The window moves by its top strip or by the name in the corner.
+		do
+			local dragging, dragStart, startPosition = false, nil, nil
+			for _, handle in ipairs({ now, brand }) do
+				handle.InputBegan:Connect(function(input)
+					if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+						dragging, dragStart, startPosition = true, input.Position, panel.Position
+					end
+				end)
+			end
+			table.insert(BeyRivals.connections, userInputService.InputChanged:Connect(function(input)
+				if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+					local delta = input.Position - dragStart
+					panel.Position = UDim2.new(startPosition.X.Scale, startPosition.X.Offset + delta.X, startPosition.Y.Scale, startPosition.Y.Offset + delta.Y)
+				end
+			end))
+			table.insert(BeyRivals.connections, userInputService.InputEnded:Connect(function(input)
+				if (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) and dragging then
+					dragging = false
+					-- AbsolutePosition is measured under the top bar; the window ignores the inset.
+					local inset = game:GetService("GuiService"):GetGuiInset()
+					Config.WindowX = math.floor(panel.AbsolutePosition.X + inset.X)
+					Config.WindowY = math.floor(panel.AbsolutePosition.Y + inset.Y)
+				end
+			end))
+		end
+
+		content = create("Frame", {
+			Position = UDim2.fromOffset(SIDEBAR + 1, HEADER),
+			Size = UDim2.new(1, -SIDEBAR - 1, 1, -HEADER),
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			ClipsDescendants = true,
+			Parent = panel,
+		})
+	end
 
 	local pages, tabButtons = {}, {}
 	UI.pages, UI.tabButtons = pages, tabButtons
@@ -3646,10 +3867,17 @@ do
 		return layoutOrder
 	end
 
-	---A group box in one column of a page. Title is optional (the first box often has none).
-	local function newBox(page, title, side)
+	function UI.refreshAll()
+		for _, refresh in ipairs(UI.refreshers) do
+			pcall(refresh)
+		end
+	end
+
+	---A card. side: "left", "right", "full" (above the columns) or "bottom" (under them).
+	---note: one muted line under the title.
+	local function newBox(page, title, side, note)
 		local columns = UI.columns[page]
-		if side ~= "left" and side ~= "right" then
+		if side ~= "left" and side ~= "right" and side ~= "full" and side ~= "bottom" then
 			side = columns.height.left <= columns.height.right and "left" or "right"
 		end
 		local box = create("Frame", {
@@ -3660,121 +3888,310 @@ do
 			LayoutOrder = UI.nextOrder(),
 			Parent = columns[side],
 		})
+		round(box, 10)
 		stroke(box, "Outline")
-		create("Frame", { Size = UDim2.new(1, 0, 0, 2), BackgroundColor3 = UI.roles.Accent, BorderSizePixel = 0, Parent = box })
 		local body = create("Frame", {
-			Position = UDim2.fromOffset(0, 2),
 			Size = UDim2.new(1, 0, 0, 0),
 			AutomaticSize = Enum.AutomaticSize.Y,
 			BackgroundTransparency = 1,
 			Parent = box,
 		}, {
-			create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 4) }),
-			create("UIPadding", { PaddingTop = UDim.new(0, 6), PaddingBottom = UDim.new(0, 7), PaddingLeft = UDim.new(0, 6), PaddingRight = UDim.new(0, 6) }),
+			create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 12) }),
+			create("UIPadding", { PaddingTop = UDim.new(0, 16), PaddingBottom = UDim.new(0, 16), PaddingLeft = UDim.new(0, 16), PaddingRight = UDim.new(0, 16) }),
 		})
-		columns.height[side] += 20
-		UI.current[page] = { body = body, side = side }
+		if columns.height[side] then
+			columns.height[side] += 44
+		end
+		UI.current[page] = { body = body, side = side, box = box }
 		if title and title ~= "" then
-			label({ Size = UDim2.new(1, 0, 0, 16), Text = title, LayoutOrder = UI.nextOrder(), Parent = body })
-			columns.height[side] += 20
+			-- (No list layout here: a "?" may be put beside the title.)
+			local head = create("Frame", { Name = "Head", Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, LayoutOrder = UI.nextOrder(), Parent = body })
+			label({ Name = "Title", Size = UDim2.new(1, 0, 0, 20), Text = title, FontFace = CODE_BOLD, TextSize = px(16), TextTruncate = Enum.TextTruncate.AtEnd, Parent = head })
+			if note and note ~= "" then
+				wrapped({ Position = UDim2.fromOffset(0, 23), Size = UDim2.new(1, 0, 0, 16), Text = note, TextSize = px(13), TextColor3 = UI.roles.Muted, Parent = head })
+			end
+			if columns.height[side] then
+				columns.height[side] += 30
+			end
 		end
 		return body
 	end
 
-	---Where the next control on this page goes (a new untitled box if none is open).
+	---Where the next control on this page goes (a new untitled card if none is open).
 	local function slot(page, height)
 		local current = UI.current[page] or { body = newBox(page) }
 		current = UI.current[page]
-		UI.columns[page].height[current.side] += (height or 18) + 4
+		if UI.columns[page].height[current.side] then
+			UI.columns[page].height[current.side] += (height or 24) + 12
+		end
 		return current.body
 	end
 	UI.slot = slot
 
-	function UI.makePage(name)
+	---A page. about: one or two sentences under its title. group: its heading in the page list.
+	function UI.makePage(name, about, group)
 		local page = create("ScrollingFrame", {
 			Name = name,
-			Position = UDim2.fromOffset(6, 7),
-			Size = UDim2.new(1, -12, 1, -13),
+			Size = UDim2.fromScale(1, 1),
 			BackgroundTransparency = 1,
 			BorderSizePixel = 0,
-			ScrollBarThickness = 3,
+			ScrollBarThickness = 4,
 			ScrollBarImageColor3 = UI.roles.Outline,
 			CanvasSize = UDim2.new(),
 			AutomaticCanvasSize = Enum.AutomaticSize.Y,
+			ScrollingDirection = Enum.ScrollingDirection.Y,
 			Visible = false,
 			Parent = content,
+		}, {
+			create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 14) }),
+			create("UIPadding", { PaddingTop = UDim.new(0, 18), PaddingBottom = UDim.new(0, GUTTER), PaddingLeft = UDim.new(0, GUTTER), PaddingRight = UDim.new(0, GUTTER) }),
 		})
+		local intro = create("Frame", { Name = "Intro", Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, LayoutOrder = 1, Parent = page }, {
+			create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 4) }),
+		})
+		label({ Size = UDim2.new(1, 0, 0, 28), Text = name, FontFace = CODE_BOLD, TextSize = px(22), LayoutOrder = 1, Parent = intro })
+		if about and about ~= "" then
+			wrapped({ Size = UDim2.new(1, 0, 0, 18), Text = about, TextSize = px(14), TextColor3 = UI.roles.Muted, LayoutOrder = 2, Parent = intro })
+		end
+		local full = create("Frame", { Name = "Full", Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, LayoutOrder = 2, Visible = false, Parent = page }, {
+			create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 14) }),
+		})
+		full.ChildAdded:Connect(function()
+			full.Visible = true
+		end)
+		local holder = create("Frame", { Name = "Columns", Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, LayoutOrder = 3, Parent = page })
 		local function column(x)
 			return create("Frame", {
-				Position = UDim2.new(x, x == 0 and 0 or 4, 0, 0),
-				Size = UDim2.new(0.5, -6, 0, 0),
+				Position = UDim2.new(x, x == 0 and 0 or 7, 0, 0),
+				Size = UDim2.new(0.5, -7, 0, 0),
 				AutomaticSize = Enum.AutomaticSize.Y,
 				BackgroundTransparency = 1,
-				Parent = page,
-			}, { create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 8) }) })
+				Parent = holder,
+			}, {
+				create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 14) }),
+				create("UIPadding", { PaddingBottom = UDim.new(0, 2), PaddingLeft = UDim.new(0, 1), PaddingRight = UDim.new(0, 1), PaddingTop = UDim.new(0, 1) }),
+			})
 		end
 		local left, right = column(0), column(0.5)
-		UI.columns[page] = { left = left, right = right, height = { left = 0, right = 0 } }
-		-- Custom rows that a script parents straight to the page land in the open box.
+		local bottom = create("Frame", { Name = "Bottom", Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, LayoutOrder = 4, Visible = false, Parent = page }, {
+			create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 14) }),
+		})
+		bottom.ChildAdded:Connect(function()
+			bottom.Visible = true
+		end)
+		UI.columns[page] = { left = left, right = right, full = full, bottom = bottom, intro = intro, height = { left = 0, right = 0 } }
+		-- Custom rows that a script parents straight to the page land in the open card.
 		page.ChildAdded:Connect(function(child)
-			if child ~= left and child ~= right and child:IsA("GuiObject") then
+			if child ~= intro and child ~= full and child ~= holder and child ~= bottom and child:IsA("GuiObject") then
 				task.defer(function()
 					if child.Parent == page then
-						child.Parent = slot(page, child.AbsoluteSize.Y > 0 and child.AbsoluteSize.Y or 22)
+						child.Parent = slot(page, child.AbsoluteSize.Y > 0 and child.AbsoluteSize.Y or 24)
 					end
 				end)
 			end
 		end)
 		pages[name] = page
 		table.insert(UI.order, name)
+		UI.groups[name] = group or "More"
 		return page
 	end
 
 	function UI.selectTab(name)
+		if not pages[name] then
+			return
+		end
 		for pageName, page in pairs(pages) do
 			page.Visible = pageName == name
 		end
 		for buttonName, tabButton in pairs(tabButtons) do
 			local active = buttonName == name
-			tabButton.BackgroundColor3 = active and UI.roles.Background or UI.roles.Main
+			tabButton.BackgroundColor3 = UI.roles.Main
+			tabButton.BackgroundTransparency = active and 0 or 1
 			tabButton.TextColor3 = active and UI.roles.Font or UI.roles.Muted
-			tabButton.UIStroke.Color = UI.roles.Outline
-			tabButton.ZIndex = active and 3 or 2
+			tabButton.FontFace = active and CODE_BOLD or CODE_MEDIUM
+			local bar = tabButton:FindFirstChild("Bar")
+			if bar then
+				bar.BackgroundColor3 = UI.roles.Accent
+				bar.Visible = active
+			end
 		end
 		UI.activeTab = name
+		UI.showTip(nil)
 	end
 
 	function UI.makeTab(name, order)
 		local tabButton = create("TextButton", {
 			Name = name,
-			Size = UDim2.fromOffset(0, 22),
-			AutomaticSize = Enum.AutomaticSize.X,
+			Size = UDim2.new(1, 0, 0, 30),
 			BackgroundColor3 = UI.roles.Main,
+			BackgroundTransparency = 1,
 			BorderSizePixel = 0,
-			FontFace = CODE,
+			FontFace = CODE_MEDIUM,
 			Text = name,
-			TextSize = TEXT_SIZE,
+			TextSize = px(15),
 			TextColor3 = UI.roles.Muted,
+			TextXAlignment = Enum.TextXAlignment.Left,
 			AutoButtonColor = false,
 			LayoutOrder = order or 0,
 			Parent = tabBar,
-		}, { create("UIPadding", { PaddingLeft = UDim.new(0, 7), PaddingRight = UDim.new(0, 7) }) })
-		stroke(tabButton, "Outline")
+		}, { create("UIPadding", { PaddingLeft = UDim.new(0, 14) }) })
+		round(tabButton, 7)
+		local bar = create("Frame", { Name = "Bar", AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, -8, 0.5, 0), Size = UDim2.fromOffset(3, 14), BackgroundColor3 = UI.roles.Accent, BorderSizePixel = 0, Visible = false, Parent = tabButton })
+		round(bar, 2)
 		tabButtons[name] = tabButton
+		tabButton.MouseEnter:Connect(function()
+			if UI.activeTab ~= name then
+				tabButton.TextColor3 = UI.roles.Font
+			end
+		end)
+		tabButton.MouseLeave:Connect(function()
+			if UI.activeTab ~= name then
+				tabButton.TextColor3 = UI.roles.Muted
+			end
+		end)
 		tabButton.MouseButton1Click:Connect(function()
 			UI.selectTab(name)
 		end)
 		return tabButton
 	end
-
-	-- Controls. Every builder takes the page; heading() opens a new group box.
-	function UI.heading(page, text, side)
-		newBox(page, text, side)
+	---The heading of a group of pages in the list.
+	function UI.makeGroup(name, order)
+		local caption = label({ Size = UDim2.new(1, 0, 0, order > 1 and 32 or 20), Text = name, FontFace = Font.new(Type.family, Enum.FontWeight.Bold), TextSize = px(12), TextColor3 = UI.roles.Muted, TextYAlignment = Enum.TextYAlignment.Bottom, LayoutOrder = order, Parent = tabBar })
+		create("UIPadding", { PaddingLeft = UDim.new(0, 14), PaddingBottom = UDim.new(0, 5), Parent = caption })
+		return caption
 	end
 
+	-- Longer explanations sit behind a "?" beside the control they explain and show while the
+	-- cursor is on it. What a control does in a line is written under its name instead.
+	UI.lastRow = {}
+	function UI.showTip(text)
+		local tip = UI.tipFrame
+		if not tip then
+			tip = create("TextLabel", {
+				Name = "PotentTip",
+				Size = UDim2.fromOffset(300, 0),
+				AutomaticSize = Enum.AutomaticSize.Y,
+				BackgroundColor3 = UI.roles.Raised,
+				BorderSizePixel = 0,
+				FontFace = CODE,
+				TextSize = px(14),
+				LineHeight = 1.2,
+				TextColor3 = UI.roles.Font,
+				TextWrapped = true,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				TextYAlignment = Enum.TextYAlignment.Top,
+				Visible = false,
+				ZIndex = 200,
+				Parent = screenGui,
+			}, {
+				create("UICorner", { CornerRadius = UDim.new(0, 8) }),
+				create("UIPadding", { PaddingTop = UDim.new(0, 10), PaddingBottom = UDim.new(0, 10), PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12) }),
+				create("UIStroke", { Color = UI.roles.Outline, Thickness = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border }),
+			})
+			UI.tipFrame = tip
+		end
+		if not text or text == "" then
+			tip.Visible = false
+			return
+		end
+		tip.Text = text
+		local mouse = userInputService:GetMouseLocation()
+		local view = screenGui.AbsoluteSize
+		local x = mouse.X + 16
+		if x + 310 > view.X then
+			x = mouse.X - 316
+		end
+		tip.Position = UDim2.fromOffset(math.max(x, 4), math.clamp(mouse.Y + 18, 4, math.max(view.Y - math.max(tip.AbsoluteSize.Y, 140) - 4, 4)))
+		tip.Visible = true
+	end
+	---Put a "?" on a row. `spot` = { position (UDim2, anchored at its right edge), row, caption }.
+	function UI.attachTip(spot, text)
+		if spot.icon then
+			spot.text = spot.text .. "\n\n" .. text
+			return spot
+		end
+		spot.text = text
+		local caption = spot.caption
+		if caption then
+			-- Leave room for the "?" beside the name.
+			caption.Size = UDim2.new(caption.Size.X.Scale, caption.Size.X.Offset - 26, caption.Size.Y.Scale, caption.Size.Y.Offset)
+		end
+		local mark = create("TextLabel", {
+			Name = "Tip",
+			AnchorPoint = Vector2.new(1, 0),
+			Position = spot.position,
+			Size = UDim2.fromOffset(18, 18),
+			BackgroundColor3 = UI.roles.Control,
+			BorderSizePixel = 0,
+			FontFace = CODE_BOLD,
+			Text = "?",
+			TextSize = px(13),
+			TextColor3 = UI.roles.Muted,
+			TextXAlignment = Enum.TextXAlignment.Center,
+			Active = true,
+			ZIndex = 3,
+			Parent = spot.row,
+		}, { create("UICorner", { CornerRadius = UDim.new(1, 0) }) })
+		local ring = stroke(mark, "Outline")
+		spot.icon = mark
+		mark.MouseEnter:Connect(function()
+			ring.Color = UI.roles.Accent
+			mark.TextColor3 = UI.roles.Font
+			UI.showTip(spot.text)
+		end)
+		mark.MouseMoved:Connect(function()
+			UI.showTip(spot.text)
+		end)
+		mark.MouseLeave:Connect(function()
+			ring.Color = UI.roles.Outline
+			mark.TextColor3 = UI.roles.Muted
+			UI.showTip(nil)
+		end)
+		return spot
+	end
+	---A "?" beside the title of the open card.
+	function UI.cardTip(page, text)
+		local current = UI.current[page]
+		local head = current and current.body:FindFirstChild("Head")
+		if head then
+			UI.attachTip({ row = head, position = UDim2.new(1, 0, 0, 1), caption = head:FindFirstChild("Title") }, text)
+		end
+	end
+	---Builders call this so the hint that follows knows which row it explains.
+	---`whole`: the full row when `row` is only its top line (so a mode gate can hide all of it).
+	function UI.markRow(page, row, position, captionLabel, whole)
+		UI.lastRow[page] = { row = row, position = position, body = (whole or row).Parent, caption = captionLabel, whole = whole }
+	end
+
+	---The left part of a row: its name and, under it, one short note. `reserve` px stay free on
+	---the right for the control. Returns the holder and the note label (nil without a note).
+	local function caption(row, text, note, reserve)
+		local holder = create("Frame", {
+			Name = "Caption",
+			Size = UDim2.new(1, -(reserve or 0), 0, 0),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			BackgroundTransparency = 1,
+			Parent = row,
+		}, { create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 2) }) })
+		local name = wrapped({ Name = "Name", Size = UDim2.new(1, 0, 0, 20), Text = text, FontFace = CODE_MEDIUM, LayoutOrder = 1, Parent = holder })
+		local noteLabel
+		if note and note ~= "" then
+			noteLabel = wrapped({ Name = "Note", Size = UDim2.new(1, 0, 0, 16), Text = note, TextSize = px(13), TextColor3 = UI.roles.Muted, LayoutOrder = 2, Parent = holder })
+		end
+		return holder, noteLabel, name
+	end
+
+	-- Controls. Every builder takes the page; heading() opens a new card.
+	function UI.heading(page, text, side, note)
+		newBox(page, text, side, note)
+		UI.lastRow[page] = nil
+	end
+
+	---A row in the open card. Grows with its content; `height` is its least height.
 	function UI.rowBase(page, height, clickable)
 		local row = create(clickable and "TextButton" or "Frame", {
 			Size = UDim2.new(1, 0, 0, height),
+			AutomaticSize = Enum.AutomaticSize.Y,
 			BackgroundTransparency = 1,
 			BorderSizePixel = 0,
 			LayoutOrder = UI.nextOrder(),
@@ -3790,29 +4207,50 @@ do
 	function UI.rowLabel(row, text, y, width)
 		return label({
 			Position = UDim2.fromOffset(0, y or 0),
-			Size = width or UDim2.new(1, -110, 0, y and 18 or row.Size.Y.Offset),
+			Size = width or UDim2.new(1, -110, 0, y and 20 or row.Size.Y.Offset),
 			Text = text,
 			Parent = row,
 		})
 	end
 
-	function UI.toggle(page, text, key)
-		local row = UI.rowBase(page, 18, true)
-		local box = create("Frame", {
-			Position = UDim2.fromOffset(0, 3),
-			Size = UDim2.fromOffset(12, 12),
+	---On / off switch: the name (and a note) on the left, a pill on the right that slides and
+	---fills when on.
+	function UI.toggle(page, text, key, note)
+		local row = UI.rowBase(page, 22, true)
+		local holder, _, name = caption(row, text, note, 50)
+		UI.markRow(page, row, UDim2.new(1, -46, 0, 2), holder)
+		local track = create("Frame", {
+			AnchorPoint = Vector2.new(1, 0),
+			Position = UDim2.new(1, 0, 0, 1),
+			Size = UDim2.fromOffset(36, 20),
 			BackgroundColor3 = UI.roles.Control,
 			BorderSizePixel = 0,
 			Parent = row,
 		})
-		stroke(box, "Outline")
-		label({ Position = UDim2.fromOffset(19, 0), Size = UDim2.new(1, -19, 1, 0), Text = text, Parent = row })
+		round(track, 10)
+		local outline = stroke(track, "Outline")
+		local knob = create("Frame", {
+			AnchorPoint = Vector2.new(0, 0.5),
+			Position = UDim2.new(0, 3, 0.5, 0),
+			Size = UDim2.fromOffset(14, 14),
+			BackgroundColor3 = UI.roles.Muted,
+			BorderSizePixel = 0,
+			Parent = track,
+		})
+		round(knob, 7)
+		local shown
 		local function refresh()
-			box.BackgroundColor3 = Config[key] and UI.roles.Accent or UI.roles.Control
+			local on = Config[key] and true or false
+			local quick = (shown == nil or shown == on) and 0 or 0.14
+			shown = on
+			tween(track, { BackgroundColor3 = on and UI.roles.Accent or UI.roles.Control }, quick)
+			tween(knob, { Position = UDim2.new(0, on and 19 or 3, 0.5, 0), BackgroundColor3 = on and UI.onAccent() or UI.roles.Muted }, quick)
+			outline.Color = on and UI.roles.Accent or UI.roles.Outline
+			name.TextColor3 = on and UI.roles.Font or UI.roles.Font:Lerp(UI.roles.Muted, 0.5)
 		end
 		row.MouseButton1Click:Connect(function()
 			Config[key] = not Config[key]
-			refresh()
+			UI.refreshAll()
 		end)
 		table.insert(UI.refreshers, refresh)
 		if type(BeyRivals.toggleRefreshers) == "table" then
@@ -3822,42 +4260,66 @@ do
 		return row
 	end
 
-	function UI.slider(page, text, key, minValue, maxValue, step, format)
-		local row = UI.rowBase(page, 34, false)
-		label({ Size = UDim2.new(1, -70, 0, 16), Text = text, Parent = row })
+	function UI.slider(page, text, key, minValue, maxValue, step, format, note)
+		local row = UI.rowBase(page, 44, false)
+		create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 4), Parent = row })
+		local top = create("Frame", { Size = UDim2.new(1, 0, 0, 20), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, LayoutOrder = 1, Parent = row })
+		local holder = caption(top, text, note, 84)
+		UI.markRow(page, top, UDim2.new(1, -80, 0, 2), holder, row)
 		local valueLabel = label({
 			AnchorPoint = Vector2.new(1, 0),
 			Position = UDim2.new(1, 0, 0, 0),
-			Size = UDim2.fromOffset(70, 16),
+			Size = UDim2.fromOffset(78, 20),
 			TextXAlignment = Enum.TextXAlignment.Right,
-			TextColor3 = UI.roles.Muted,
+			FontFace = CODE_BOLD,
+			TextSize = px(14),
 			Text = "",
-			Parent = row,
+			Parent = top,
 		})
-		local track = create("TextButton", {
-			Position = UDim2.fromOffset(0, 19),
-			Size = UDim2.new(1, 0, 0, 13),
-			BackgroundColor3 = UI.roles.Control,
+		-- Tall invisible hit area around a thin track: easy to grab, light to look at.
+		local hit = create("TextButton", {
+			Size = UDim2.new(1, 0, 0, 18),
+			BackgroundTransparency = 1,
 			BorderSizePixel = 0,
 			Text = "",
 			AutoButtonColor = false,
+			LayoutOrder = 2,
 			Parent = row,
 		})
-		stroke(track, "Outline")
+		local track = create("Frame", {
+			AnchorPoint = Vector2.new(0, 0.5),
+			Position = UDim2.new(0, 7, 0.5, 0),
+			Size = UDim2.new(1, -14, 0, 4),
+			BackgroundColor3 = UI.roles.Control,
+			BorderSizePixel = 0,
+			Parent = hit,
+		})
+		round(track, 2)
 		local fill = create("Frame", { Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = UI.roles.Accent, BorderSizePixel = 0, Parent = track })
+		round(fill, 2)
+		local knob = create("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromScale(0, 0.5),
+			Size = UDim2.fromOffset(14, 14),
+			BackgroundColor3 = UI.roles.Font,
+			BorderSizePixel = 0,
+			Parent = track,
+		})
+		round(knob, 7)
 		local function refresh()
 			local fraction = math.clamp((Config[key] - minValue) / (maxValue - minValue), 0, 1)
 			fill.Size = UDim2.new(fraction, 0, 1, 0)
+			knob.Position = UDim2.fromScale(fraction, 0.5)
 			valueLabel.Text = format(Config[key])
 		end
 		local dragging = false
 		local function setFromX(x)
-			local fraction = math.clamp((x - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
+			local fraction = math.clamp((x - track.AbsolutePosition.X) / math.max(track.AbsoluteSize.X, 1), 0, 1)
 			local value = minValue + fraction * (maxValue - minValue)
 			Config[key] = math.clamp(math.floor(value / step + 0.5) * step, minValue, maxValue)
 			refresh()
 		end
-		track.InputBegan:Connect(function(input)
+		hit.InputBegan:Connect(function(input)
 			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
 				dragging = true
 				setFromX(input.Position.X)
@@ -3878,46 +4340,68 @@ do
 		return row
 	end
 
-	function UI.segmented(page, text, key, options)
+	---Pick one of a few: the chosen option is a filled pill, the rest are plain words.
+	---`names` maps an option to the word shown for it.
+	function UI.segmented(page, text, key, options, note, names)
 		local hasLabel = text ~= nil and text ~= ""
-		local row = UI.rowBase(page, hasLabel and 38 or 20, false)
+		local row = UI.rowBase(page, 32, false)
+		create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 6), Parent = row })
 		if hasLabel then
-			label({ Size = UDim2.new(1, 0, 0, 16), Text = text, Parent = row })
+			local top = create("Frame", { Size = UDim2.new(1, 0, 0, 20), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, LayoutOrder = 1, Parent = row })
+			local holder = caption(top, text, note, 0)
+			UI.markRow(page, top, UDim2.new(1, 0, 0, 2), holder, row)
 		end
 		local group = create("Frame", {
-			Position = UDim2.fromOffset(0, hasLabel and 18 or 0),
-			Size = UDim2.new(1, 0, 0, 20),
-			BackgroundTransparency = 1,
+			Size = UDim2.new(1, 0, 0, 32),
+			BackgroundColor3 = UI.roles.Control,
+			BorderSizePixel = 0,
+			LayoutOrder = 2,
 			Parent = row,
-		}, { create("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 3) }) })
+		}, {
+			create("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 2) }),
+			create("UIPadding", { PaddingTop = UDim.new(0, 3), PaddingBottom = UDim.new(0, 3), PaddingLeft = UDim.new(0, 3), PaddingRight = UDim.new(0, 3) }),
+		})
+		round(group, 8)
 		local buttons = {}
 		local function refresh()
 			for option, optionButton in pairs(buttons) do
 				local active = Config[key] == option
-				optionButton.TextColor3 = active and UI.roles.Accent or UI.roles.Muted
-				optionButton.UIStroke.Color = active and UI.roles.Accent or UI.roles.Outline
+				optionButton.BackgroundColor3 = UI.roles.Accent
+				optionButton.BackgroundTransparency = active and 0 or 1
+				optionButton.TextColor3 = active and UI.onAccent() or UI.roles.Muted
+				optionButton.FontFace = active and CODE_BOLD or CODE_MEDIUM
 			end
 		end
 		for index, option in ipairs(options) do
 			local optionButton = create("TextButton", {
-				Size = UDim2.new(1 / #options, -3 + 3 / #options, 1, 0),
-				BackgroundColor3 = UI.roles.Control,
+				Size = UDim2.new(1 / #options, -2 + 2 / #options, 1, 0),
+				BackgroundColor3 = UI.roles.Accent,
+				BackgroundTransparency = 1,
 				BorderSizePixel = 0,
-				FontFace = CODE,
-				Text = tostring(option),
-				TextSize = 13,
+				FontFace = CODE_MEDIUM,
+				Text = tostring(names and names[option] or option),
+				TextSize = px(14),
 				TextColor3 = UI.roles.Muted,
+				TextTruncate = Enum.TextTruncate.AtEnd,
 				AutoButtonColor = false,
 				LayoutOrder = index,
 				Parent = group,
 			})
-			stroke(optionButton, "Outline")
+			round(optionButton, 6)
 			buttons[option] = optionButton
+			optionButton.MouseEnter:Connect(function()
+				if Config[key] ~= option then
+					optionButton.TextColor3 = UI.roles.Font
+				end
+			end)
+			optionButton.MouseLeave:Connect(function()
+				if Config[key] ~= option then
+					optionButton.TextColor3 = UI.roles.Muted
+				end
+			end)
 			optionButton.MouseButton1Click:Connect(function()
 				Config[key] = option
-				for _, other in ipairs(UI.refreshers) do
-					other()
-				end
+				UI.refreshAll()
 			end)
 		end
 		table.insert(UI.refreshers, refresh)
@@ -3928,46 +4412,166 @@ do
 		return row
 	end
 
+	---A longer explanation for the row above (a "?" beside it). With no row above, a plain note.
 	function UI.hint(page, text)
-		local hintLabel = label({
-			Size = UDim2.new(1, 0, 0, 14),
-			AutomaticSize = Enum.AutomaticSize.Y,
+		local last = UI.lastRow[page]
+		if text ~= "" and last and UI.current[page] and last.body == UI.current[page].body and last.row.Parent then
+			UI.attachTip(last, text)
+			-- Callers may keep the label and rewrite it: the "?" follows.
+			local proxy = label({ Size = UDim2.new(), Text = text, Visible = false, Parent = last.row })
+			proxy:GetPropertyChangedSignal("Text"):Connect(function()
+				last.text = proxy.Text
+			end)
+			return proxy
+		end
+		return UI.note(page, text)
+	end
+	---A muted line of small print in the open card.
+	function UI.note(page, text)
+		return wrapped({
+			Size = UDim2.new(1, 0, 0, 16),
 			Text = text,
-			TextSize = 13,
+			TextSize = px(13),
 			TextColor3 = UI.roles.Muted,
-			TextWrapped = true,
 			LayoutOrder = UI.nextOrder(),
-			Parent = slot(page, 14),
+			Parent = slot(page, 18),
 		})
-		return hintLabel
 	end
 
+	---A line (or block) of live text in the open card.
 	function UI.infoLine(page, height)
+		local tall = (height or 20) > 20
 		return label({
-			Size = UDim2.new(1, 0, 0, height or 18),
+			Size = UDim2.new(1, 0, 0, tall and 18 or 20),
+			AutomaticSize = tall and Enum.AutomaticSize.Y or Enum.AutomaticSize.None,
 			Text = "",
-			TextSize = 13,
-			TextWrapped = (height or 18) > 18,
+			TextSize = px(14),
+			LineHeight = 1.2,
+			TextWrapped = tall,
+			TextTruncate = tall and Enum.TextTruncate.None or Enum.TextTruncate.AtEnd,
 			TextYAlignment = Enum.TextYAlignment.Top,
 			LayoutOrder = UI.nextOrder(),
-			Parent = slot(page, height or 18),
+			Parent = slot(page, height or 20),
 		})
 	end
 
-	---Unfolding option list under a row (scrolls past 9 options).
+	---A "name ........ value" line; returns the value label.
+	function UI.kv(page, name)
+		local row = UI.rowBase(page, 20, false)
+		label({ Size = UDim2.new(0.44, 0, 0, 20), Text = name, TextColor3 = UI.roles.Muted, TextSize = px(14), TextTruncate = Enum.TextTruncate.AtEnd, Parent = row })
+		return label({ Position = UDim2.fromScale(0.44, 0), Size = UDim2.new(0.56, 0, 0, 20), Text = "", FontFace = CODE_MEDIUM, TextSize = px(14), TextXAlignment = Enum.TextXAlignment.Right, TextTruncate = Enum.TextTruncate.AtEnd, Parent = row })
+	end
+	---A grid of figures (big value over its name); returns name -> value label.
+	function UI.tiles(page, names, perRow)
+		perRow = perRow or 2
+		local rows = math.ceil(#names / perRow)
+		local grid = UI.rowBase(page, rows * 60 + (rows - 1) * 8, false)
+		grid.AutomaticSize = Enum.AutomaticSize.None
+		UI.grid(grid, perRow, 8, 60)
+		local values = {}
+		for index, name in ipairs(names) do
+			local tile = create("Frame", { BackgroundColor3 = UI.roles.Control, BorderSizePixel = 0, LayoutOrder = index, Parent = grid }, { create("UICorner", { CornerRadius = UDim.new(0, 8) }) })
+			values[name] = label({ Position = UDim2.fromOffset(12, 8), Size = UDim2.new(1, -24, 0, 26), Text = "0", FontFace = CODE_BOLD, TextSize = px(22), TextTruncate = Enum.TextTruncate.AtEnd, Parent = tile })
+			label({ Position = UDim2.fromOffset(12, 35), Size = UDim2.new(1, -24, 0, 16), Text = name, TextSize = px(13), TextColor3 = UI.roles.Muted, TextTruncate = Enum.TextTruncate.AtEnd, Parent = tile })
+		end
+		return values
+	end
+	---A stack of rows that is rebuilt whenever its content changes (banner odds, drop tables).
+	---Returns set(rows). A row is one of:
+	---  { title = "Summer 2026", right = "150 Summer Pearls a pull" }   group heading
+	---  { name = "Phoenix", value = "0.25%", extra = "1 in 400", accent = true, tick = true }
+	---  { note = "..." }                                               wrapped small print
+	---  { gap = true }
+	function UI.list(page)
+		local body = slot(page, 80)
+		local holder = create("Frame", {
+			Size = UDim2.new(1, 0, 0, 0),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			BackgroundTransparency = 1,
+			LayoutOrder = UI.nextOrder(),
+			Parent = body,
+		}, { create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 4) }) })
+		-- A hint() after the list becomes a "?" at the end of the card's title.
+		local head = body:FindFirstChild("Head")
+		if head then
+			UI.markRow(page, head, UDim2.new(1, 0, 0, 1), head:FindFirstChild("Title"))
+		end
+		local signature
+		return function(rows)
+			local now = httpService:JSONEncode(rows)
+			if now == signature then
+				return
+			end
+			signature = now
+			for _, child in ipairs(holder:GetChildren()) do
+				if child:IsA("GuiObject") then
+					child:Destroy()
+				end
+			end
+			for index, row in ipairs(rows) do
+				if row.gap then
+					create("Frame", { Size = UDim2.new(1, 0, 0, 6), BackgroundTransparency = 1, LayoutOrder = index, Parent = holder })
+				elseif row.bar then
+					-- A progress bar (0 to 1) under the row before it; green once full.
+					local track = create("Frame", { Size = UDim2.new(1, 0, 0, row.tall and 8 or 5), BackgroundColor3 = UI.roles.Control, BorderSizePixel = 0, LayoutOrder = index, Parent = holder }, { create("UICorner", { CornerRadius = UDim.new(1, 0) }) })
+					local share = math.clamp(tonumber(row.bar) or 0, 0, 1)
+					if share > 0 then
+						local fill = create("Frame", { Size = UDim2.fromScale(share, 1), BackgroundColor3 = share >= 1 and WIN or UI.roles.Accent, BorderSizePixel = 0, Parent = track }, { create("UICorner", { CornerRadius = UDim.new(1, 0) }) })
+						if share >= 1 then
+							fill:SetAttribute("NoTheme", true)
+						end
+					end
+				elseif row.title then
+					local head = create("Frame", { Size = UDim2.new(1, 0, 0, 22), BackgroundTransparency = 1, LayoutOrder = index, Parent = holder }, {
+						create("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, VerticalAlignment = Enum.VerticalAlignment.Center, Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder }),
+					})
+					label({ Size = UDim2.new(0, 0, 1, 0), AutomaticSize = Enum.AutomaticSize.X, Text = row.title, FontFace = CODE_BOLD, TextSize = px(14), LayoutOrder = 1, Parent = head })
+					create("UIFlexItem", { FlexMode = Enum.UIFlexMode.Fill, Parent = label({ Size = UDim2.new(0, 0, 1, 0), Text = row.right or "", TextSize = px(13), TextColor3 = UI.roles.Muted, TextXAlignment = Enum.TextXAlignment.Right, TextTruncate = Enum.TextTruncate.AtEnd, LayoutOrder = 2, Parent = head }) })
+				elseif row.note then
+					wrapped({ Size = UDim2.new(1, 0, 0, 16), Text = row.note, TextSize = px(13), TextColor3 = UI.roles.Muted, LayoutOrder = index, Parent = holder })
+				else
+					local line = create("Frame", { Size = UDim2.new(1, 0, 0, 28), BackgroundColor3 = UI.roles.Control, BorderSizePixel = 0, LayoutOrder = index, Parent = holder }, {
+						create("UICorner", { CornerRadius = UDim.new(0, 6) }),
+						create("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) }),
+						create("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, VerticalAlignment = Enum.VerticalAlignment.Center, Padding = UDim.new(0, 7), SortOrder = Enum.SortOrder.LayoutOrder }),
+					})
+					if row.accent then
+						create("Frame", { Size = UDim2.fromOffset(3, 14), BackgroundColor3 = UI.roles.Accent, BorderSizePixel = 0, LayoutOrder = 1, Parent = line }, { create("UICorner", { CornerRadius = UDim.new(0, 2) }) })
+					end
+					local name = label({ Size = UDim2.new(0, 0, 1, 0), Text = tostring(row.name), TextSize = px(14), FontFace = row.accent and CODE_MEDIUM or CODE, TextTruncate = Enum.TextTruncate.AtEnd, LayoutOrder = 2, Parent = line })
+					create("UIFlexItem", { FlexMode = Enum.UIFlexMode.Fill, Parent = name })
+					if row.tick then
+						icon(line, "check", 12, WIN, { LayoutOrder = 3 }):SetAttribute("NoTheme", true)
+					end
+					if row.extra then
+						label({ Size = UDim2.new(0, 0, 1, 0), AutomaticSize = Enum.AutomaticSize.X, Text = row.extra, TextSize = px(13), TextColor3 = UI.roles.Muted, LayoutOrder = 4, Parent = line })
+					end
+					if row.value then
+						label({ Size = UDim2.new(0, 0, 1, 0), AutomaticSize = Enum.AutomaticSize.X, Text = row.value, TextSize = px(14), FontFace = CODE_MEDIUM, TextXAlignment = Enum.TextXAlignment.Right, LayoutOrder = 5, Parent = line })
+					end
+				end
+			end
+		end
+	end
+
+	---Unfolding option list under a row (scrolls past 8 options).
 	local function optionList(row, onChoose)
 		local list = create("ScrollingFrame", {
 			Size = UDim2.new(1, 0, 0, 0),
 			BackgroundColor3 = UI.roles.Control,
 			BorderSizePixel = 0,
-			ScrollBarThickness = 3,
+			ScrollBarThickness = 4,
 			ScrollBarImageColor3 = UI.roles.Outline,
 			CanvasSize = UDim2.new(),
 			AutomaticCanvasSize = Enum.AutomaticSize.Y,
 			Visible = false,
 			LayoutOrder = UI.nextOrder(),
 			Parent = row.Parent,
-		}, { create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder }) })
+		}, {
+			create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 2) }),
+			create("UIPadding", { PaddingTop = UDim.new(0, 4), PaddingBottom = UDim.new(0, 4), PaddingLeft = UDim.new(0, 4), PaddingRight = UDim.new(0, 8) }),
+		})
+		round(list, 7)
 		stroke(list, "Outline")
 		local function fill(entries)
 			for _, child in ipairs(list:GetChildren()) do
@@ -3977,20 +4581,21 @@ do
 			end
 			for index, entry in ipairs(entries) do
 				local item = create("TextButton", {
-					Size = UDim2.new(1, -4, 0, 18),
-					BackgroundColor3 = UI.roles.Main,
+					Size = UDim2.new(1, 0, 0, 28),
+					BackgroundColor3 = UI.roles.Raised,
 					BackgroundTransparency = 1,
 					BorderSizePixel = 0,
-					FontFace = CODE,
-					Text = "  " .. tostring(entry.text),
-					TextSize = 13,
+					FontFace = entry.current and CODE_BOLD or CODE,
+					Text = tostring(entry.text),
+					TextSize = px(14),
 					TextColor3 = entry.current and UI.roles.Accent or UI.roles.Font,
 					TextXAlignment = Enum.TextXAlignment.Left,
 					TextTruncate = Enum.TextTruncate.AtEnd,
 					AutoButtonColor = false,
 					LayoutOrder = index,
 					Parent = list,
-				})
+				}, { create("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8) }) })
+				round(item, 5)
 				item.MouseEnter:Connect(function()
 					item.BackgroundTransparency = 0
 				end)
@@ -4002,38 +4607,54 @@ do
 					onChoose(entry.value)
 				end)
 			end
-			list.Size = UDim2.new(1, 0, 0, math.min(#entries, 9) * 18 + 2)
+			list.Size = UDim2.new(1, 0, 0, math.min(#entries, 8) * 30 + 6)
 		end
 		return list, fill
 	end
 
-	local function valueBox(row, y)
+	---The box of a drop-down: its value and a mark that it opens.
+	local function valueBox(row)
 		local box = create("TextButton", {
-			Position = UDim2.fromOffset(0, y),
-			Size = UDim2.new(1, 0, 0, 20),
+			Size = UDim2.new(1, 0, 0, 32),
 			BackgroundColor3 = UI.roles.Control,
 			BorderSizePixel = 0,
 			Text = "",
 			AutoButtonColor = false,
+			LayoutOrder = 2,
 			Parent = row,
 		})
-		stroke(box, "Outline")
-		local value = label({ Position = UDim2.fromOffset(6, 0), Size = UDim2.new(1, -24, 1, 0), Text = "", TextSize = 13, TextTruncate = Enum.TextTruncate.AtEnd, Parent = box })
-		label({ AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -6, 0, 0), Size = UDim2.fromOffset(12, 20), Text = "v", TextColor3 = UI.roles.Muted, TextXAlignment = Enum.TextXAlignment.Right, Parent = box })
+		round(box, 7)
+		local outline = stroke(box, "Outline")
+		box.MouseEnter:Connect(function()
+			outline.Color = UI.roles.Muted
+		end)
+		box.MouseLeave:Connect(function()
+			outline.Color = UI.roles.Outline
+		end)
+		local value = label({ Position = UDim2.fromOffset(10, 0), Size = UDim2.new(1, -38, 1, 0), Text = "", TextSize = px(14), TextTruncate = Enum.TextTruncate.AtEnd, Parent = box })
+		icon(box, "down", 12, UI.roles.Muted, { AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -11, 0.5, 0) })
 		return box, value
+	end
+	---The shared body of both drop-downs: name (and note) above, the box under it.
+	local function dropRow(page, text, note)
+		local row = UI.rowBase(page, 56, false)
+		create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 6), Parent = row })
+		local top = create("Frame", { Size = UDim2.new(1, 0, 0, 20), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, LayoutOrder = 1, Parent = row })
+		local holder = caption(top, text, note, 0)
+		UI.markRow(page, top, UDim2.new(1, 0, 0, 2), holder, row)
+		return row
 	end
 
 	---Pick-one drop-down for lists of option tables ({ ..., name =, current = }).
-	function UI.cycler(page, text, getOptions, getLabel, onPick)
-		local row = UI.rowBase(page, 38, false)
-		label({ Size = UDim2.new(1, 0, 0, 16), Text = text, Parent = row })
-		local box, value = valueBox(row, 18)
+	function UI.cycler(page, text, getOptions, getLabel, onPick, note)
+		local row = dropRow(page, text, note)
+		local box, value = valueBox(row)
 		local function refresh()
 			value.Text = tostring(getLabel())
 		end
 		local list, fill = optionList(row, function(option)
 			onPick(option)
-			refresh()
+			UI.refreshAll()
 		end)
 		box.MouseButton1Click:Connect(function()
 			list.Visible = not list.Visible
@@ -4041,7 +4662,7 @@ do
 				local entries = {}
 				for _, option in ipairs(getOptions()) do
 					local name = option.name or option.label or option.id or option.uid or option.slot
-					table.insert(entries, { text = (name == "" or name == nil) and "--" or name, value = option, current = option.current })
+					table.insert(entries, { text = (name == "" or name == nil) and "None" or name, value = option, current = option.current })
 				end
 				fill(entries)
 			end
@@ -4051,36 +4672,84 @@ do
 		return refresh
 	end
 
-	function UI.button(page, text, action)
-		local buttonFrame = create("TextButton", {
-			Size = UDim2.new(1, 0, 0, 22),
-			BackgroundColor3 = UI.roles.Control,
-			BorderSizePixel = 0,
-			FontFace = CODE,
-			Text = text,
-			TextSize = TEXT_SIZE,
-			TextColor3 = UI.roles.Font,
-			AutoButtonColor = false,
-			LayoutOrder = UI.nextOrder(),
-			Parent = slot(page, 22),
-		})
-		local outline = stroke(buttonFrame, "Outline")
+	---Drop-down over plain string options.
+	function UI.dropdown(page, text, getOptions, getValue, onPick, note)
+		local row = dropRow(page, text, note)
+		local box, value = valueBox(row)
+		local function refresh()
+			value.Text = tostring(getValue() or "None")
+		end
+		local list, fill = optionList(row, function(option)
+			onPick(option)
+			UI.refreshAll()
+		end)
+		box.MouseButton1Click:Connect(function()
+			list.Visible = not list.Visible
+			if list.Visible then
+				local entries = {}
+				-- An option is a string, or { text = what the row shows, value = what is picked }.
+				for _, option in ipairs(getOptions()) do
+					if type(option) == "table" then
+						table.insert(entries, { text = option.text, value = option.value, current = option.value == getValue() })
+					else
+						table.insert(entries, { text = option, value = option, current = option == getValue() })
+					end
+				end
+				fill(entries)
+			end
+		end)
+		table.insert(UI.refreshers, refresh)
+		refresh()
+		return refresh
+	end
+
+	---Shared look and press feedback of every push button. props.Primary fills it with the accent.
+	local function pushButton(props, text, action)
+		local primary = props.Primary
+		props.Primary = nil
+		props.BackgroundColor3 = primary and UI.roles.Accent or UI.roles.Control
+		props.BorderSizePixel = 0
+		props.FontFace = primary and CODE_BOLD or CODE_MEDIUM
+		props.Text = text
+		props.TextSize = px(15)
+		props.TextColor3 = primary and UI.onAccent() or UI.roles.Font
+		props.TextTruncate = Enum.TextTruncate.AtEnd
+		props.AutoButtonColor = false
+		local buttonFrame = create("TextButton", props)
+		round(buttonFrame, 7)
+		local outline = stroke(buttonFrame, primary and "Accent" or "Outline")
 		buttonFrame.MouseEnter:Connect(function()
-			outline.Color = UI.roles.Accent
+			if primary then
+				buttonFrame.BackgroundTransparency = 0.12
+			else
+				buttonFrame.BackgroundColor3 = UI.roles.Raised
+				outline.Color = UI.roles.Muted
+			end
 		end)
 		buttonFrame.MouseLeave:Connect(function()
-			outline.Color = UI.roles.Outline
+			if primary then
+				buttonFrame.BackgroundTransparency = 0
+			else
+				buttonFrame.BackgroundColor3 = UI.roles.Control
+				outline.Color = UI.roles.Outline
+			end
 		end)
+		if primary then
+			table.insert(UI.colorRefreshers, function()
+				buttonFrame.BackgroundColor3, buttonFrame.TextColor3, outline.Color = UI.roles.Accent, UI.onAccent(), UI.roles.Accent
+			end)
+		end
 		buttonFrame.MouseButton1Click:Connect(function()
 			if not action then
 				return
 			end
 			task.spawn(function()
-				buttonFrame.Text = "..."
+				buttonFrame.Text = "Working"
 				local ok, message = pcall(action)
 				pcall(function()
 					buttonFrame.Text = (ok and message) and tostring(message) or text
 				end)
+				UI.refreshAll()
 				task.wait(1.5)
 				pcall(function()
 					buttonFrame.Text = text
@@ -4089,30 +4758,53 @@ do
 		end)
 		return buttonFrame
 	end
+	UI.colorRefreshers = {}
 
-	local SHORT_KEYS = { RightControl = "RCtrl", LeftControl = "LCtrl", RightShift = "RShift", LeftShift = "LShift", RightAlt = "RAlt", LeftAlt = "LAlt", Insert = "Ins", Delete = "Del" }
-	function UI.keybind(page, text, key)
-		local row = UI.rowBase(page, 18, false)
-		label({ Size = UDim2.new(1, -60, 1, 0), Text = text, Parent = row })
+	function UI.button(page, text, action, primary)
+		local made = pushButton({ Size = UDim2.new(1, 0, 0, 34), LayoutOrder = UI.nextOrder(), Parent = slot(page, 34), Primary = primary }, text, action)
+		UI.lastRow[page] = nil
+		return made
+	end
+
+	---Two buttons side by side in one row.
+	function UI.buttonPair(page, leftText, leftAction, rightText, rightAction)
+		local row = UI.rowBase(page, 34, false)
+		row.AutomaticSize = Enum.AutomaticSize.None
+		UI.lastRow[page] = nil
+		pushButton({ Position = UDim2.new(0, 0, 0, 0), Size = UDim2.new(0.5, -4, 1, 0), Parent = row }, leftText, leftAction)
+		pushButton({ Position = UDim2.new(0.5, 4, 0, 0), Size = UDim2.new(0.5, -4, 1, 0), Parent = row }, rightText, rightAction)
+		return row
+	end
+
+	local SHORT_KEYS = { RightControl = "Right Ctrl", LeftControl = "Left Ctrl", RightShift = "Right Shift", LeftShift = "Left Shift", RightAlt = "Right Alt", LeftAlt = "Left Alt", Insert = "Insert", Delete = "Delete" }
+	function UI.keybind(page, text, key, note)
+		local row = UI.rowBase(page, 30, false)
+		local holder = caption(row, text, note, 116)
+		UI.markRow(page, row, UDim2.new(1, -112, 0, 2), holder)
 		local box = create("TextButton", {
 			AnchorPoint = Vector2.new(1, 0),
 			Position = UDim2.new(1, 0, 0, 0),
-			Size = UDim2.fromOffset(54, 18),
+			Size = UDim2.fromOffset(106, 30),
 			BackgroundColor3 = UI.roles.Control,
 			BorderSizePixel = 0,
-			FontFace = CODE,
-			TextSize = 13,
+			FontFace = CODE_MEDIUM,
+			TextSize = px(14),
 			TextColor3 = UI.roles.Font,
+			TextTruncate = Enum.TextTruncate.AtEnd,
 			AutoButtonColor = false,
 			Parent = row,
 		})
+		round(box, 7)
 		stroke(box, "Outline")
 		local function refresh()
 			box.Text = SHORT_KEYS[Config[key]] or tostring(Config[key])
+			if key == "MenuKey" and UI.keyHint then
+				UI.keyHint.Text = box.Text .. " hides the menu"
+			end
 		end
 		box.MouseButton1Click:Connect(function()
 			UI.capturing = true
-			box.Text = "..."
+			box.Text = "Press a key"
 			local connection
 			connection = userInputService.InputBegan:Connect(function(input)
 				if input.UserInputType ~= Enum.UserInputType.Keyboard then
@@ -4132,11 +4824,357 @@ do
 		return row
 	end
 
+	function UI.textbox(page, text, placeholder, note)
+		local row = dropRow(page, text, note)
+		local box = create("TextBox", {
+			Size = UDim2.new(1, 0, 0, 32),
+			BackgroundColor3 = UI.roles.Control,
+			BorderSizePixel = 0,
+			FontFace = CODE,
+			TextSize = px(14),
+			TextColor3 = UI.roles.Font,
+			PlaceholderText = placeholder or "",
+			PlaceholderColor3 = UI.roles.Muted,
+			Text = "",
+			ClearTextOnFocus = false,
+			ClipsDescendants = true,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			LayoutOrder = 2,
+			Parent = row,
+		}, { create("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) }) })
+		round(box, 7)
+		local outline = stroke(box, "Outline")
+		box.Focused:Connect(function()
+			outline.Color = UI.roles.Accent
+		end)
+		box.FocusLost:Connect(function()
+			outline.Color = UI.roles.Outline
+		end)
+		return box
+	end
+
+	---A tinted block of text that states a rule or a result. Returns the label.
+	function UI.callout(page, text)
+		local box = create("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = UI.roles.Control, BorderSizePixel = 0, LayoutOrder = UI.nextOrder(), Parent = slot(page, 44) }, {
+			create("UIPadding", { PaddingTop = UDim.new(0, 10), PaddingBottom = UDim.new(0, 10), PaddingLeft = UDim.new(0, 14), PaddingRight = UDim.new(0, 12) }),
+		})
+		round(box, 8)
+		create("Frame", { Position = UDim2.new(0, -14, 0, -2), Size = UDim2.new(0, 3, 1, 4), BackgroundColor3 = UI.roles.Accent, BorderSizePixel = 0, Parent = box }, { UI.corner(2) })
+		UI.lastRow[page] = nil
+		return wrapped({ Size = UDim2.new(1, 0, 0, 18), Text = text, TextSize = px(14), Parent = box })
+	end
+
+	---Pick one of a few big options, each with a line of what it does and three gauges.
+	---choices: { { value, title, text, gauges = { { name, level 1-3 }, ... } } }.
+	function UI.choiceCards(page, key, choices, onChange)
+		local row = create("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, LayoutOrder = UI.nextOrder(), Parent = slot(page, 150) }, {
+			create("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 10), HorizontalFlex = Enum.UIFlexAlignment.Fill, ItemLineAlignment = Enum.ItemLineAlignment.Stretch }),
+		})
+		UI.lastRow[page] = nil
+		local cards = {}
+		local function refresh()
+			for value, card in pairs(cards) do
+				local active = Config[key] == value
+				card.ring.Color = active and UI.roles.Accent or UI.roles.Outline
+				card.ring.Thickness = active and 2 or 1
+				card.frame.BackgroundColor3 = active and UI.roles.Control or UI.roles.Main
+				card.title.TextColor3 = UI.roles.Font
+				card.text.TextColor3 = active and UI.roles.Font or UI.roles.Muted
+				card.tag.Visible = active
+				card.tag.BackgroundColor3, card.tag.TextColor3 = UI.roles.Accent, UI.onAccent()
+				for _, pip in ipairs(card.pips) do
+					pip.frame.BackgroundColor3 = pip.on and (active and UI.roles.Accent or UI.roles.Muted) or UI.roles.Raised
+				end
+			end
+		end
+		for index, choice in ipairs(choices) do
+			local frame = create("TextButton", { Size = UDim2.new(0, 100, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = UI.roles.Main, BorderSizePixel = 0, Text = "", AutoButtonColor = false, LayoutOrder = index, Parent = row }, {
+				create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 8) }),
+				create("UIPadding", { PaddingTop = UDim.new(0, 14), PaddingBottom = UDim.new(0, 14), PaddingLeft = UDim.new(0, 14), PaddingRight = UDim.new(0, 14) }),
+			})
+			frame:SetAttribute("NoTheme", true)
+			round(frame, 10)
+			local ring = create("UIStroke", { Color = UI.roles.Outline, Thickness = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Parent = frame })
+			ring:SetAttribute("NoTheme", true)
+			local head = create("Frame", { Size = UDim2.new(1, 0, 0, 22), BackgroundTransparency = 1, LayoutOrder = 1, Parent = frame })
+			local title = label({ Size = UDim2.new(1, -58, 1, 0), Text = choice.title, FontFace = CODE_BOLD, TextSize = px(17), TextTruncate = Enum.TextTruncate.AtEnd, Parent = head })
+			local tag = label({ AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, 0, 0.5, 0), Size = UDim2.fromOffset(52, 20), Text = "Active", FontFace = CODE_BOLD, TextSize = px(12), TextXAlignment = Enum.TextXAlignment.Center, BackgroundTransparency = 0, Visible = false, Parent = head })
+			tag.BackgroundTransparency = 0
+			tag:SetAttribute("NoTheme", true)
+			round(tag, 10)
+			local text = wrapped({ Size = UDim2.new(1, 0, 0, px(13) * 1.2 * 3 + 1), Text = choice.text, TextSize = px(13), TextColor3 = UI.roles.Muted, LayoutOrder = 2, Parent = frame })
+			text:SetAttribute("NoTheme", true)
+			local pips = {}
+			local gauges = create("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, LayoutOrder = 3, Parent = frame }, {
+				create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 5) }),
+			})
+			for gaugeIndex, gauge in ipairs(choice.gauges or {}) do
+				local line = create("Frame", { Size = UDim2.new(1, 0, 0, 16), BackgroundTransparency = 1, LayoutOrder = gaugeIndex, Parent = gauges })
+				label({ Size = UDim2.new(1, -86, 1, 0), Text = gauge[1], TextSize = px(13), TextColor3 = UI.roles.Muted, TextTruncate = Enum.TextTruncate.AtEnd, Parent = line })
+				for step = 1, 3 do
+					local pip = create("Frame", { AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -(3 - step) * 27, 0.5, 0), Size = UDim2.fromOffset(23, 5), BackgroundColor3 = UI.roles.Raised, BorderSizePixel = 0, Parent = line })
+					pip:SetAttribute("NoTheme", true)
+					round(pip, 3)
+					table.insert(pips, { frame = pip, on = step <= gauge[2] })
+				end
+			end
+			cards[choice.value] = { frame = frame, ring = ring, title = title, text = text, tag = tag, pips = pips }
+			frame.MouseEnter:Connect(function()
+				if Config[key] ~= choice.value then
+					ring.Color = UI.roles.Muted
+				end
+			end)
+			frame.MouseLeave:Connect(function()
+				refresh()
+			end)
+			frame.MouseButton1Click:Connect(function()
+				Config[key] = choice.value
+				if onChange then
+					pcall(onChange, choice.value)
+				end
+				UI.refreshAll()
+			end)
+		end
+		table.insert(UI.refreshers, refresh)
+		table.insert(UI.colorRefreshers, refresh)
+		refresh()
+		return row
+	end
+
+	---Lays a holder out as a grid of equal cells, perRow across. Two things the plain layout
+	---got wrong: cells that add up to exactly the row's width wrap one short on some window
+	---widths (rounding), so each cell gives up half a pixel; and the holder follows the grid's
+	---real height, so a grid that does wrap grows its card instead of spilling over the next.
+	function UI.grid(holder, perRow, gap, height)
+		local layout = create("UIGridLayout", { CellSize = UDim2.new(1 / perRow, -gap * (perRow - 1) / perRow - 0.5, 0, height), CellPadding = UDim2.fromOffset(gap, gap), FillDirectionMaxCells = perRow, SortOrder = Enum.SortOrder.LayoutOrder, Parent = holder })
+		local function fit()
+			local content = layout.AbsoluteContentSize.Y
+			if content > 0 and math.abs(holder.Size.Y.Offset - content) >= 1 then
+				holder.Size = UDim2.new(1, 0, 0, content)
+			end
+		end
+		layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(fit)
+		fit()
+		return layout
+	end
+
+	---A list the user edits: one row per entry with a remove button, and an up arrow when the
+	---order matters. options:
+	---  get() -> names           remove(index, name)        moveUp(index)      ordered, empty
+	---  marks(name, index) -> a muted word at the right; a second result of true paints it in the accent
+	---  tag(name, index) -> text, tone ("bad" | "good" | "accent"): a small label before the buttons
+	---  detail(name, index) -> a wrapped line under the name
+	---  maxHeight -> past this height the list scrolls inside its own frame
+	function UI.editList(page, options)
+		local scrolls = options.maxHeight ~= nil
+		local holder = create(scrolls and "ScrollingFrame" or "Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = scrolls and Enum.AutomaticSize.None or Enum.AutomaticSize.Y, BackgroundTransparency = 1, BorderSizePixel = 0, LayoutOrder = UI.nextOrder(), Parent = slot(page, 60) })
+		local layout = create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 4), Parent = holder })
+		if scrolls then
+			holder.ScrollBarThickness = 4
+			holder.ScrollBarImageColor3 = UI.roles.Outline
+			holder.ScrollingDirection = Enum.ScrollingDirection.Y
+			holder.CanvasSize = UDim2.new()
+			local pad = create("UIPadding", { Parent = holder })
+			local function fit()
+				local content = layout.AbsoluteContentSize.Y
+				holder.Size = UDim2.new(1, 0, 0, math.min(content, options.maxHeight))
+				holder.CanvasSize = UDim2.fromOffset(0, content)
+				pad.PaddingRight = UDim.new(0, content > options.maxHeight and 8 or 0)
+			end
+			layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(fit)
+			fit()
+		end
+		UI.lastRow[page] = nil
+		local signature
+		local function smallButton(parent, kind, order, action)
+			local button = create("TextButton", { Size = UDim2.fromOffset(24, 24), BackgroundColor3 = UI.roles.Raised, BackgroundTransparency = 1, BorderSizePixel = 0, Text = "", AutoButtonColor = false, LayoutOrder = order, Parent = parent })
+			round(button, 6)
+			local mark = icon(button, kind, 10, UI.roles.Muted, { AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5) })
+			button.MouseEnter:Connect(function()
+				button.BackgroundTransparency = 0
+				UI.tint(mark, UI.roles.Font)
+			end)
+			button.MouseLeave:Connect(function()
+				button.BackgroundTransparency = 1
+				UI.tint(mark, UI.roles.Muted)
+			end)
+			button.MouseButton1Click:Connect(action)
+			return button
+		end
+		local function refresh()
+			local names = options.get()
+			local rows, parts = {}, { UI.roles.Accent:ToHex(), UI.roles.Font:ToHex() }
+			for index, name in ipairs(names) do
+				local row = { name = name }
+				if options.marks then
+					row.mark, row.markAccent = options.marks(name, index)
+				end
+				if options.tag then
+					row.tag, row.tone = options.tag(name, index)
+				end
+				if options.detail then
+					row.detail = options.detail(name, index)
+				end
+				rows[index] = row
+				table.insert(parts, table.concat({ name, tostring(row.mark), tostring(row.markAccent), tostring(row.tag), tostring(row.detail) }, "~"))
+			end
+			local now = table.concat(parts, "|")
+			if now == signature then
+				return
+			end
+			signature = now
+			for _, child in ipairs(holder:GetChildren()) do
+				if child:IsA("GuiObject") then
+					child:Destroy()
+				end
+			end
+			if #names == 0 then
+				wrapped({ Size = UDim2.new(1, 0, 0, 16), Text = options.empty or "Nothing here yet.", TextSize = px(13), TextColor3 = UI.roles.Muted, LayoutOrder = 1, Parent = holder })
+				return
+			end
+			for index, row in ipairs(rows) do
+				local line = create("Frame", { Size = UDim2.new(1, 0, 0, 30), AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = UI.roles.Control, BorderSizePixel = 0, LayoutOrder = index, Parent = holder }, {
+					create("UICorner", { CornerRadius = UDim.new(0, 6) }),
+					create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder }),
+				})
+				local top = create("Frame", { Size = UDim2.new(1, 0, 0, 30), BackgroundTransparency = 1, LayoutOrder = 1, Parent = line }, {
+					create("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 3) }),
+					create("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, VerticalAlignment = Enum.VerticalAlignment.Center, Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }),
+				})
+				if options.ordered then
+					label({ Size = UDim2.fromOffset(18, 30), Text = tostring(index), FontFace = CODE_BOLD, TextSize = px(13), TextColor3 = UI.roles.Accent, LayoutOrder = 1, Parent = top })
+				end
+				local nameLabel = label({ Size = UDim2.new(0, 0, 1, 0), Text = row.name, TextSize = px(14), TextTruncate = Enum.TextTruncate.AtEnd, LayoutOrder = 2, Parent = top })
+				create("UIFlexItem", { FlexMode = Enum.UIFlexMode.Fill, Parent = nameLabel })
+				if row.tag and row.tag ~= "" then
+					-- Red for a curse, green for a blessing, pulled toward the text color so it
+					-- reads on any theme. The word says it too.
+					local tone = row.tone == "bad" and Color3.fromRGB(235, 87, 87) or row.tone == "good" and Color3.fromRGB(72, 199, 142) or row.tone == "accent" and UI.roles.Accent or UI.roles.Muted
+					local pill = create("Frame", { Size = UDim2.fromOffset(0, 18), AutomaticSize = Enum.AutomaticSize.X, BackgroundColor3 = UI.roles.Raised, BorderSizePixel = 0, LayoutOrder = 3, Parent = top }, {
+						create("UICorner", { CornerRadius = UDim.new(0, 5) }),
+						create("UIPadding", { PaddingLeft = UDim.new(0, 7), PaddingRight = UDim.new(0, 7) }),
+					})
+					pill:SetAttribute("NoTheme", true)
+					label({ Size = UDim2.new(0, 0, 1, 0), AutomaticSize = Enum.AutomaticSize.X, Text = row.tag, FontFace = CODE_BOLD, TextSize = px(12), TextColor3 = (row.tone == "bad" or row.tone == "good") and tone:Lerp(UI.roles.Font, 0.2) or tone, Parent = pill })
+				end
+				if row.mark and row.mark ~= "" then
+					local markLabel = label({ Size = UDim2.new(0, 0, 1, 0), AutomaticSize = Enum.AutomaticSize.X, Text = row.mark, FontFace = row.markAccent and CODE_BOLD or CODE, TextSize = px(12), TextColor3 = row.markAccent and UI.roles.Accent or UI.roles.Muted, LayoutOrder = 4, Parent = top })
+					if row.markAccent then
+						markLabel:SetAttribute("NoTheme", true)
+					end
+				end
+				if options.ordered and index > 1 then
+					smallButton(top, "up", 5, function()
+						options.moveUp(index)
+						UI.refreshAll()
+					end)
+				end
+				smallButton(top, "cross", 6, function()
+					options.remove(index, row.name)
+					UI.refreshAll()
+				end)
+				if row.detail and row.detail ~= "" then
+					local under = create("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, LayoutOrder = 2, Parent = line }, {
+						create("UIPadding", { PaddingLeft = UDim.new(0, options.ordered and 34 or 10), PaddingRight = UDim.new(0, 10), PaddingBottom = UDim.new(0, 8) }),
+					})
+					wrapped({ Size = UDim2.new(1, 0, 0, 16), Text = row.detail, TextSize = px(13), TextColor3 = UI.roles.Muted, Parent = under })
+				end
+			end
+		end
+		table.insert(UI.refreshers, refresh)
+		table.insert(UI.colorRefreshers, function()
+			signature = nil
+			refresh()
+		end)
+		refresh()
+		return refresh, holder
+	end
+
+	-- The script's own notices, in the menu's typeface (Roblox's notification box uses the
+	-- client's font). They stack in the bottom right corner and leave on their own.
+	function UI.toast(title, text, seconds)
+		if Config.MuteNotifications then
+			return
+		end
+		local stack = UI.toastStack
+		if not stack then
+			stack = create("Frame", { Name = "PotentToasts", AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, -16, 1, -16), Size = UDim2.fromOffset(300, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, ZIndex = 150, Parent = screenGui }, {
+				create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 8), VerticalAlignment = Enum.VerticalAlignment.Bottom }),
+			})
+			UI.toastStack = stack
+		end
+		local toast = create("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = UI.roles.Main, BorderSizePixel = 0, LayoutOrder = UI.nextOrder(), ZIndex = 150, Parent = stack }, {
+			create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 3) }),
+			create("UIPadding", { PaddingTop = UDim.new(0, 12), PaddingBottom = UDim.new(0, 12), PaddingLeft = UDim.new(0, 14), PaddingRight = UDim.new(0, 14) }),
+		})
+		round(toast, 10)
+		stroke(toast, "Outline")
+		label({ Size = UDim2.new(1, 0, 0, 20), Text = title, FontFace = CODE_BOLD, TextSize = px(15), TextTruncate = Enum.TextTruncate.AtEnd, LayoutOrder = 1, ZIndex = 151, Parent = toast })
+		wrapped({ Size = UDim2.new(1, 0, 0, 16), Text = text, TextSize = px(14), TextColor3 = UI.roles.Muted, LayoutOrder = 2, ZIndex = 151, Parent = toast })
+		task.delay(seconds or 5, function()
+			toast:Destroy()
+		end)
+		return toast
+	end
+
+	---Theme presets as small pictures of the window in that theme; click one to wear it.
+	function UI.themeGrid(page)
+		local perRow = 4
+		local rows = math.ceil(#UI.PRESETS / perRow)
+		local grid = UI.rowBase(page, rows * 96 + (rows - 1) * 10, false)
+		grid.AutomaticSize = Enum.AutomaticSize.None
+		UI.grid(grid, perRow, 10, 96)
+		local rings = {}
+		local function paint(parent, props, color, radius)
+			props.BackgroundColor3 = color
+			props.BorderSizePixel = 0
+			props.Parent = parent
+			local frame = create("Frame", props, { create("UICorner", { CornerRadius = UDim.new(0, radius or 3) }) })
+			frame:SetAttribute("NoTheme", true)
+			return frame
+		end
+		local function refresh()
+			for name, ring in pairs(rings) do
+				local current = (Config.ThemeName or "") == name
+				ring.Thickness = current and 2 or 1
+				ring.Transparency = current and 0 or 0.4
+			end
+		end
+		for index, preset in ipairs(UI.PRESETS) do
+			local back, main, accent, outline, font = Color3.fromHex(preset[2]), Color3.fromHex(preset[3]), Color3.fromHex(preset[4]), Color3.fromHex(preset[5]), Color3.fromHex(preset[6])
+			local card = create("TextButton", { BackgroundColor3 = back, BorderSizePixel = 0, Text = "", AutoButtonColor = false, LayoutOrder = index, Parent = grid }, { create("UICorner", { CornerRadius = UDim.new(0, 9) }) })
+			card:SetAttribute("NoTheme", true)
+			local ring = create("UIStroke", { Color = accent, Thickness = 1, Transparency = 0.4, ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Parent = card })
+			ring:SetAttribute("NoTheme", true)
+			rings[preset[1]] = ring
+			-- The window in miniature: the page list, a title, two lines of text, a switch.
+			paint(card, { Position = UDim2.fromOffset(10, 12), Size = UDim2.fromOffset(18, 4) }, font, 2)
+			paint(card, { Position = UDim2.fromOffset(10, 22), Size = UDim2.fromOffset(12, 4) }, outline, 2)
+			paint(card, { Position = UDim2.fromOffset(10, 30), Size = UDim2.fromOffset(14, 4) }, outline, 2)
+			paint(card, { Position = UDim2.fromOffset(10, 38), Size = UDim2.fromOffset(10, 4) }, outline, 2)
+			local sheet = paint(card, { Position = UDim2.fromOffset(38, 10), Size = UDim2.new(1, -48, 0, 44) }, main, 5)
+			paint(sheet, { Position = UDim2.fromOffset(8, 8), Size = UDim2.new(0.5, 0, 0, 4) }, font, 2)
+			paint(sheet, { Position = UDim2.fromOffset(8, 18), Size = UDim2.new(0.7, -8, 0, 3) }, font:Lerp(main, 0.55), 2)
+			paint(sheet, { Position = UDim2.fromOffset(8, 26), Size = UDim2.new(0.5, -8, 0, 3) }, font:Lerp(main, 0.55), 2)
+			paint(sheet, { AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, -8, 1, -8), Size = UDim2.fromOffset(16, 8) }, accent, 4)
+			local caption = label({ AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 10, 1, -9), Size = UDim2.new(1, -20, 0, 18), Text = preset[1], FontFace = CODE_BOLD, TextSize = px(14), TextColor3 = font, TextTruncate = Enum.TextTruncate.AtEnd, Parent = card })
+			caption:SetAttribute("NoTheme", true)
+			card.MouseButton1Click:Connect(function()
+				Config.ThemeName = preset[1]
+				Config.UseDefaultTheme = false
+				UI.useTheme({ ThemeBackground = preset[2], ThemeMain = preset[3], ThemeAccent = preset[4], ThemeOutline = preset[5], ThemeFont = preset[6] })
+				refresh()
+			end)
+		end
+		table.insert(UI.refreshers, refresh)
+		refresh()
+	end
+
 	-- Theme registry: every element remembers which theme role each of its colors belongs to
 	-- (decided once, when it is created), so recoloring never confuses two roles that happen to
 	-- share a color. Elements built by the scripts themselves are classified the same way.
 	local PROPERTIES = { "BackgroundColor3", "TextColor3", "Color", "ScrollBarImageColor3", "PlaceholderColor3", "ImageColor3" }
-	local ROLE_ORDER = { "Accent", "Font", "Muted", "Outline", "Control", "Main", "Background" }
+	local ROLE_ORDER = { "Accent", "Font", "Muted", "Outline", "Raised", "Control", "Main", "Background" }
 	-- Strong keys on purpose: Instance proxies in a weak table get collected while the
 	-- instance still exists, which silently drops them from the theme.
 	local painted = {}
@@ -4180,9 +5218,7 @@ do
 				end
 			end
 		end
-		for _, refresh in ipairs(UI.refreshers) do
-			pcall(refresh)
-		end
+		UI.refreshAll()
 		for _, refresh in ipairs(UI.colorRefreshers) do
 			pcall(refresh)
 		end
@@ -4190,14 +5226,247 @@ do
 			UI.selectTab(UI.activeTab)
 		end
 	end
-	UI.colorRefreshers = {}
+
+	-- Controls of the trait roller: a card with two panes, a list to pick one rich row from,
+	-- chips to tick any number of options, and a button whose label follows a state.
+
+	---Two panes side by side inside the open card. Returns left, right and into(pane): controls
+	---built after into(pane) land in that pane, into(nil) goes back to the card itself.
+	function UI.split(page, share)
+		share = share or 0.5
+		local body = slot(page, 0)
+		local row = create("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, LayoutOrder = UI.nextOrder(), Parent = body })
+		local function pane(x, width, offset)
+			return create("Frame", { Position = UDim2.new(x, offset, 0, 0), Size = UDim2.new(width, -10, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, Parent = row }, {
+				create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 12) }),
+			})
+		end
+		local left, right = pane(0, share, 0), pane(share, 1 - share, 10)
+		local current = UI.current[page]
+		return left, right, function(target)
+			current.body = target or body
+			UI.lastRow[page] = nil
+		end
+	end
+
+	---A small heading inside a card or pane.
+	function UI.subhead(page, text, note)
+		local holder = create("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, LayoutOrder = UI.nextOrder(), Parent = slot(page, 20) }, {
+			create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 2) }),
+		})
+		label({ Size = UDim2.new(1, 0, 0, 20), Text = text, FontFace = CODE_BOLD, TextSize = px(15), TextTruncate = Enum.TextTruncate.AtEnd, LayoutOrder = 1, Parent = holder })
+		local noteLabel
+		if note and note ~= "" then
+			noteLabel = wrapped({ Size = UDim2.new(1, 0, 0, 16), Text = note, TextSize = px(13), TextColor3 = UI.roles.Muted, LayoutOrder = 2, Parent = holder })
+		end
+		UI.lastRow[page] = nil
+		return noteLabel
+	end
+
+	---A list to pick one row from. options: get() -> rows { id, title, sub, tag, section },
+	---selected() -> id, pick(id), height, empty. Rows of one section sit under its name. The
+	---picked row is filled, ringed in the accent and ticked. Returns refresh().
+	function UI.pickList(page, options)
+		local frame = create("ScrollingFrame", {
+			Size = UDim2.new(1, 0, 0, options.height or 280),
+			BackgroundColor3 = UI.roles.Control,
+			BorderSizePixel = 0,
+			ScrollBarThickness = 4,
+			ScrollBarImageColor3 = UI.roles.Outline,
+			CanvasSize = UDim2.new(),
+			AutomaticCanvasSize = Enum.AutomaticSize.Y,
+			ScrollingDirection = Enum.ScrollingDirection.Y,
+			LayoutOrder = UI.nextOrder(),
+			Parent = slot(page, options.height or 280),
+		}, {
+			create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 3) }),
+			create("UIPadding", { PaddingTop = UDim.new(0, 6), PaddingBottom = UDim.new(0, 6), PaddingLeft = UDim.new(0, 6), PaddingRight = UDim.new(0, 10) }),
+		})
+		round(frame, 8)
+		stroke(frame, "Outline")
+		UI.lastRow[page] = nil
+		local signature
+		local function refresh()
+			local rows = options.get()
+			local picked = options.selected()
+			local parts = { tostring(picked), UI.roles.Accent:ToHex(), UI.roles.Raised:ToHex() }
+			for _, row in ipairs(rows) do
+				table.insert(parts, table.concat({ tostring(row.id), tostring(row.title), tostring(row.sub), tostring(row.tag), tostring(row.section), tostring(row.note) }, "~"))
+			end
+			local now = table.concat(parts, "|")
+			if now == signature then
+				return
+			end
+			signature = now
+			for _, child in ipairs(frame:GetChildren()) do
+				if child:IsA("GuiObject") then
+					child:Destroy()
+				end
+			end
+			if #rows == 0 then
+				wrapped({ Size = UDim2.new(1, -8, 0, 16), Text = options.empty or "Nothing to show.", TextSize = px(13), TextColor3 = UI.roles.Muted, LayoutOrder = 1, Parent = frame })
+				return
+			end
+			local section
+			local order = 0
+			for _, row in ipairs(rows) do
+				if row.note then
+					order += 1
+					wrapped({ Size = UDim2.new(1, -8, 0, 16), Text = row.note, TextSize = px(13), TextColor3 = UI.roles.Muted, LayoutOrder = order, Parent = frame })
+				else
+					if row.section and row.section ~= section then
+						section = row.section
+						order += 1
+						local head = create("Frame", { Size = UDim2.new(1, 0, 0, order == 1 and 22 or 30), BackgroundTransparency = 1, LayoutOrder = order, Parent = frame })
+						label({ AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 6, 1, -2), Size = UDim2.new(1, -12, 0, 16), Text = section, FontFace = CODE_BOLD, TextSize = px(12), TextColor3 = UI.roles.Muted, TextTruncate = Enum.TextTruncate.AtEnd, Parent = head })
+					end
+					order += 1
+					local isPicked = row.id == picked
+					local item = create("TextButton", { Size = UDim2.new(1, 0, 0, 46), BackgroundColor3 = UI.roles.Raised, BackgroundTransparency = isPicked and 0 or 1, BorderSizePixel = 0, Text = "", AutoButtonColor = false, LayoutOrder = order, Parent = frame })
+					item:SetAttribute("NoTheme", true)
+					round(item, 7)
+					local ring = create("UIStroke", { Color = UI.roles.Accent, Thickness = 1.5, Transparency = isPicked and 0 or 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Parent = item })
+					ring:SetAttribute("NoTheme", true)
+					local reserve = isPicked and 34 or 12
+					local hasTag = row.tag ~= nil and row.tag ~= ""
+					if hasTag then
+						label({ AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -reserve, 0, 7), Size = UDim2.fromOffset(52, 16), Text = row.tag, FontFace = CODE_BOLD, TextSize = px(12), TextColor3 = UI.roles.Accent, TextXAlignment = Enum.TextXAlignment.Right, Parent = item })
+					end
+					label({ Position = UDim2.fromOffset(12, 6), Size = UDim2.new(1, -(reserve + 12 + (hasTag and 58 or 0)), 0, 18), Text = tostring(row.title), FontFace = isPicked and CODE_BOLD or CODE_MEDIUM, TextSize = px(15), TextTruncate = Enum.TextTruncate.AtEnd, Parent = item })
+					label({ Position = UDim2.fromOffset(12, 25), Size = UDim2.new(1, -24, 0, 16), Text = tostring(row.sub or ""), TextSize = px(13), TextColor3 = UI.roles.Muted, TextTruncate = Enum.TextTruncate.AtEnd, Parent = item })
+					if isPicked then
+						icon(item, "check", 13, UI.roles.Accent, { AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -12, 0, 8) })
+					end
+					item.MouseEnter:Connect(function()
+						if not isPicked then
+							item.BackgroundTransparency = 0.45
+						end
+					end)
+					item.MouseLeave:Connect(function()
+						if not isPicked then
+							item.BackgroundTransparency = 1
+						end
+					end)
+					item.MouseButton1Click:Connect(function()
+						options.pick(row.id)
+						UI.refreshAll()
+					end)
+				end
+			end
+		end
+		table.insert(UI.refreshers, refresh)
+		table.insert(UI.colorRefreshers, function()
+			signature = nil
+			refresh()
+		end)
+		refresh()
+		return refresh
+	end
+
+	---Chips to tick any number of options. options: get() -> { { id, name, note } } (read once),
+	---isOn(id), toggle(id), perRow. A ticked chip is ringed and its box filled.
+	function UI.chips(page, options)
+		local entries = options.get()
+		local perRow = options.perRow or 2
+		local rows = math.max(math.ceil(#entries / perRow), 1)
+		local grid = UI.rowBase(page, rows * 34 + (rows - 1) * 6, false)
+		grid.AutomaticSize = Enum.AutomaticSize.None
+		UI.lastRow[page] = nil
+		UI.grid(grid, perRow, 6, 34)
+		local chips = {}
+		local function refresh()
+			for id, chip in pairs(chips) do
+				local on = options.isOn(id) == true
+				chip.frame.BackgroundColor3 = on and UI.roles.Raised or UI.roles.Control
+				chip.ring.Color = on and UI.roles.Accent or UI.roles.Outline
+				chip.ring.Thickness = on and 1.5 or 1
+				chip.box.BackgroundColor3 = UI.roles.Accent
+				chip.box.BackgroundTransparency = on and 0 or 1
+				chip.boxRing.Color = on and UI.roles.Accent or UI.roles.Muted
+				chip.mark.Visible = on
+				UI.tint(chip.mark, UI.onAccent())
+				chip.name.TextColor3 = UI.roles.Font
+				chip.name.FontFace = on and CODE_BOLD or CODE
+				chip.note.TextColor3 = UI.roles.Muted
+			end
+		end
+		for index, entry in ipairs(entries) do
+			local frame = create("TextButton", { BackgroundColor3 = UI.roles.Control, BorderSizePixel = 0, Text = "", AutoButtonColor = false, LayoutOrder = index, Parent = grid })
+			frame:SetAttribute("NoTheme", true)
+			round(frame, 7)
+			local ring = create("UIStroke", { Color = UI.roles.Outline, Thickness = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Parent = frame })
+			ring:SetAttribute("NoTheme", true)
+			local box = create("Frame", { AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 10, 0.5, 0), Size = UDim2.fromOffset(16, 16), BackgroundColor3 = UI.roles.Accent, BackgroundTransparency = 1, BorderSizePixel = 0, Parent = frame })
+			box:SetAttribute("NoTheme", true)
+			round(box, 4)
+			local boxRing = create("UIStroke", { Color = UI.roles.Muted, Thickness = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Parent = box })
+			local mark = icon(box, "check", 10, UI.onAccent(), { AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5) })
+			mark:SetAttribute("NoTheme", true)
+			local hasNote = entry.note ~= nil and entry.note ~= ""
+			local name = label({ Position = UDim2.fromOffset(34, 0), Size = UDim2.new(1, hasNote and -96 or -42, 1, 0), Text = tostring(entry.name), TextSize = px(14), TextTruncate = Enum.TextTruncate.AtEnd, Parent = frame })
+			local note = label({ AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -10, 0, 0), Size = UDim2.new(0, 52, 1, 0), Text = tostring(entry.note or ""), TextSize = px(12), TextColor3 = UI.roles.Muted, TextXAlignment = Enum.TextXAlignment.Right, Parent = frame })
+			chips[entry.id] = { frame = frame, ring = ring, box = box, boxRing = boxRing, mark = mark, name = name, note = note }
+			frame.MouseEnter:Connect(function()
+				if not options.isOn(entry.id) then
+					ring.Color = UI.roles.Muted
+				end
+			end)
+			frame.MouseLeave:Connect(refresh)
+			frame.MouseButton1Click:Connect(function()
+				options.toggle(entry.id)
+				UI.refreshAll()
+			end)
+		end
+		table.insert(UI.refreshers, refresh)
+		table.insert(UI.colorRefreshers, refresh)
+		refresh()
+		return refresh
+	end
+
+	---A button whose label and look follow a state: state() -> text, primary. Returns refresh().
+	function UI.liveButton(page, state, action)
+		local button = create("TextButton", { Size = UDim2.new(1, 0, 0, 38), BackgroundColor3 = UI.roles.Control, BorderSizePixel = 0, AutoButtonColor = false, FontFace = CODE_BOLD, Text = "", TextSize = px(15), TextTruncate = Enum.TextTruncate.AtEnd, LayoutOrder = UI.nextOrder(), Parent = slot(page, 38) })
+		button:SetAttribute("NoTheme", true)
+		round(button, 7)
+		local outline = create("UIStroke", { Color = UI.roles.Outline, Thickness = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Parent = button })
+		UI.lastRow[page] = nil
+		local function refresh()
+			local text, primary = state()
+			button.Text = tostring(text)
+			button.BackgroundColor3 = primary and UI.roles.Accent or UI.roles.Control
+			button.TextColor3 = primary and UI.onAccent() or UI.roles.Font
+			outline.Color = primary and UI.roles.Accent or UI.roles.Outline
+		end
+		button.MouseEnter:Connect(function()
+			button.BackgroundTransparency = 0.14
+		end)
+		button.MouseLeave:Connect(function()
+			button.BackgroundTransparency = 0
+		end)
+		local busy = false
+		button.MouseButton1Click:Connect(function()
+			if busy then
+				return
+			end
+			busy = true
+			task.spawn(function()
+				pcall(action)
+				busy = false
+				UI.refreshAll()
+			end)
+		end)
+		table.insert(UI.refreshers, refresh)
+		table.insert(UI.colorRefreshers, refresh)
+		refresh()
+		return refresh
+	end
 
 	-- Color picker: a saturation / brightness square with the hue bar on its right.
 	local picker = {}
 	do
 		local frame = create("Frame", {
 			Name = "PotentPicker",
-			Size = UDim2.fromOffset(222, 206),
+			Size = UDim2.fromOffset(238, 232),
 			BackgroundColor3 = UI.roles.Background,
 			BorderSizePixel = 0,
 			Visible = false,
@@ -4205,10 +5474,11 @@ do
 			Parent = screenGui,
 		})
 		create("UIStroke", { Color = UI.roles.Outline, Parent = frame })
-		local title = label({ Position = UDim2.fromOffset(8, 4), Size = UDim2.new(1, -16, 0, 16), Text = "", ZIndex = 51, Parent = frame })
+		round(frame, 10)
+		local title = label({ Position = UDim2.fromOffset(12, 10), Size = UDim2.new(1, -24, 0, 18), Text = "", FontFace = CODE_BOLD, TextSize = px(14), ZIndex = 51, Parent = frame })
 		local square = create("TextButton", {
-			Position = UDim2.fromOffset(8, 24),
-			Size = UDim2.fromOffset(178, 150),
+			Position = UDim2.fromOffset(12, 36),
+			Size = UDim2.fromOffset(186, 150),
 			BorderSizePixel = 0,
 			Text = "",
 			AutoButtonColor = false,
@@ -4237,8 +5507,8 @@ do
 			table.insert(hueKeys, ColorSequenceKeypoint.new(i / 6, Color3.fromHSV(i / 6 % 1, 1, 1)))
 		end
 		local hueBar = create("TextButton", {
-			Position = UDim2.fromOffset(196, 24),
-			Size = UDim2.fromOffset(16, 150),
+			Position = UDim2.fromOffset(208, 36),
+			Size = UDim2.fromOffset(18, 150),
 			BackgroundColor3 = Color3.new(1, 1, 1),
 			BorderSizePixel = 0,
 			Text = "",
@@ -4254,15 +5524,16 @@ do
 			ZIndex = 55,
 			Parent = hueBar,
 		}, { create("UICorner", { CornerRadius = UDim.new(1, 0) }), create("UIStroke", { Color = Color3.new(1, 1, 1), Thickness = 2 }) })
-		local preview = create("Frame", { Position = UDim2.fromOffset(8, 182), Size = UDim2.fromOffset(20, 16), BorderSizePixel = 0, ZIndex = 51, Parent = frame })
+		local preview = create("Frame", { Position = UDim2.fromOffset(12, 196), Size = UDim2.fromOffset(24, 24), BorderSizePixel = 0, ZIndex = 51, Parent = frame })
 		create("UIStroke", { Color = UI.roles.Outline, Parent = preview })
+		round(preview, 6)
 		local hexBox = create("TextBox", {
-			Position = UDim2.fromOffset(34, 182),
-			Size = UDim2.fromOffset(90, 16),
+			Position = UDim2.fromOffset(44, 196),
+			Size = UDim2.fromOffset(96, 24),
 			BackgroundColor3 = UI.roles.Control,
 			BorderSizePixel = 0,
 			FontFace = CODE,
-			TextSize = 13,
+			TextSize = px(14),
 			TextColor3 = UI.roles.Font,
 			Text = "",
 			ClearTextOnFocus = false,
@@ -4270,13 +5541,14 @@ do
 			Parent = frame,
 		})
 		create("UIStroke", { Color = UI.roles.Outline, Parent = hexBox })
+		round(hexBox, 6)
 		local done = create("TextButton", {
-			Position = UDim2.fromOffset(132, 182),
-			Size = UDim2.fromOffset(80, 16),
+			Position = UDim2.fromOffset(148, 196),
+			Size = UDim2.fromOffset(78, 24),
 			BackgroundColor3 = UI.roles.Control,
 			BorderSizePixel = 0,
-			FontFace = CODE,
-			TextSize = 13,
+			FontFace = CODE_MEDIUM,
+			TextSize = px(14),
 			TextColor3 = UI.roles.Font,
 			Text = "Done",
 			AutoButtonColor = false,
@@ -4284,8 +5556,9 @@ do
 			Parent = frame,
 		})
 		create("UIStroke", { Color = UI.roles.Outline, Parent = done })
+		round(done, 6)
 		picker.frame = frame
-		for _, object in ipairs({ square, white, dot, hueBar, hueKnob, preview }) do
+		for _, object in ipairs({ square, white, dot, hueBar, hueKnob }) do
 			object:SetAttribute("NoTheme", true)
 		end
 		for _, object in ipairs(square:GetChildren()) do
@@ -4309,6 +5582,7 @@ do
 			if key then
 				Config[key] = Color3.fromHSV(h, s, v):ToHex():upper()
 				Config.UseDefaultTheme = false
+				Config.ThemeName = "Custom"
 				UI.applyTheme()
 			end
 			show()
@@ -4383,11 +5657,11 @@ do
 			local viewport = screenGui.AbsoluteSize
 			local left, width = panel.AbsolutePosition.X, panel.AbsoluteSize.X
 			local x = left + width + 6
-			if x + 222 > viewport.X then
-				x = left - 228
+			if x + 238 > viewport.X then
+				x = left - 244
 			end
-			x = math.clamp(x, 0, math.max(viewport.X - 222, 0))
-			local y = math.clamp(at.Y - 90, 0, math.max(viewport.Y - 206, 0))
+			x = math.clamp(x, 0, math.max(viewport.X - 238, 0))
+			local y = math.clamp(at.Y - 90, 0, math.max(viewport.Y - 232, 0))
 			frame.Position = UDim2.fromOffset(x, y)
 			frame.BackgroundColor3, title.TextColor3 = UI.roles.Background, UI.roles.Font
 			frame.Visible = true
@@ -4397,16 +5671,18 @@ do
 
 	---Theme color row: the swatch opens the color picker.
 	function UI.colorRow(page, text, key)
-		local row = UI.rowBase(page, 18, true)
-		label({ Size = UDim2.new(1, -44, 1, 0), Text = text, Parent = row })
+		local row = UI.rowBase(page, 24, true)
+		row.AutomaticSize = Enum.AutomaticSize.None
+		label({ Size = UDim2.new(1, -60, 1, 0), Text = text, FontFace = CODE_MEDIUM, TextTruncate = Enum.TextTruncate.AtEnd, Parent = row })
 		local swatch = create("Frame", {
-			AnchorPoint = Vector2.new(1, 0),
-			Position = UDim2.new(1, 0, 0, 2),
-			Size = UDim2.fromOffset(36, 14),
+			AnchorPoint = Vector2.new(1, 0.5),
+			Position = UDim2.new(1, 0, 0.5, 0),
+			Size = UDim2.fromOffset(46, 22),
 			BorderSizePixel = 0,
 			Parent = row,
 		})
 		swatch:SetAttribute("NoTheme", true)
+		round(swatch, 6)
 		stroke(swatch, "Outline")
 		local function refresh()
 			local ok, color = pcall(Color3.fromHex, Config[key])
@@ -4420,97 +5696,12 @@ do
 		return row
 	end
 
-	---Drop-down over plain string options.
-	function UI.dropdown(page, text, getOptions, getValue, onPick)
-		local row = UI.rowBase(page, 38, false)
-		label({ Size = UDim2.new(1, 0, 0, 16), Text = text, Parent = row })
-		local box, value = valueBox(row, 18)
-		local function refresh()
-			value.Text = tostring(getValue() or "--")
-		end
-		local list, fill = optionList(row, function(option)
-			onPick(option)
-			refresh()
-		end)
-		box.MouseButton1Click:Connect(function()
-			list.Visible = not list.Visible
-			if list.Visible then
-				local entries = {}
-				for _, option in ipairs(getOptions()) do
-					table.insert(entries, { text = option, value = option, current = option == getValue() })
-				end
-				fill(entries)
-			end
-		end)
-		table.insert(UI.refreshers, refresh)
-		refresh()
-		return refresh
-	end
-
-	function UI.textbox(page, text, placeholder)
-		local row = UI.rowBase(page, 38, false)
-		label({ Size = UDim2.new(1, 0, 0, 16), Text = text, Parent = row })
-		local box = create("TextBox", {
-			Position = UDim2.fromOffset(0, 18),
-			Size = UDim2.new(1, 0, 0, 20),
-			BackgroundColor3 = UI.roles.Control,
-			BorderSizePixel = 0,
-			FontFace = CODE,
-			TextSize = 13,
-			TextColor3 = UI.roles.Font,
-			PlaceholderText = placeholder or "",
-			PlaceholderColor3 = UI.roles.Muted,
-			Text = "",
-			ClearTextOnFocus = false,
-			TextXAlignment = Enum.TextXAlignment.Left,
-			Parent = row,
-		}, { create("UIPadding", { PaddingLeft = UDim.new(0, 6) }) })
-		stroke(box, "Outline")
-		return box
-	end
-
-	---Two buttons side by side in one row.
-	function UI.buttonPair(page, leftText, leftAction, rightText, rightAction)
-		local row = UI.rowBase(page, 22, false)
-		local function half(text, action, x)
-			local half = create("TextButton", {
-				Position = UDim2.new(x, x > 0 and 2 or 0, 0, 0),
-				Size = UDim2.new(0.5, -2, 1, 0),
-				BackgroundColor3 = UI.roles.Control,
-				BorderSizePixel = 0,
-				FontFace = CODE,
-				Text = text,
-				TextSize = TEXT_SIZE,
-				TextColor3 = UI.roles.Font,
-				AutoButtonColor = false,
-				Parent = row,
-			})
-			local outline = stroke(half, "Outline")
-			half.MouseEnter:Connect(function()
-				outline.Color = UI.roles.Accent
-			end)
-			half.MouseLeave:Connect(function()
-				outline.Color = UI.roles.Outline
-			end)
-			half.MouseButton1Click:Connect(function()
-				task.spawn(function()
-					local ok, message = pcall(action)
-					half.Text = (ok and message) and tostring(message) or text
-					task.wait(1.5)
-					half.Text = text
-				end)
-			end)
-		end
-		half(leftText, leftAction, 0)
-		half(rightText, rightAction, 0.5)
-		return row
-	end
-
 	-- Themes: built-in presets, your own saved themes (shared by every Potent script), and a
 	-- default theme every script starts with.
 	local THEME_FOLDER = "PotentHub/themes"
 	local DEFAULT_FILE = "PotentHub/default_theme.json"
 	UI.PRESETS = {
+		{ "Dusk", "11141D", "191E2B", "F2B33D", "2A3145", "E8EBF3" },
 		{ "Potent", "111111", "1A1A1A", "96D9CF", "2E2E2E", "EBEBEB" },
 		{ "Crimson", "0A0707", "130E0F", "E2323C", "3B1A1D", "F4E9E9" },
 		{ "Mint", "0D1210", "141B18", "4FE0A0", "26332E", "E6F2EC" },
@@ -4519,6 +5710,13 @@ do
 		{ "Gold", "110F0B", "1A1712", "E8AE3C", "3A3226", "F2EDE4" },
 		{ "Steel", "141D24", "1A2731", "F2B33D", "2F4757", "E9EEF0" },
 		{ "Mono", "0E0E0E", "171717", "F0F0F0", "2F2F2F", "D8D8D8" },
+		{ "Rose", "17131A", "211B25", "FF6F91", "3A2D3D", "F4ECF2" },
+		{ "Lavender", "15141D", "1E1C2A", "B49CFF", "34304A", "ECEAF7" },
+		{ "Cherry", "181214", "22191C", "FF5C6C", "3F2A2F", "F6EAEC" },
+		{ "Arctic", "DCE6EA", "EEF4F6", "17879B", "B9CBD2", "16323A" },
+		{ "Blossom", "F1DDE6", "FAEEF3", "C2276B", "E2BFCF", "3D1228" },
+		{ "Light", "E4E7EC", "F5F6F8", "2463EB", "C9CED8", "1C2230" },
+		{ "High Contrast", "000000", "0A0A0A", "FFE23D", "FFFFFF", "FFFFFF" },
 	}
 	local function currentTheme()
 		local theme = {}
@@ -4561,44 +5759,37 @@ do
 		return names
 	end
 	function UI.themeSection(page)
-		UI.heading(page, "Themes", "left")
-		UI.colorRow(page, "Background color", "ThemeBackground")
-		UI.colorRow(page, "Main color", "ThemeMain")
-		UI.colorRow(page, "Accent color", "ThemeAccent")
-		UI.colorRow(page, "Outline color", "ThemeOutline")
-		UI.colorRow(page, "Font color", "ThemeFont")
-		UI.dropdown(page, "Theme list", function()
-			local names = {}
-			for _, preset in ipairs(UI.PRESETS) do
-				table.insert(names, preset[1])
-			end
-			return names
-		end, function()
-			return Config.ThemeName ~= "" and Config.ThemeName or "--"
-		end, function(name)
-			for _, preset in ipairs(UI.PRESETS) do
-				if preset[1] == name then
-					Config.ThemeName = name
-					Config.UseDefaultTheme = false
-					useTheme({ ThemeBackground = preset[2], ThemeMain = preset[3], ThemeAccent = preset[4], ThemeOutline = preset[5], ThemeFont = preset[6] })
-				end
-			end
-		end)
-		UI.button(page, "Set as default", function()
+		UI.heading(page, "Presets", "full", "Click one to wear it.")
+		UI.themeGrid(page)
+		UI.heading(page, "Your own colors", "left", "Click a swatch to change it.")
+		UI.colorRow(page, "Window", "ThemeBackground")
+		UI.colorRow(page, "Cards", "ThemeMain")
+		UI.colorRow(page, "Accent", "ThemeAccent")
+		UI.colorRow(page, "Lines", "ThemeOutline")
+		UI.colorRow(page, "Text", "ThemeFont")
+		UI.button(page, "Use these colors in every Potent script", function()
 			ensureFolder()
 			writefile(DEFAULT_FILE, httpService:JSONEncode(currentTheme()))
 			Config.UseDefaultTheme = true
-			return "Default for every script"
+			return "Saved as the default"
 		end)
-		local nameBox = UI.textbox(page, "Custom theme name", "Type a name")
+		UI.button(page, "Back to the first preset", function()
+			local preset = UI.PRESETS[1]
+			Config.ThemeName = preset[1]
+			Config.UseDefaultTheme = false
+			useTheme({ ThemeBackground = preset[2], ThemeMain = preset[3], ThemeAccent = preset[4], ThemeOutline = preset[5], ThemeFont = preset[6] })
+			return "Done"
+		end)
+		UI.heading(page, "Saved themes", "right", "Kept in PotentHub/themes and shared by every Potent script.")
+		local nameBox = UI.textbox(page, "Name", "Name this theme")
 		local selected = nil
-		local refreshCustom = UI.dropdown(page, "Custom themes", customThemes, function()
-			return selected or "--"
+		UI.dropdown(page, "Saved", customThemes, function()
+			return selected or "None picked"
 		end, function(name)
 			selected = name
 			nameBox.Text = name
 		end)
-		UI.buttonPair(page, "Save theme", function()
+		UI.buttonPair(page, "Save", function()
 			local name = (nameBox.Text:gsub("[^%w%s%-_]", "")):sub(1, 30)
 			if name == "" then
 				return "Name it first"
@@ -4606,9 +5797,8 @@ do
 			ensureFolder()
 			writefile(THEME_FOLDER .. "/" .. name .. ".json", httpService:JSONEncode(currentTheme()))
 			selected = name
-			refreshCustom()
 			return "Saved"
-		end, "Load theme", function()
+		end, "Load", function()
 			local name = selected or nameBox.Text
 			local path = THEME_FOLDER .. "/" .. name .. ".json"
 			if name == "" or not isfile(path) then
@@ -4619,17 +5809,12 @@ do
 			useTheme(httpService:JSONDecode(readfile(path)))
 			return "Loaded"
 		end)
-		UI.button(page, "Refresh list", function()
-			refreshCustom()
-			return "Refreshed"
-		end)
-		UI.button(page, "Reset theme", function()
-			Config.ThemeName = "Potent"
-			Config.UseDefaultTheme = false
-			local preset = UI.PRESETS[1]
-			useTheme({ ThemeBackground = preset[2], ThemeMain = preset[3], ThemeAccent = preset[4], ThemeOutline = preset[5], ThemeFont = preset[6] })
-			return "Reset"
-		end)
+		UI.heading(page, "Typeface", "right")
+		UI.segmented(page, "Menu typeface", "MenuFont", { "Own", "Roblox" }, "Own is the same on every client. Roblox uses whatever your client renders, a Fishstrap font included. Applies the next time the script loads.", { Own = "The menu's own", Roblox = "Roblox's" })
+		local using = UI.note(page, "")
+		using.Text = Type.own and ("Showing " .. Type.name .. ", fetched from Roblox by asset id. Fishstrap's font swap doesn't reach it.")
+			or (Config.MenuFont == "Roblox" and "Showing your client's font. Text is sized down to fit where it runs wider."
+				or "The menu's own typeface could not be fetched, so this is your client's font, sized down to fit. It is tried again on the next load.")
 	end
 
 	-- (Own function scope: the scripts sit close to Luau's 200-local limit.)
@@ -4836,7 +6021,7 @@ do
 	function UI.makeMuter()
 		local muted, groupVolume, scanAt = {}, nil, 0
 		local function check(sound)
-			if sound:IsA("Sound") and sound.Name ~= "PotentMusic" and sound.Name ~= "PotentMyMusic"
+			if sound:IsA("Sound") and sound.Name ~= "PotentMusic" and sound.Name ~= "PotentMyMusic" and sound.Name ~= "PotentClassicTheme"
 				and sound.TimeLength > 40 and not muted[sound] and (sound.IsPlaying or sound.Volume > 0) then
 				local record = { volume = sound.Volume }
 				record.connection = sound:GetPropertyChangedSignal("Volume"):Connect(function()
@@ -4922,28 +6107,27 @@ do
 	end)
 
 	function UI.musicSection(page)
-		UI.heading(page, "My songs", "left")
+		UI.heading(page, "My songs", "left", "Your own files, shared by every Potent script.")
 		UI.toggle(page, "Play my songs", "MyMusicOn")
 		UI.toggle(page, "Shuffle", "MyMusicShuffle")
 		UI.toggle(page, "Mute the game's music", "MyMusicMuteGame")
 		UI.slider(page, "Volume", "MyMusicVolume", 0, 100, 5, function(v)
 			return v .. "%"
 		end)
-		local nowLine = UI.infoLine(page, 32)
-		nowLine.TextTruncate = Enum.TextTruncate.AtEnd
-		UI.buttonPair(page, "Prev", function()
+		local nowLine = UI.infoLine(page, 36)
+		UI.buttonPair(page, "Previous", function()
 			Player.next(-1)
 		end, "Next", function()
 			Player.next(1)
 		end)
-		UI.buttonPair(page, "Shuffle play", function()
+		UI.buttonPair(page, "Shuffle all", function()
 			Config.MyMusicShuffle = true
 			for _, refresh in ipairs(UI.refreshers) do
 				pcall(refresh)
 			end
 			Player.start(Player.visible())
 			return "Shuffled"
-		end, "Pause / play", function()
+		end, "Pause or play", function()
 			return Player.togglePause()
 		end)
 		UI.button(page, "Play in order", function()
@@ -4953,9 +6137,9 @@ do
 			Config.MyMusicShuffle = was
 			return "Playing"
 		end)
-		UI.hint(page, "Add songs: put files in workspace/" .. MUSIC_ROOT .. "/<Playlist>/, then Rescan.")
+		UI.note(page, "To add songs, put files in workspace/" .. MUSIC_ROOT .. "/<playlist name>/ and press Rescan files.")
 
-		UI.heading(page, "Playlist", "right")
+		UI.heading(page, "Song list", "left")
 		local fillList
 		UI.dropdown(page, "Playlist", function()
 			local options = { "All" }
@@ -4980,13 +6164,17 @@ do
 			Size = UDim2.new(1, 0, 0, 300),
 			BackgroundColor3 = UI.roles.Background,
 			BorderSizePixel = 0,
-			ScrollBarThickness = 3,
+			ScrollBarThickness = 4,
 			ScrollBarImageColor3 = UI.roles.Outline,
 			CanvasSize = UDim2.new(),
 			AutomaticCanvasSize = Enum.AutomaticSize.Y,
 			LayoutOrder = UI.nextOrder(),
 			Parent = slot(page, 300),
-		}, { create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder }) })
+		}, {
+			create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 2) }),
+			create("UIPadding", { PaddingTop = UDim.new(0, 4), PaddingBottom = UDim.new(0, 4), PaddingLeft = UDim.new(0, 4), PaddingRight = UDim.new(0, 8) }),
+			UI.corner(7),
+		})
 		stroke(scroller, "Outline")
 		UI.button(page, "Rescan files", function()
 			table.clear(Player.cache)
@@ -5000,16 +6188,16 @@ do
 			end
 			table.clear(Player.rows)
 			local list = Player.visible()
-			countLine.Text = #list .. " songs" .. ((Config.MyMusicPlaylist or "All") ~= "All" and ("  |  " .. Config.MyMusicPlaylist) or "")
+			countLine.Text = #list .. " songs" .. ((Config.MyMusicPlaylist or "All") ~= "All" and (" in " .. Config.MyMusicPlaylist) or "")
 			for index, song in ipairs(list) do
 				local button = create("TextButton", {
-					Size = UDim2.new(1, -4, 0, 20),
+					Size = UDim2.new(1, 0, 0, 26),
 					BackgroundColor3 = UI.roles.Main,
 					BackgroundTransparency = 1,
 					BorderSizePixel = 0,
 					FontFace = CODE,
 					Text = "    " .. song.label,
-					TextSize = 13,
+					TextSize = px(14),
 					TextColor3 = UI.roles.Font,
 					TextXAlignment = Enum.TextXAlignment.Left,
 					TextTruncate = Enum.TextTruncate.AtEnd,
@@ -5018,7 +6206,8 @@ do
 					Parent = scroller,
 				})
 				button:SetAttribute("NoTheme", true)
-				local bar = create("Frame", { Size = UDim2.new(0, 2, 1, 0), BackgroundColor3 = UI.roles.Accent, BorderSizePixel = 0, Visible = false, Parent = button })
+				UI.corner(5).Parent = button
+				local bar = create("Frame", { AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 4, 0.5, 0), Size = UDim2.fromOffset(3, 14), BackgroundColor3 = UI.roles.Accent, BorderSizePixel = 0, Visible = false, Parent = button }, { UI.corner(2) })
 				bar:SetAttribute("NoTheme", true)
 				local row = { button = button, bar = bar, song = song }
 				button.MouseEnter:Connect(function()
@@ -5088,9 +6277,9 @@ do
 						Player.muteGame(Config.MyMusicMuteGame and sound ~= nil and sound.IsPlaying)
 						local current = Player.current
 						if current and sound then
-							nowLine.Text = (Player.paused and "Paused: " or "Now: ") .. current.title .. (current.artist ~= "" and (" - " .. current.artist) or "") .. "\n" .. clock(sound.TimePosition) .. " / " .. clock(sound.TimeLength) .. "   " .. current.playlist .. ((Config.MyMusicShuffle and "   shuffle") or "")
+							nowLine.Text = (Player.paused and "Paused: " or "Now: ") .. current.title .. (current.artist ~= "" and (" - " .. current.artist) or "") .. "\n" .. clock(sound.TimePosition) .. " of " .. clock(sound.TimeLength) .. ", " .. current.playlist .. ((Config.MyMusicShuffle and ", shuffled") or "")
 						else
-							nowLine.Text = Player.status or "No songs found"
+							nowLine.Text = Player.status or "No songs found."
 						end
 					else
 						if wasOn then
@@ -5101,7 +6290,7 @@ do
 							Player.muteGame(false)
 							Player.highlight()
 						end
-						nowLine.Text = Player.current and ("Off  (last: " .. Player.current.title .. ")") or "Off"
+						nowLine.Text = Player.current and ("Off. Last played: " .. Player.current.title) or "Off."
 					end
 				end)
 				task.wait(0.5)
@@ -5114,37 +6303,29 @@ do
 	end
 	end)()
 
-	---Last step of every script: Misc tab settings, tabs, menu key, anti-AFK, hide on execute.
+	---Last step: the list of pages, the menu key, and showing the window.
 	function UI.finish(firstTab)
-		UI.musicSection(pages.Music or UI.makePage("Music"))
-		local page = pages.Misc or UI.makePage("Misc")
-		UI.heading(page, "Menu", "right")
-		UI.current[page].body.Parent.LayoutOrder = -100 -- top of the right column
-		UI.toggle(page, "Anti-AFK", "AntiAfk")
-		UI.keybind(page, "Menu bind", "MenuKey")
-		UI.toggle(page, "Hide UI when executed", "HideOnExecute")
-		UI.toggle(page, "Mute notifications", "MuteNotifications")
-		local unload = UI.button(page, "Unload", nil)
-		UI.themeSection(page)
-		-- Misc goes last.
-		for index, name in ipairs(UI.order) do
-			if name == "Misc" then
-				table.remove(UI.order, index)
-				break
+		local order = 0
+		for _, group in ipairs({ "Play", "Account", "Menu" }) do
+			local opened = false
+			for _, name in ipairs(UI.order) do
+				if UI.groups[name] == group then
+					if not opened then
+						opened = true
+						order += 1
+						UI.makeGroup(group, order)
+					end
+					order += 1
+					UI.makeTab(name, order)
+				end
 			end
 		end
-		table.insert(UI.order, "Misc")
-		-- Fixed order: each tab's LayoutOrder is its place in the list (ties let the layout shuffle them).
-		for index, name in ipairs(UI.order) do
-			UI.makeTab(name, index)
-		end
-
 		screenGui.Parent = guiParent
 		for _, object in ipairs(screenGui:GetDescendants()) do
 			pcall(UI.fitText, object)
 			pcall(UI.classify, object)
 		end
-		UI.selectTab(firstTab or UI.order[1])
+		UI.selectTab(pages[firstTab] and firstTab or UI.order[1])
 		panel.Visible = not Config.HideOnExecute
 
 		table.insert(BeyRivals.connections, userInputService.InputBegan:Connect(function(input)
@@ -5153,77 +6334,66 @@ do
 			end
 			if input.KeyCode.Name == Config.MenuKey then
 				panel.Visible = not panel.Visible
+				UI.showTip(nil)
 			end
 		end))
-		table.insert(BeyRivals.connections, localPlayer.Idled:Connect(function()
-			if Config.AntiAfk then
-				local virtualUser = game:GetService("VirtualUser")
-				virtualUser:CaptureController()
-				virtualUser:ClickButton2(Vector2.new())
-			end
-		end))
-		if Config.HideOnExecute and not Config.MuteNotifications then
-			pcall(function()
-				game:GetService("StarterGui"):SetCore("SendNotification", {
-					Title = "Potent Hub",
-					Text = "Bey Rivals loaded. " .. tostring(Config.MenuKey) .. " opens the menu.",
-					Duration = 5,
-				})
-			end)
+		if Config.HideOnExecute then
+			UI.toast("Bey Rivals is running", (SHORT_KEYS[Config.MenuKey] or tostring(Config.MenuKey)) .. " opens the menu.", 6)
 		end
-		return unload
 	end
-end
+end)()
+
+
+	---What a stage drops. Listed chances come from the game's own data, wherever in the level's
+	---table they sit (reward groups, wave-modifier drops, board rewards). Anything the game does
+	---not list (the server rolls it: secret portals, units) is measured instead: how many logged
+
 
 local create, statusLabel, panel, nextOrder, makePage, rowBase, rowLabel, heading, toggle, slider, segmented, hint, cycler, button = UI.create, UI.statusLabel, UI.panel, UI.nextOrder, UI.makePage, UI.rowBase, UI.rowLabel, UI.heading, UI.toggle, UI.slider, UI.segmented, UI.hint, UI.cycler, UI.button
-local mark = UI.mark
-local beyMark = UI.mark
-
 -- Battle page.
-local battlePage = makePage("Battle")
-heading(battlePage, "Auto battle")
-toggle(battlePage, "Auto battle", "AutoBattle")
-hint(battlePage, "Aims, launches, rips, fights and clashes for you")
-
-heading(battlePage, "Launch")
-toggle(battlePage, "Lock in launch automatically", "AutoLaunch")
-toggle(battlePage, "Pick the best launch spot", "PlanLaunch")
+local battlePage = makePage("Battle", "The script plays the battle for you: it aims, launches, rips, fights and clashes.", "Play")
+heading(battlePage, "Auto battle", "left")
+toggle(battlePage, "Auto battle", "AutoBattle", "Plays every battle you are in.")
+toggle(battlePage, "Lock in the launch", "AutoLaunch")
+toggle(battlePage, "Pick the best launch spot", "PlanLaunch", "Plays each spot out first and takes the one that ends best.")
 toggle(battlePage, "Perfect rip on every ring", "PerfectRip")
 toggle(battlePage, "Tilt launch to the ridge", "TiltLaunch")
 
-heading(battlePage, "Fight")
+heading(battlePage, "How it fights", "left")
 slider(battlePage, "Pilot skill", "PilotLevel", 0.5, 1, 0.05, function(v) return math.floor(v * 100 + 0.5) .. "%" end)
-toggle(battlePage, "Look ahead and pick the best line", "Lookahead")
-toggle(battlePage, "Classic AI (the 89-win version, rules after 11-05 off)", "ClassicAI")
-toggle(battlePage, "Expect human rivals to fight back", "ModelHumans")
-toggle(battlePage, "No ridge rush at high gauge", "SafeRidge")
-toggle(battlePage, "Run the clock when ahead on spin", "RunClock")
-toggle(battlePage, "No contact in the crush zone", "CrushGuard")
-toggle(battlePage, "Burst race by HP left (not %)", "AbsBurst")
-toggle(battlePage, "Fight when keep-away would lose on spin", "SpinOutRace")
-toggle(battlePage, "Adapt to challenge stadium mechanics", "StadiumAware")
-toggle(battlePage, "Vs bots: no contact in the crush zone unless winning", "BossCrushGuard")
-toggle(battlePage, "Vs bots: deep finish search (fastest wins)", "DeepFinish")
-toggle(battlePage, "Leave when a rival ability is live in the crush zone", "AbilityCrushGuard")
-toggle(battlePage, "Both crushable + rival as fast: strike/guard, don't flee", "MutualCrush")
+slider(battlePage, "Aggression", "Aggression", 0, 3, 0.1, function(v) return string.format("%.1f", v) end, "Higher presses the rival and pushes them to the rim harder.")
 segmented(battlePage, "Play style", "PlayStyle", { "Auto", "Attack", "Balance", "Stamina", "Defense" })
-toggle(battlePage, "No ability starts on the rim next to a pocket", "RimAbilityGuard")
-toggle(battlePage, "Vs Spriggan: don't attack into its ready guard", "LongGuardVeto")
-toggle(battlePage, "Guard incoming rushes (physics check vs players)", "RushGuard")
-toggle(battlePage, "No counter-attack near burst into a ready guard", "SafeCounter")
-slider(battlePage, "Deep search time per frame", "DeepMs", 2, 10, 1, function(v) return v .. " ms" end)
-toggle(battlePage, "Brace for hits at the rim", "RimBrace")
-toggle(battlePage, "Dodge rival abilities (sweeps, AoE, waves)", "SweepDodge")
-toggle(battlePage, "Go for the burst when losing on spin", "SpinRace")
-slider(battlePage, "Look-ahead budget", "LookaheadMs", 2, 16, 0.5, function(v) return string.format("%.1f ms", v) end)
-slider(battlePage, "Max AI time per frame (FPS)", "FrameCapMs", 6, 30, 1, function(v) return v .. " ms" end)
-toggle(battlePage, "Perfect clash timing", "PerfectClash")
-toggle(battlePage, "Perfect guard before every hit", "AutoGuard")
-toggle(battlePage, "Counter after every perfect guard", "AutoCounter")
-slider(battlePage, "Aggression", "Aggression", 0, 3, 0.1, function(v) return string.format("%.1f", v) end)
-hint(battlePage, "Higher presses the rival and pushes them to the rim harder")
+toggle(battlePage, "Look ahead and pick the best line", "Lookahead")
+toggle(battlePage, "Classic AI", "ClassicAI", "The 89-win version: the rules added after 11-05 are off.")
+toggle(battlePage, "Expect human rivals to fight back", "ModelHumans")
+toggle(battlePage, "Adapt to challenge stadiums", "StadiumAware")
+toggle(battlePage, "Vs bots: deep finish search", "DeepFinish", "Looks for the fastest winning line. Off while Human mode is on.")
 
-heading(battlePage, "Next battle")
+heading(battlePage, "Presses", "left")
+toggle(battlePage, "Perfect clash timing", "PerfectClash")
+toggle(battlePage, "Guard before every hit", "AutoGuard")
+toggle(battlePage, "Counter after every perfect guard", "AutoCounter")
+toggle(battlePage, "Guard incoming rushes", "RushGuard", "A physics check, used against players.")
+toggle(battlePage, "Dodge rival abilities", "SweepDodge", "Sweeps, area hits and waves.")
+toggle(battlePage, "Brace for hits at the rim", "RimBrace")
+
+heading(battlePage, "Safety rules", "right")
+toggle(battlePage, "No ridge rush at high gauge", "SafeRidge")
+toggle(battlePage, "No contact in the crush zone", "CrushGuard")
+toggle(battlePage, "Vs bots: no crush-zone contact unless winning", "BossCrushGuard")
+toggle(battlePage, "Leave when a rival ability is live in the crush zone", "AbilityCrushGuard")
+toggle(battlePage, "Both crushable and rival as fast: strike or guard", "MutualCrush", "Instead of fleeing.")
+toggle(battlePage, "No ability starts on the rim next to a pocket", "RimAbilityGuard")
+toggle(battlePage, "Vs Spriggan: no attack into its ready guard", "LongGuardVeto")
+toggle(battlePage, "No counter near burst into a ready guard", "SafeCounter")
+
+heading(battlePage, "Races", "right")
+toggle(battlePage, "Run the clock when ahead on spin", "RunClock")
+toggle(battlePage, "Burst race by health left, not percent", "AbsBurst")
+toggle(battlePage, "Fight when keep-away would lose on spin", "SpinOutRace")
+toggle(battlePage, "Go for the burst when losing on spin", "SpinRace")
+
+heading(battlePage, "Next battle", "right")
 toggle(battlePage, "Auto queue after each battle", "AutoQueue")
 segmented(battlePage, "Join by", "QueueMode", { "Queue", "Rematch" })
 for _, key in ipairs({ "Spot2v2", "Spot3v3" }) do
@@ -5231,13 +6401,16 @@ for _, key in ipairs({ "Spot2v2", "Spot3v3" }) do
 		Config[key] = ({ "1st", "2nd", "3rd" })[Config[key]] or "None"
 	end
 end
-segmented(battlePage, "2v2 auto spot", "Spot2v2", { "None", "1st", "2nd" })
-segmented(battlePage, "3v3 auto spot", "Spot3v3", { "None", "1st", "2nd", "3rd" })
-toggle(battlePage, "Ranked: auto ready up", "AutoReady")
-toggle(battlePage, "Auto skip replay", "AutoSkipReplay")
-toggle(battlePage, "Stay active when Roblox is unfocused", "StayActive")
-hint(battlePage, "Keeps going with Roblox in the background")
+segmented(battlePage, "2v2 spot", "Spot2v2", { "None", "1st", "2nd" })
+segmented(battlePage, "3v3 spot", "Spot3v3", { "None", "1st", "2nd", "3rd" })
+toggle(battlePage, "Ranked: ready up", "AutoReady")
+toggle(battlePage, "Skip the replay", "AutoSkipReplay")
+toggle(battlePage, "Stay active when Roblox is unfocused", "StayActive", "Keeps going with Roblox in the background.")
 
+heading(battlePage, "Thinking time", "right", "How much of each frame the script may use.")
+slider(battlePage, "Look-ahead budget", "LookaheadMs", 2, 16, 0.5, function(v) return string.format("%.1f ms", v) end)
+slider(battlePage, "Deep search a frame", "DeepMs", 2, 10, 1, function(v) return v .. " ms" end)
+slider(battlePage, "Most time a frame", "FrameCapMs", 6, 30, 1, function(v) return v .. " ms" end, "Lower keeps your frame rate up.")
 
 
 local stopTraitRolling
@@ -5383,7 +6556,7 @@ end
 -- Traits page.
 -- Assist page: you play, the script only times guards / counters / clashes / rips for you.
 do
-	local assistPage = makePage("Assist")
+	local assistPage = makePage("Assist", "You play; the script only times the presses you tick here.", "Play")
 	heading(assistPage, "Assist mode")
 	toggle(assistPage, "Assist (when Auto battle is off)", "Assist")
 	hint(assistPage, "You steer and play; these fire on top of your inputs")
@@ -5397,7 +6570,7 @@ do
 	hint(assistPage, "Auto battle on overrides all of this")
 end
 
-local traitsPage = makePage("Traits")
+local traitsPage = makePage("Traits", "Keeps rolling one trait slot until a trait you want lands.", "Account")
 
 
 heading(traitsPage, "Item")
@@ -5615,7 +6788,7 @@ do
 		return state
 	end
 
-	local rollsPage = makePage("Rolls")
+	local rollsPage = makePage("Rolls", "Draws, pulls and surname rolls that stop on what you ticked.", "Account")
 
 	-- Halloween soul draw.
 	-- (Only while the event runs: the module stays in the game after it ends.)
@@ -5838,7 +7011,7 @@ end
 
 -- Legit page: Human mode and every timing and chance the script plays by.
 do
-	local legitPage = makePage("Legit")
+	local legitPage = makePage("Legit", "Human mode, and every timing and chance the script plays by.", "Play")
 	heading(legitPage, "Human mode")
 	toggle(legitPage, "Human / legit mode", "Human")
 	hint(legitPage, "On: every value on this tab goes to a human figure (late, uneven, sometimes wrong) and the deep finish search stops. Off: the values you had come back. You can still move any slider while it is on.")
@@ -5881,7 +7054,7 @@ do
 end
 
 -- Stats page.
-local statsPage = makePage("Stats")
+local statsPage = makePage("Stats", "This session and all time.", "Account")
 heading(statsPage, "This session")
 local statLabels = {}
 local function statRow(label, key)
@@ -5986,8 +7159,32 @@ do
 	end)
 end
 
--- Footer.
-local unloadButton = UI.finish("Battle")
+-- Music, Themes, Settings, then the window goes up.
+do
+	UI.musicSection(makePage("Music", "Your own songs while you play.", "Menu"))
+	UI.themeSection(makePage("Themes", "Colors and the typeface of this menu.", "Menu"))
+	local page = makePage("Settings", "The script itself: the menu and staying connected.", "Menu")
+	heading(page, "Menu", "left")
+	UI.keybind(page, "Show or hide the menu", "MenuKey")
+	toggle(page, "Start hidden", "HideOnExecute", "The menu stays closed when the script loads.")
+	toggle(page, "No notices", "MuteNotifications", "Hides the script's own pop-up notices.")
+	heading(page, "Script", "right")
+	toggle(page, "Anti-AFK", "AntiAfk", "Answers Roblox's 20 minute idle check.")
+	button(page, "Unload the script", function()
+		task.defer(function()
+			BeyRivals.detach()
+		end)
+		return "Unloading"
+	end)
+	table.insert(BeyRivals.connections, localPlayer.Idled:Connect(function()
+		if Config.AntiAfk then
+			local virtualUser = game:GetService("VirtualUser")
+			virtualUser:CaptureController()
+			virtualUser:ClickButton2(Vector2.new())
+		end
+	end))
+end
+UI.finish("Battle")
 
 -- Autosave whenever a setting changes.
 do
@@ -6010,7 +7207,6 @@ end
 -- Live status, stats, and the spinning bey mark.
 table.insert(BeyRivals.connections, runService.RenderStepped:Connect(function(dt)
 	if Config.AutoBattle then
-		beyMark.Rotation = (beyMark.Rotation + dt * 720) % 360
 		local stadiumId = BeyRivals.liveStadium
 		local info = stadiumId and BeyRivals.stadiumInfo(stadiumId)
 		local text = (info and #info.list > 0) and (status .. " | " .. info.label) or status
@@ -6018,13 +7214,26 @@ table.insert(BeyRivals.connections, runService.RenderStepped:Connect(function(dt
 			text = text .. " [" .. BeyRivals.liveProfile .. "]"
 		end
 		statusLabel.Text = text
-		statusLabel.TextColor3 = (status == "Behind" or status == "Defending") and LOSS or GOLD
 	elseif Config.AutoQueue then
 		statusLabel.Text = status == "Idle" and "Auto queue on" or status
-		statusLabel.TextColor3 = GOLD
 	else
-		statusLabel.Text = "Off"
-		statusLabel.TextColor3 = MUTED
+		statusLabel.Text = Config.Assist and "Assist" or "Off"
+	end
+	-- The strip under the title: what is going on, and the record.
+	do
+		local battle = currentBattle()
+		local round = battle and battle.round
+		local sub = "No battle"
+		if battle and round then
+			sub = string.format("Round %s, %s%s", tostring(round.no or "?"), tostring(round.phase or ""):lower(), Config.Human and " | Human mode" or "")
+		elseif Config.Human then
+			sub = "No battle | Human mode"
+		end
+		UI.setNow({
+			sub = sub,
+			busy = battle ~= nil and not battle.over,
+			figures = { { Stats.wins .. "-" .. Stats.losses, "this session" }, { Lifetime.wins .. "-" .. Lifetime.losses, "all time" } },
+		})
 	end
 
 	statLabels.battles.Text = tostring(Stats.battles)
@@ -6075,7 +7284,6 @@ function BeyRivals.detach()
 	end
 end
 
-unloadButton.MouseButton1Click:Connect(BeyRivals.detach)
 
 BeyRivals.test = { currentBattle = currentBattle, firePacket = firePacket, status = function() return status end }
 shared.BeyRivals = BeyRivals
@@ -6087,4 +7295,4 @@ table.insert(BeyRivals.connections, runService.Heartbeat:Connect(function()
 		BeyRivals.detach()
 	end
 end))
-print("[Bey Rivals] Loaded. Right Ctrl toggles the panel.")
+print("[Bey Rivals] Loaded. " .. tostring(Config.MenuKey) .. " toggles the menu.")
