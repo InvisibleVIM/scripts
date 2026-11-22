@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v265", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v266", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -344,6 +344,8 @@ local Config = {
 	SellEpic = false,
 	AntiAfk = true,
 	NoClip = false,
+	ClickTeleport = false,
+	ClickTeleportKey = "LeftControl",
 	MusicOn = false,
 	ClassicTheme = false,
 	ClassicVolume = 50,
@@ -14401,6 +14403,38 @@ do
 	end))
 end
 
+-- Click teleport (v266): with the toggle on, hold the chosen key and click; the character is put
+-- where the click lands. Clicks on the game's or the script's own buttons are left alone.
+table.insert(AA.connections, userInputService.InputBegan:Connect(function(input, processed)
+	if input.UserInputType ~= Enum.UserInputType.MouseButton1 or not Config.ClickTeleport or processed then
+		return
+	end
+	local ok, keyCode = pcall(function()
+		return Enum.KeyCode[tostring(Config.ClickTeleportKey)]
+	end)
+	if not ok or not keyCode or not userInputService:IsKeyDown(keyCode) then
+		return
+	end
+	local character = localPlayer.Character
+	local camera = workspace.CurrentCamera
+	if not character or not camera or not character:FindFirstChild("HumanoidRootPart") then
+		return
+	end
+	local at = userInputService:GetMouseLocation()
+	local ray = camera:ViewportPointToRay(at.X, at.Y)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { character }
+	local hit = workspace:Raycast(ray.Origin, ray.Direction * 5000, params)
+	if hit then
+		-- Keep the way the character is facing; stand on the spot, not in it.
+		local pivot = character:GetPivot()
+		character:PivotTo(pivot.Rotation + hit.Position + Vector3.new(0, 3.5, 0))
+		local root = character.HumanoidRootPart
+		root.AssemblyLinearVelocity = Vector3.zero
+	end
+end))
+
 -- Anti-AFK.
 table.insert(AA.connections, localPlayer.Idled:Connect(function()
 	if Config.AntiAfk then
@@ -20868,6 +20902,8 @@ do
 			heading(page, "Staying connected", "left")
 			toggle(page, "Anti-AFK", "AntiAfk", "Keeps Roblox from kicking you for standing still.")
 			toggle(page, "No clip", "NoClip", "Your character walks through walls, units and scenery. The floor still holds you.")
+			toggle(page, "Click teleport", "ClickTeleport", "Hold the key below and click: your character is put where you clicked.")
+			UI.keybind(page, "Click teleport key", "ClickTeleportKey", "Hold this while you click.")
 			toggle(page, "Rejoin after a disconnect", "AutoRejoin")
 			UI.buttonPair(page, "Rejoin this server", function()
 				task.spawn(function()
