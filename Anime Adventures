@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v264", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v265", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -20445,7 +20445,6 @@ do
 		-- Teleport page (lobby): every NPC and every place, read from the live lobby so new ones show up.
 		if IS_LOBBY then
 			local page = makePage("Teleport", "Stand next to any place or character in the lobby.", "Menu")
-			toggle(page, "No clip", "NoClip", "Your character walks through walls, units and scenery. The floor still holds you.")
 			-- What each NPC is for (from their dialogue options); unlisted ones are just scenery.
 			local ROLES = {
 				beerus = "stat reroll", whis = "trait reroll", gogeta = "limit break", alluka = "transfer stats/traits",
@@ -20868,6 +20867,7 @@ do
 
 			heading(page, "Staying connected", "left")
 			toggle(page, "Anti-AFK", "AntiAfk", "Keeps Roblox from kicking you for standing still.")
+			toggle(page, "No clip", "NoClip", "Your character walks through walls, units and scenery. The floor still holds you.")
 			toggle(page, "Rejoin after a disconnect", "AutoRejoin")
 			UI.buttonPair(page, "Rejoin this server", function()
 				task.spawn(function()
