@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v263", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v264", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -343,6 +343,7 @@ local Config = {
 	SellRare = false,
 	SellEpic = false,
 	AntiAfk = true,
+	NoClip = false,
 	MusicOn = false,
 	ClassicTheme = false,
 	ClassicVolume = 50,
@@ -14369,6 +14370,37 @@ local function measureLoop()
 	end
 end
 
+-- No clip (v264): your character walks through walls, units and scenery. The parts it switched
+-- off are remembered and switched back on when the toggle goes off or the script unloads.
+do
+	local changed = {}
+	function AA.noClipRestore()
+		for part in pairs(changed) do
+			if part.Parent then
+				part.CanCollide = true
+			end
+		end
+		table.clear(changed)
+	end
+	table.insert(AA.connections, runService.Stepped:Connect(function()
+		if not Config.NoClip then
+			if next(changed) then
+				AA.noClipRestore()
+			end
+			return
+		end
+		local character = localPlayer.Character
+		if character then
+			for _, part in ipairs(character:GetDescendants()) do
+				if part:IsA("BasePart") and part.CanCollide then
+					part.CanCollide = false
+					changed[part] = true
+				end
+			end
+		end
+	end))
+end
+
 -- Anti-AFK.
 table.insert(AA.connections, localPlayer.Idled:Connect(function()
 	if Config.AntiAfk then
@@ -20413,6 +20445,7 @@ do
 		-- Teleport page (lobby): every NPC and every place, read from the live lobby so new ones show up.
 		if IS_LOBBY then
 			local page = makePage("Teleport", "Stand next to any place or character in the lobby.", "Menu")
+			toggle(page, "No clip", "NoClip", "Your character walks through walls, units and scenery. The floor still holds you.")
 			-- What each NPC is for (from their dialogue options); unlisted ones are just scenery.
 			local ROLES = {
 				beerus = "stat reroll", whis = "trait reroll", gogeta = "limit break", alluka = "transfer stats/traits",
@@ -21141,6 +21174,7 @@ end
 function AA.detach()
 	AA.alive = false
 	saveSettings()
+	pcall(AA.noClipRestore)
 	for _, connection in ipairs(AA.connections) do
 		connection:Disconnect()
 	end
