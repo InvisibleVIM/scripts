@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v266", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v267", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -297,6 +297,11 @@ local Config = {
 	AutoSummon = false,
 	Banner = "EventClover",
 	PortalPick = "",
+	-- Portals mode (v267): only tiers in this range, and none with a modifier on the avoid list
+	-- (JSON list of modifier families, e.g. ["high_cost"]). 0-20 is every tier.
+	PortalTierMin = 0,
+	PortalTierMax = 20,
+	PortalAvoid = "[]",
 	SummonTen = true,
 	SummonStopMythic = true,
 	CompassPick = "",
@@ -1876,7 +1881,15 @@ function AA.portalItems()
 			local own = type(extra._unique_portal_data) == "table" and extra._unique_portal_data.level_id
 			local group = known.group or (own and Levels[own] and Levels[own].portal_group) or nil
 			local depth = type(extra._unique_portal_data) == "table" and tonumber(extra._unique_portal_data.portal_depth) or nil
-			table.insert(list, { uuid = item.uuid, id = itemId, name = known.name, group = group, level = own or known.level, depth = depth, tries = tries, left = max - tries, made = tonumber(item._creation_time) or 0 })
+			-- Its modifiers ("high_cost_2", "tank_enemies_3"...) sit on the item itself.
+			local mods = {}
+			local ctl = type(extra._unique_portal_data) == "table" and extra._unique_portal_data._ctl
+			for _, entry in pairs(type(ctl) == "table" and type(ctl._levelmodifiers) == "table" and ctl._levelmodifiers or {}) do
+				if type(entry) == "table" and type(entry.id) == "string" then
+					table.insert(mods, entry.id)
+				end
+			end
+			table.insert(list, { uuid = item.uuid, id = itemId, name = known.name, group = group, level = own or known.level, depth = depth, mods = mods, tries = tries, left = max - tries, made = tonumber(item._creation_time) or 0 })
 		end
 	end
 	return list
@@ -1936,13 +1949,70 @@ function AA.portalKinds()
 	return list
 end
 
+---Portal modifiers by family, every strength of one counted together ("high_cost_3" is High
+---Cost). The order is the order of the chips in the menu.
+AA.PORTAL_MODS = {
+	{ id = "high_cost", name = "High Cost" }, { id = "fast_enemies", name = "Fast Enemies" },
+	{ id = "tank_enemies", name = "Tank Enemies" }, { id = "shield_enemies", name = "Shield Enemies" },
+	{ id = "regen_enemies", name = "Regen Enemies" }, { id = "infested", name = "Infested" },
+	{ id = "short_range", name = "Short Range" }, { id = "elemental_enemies", name = "Elemental" },
+	{ id = "armored_enemies", name = "Armored" }, { id = "burst_enemies", name = "Burst" },
+	{ id = "flying_enemies", name = "Flying" }, { id = "boss_waves", name = "Boss Waves" },
+}
+function AA.portalAvoid()
+	if AA.portalAvoidText ~= Config.PortalAvoid then
+		local ok, list = pcall(function()
+			return httpService:JSONDecode(Config.PortalAvoid)
+		end)
+		local set = {}
+		for _, id in ipairs(ok and type(list) == "table" and list or {}) do
+			set[tostring(id)] = true
+		end
+		AA.portalAvoidText, AA.portalAvoidSet = Config.PortalAvoid, set
+	end
+	return AA.portalAvoidSet
+end
+---Whether Portals mode may open this portal: its tier inside the range picked, and none of its
+---modifiers on the avoid list. USER (v267): "do only tiers 1-5 of a portal", "pick which
+---modifiers i don't want". A portal with no tier of its own counts as tier 0.
+function AA.portalAllowed(item)
+	local low, high = tonumber(Config.PortalTierMin) or 0, tonumber(Config.PortalTierMax) or 20
+	if low > high then
+		low, high = high, low
+	end
+	local tier = tonumber(item.depth) or 0
+	if tier < low or tier > high then
+		return false
+	end
+	local avoid = AA.portalAvoid()
+	for _, id in ipairs(item.mods or {}) do
+		if avoid[(tostring(id):gsub("_%d+$", ""))] then
+			return false
+		end
+	end
+	return true
+end
+---How many portals (of the picked kind) pass the filters, and how many there are.
+function AA.portalCount()
+	local pass, all = 0, 0
+	for _, item in ipairs(AA.portalItems()) do
+		if (Config.PortalPick == "" or item.id == Config.PortalPick) and item.left > 0 then
+			all += 1
+			if AA.portalAllowed(item) then
+				pass += 1
+			end
+		end
+	end
+	return pass, all
+end
+
 ---The portal to open next: the picked kind (or any), one already started first, then the oldest.
 ---With a group (the running portal match's), only portals the game lets that match go on with.
 function AA.portalChoose(group)
 	local best
 	pcall(AA.portalKinds)
 	for _, item in ipairs(AA.portalItems()) do
-		if (Config.PortalPick == "" or item.id == Config.PortalPick) and item.left > 0 and not (AA.portalTried and AA.portalTried[item.uuid]) and (not group or not item.group or item.group == group) then
+		if (Config.PortalPick == "" or item.id == Config.PortalPick) and item.left > 0 and AA.portalAllowed(item) and not (AA.portalTried and AA.portalTried[item.uuid]) and (not group or not item.group or item.group == group) then
 			local started, bestStarted = item.tries > 0, best and best.tries > 0
 			if not best or (started and not bestStarted) or (started == bestStarted and item.made < best.made) then
 				best = item
@@ -17408,7 +17478,7 @@ AA.ui = UI
 		table.insert(UI.refreshers, refresh)
 		table.insert(UI.colorRefreshers, refresh)
 		refresh()
-		return refresh
+		return refresh, grid
 	end
 
 	---A button whose label and look follow a state: state() -> text, primary. Returns refresh().
@@ -19256,6 +19326,50 @@ do
 				end, "A portal already started is finished first, then the oldest.")
 				only({ "Portals" })
 				hint(page, "The list keeps every kind of portal you have had since the script started tracking, so one can stay picked while you have none: the script then waits for it or plays your fallback mode.")
+				only({ "Portals" })
+				local function tierText(value)
+					return "Tier " .. tostring(value)
+				end
+				slider(page, "Lowest tier", "PortalTierMin", 0, 20, 1, tierText, "Portals below this tier are left alone.")
+				only({ "Portals" })
+				slider(page, "Highest tier", "PortalTierMax", 0, 20, 1, tierText, "Portals above this tier are left alone. Set both to the same number for one tier only.")
+				only({ "Portals" })
+				only({ "Portals" }, UI.subhead(page, "Skip portals with", "Tick a modifier and no portal carrying it is opened, at any strength.").Parent)
+				local _, chipGrid = UI.chips(page, {
+					perRow = 2,
+					get = function()
+						return AA.PORTAL_MODS
+					end,
+					isOn = function(id)
+						return AA.portalAvoid()[id] == true
+					end,
+					toggle = function(id)
+						local set = table.clone(AA.portalAvoid())
+						set[id] = not set[id] or nil
+						local list = {}
+						for _, entry in ipairs(AA.PORTAL_MODS) do
+							if set[entry.id] then
+								table.insert(list, entry.id)
+							end
+						end
+						Config.PortalAvoid = httpService:JSONEncode(list)
+						AA.portalTried = nil
+					end,
+				})
+				only({ "Portals" }, chipGrid)
+				local matchLine = UI.note(page, "")
+				only({ "Portals" }, matchLine)
+				local function matchRefresh()
+					local pass, all = AA.portalCount()
+					matchLine.Text = ("%d of your %d portals%s pass these filters."):format(pass, all, Config.PortalPick == "" and "" or " of this kind")
+				end
+				table.insert(UI.refreshers, matchRefresh)
+				task.spawn(function()
+					while AA.alive and matchLine.Parent do
+						pcall(matchRefresh)
+						task.wait(1)
+					end
+				end)
 			end
 			UI.lastRow[page] = nil
 			only({ "Missions" }, UI.note(page, "Plays the world whose daily kill mission is open: its infinite stage, or its acts in order until infinite unlocks. When the mission is done it is claimed and the script plays infinite on the world picked below."))
