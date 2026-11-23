@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v267", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v268", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -302,6 +302,16 @@ local Config = {
 	PortalTierMin = 0,
 	PortalTierMax = 20,
 	PortalAvoid = "[]",
+	-- Misty Village (Update 21.5). Stage: Auto plays the night stage while it is night and the
+	-- day stage otherwise. Ore is only spent where a switch says so.
+	VillageStage = "Auto",
+	VillageBloodMoon = true,
+	VillageSell = true,
+	VillageForge = false,
+	VillageUpgrade = false,
+	VillageKeepOre = 0,
+	-- Misty Tower: 0 climbs (the next floor not cleared yet); a number plays that floor.
+	TowerFloor = 0,
 	SummonTen = true,
 	SummonStopMythic = true,
 	CompassPick = "",
@@ -404,7 +414,8 @@ do
 	end
 	-- A saved choice that is no longer an option (an older version's) goes back to its default.
 	local choices = {
-		Mode = { "Story", "Level", "Infinite", "Legend", "Relic", "Raid", "Artifact", "Challenge", "Daily", "Missions", "Quests", "Summer", "Cursed Womb", "Tournament", "Castle", "Dungeon", "Portals", "Kills" },
+		Mode = { "Story", "Level", "Infinite", "Legend", "Relic", "Raid", "Artifact", "Challenge", "Daily", "Missions", "Quests", "Summer", "Cursed Womb", "Tournament", "Castle", "Dungeon", "Portals", "Misty Village", "Misty Tower", "Kills" },
+		VillageStage = { "Auto", "Day", "Night" },
 		AfterGame = { "Auto", "Next", "Replay", "Lobby" },
 		Difficulty = { "Normal", "Hard" },
 		PlaceStyle = { "Auto", "Front", "Normal" },
@@ -1857,6 +1868,223 @@ function AA.charmStep()
 		end
 	end
 	AA.charmTidy()
+end
+
+-- Misty Village (Update 21.5, the Swordsmith event). Three stages on one map: Day (always open,
+-- pays Scarlet Ore every wave and Dawn Coins), Night (only while the village clock says night,
+-- pays Dawn Coins) and Blood Moon (a night in four, three times the coins). The clock is the
+-- server time in hour-long halves, so both the lobby and a match server can read it. The stages
+-- are opened like the game's own stage window does: open_portal_level_new, then the portal lobby
+-- it makes is started. The village itself is a forge: Scarlet Ore in (5 a sword), swords out
+-- over time, sold for Dawn Coins; two upgrades (forge speed, sword quality) cost ore.
+AA.Village = {}
+do
+	local Village = AA.Village
+	local function setting(name, default)
+		local value = Core.Settings[name]
+		return type(value) == "number" and value or default
+	end
+	---Night?, seconds left in this half.
+	function Village.clock(now)
+		local forced = workspace:GetAttribute("swordsmith_night")
+		if forced ~= nil then
+			return forced == true, 0
+		end
+		local day, night = setting("SWORDSMITH_DAY_LENGTH", 3600), setting("SWORDSMITH_NIGHT_LENGTH", 3600)
+		local at = ((now or workspace:GetServerTimeNow()) - setting("SWORDSMITH_CLOCK_OFFSET", 0)) % (day + night)
+		if at < day then
+			return false, day - at
+		end
+		return true, day + night - at
+	end
+	---Is tonight a Blood Moon (the game's own roll: seeded by the cycle number)?
+	function Village.bloodMoon(now)
+		if not Village.clock(now) then
+			return false
+		end
+		local forced = workspace:GetAttribute("swordsmith_blood_moon")
+		if forced ~= nil then
+			return forced == true
+		end
+		local day, night = setting("SWORDSMITH_DAY_LENGTH", 3600), setting("SWORDSMITH_NIGHT_LENGTH", 3600)
+		local cycle = math.floor(((now or workspace:GetServerTimeNow()) - setting("SWORDSMITH_CLOCK_OFFSET", 0)) / (day + night))
+		local rigged = workspace:GetAttribute("swordsmith_blood_moon_rig_" .. tostring(cycle))
+		if rigged ~= nil then
+			return rigged == true
+		end
+		local roll = Random.new(cycle * 7919 + 4421)
+		roll:NextNumber()
+		return roll:NextNumber() < setting("SWORDSMITH_BLOOD_MOON_CHANCE", 0.25)
+	end
+	---The stage to play now, or nil and why ("night": waiting for nightfall).
+	function Village.stage(done, playing)
+		done = done or completedLevels()
+		local pick = tostring(Config.VillageStage)
+		local night, left = Village.clock()
+		if night and left < 120 then
+			-- Two minutes of night left: not worth opening a night stage for.
+			night = false
+		end
+		-- The night stages ask for one clear of the day stage.
+		-- (A night match in progress proves it is open, whatever this server's profile copy says.)
+		local nightOpen = Levels.swordsmith_night ~= nil and (done.swordsmith_day ~= nil or AA.myClears().swordsmith_day ~= nil or playing == "swordsmith_night" or playing == "swordsmith_blood_moon")
+		-- Auto gives a night up after two losses in it: the night stages are built for a full
+		-- lobby with defences (first solo run: lost on wave 7 of 20 with High Cost II up), and
+		-- every lost run is ten minutes the day stage would have paid ore and coins.
+		local lost = type(AA.progress.villageNight) == "table" and AA.progress.villageNight or {}
+		local hour = math.floor(workspace:GetServerTimeNow() / 3600)
+		if night and pick == "Auto" and lost.hour == hour and (tonumber(lost.losses) or 0) >= 2 then
+			return Levels.swordsmith_day and "swordsmith_day" or nil
+		end
+		if night and pick ~= "Day" and nightOpen then
+			if Config.VillageBloodMoon and Levels.swordsmith_blood_moon and Village.bloodMoon() then
+				return "swordsmith_blood_moon"
+			end
+			return "swordsmith_night"
+		end
+		if pick == "Night" and nightOpen then
+			return nil, "night"
+		end
+		return Levels.swordsmith_day and "swordsmith_day" or nil
+	end
+	---The running event tower: world id, the floor to play, its level id.
+	function Village.tower()
+		local core = findData("EventTowerServiceCore", "get_floor_level_id")
+		if not core then
+			return nil
+		end
+		local world = gameCall(core.get_current, workspace:GetServerTimeNow(), core.DEFAULT_SLOT)
+		if type(world) ~= "string" then
+			return nil
+		end
+		local floor = tonumber(Config.TowerFloor) or 0
+		local reached = tonumber(gameCall(core.get_floor_reached, session(), world)) or 1
+		if floor <= 0 or floor > reached then
+			floor = reached
+		end
+		-- (What this script cleared itself since the profile was last read, e.g. on a match server.)
+		local own = AA.progress and type(AA.progress.towerFloor) == "table" and tonumber(AA.progress.towerFloor[world]) or 0
+		if (tonumber(Config.TowerFloor) or 0) <= 0 and own + 1 > floor then
+			floor = own + 1
+		end
+		local id = gameCall(core.get_floor_level_id, world, floor)
+		if type(id) ~= "string" then
+			return world, floor, nil
+		end
+		return world, floor, id
+	end
+	function Village.ore()
+		local items = (profile().inventory or {}).normal_items or {}
+		return tonumber(items.swordsmith_scarlet_ore) or 0
+	end
+	function Village.coins()
+		local items = (profile().inventory or {}).normal_items or {}
+		return tonumber(items.swordsmith_dawn_coin) or 0
+	end
+	---Lobby upkeep, at most once every two minutes: sell the swords on the rack, upgrade, feed the
+	---forge. Each part has its own switch; ore under "keep" is never spent.
+	function Village.upkeep()
+		if not (Config.VillageSell or Config.VillageForge or Config.VillageUpgrade) then
+			return
+		end
+		if os.clock() - (Village.keptAt or -1e9) < 120 then
+			return
+		end
+		Village.keptAt = os.clock()
+		local ok, village = invoke("get_swordsmith_village")
+		if not ok or type(village) ~= "table" then
+			return
+		end
+		Village.state = village
+		local grades = type(Core.Settings.SWORDSMITH_VILLAGE) == "table" and Core.Settings.SWORDSMITH_VILLAGE or {}
+		local function refresh(okNow, now)
+			if okNow and type(now) == "table" then
+				village = now
+				Village.state = now
+			end
+		end
+		local swords = 0
+		for _, count in pairs(type(village.rack) == "table" and village.rack or {}) do
+			swords += tonumber(count) or 0
+		end
+		if Config.VillageSell and swords > 0 then
+			local before = Village.coins()
+			refresh(invoke("request_village_collect"))
+			note("villageSell", { swords = swords, coins = Village.coins() - before })
+		end
+		local keep = math.max(tonumber(Config.VillageKeepOre) or 0, 0)
+		if Config.VillageUpgrade then
+			-- The cheaper of the two next levels first, while the ore covers it.
+			for _ = 1, 20 do
+				local best
+				for _, track in ipairs({ { key = "forge", field = "f" }, { key = "swordsmith", field = "s" } }) do
+					local levels = type(grades[track.key]) == "table" and grades[track.key] or {}
+					local nextLevel = levels[(tonumber(village[track.field]) or 1) + 1]
+					local cost = type(nextLevel) == "table" and tonumber(nextLevel.cost)
+					if cost and (not best or cost < best.cost) then
+						best = { key = track.key, cost = cost, level = (tonumber(village[track.field]) or 1) + 1 }
+					end
+				end
+				if not best or Village.ore() - keep < best.cost then
+					break
+				end
+				local okUp, now = invoke("request_village_upgrade", best.key)
+				if not okUp or type(now) ~= "table" then
+					break
+				end
+				refresh(okUp, now)
+				note("villageUpgrade", { what = best.key, level = best.level, cost = best.cost })
+			end
+		end
+		if Config.VillageForge then
+			local per = tonumber(grades.ore_per_sword) or 5
+			local spare = math.floor((Village.ore() - keep) / per) * per
+			if spare >= per then
+				local okAdd, now = invoke("request_village_add_ore", spare)
+				refresh(okAdd, now)
+				note("villageOre", { ore = spare })
+			end
+		end
+	end
+	-- What the server says about defences and the in-match Village Shop, kept in
+	-- accounts/<id>/village.txt (the first matches are how their shapes were learned).
+	do
+		local events = replicatedStorage.endpoints:FindFirstChild("server_to_client")
+		for _, name in ipairs({ "village_shop_changed", "defense_offer_changed", "defense_units_changed", "defense_equipped_changed", "open_defenses", "offer_changed" }) do
+			local event = events and events:FindFirstChild(name)
+			if event and event:IsA("RemoteEvent") then
+				table.insert(AA.connections, event.OnClientEvent:Connect(function(...)
+					local args = table.pack(...)
+					Village.last = Village.last or {}
+					Village.last[name] = args
+					pcall(function()
+						local parts = {}
+						for index = 1, args.n do
+							local okJson, text = pcall(function()
+								return httpService:JSONEncode(args[index])
+							end)
+							table.insert(parts, okJson and text or tostring(args[index]))
+						end
+						AA.appendLog(ACCOUNT_FOLDER .. "/village.txt", os.date("%m-%d %H:%M:%S ") .. name .. " " .. table.concat(parts, " | "):sub(1, 1500) .. "\n")
+					end)
+				end))
+			end
+		end
+	end
+	---One line for the menu: the clock, what is carried, the forge.
+	function Village.text()
+		local night, left = Village.clock()
+		local line = string.format("%s for %d:%02d more%s. %d Scarlet Ore, %d Dawn Coins.", night and "Night" or "Day", left // 60, math.floor(left % 60), (night and Village.bloodMoon()) and " (Blood Moon)" or "", Village.ore(), Village.coins())
+		local village = Village.state
+		if type(village) == "table" then
+			local swords = 0
+			for _, count in pairs(type(village.rack) == "table" and village.rack or {}) do
+				swords += tonumber(count) or 0
+			end
+			line ..= string.format(" Forge Lv %d, smith Lv %d, %d swords on the rack.", tonumber(village.f) or 1, tonumber(village.s) or 1, swords)
+		end
+		return line
+	end
 end
 
 function AA.portalItems()
@@ -7778,6 +8006,10 @@ local function matchKind()
 		return "Challenge"
 	elseif data._gamemode == "infinite_tower" then
 		return "Castle"
+	elseif data._swordsmith then
+		return "Misty Village"
+	elseif tostring(data.id):find("^event_tower_") then
+		return "Misty Tower"
 	elseif data._dungeon then
 		return "Dungeon"
 	elseif data.infinite or data._gamemode == "infinite" then
@@ -8254,6 +8486,34 @@ local function finishMatch()
 			AA.expectMatch(AA.nextStory(id), "Normal")
 		else
 			after = "Replay"
+		end
+	end
+	if kind == "Misty Tower" then
+		-- The next floor is a different level, opened from the lobby. A lost floor is retried.
+		if won then
+			local world = tostring(id):match("^(.-)_%d+$")
+			local floor = tonumber(tostring(id):match("_(%d+)$"))
+			if world and floor then
+				AA.progress.towerFloor = type(AA.progress.towerFloor) == "table" and AA.progress.towerFloor or {}
+				AA.progress.towerFloor[world] = math.max(tonumber(AA.progress.towerFloor[world]) or 0, floor)
+				pcall(AA.saveProgress)
+			end
+		end
+		if after == "Replay" and (won and (tonumber(Config.TowerFloor) or 0) <= 0) then
+			after = "Lobby"
+		end
+	end
+	if kind == "Misty Village" and not won and not gaveUp and (id == "swordsmith_night" or id == "swordsmith_blood_moon") then
+		local hour = math.floor(workspace:GetServerTimeNow() / 3600)
+		local lost = type(AA.progress.villageNight) == "table" and AA.progress.villageNight or {}
+		AA.progress.villageNight = { hour = hour, losses = (lost.hour == hour and (tonumber(lost.losses) or 0) or 0) + 1 }
+		pcall(AA.saveProgress)
+	end
+	if kind == "Misty Village" and after == "Replay" then
+		-- Day and night are different levels: the same one again only while it is still the
+		-- one to play (night has not fallen or ended, the Blood Moon has not come up).
+		if AA.playMode() == "Misty Village" and AA.Village.stage(nil, id) ~= id then
+			after = "Lobby"
 		end
 	end
 	local portalNext
@@ -9679,6 +9939,18 @@ AA.chooseInner = function(modeOverride)
 			return best.uuid, best.name, "portal"
 		end
 		return nil, nil, "portal"
+	elseif mode == "Misty Village" then
+		local id, why = AA.Village.stage(done)
+		if id then
+			return id, "Hard", "stageportal"
+		end
+		return nil, nil, why == "night" and "villagenight" or "locked"
+	elseif mode == "Misty Tower" then
+		local _, floor, id = AA.Village.tower()
+		if id then
+			return id, "Hard", "stageportal"
+		end
+		return nil, nil, floor and "towertop" or "tower"
 	elseif mode == "Cursed Womb" then
 		-- Its own lobby (_DUNGEONS), one Cursed Womb Key per run. Keys drop in Haunted Academy
 		-- infinite; the Robux ones are never bought.
@@ -10326,7 +10598,7 @@ local function joinGame()
 		AA.saveProgress()
 	end
 	if not id then
-		status = kind == "relicwait" and "Relic: reading your inventory" or kind == "relicnone" and "Relic: pick a relic on the Mode tab" or kind == "reliclocked" and "Relic: no stage that drops the missing materials is open (clear the story acts before it, or it was lost three times today)" or kind == "relicdone" and "Relic: everything collected, and the mode set for after it has nothing to play" or kind == "quests" and "No quest the script can play right now (see the list on the Mode tab)" or kind == "wombkey" and "No Cursed Womb Key (drops in Haunted Academy infinite)" or kind == "portal" and "No portal items" or kind == "raid" and "Waiting for a raid" or (kind == "challenge" and "No challenge left" or ((kind == "artifact" or kind == "locked") and "Locked: clear the story first" or "Nothing to join"))
+		status = kind == "relicwait" and "Relic: reading your inventory" or kind == "relicnone" and "Relic: pick a relic on the Mode tab" or kind == "reliclocked" and "Relic: no stage that drops the missing materials is open (clear the story acts before it, or it was lost three times today)" or kind == "relicdone" and "Relic: everything collected, and the mode set for after it has nothing to play" or kind == "quests" and "No quest the script can play right now (see the list on the Mode tab)" or kind == "wombkey" and "No Cursed Womb Key (drops in Haunted Academy infinite)" or kind == "portal" and "No portal items" or kind == "villagenight" and "Misty Village: waiting for night" or kind == "tower" and "Misty Tower: no tower is running" or kind == "towertop" and "Misty Tower: no floor left to play" or kind == "raid" and "Waiting for a raid" or (kind == "challenge" and "No challenge left" or ((kind == "artifact" or kind == "locked") and "Locked: clear the story first" or "Nothing to join"))
 		return false
 	end
 	do
@@ -10374,6 +10646,29 @@ local function joinGame()
 			end
 		end
 		AA.waitForTeleport(25)
+		return false
+	end
+	if kind == "stageportal" then
+		-- Misty Village stages and Misty Tower floors: the game's stage window opens a portal
+		-- lobby for the level (open_portal_level_new) and its owner starts it.
+		status = "Opening " .. tostring(Levels[id] and Levels[id].name or id)
+		local okOpen, opened = invoke("open_portal_level_new", id, { difficulty = "Hard", friends_only = Config.FriendsOnly or nil })
+		note("stagePortal", { id = id, ok = okOpen and opened ~= false })
+		task.wait(1.5)
+		local portals = workspace:FindFirstChild("_PORTALS") and workspace._PORTALS:FindFirstChild("Lobbies")
+		local mine
+		for _, lobby in ipairs(portals and portals:GetChildren() or {}) do
+			local owner = lobby:FindFirstChild("Owner")
+			if owner and owner.Value == localPlayer then
+				mine = lobby
+				invoke("request_start_game", lobby.Name)
+			end
+		end
+		AA.waitForTeleport(25)
+		if mine then
+			-- Still here: it did not start. Step out so the next try opens a fresh one.
+			invoke("request_leave_lobby", mine.Name)
+		end
 		return false
 	end
 	if kind == "event" or kind == "tournament" or kind == "castle" or kind == "dungeon" or kind == "skip" then
@@ -10939,7 +11234,30 @@ local function claimRewards()
 			invoke("claim_summer2_map_board_lines")
 		end
 	end
+	pcall(AA.Village.upkeep)
 	if Config.AutoQuests then
+		-- Quests an NPC hands out (v268: Lovey's and Misty's in Misty Village pay Dawn Coins, ore
+		-- and Star Remnants). The dialogue's [Accept Quest] is one request; finished ones are paid
+		-- by redeem_quest below like any other. Each is asked for once a session.
+		pcall(function()
+			local eventQuests = gameRequire(replicatedStorage.src.Data.QuestsEvent) or {}
+			local held = {}
+			for _, quest in pairs(pd.quest_handler and pd.quest_handler.quests or {}) do
+				local info = type(quest) == "table" and quest.quest_info
+				if info and info.id then
+					held[info.id] = true
+				end
+			end
+			AA.npcAsked = AA.npcAsked or {}
+			for id, quest in pairs(eventQuests) do
+				if type(quest) == "table" and quest._AVAILABLE_NPC_QUEST == true and not quest._EVENT_EXPIRED and not quest._event_repeatable_quest
+					and (not quest.expiry_time or quest.expiry_time > os.time()) and not held[id] and not AA.npcAsked[id] then
+					AA.npcAsked[id] = true
+					local okAsk, accepted = invoke("accept_npc_quest", id)
+					note("npcQuest", { id = id, ok = okAsk and accepted ~= false })
+				end
+			end
+		end)
 		-- Finished quests (story, daily, event, infinite...) pay out by uuid; NPC-only ones just get refused.
 		local handler = pd.quest_handler
 		for uuid, quest in pairs(handler and handler.quests or {}) do
@@ -11390,11 +11708,13 @@ local function summonStep(snipeBanner)
 	end
 	local costId = banner.resource_cost and banner.resource_cost.id or "Gems"
 	local price = banner.resource_cost and banner.resource_cost.amount or banner.gem_cost or 50
-	if costId == "GemsLegacy" then
-		costId = "GemsLegacy"
-	end
 	local have = currency(costId)
 	local keep = costId == "Gems" and Config.KeepGems or 0
+	if type(banner.item_cost) == "table" and banner.item_cost.item_id then
+		-- Paid with an item (v268: the Misty Village banner takes 50 Dawn Coins a summon).
+		costId, price, keep = tostring(banner.item_cost.item_id), tonumber(banner.item_cost.amount) or 50, 0
+		have = itemCount(costId)
+	end
 	local count = (Config.SummonTen and have - price * 10 >= keep) and 10 or 1
 	if have - price * count < keep then
 		return
@@ -11554,8 +11874,13 @@ function AA.summonNow(count)
 	end
 	local costId = banner.resource_cost and banner.resource_cost.id or "Gems"
 	local price = (banner.resource_cost and banner.resource_cost.amount or banner.gem_cost or 50) * count
-	if currency(costId) < price then
-		return "Need " .. price .. " " .. costId
+	local have = currency(costId)
+	if type(banner.item_cost) == "table" and banner.item_cost.item_id then
+		costId, price = tostring(banner.item_cost.item_id), (tonumber(banner.item_cost.amount) or 50) * count
+		have = itemCount(costId)
+	end
+	if have < price then
+		return "Need " .. price .. " " .. (AA.itemInfo and AA.itemInfo[costId] and AA.itemInfo[costId].name or costId)
 	end
 	local owned = 0
 	for _ in pairs(collectionData().owned_units or {}) do
@@ -18891,7 +19216,7 @@ do
 			return options
 		end
 
-		local MODES = { "Story", "Level", "Infinite", "Legend", "Relic", "Raid", "Artifact", "Challenge", "Daily", "Missions", "Quests", "Summer", "Cursed Womb", "Tournament", "Castle", "Dungeon", "Portals", "Farm kills" }
+		local MODES = { "Story", "Level", "Infinite", "Legend", "Relic", "Raid", "Artifact", "Challenge", "Daily", "Missions", "Quests", "Summer", "Cursed Womb", "Tournament", "Castle", "Dungeon", "Portals", "Misty Village", "Misty Tower", "Farm kills" }
 		local function modeName(mode)
 			return mode == "Kills" and "Farm kills" or mode
 		end
@@ -19049,7 +19374,9 @@ do
 					for _, entry in ipairs(ok and list or {}) do
 						local banner = type(Banners[entry.banner]) == "table" and Banners[entry.banner] or {}
 						local cost = nil
-						if type(banner.resource_cost) == "table" and banner.resource_cost.amount then
+						if type(banner.item_cost) == "table" and banner.item_cost.amount then
+							cost = ("%s %s"):format(tostring(banner.item_cost.amount), tostring(banner.item_cost.item_id) == "swordsmith_dawn_coin" and "Dawn Coins" or AA.spaced(tostring(banner.item_cost.item_id)))
+						elseif type(banner.resource_cost) == "table" and banner.resource_cost.amount then
 							cost = ("%s %s"):format(tostring(banner.resource_cost.amount), AA.spaced(banner.resource_cost.id))
 						elseif tonumber(banner.gem_cost) then
 							cost = ("%d gems"):format(banner.gem_cost)
@@ -19210,6 +19537,42 @@ do
 
 			heading(page, "Mode settings", "right")
 			only({ "Cursed Womb", "Tournament", "None" }, UI.note(page, "This mode has no settings of its own."))
+			do
+				-- Misty Village and its tower (Update 21.5).
+				segmented(page, "Stage", "VillageStage", { "Auto", "Day", "Night" }, "Auto: the night stage while it is night, the day stage otherwise. Night: waits for nightfall (or plays your fallback mode). The night stage opens after one clear of the day stage.", { Auto = "Day ore and coins, night coins", Day = "Scarlet Ore every wave", Night = "Dawn Coins only" })
+				only({ "Misty Village" })
+				toggle(page, "Play the Blood Moon when it is up", "VillageBloodMoon", "A night in four. Three times the Dawn Coins, harder enemies.")
+				only({ "Misty Village" })
+				slider(page, "Tower floor", "TowerFloor", 0, 100, 1, function(value)
+					return value == 0 and "Climb" or ("Floor " .. tostring(value))
+				end, "Climb: the next floor you have not cleared. A number replays that floor (no first-clear rewards).")
+				only({ "Misty Tower" })
+				toggle(page, "Sell forged swords", "VillageSell", "Sells every sword on the rack for Dawn Coins whenever you are in the lobby. The rack stops forging when it is full.")
+				only({ "Misty Village", "Misty Tower" })
+				toggle(page, "Put Scarlet Ore in the forge", "VillageForge", "All spare ore goes in, 5 a sword. Off: your ore is left alone.")
+				only({ "Misty Village", "Misty Tower" })
+				toggle(page, "Upgrade the forge and the smith", "VillageUpgrade", "Spends Scarlet Ore on the cheaper next level first: a faster forge, better sword grades.")
+				only({ "Misty Village", "Misty Tower" })
+				slider(page, "Scarlet Ore to keep", "VillageKeepOre", 0, 2000, 10, number, "The forge and the upgrades never take your ore below this (defences are repaired and bought with ore).")
+				only({ "Misty Village", "Misty Tower" })
+				local villageLine = UI.note(page, "")
+				only({ "Misty Village", "Misty Tower" }, villageLine)
+				task.spawn(function()
+					while AA.alive and villageLine.Parent do
+						pcall(function()
+							local text = AA.Village.text()
+							if IS_LOBBY then
+								local _, floor = AA.Village.tower()
+								if floor then
+									text ..= " Tower: floor " .. tostring(floor) .. " next."
+								end
+							end
+							villageLine.Text = text
+						end)
+						task.wait(1)
+					end
+				end)
+			end
 			toggle(page, "Take shrines", "DungeonShrines", "A shrine gives an item together with a strong curse. Off: every shrine is walked past.")
 			only({ "Dungeon" })
 			toggle(page, "Skip shrines that add enemy regen", "DungeonShrineNoRegen", "On: a shrine cursed with enemy regen is left alone, whatever it gives. Off: it is taken like any other.")
@@ -20071,7 +20434,7 @@ do
 			cycler(page, "Banner", function()
 				local options = {}
 				for id, banner in pairs(Banners) do
-					if type(banner) == "table" and banner.active and (banner.gem_cost or banner.resource_cost) then
+					if type(banner) == "table" and banner.active and (banner.gem_cost or banner.resource_cost or banner.item_cost) then
 						table.insert(options, { id = id, name = AA.spaced(id), current = id == Config.Banner })
 					end
 				end
