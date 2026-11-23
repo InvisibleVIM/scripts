@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v268", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v269", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -1441,7 +1441,7 @@ local function scanField(fresh)
 	if not fresh and now - Field.at < 0.1 then
 		return Field
 	end
-	local towers, summons, enemies, others = {}, {}, {}, {}
+	local towers, summons, enemies, others, defenses = {}, {}, {}, {}, {}
 	local folder = workspace:FindFirstChild("_UNITS")
 	for _, unit in ipairs(folder and folder:GetChildren() or {}) do
 		local unitStats = unit:FindFirstChild("_stats")
@@ -1450,7 +1450,16 @@ local function scanField(fresh)
 			local parent = unitStats:FindFirstChild("parent_unit")
 			local parentValue = parent and parent.Value
 			local summoned = parentValue ~= nil and parentValue ~= "nil" and parentValue ~= ""
-			if owner.Value == localPlayer then
+			local idValue = unitStats:FindFirstChild("id")
+			local unitData = idValue and Units[idValue.Value]
+			if type(unitData) == "table" and unitData._defense then
+				-- Misty Village defences (v269): a whetstone or a barricade the stage sets up is
+				-- handed to the lobby's owner and looked like one of my towers (it was counted,
+				-- planned around and listed). They are ground that is taken and nothing more;
+				-- the ones with an aura are read by AA.Village.auras().
+				table.insert(defenses, unit)
+				table.insert(others, unit)
+			elseif owner.Value == localPlayer then
 				if summoned then
 					table.insert(summons, unit)
 				elseif unitStats:FindFirstChild("id") and unitStats:FindFirstChild("upgrade") then
@@ -1465,7 +1474,7 @@ local function scanField(fresh)
 			end
 		end
 	end
-	Field.at, Field.towers, Field.summons, Field.enemies, Field.others = now, towers, summons, enemies, others
+	Field.at, Field.towers, Field.summons, Field.enemies, Field.others, Field.defenses = now, towers, summons, enemies, others, defenses
 	return Field
 end
 
@@ -2070,6 +2079,48 @@ do
 				end))
 			end
 		end
+	end
+	---The defences on the field that buff units standing inside their circle (whetstone: damage,
+	---war drum: cooldown, watchtower: range, sun lamp, ore cart): { position, range, id }.
+	function Village.auras()
+		if Village.auraList and os.clock() - (Village.auraAt or 0) < 1 then
+			return Village.auraList
+		end
+		if Village.defenseData == nil then
+			Village.defenseData = gameRequire(replicatedStorage.src.Data.Defenses) or false
+		end
+		local list = {}
+		local folder = workspace:FindFirstChild("_UNITS")
+		for _, unit in ipairs(folder and folder:GetChildren() or {}) do
+			local unitStats = unit:FindFirstChild("_stats")
+			local idValue = unitStats and unitStats:FindFirstChild("id")
+			local unitData = idValue and Units[idValue.Value]
+			if type(unitData) == "table" and unitData._defense then
+				local info = Village.defenseData and Village.defenseData[idValue.Value]
+				local range = unitStats:FindFirstChild("range")
+				local reach = range and tonumber(range.Value) or tonumber(unitData.range) or 0
+				if type(info) == "table" and type(info.aura) == "table" and reach > 6 then
+					table.insert(list, { position = unit:GetPivot().Position, range = reach, id = idValue.Value })
+				end
+			end
+		end
+		Village.auraList, Village.auraAt = list, os.clock()
+		return list
+	end
+	---How much a spot is worth for standing in those circles: 1 with none in reach, up to 4
+	---inside every one of them, fading over 15 studs outside a circle. USER (v269): "check
+	---placement of the defenses": the team stood at the roads' spawn, 90 studs from a whetstone
+	---and a war drum that were buffing nobody.
+	function Village.auraPull(p, auras)
+		if not auras or #auras == 0 then
+			return 1
+		end
+		local sum = 0
+		for _, aura in ipairs(auras) do
+			local away = math.sqrt((p.X - aura.position.X) ^ 2 + (p.Z - aura.position.Z) ^ 2) - (aura.range - 2)
+			sum += math.clamp(1 - away / 15, 0, 1)
+		end
+		return 1 + 3 * sum / #auras
 	end
 	---One line for the menu: the clock, what is carried, the forge.
 	function Village.text()
@@ -4764,6 +4815,12 @@ local function bestSpot(data, focus, only, free)
 							-- update the placements on 2 paths?" Elyssia went through this branch, which
 							-- never looked at AA.laneHub, and stood 170 studs past the crossing.)
 							local hubAt = summonLanes and AA.laneHub() or nil
+							local auraNow = not AA.dryBlank() and AA.Village.auras() or {}
+							if #auraNow > 0 and score > 0 then
+								local pull = AA.Village.auraPull(p, auraNow)
+								score, early = score * pull, early * pull
+								hubAt = nil
+							end
 							if hubAt and score > 0 then
 								local away = math.sqrt((p.X - hubAt.X) ^ 2 + (p.Z - hubAt.Z) ^ 2) - math.max(range - 4, 6)
 								local pull = 1 + 3 * math.clamp(1 - away / 30, 0, 1)
@@ -4814,6 +4871,13 @@ local function bestSpot(data, focus, only, free)
 	-- (Known after six waves, or from the last run on this stage and map; nil = no idea yet.)
 	local multi = (Match.laneCount or 1) > 1
 	local laneHub = multi and AA.laneHub() or nil
+	-- Aura defences on the field decide where the team stands; the crossing rule steps aside.
+	local auraList = not AA.dryBlank() and AA.Village.auras() or {}
+	if #auraList == 0 or AA.killsMode() or AA.frontForced() or AA.Order.front() then
+		auraList = nil
+	else
+		laneHub = nil
+	end
 	local reachBand = not focus and Match.pace ~= "speed" and not multi and AA.fightBand() or nil
 	local laneWeight, openLanes = nil, Match.laneCount or 1
 	if (Match.laneCount or 1) > 1 then
@@ -4930,6 +4994,9 @@ local function bestSpot(data, focus, only, free)
 							local away = math.sqrt((p.X - laneHub.X) ^ 2 + (p.Z - laneHub.Z) ^ 2) - math.max(minReach - 4, 6)
 							score *= 1 + 3 * math.clamp(1 - away / 30, 0, 1)
 						end
+					end
+					if auraList and score > 0 and not focus then
+						score *= AA.Village.auraPull(p, auraList)
 					end
 					if clusterAt and score > 0 then
 						-- Long modes: keep damage units together so one buffer / aura covers them all.
