@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v270", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v271", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -312,6 +312,8 @@ local Config = {
 	VillageKeepOre = 0,
 	-- Misty Tower: 0 climbs (the next floor not cleared yet); a number plays that floor.
 	TowerFloor = 0,
+	MatchVillage = false,
+	MatchTower = false,
 	SummonTen = true,
 	SummonStopMythic = true,
 	CompassPick = "",
@@ -8250,7 +8252,12 @@ function AA.matchmakingOn(kind, id)
 		return false
 	end
 	local lower = id:lower()
-	if lower:find("summer") then
+	if lower:find("^event_tower") then
+		-- v271: the new modes have their own switches (they were riding on the Raids one).
+		return Config.MatchTower == true
+	elseif level._swordsmith then
+		return Config.MatchVillage == true
+	elseif lower:find("summer") then
 		return Config.MatchSummer == true
 	elseif level.is_raid or kind == "Raid" or kind == "raid" then
 		return Config.MatchRaid == true
@@ -19621,6 +19628,8 @@ do
 			toggle(page, "Raids", "MatchRaid")
 			toggle(page, "Summer Hunt", "MatchSummer")
 			toggle(page, "Infinity Mansion", "MatchCastle")
+			toggle(page, "Misty Village", "MatchVillage", "Day, Night and Blood Moon stages, up to 6 players.")
+			toggle(page, "Misty Tower", "MatchTower", "Up to 2 players a floor.")
 
 			heading(page, "Mode settings", "right")
 			only({ "Cursed Womb", "Tournament", "None" }, UI.note(page, "This mode has no settings of its own."))
