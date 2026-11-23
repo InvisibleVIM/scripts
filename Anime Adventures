@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v269", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v270", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -4816,6 +4816,9 @@ local function bestSpot(data, focus, only, free)
 							-- never looked at AA.laneHub, and stood 170 studs past the crossing.)
 							local hubAt = summonLanes and AA.laneHub() or nil
 							local auraNow = not AA.dryBlank() and AA.Village.auras() or {}
+							if Config.PlaceStyle == "Front" or AA.killsMode() or AA.frontForced() or AA.Order.front() then
+								auraNow = {}
+							end
 							if #auraNow > 0 and score > 0 then
 								local pull = AA.Village.auraPull(p, auraNow)
 								score, early = score * pull, early * pull
@@ -4873,7 +4876,9 @@ local function bestSpot(data, focus, only, free)
 	local laneHub = multi and AA.laneHub() or nil
 	-- Aura defences on the field decide where the team stands; the crossing rule steps aside.
 	local auraList = not AA.dryBlank() and AA.Village.auras() or {}
-	if #auraList == 0 or AA.killsMode() or AA.frontForced() or AA.Order.front() then
+	-- USER (v270): "when on front placement it should supersede the defense placements". With
+	-- Where set to Front the team goes to the front and the circles are ignored.
+	if #auraList == 0 or Config.PlaceStyle == "Front" or AA.killsMode() or AA.frontForced() or AA.Order.front() then
 		auraList = nil
 	else
 		laneHub = nil
@@ -8556,7 +8561,6 @@ local function finishMatch()
 		end
 	end
 	if kind == "Misty Tower" then
-		-- The next floor is a different level, opened from the lobby. A lost floor is retried.
 		if won then
 			local world = tostring(id):match("^(.-)_%d+$")
 			local floor = tonumber(tostring(id):match("_(%d+)$"))
@@ -8566,7 +8570,12 @@ local function finishMatch()
 				pcall(AA.saveProgress)
 			end
 		end
-		if after == "Replay" and (won and (tonumber(Config.TowerFloor) or 0) <= 0) then
+		-- USER (v270): "it shouldn't lobby everytime it finishes a floor. it should just move onto
+		-- the next one". The result screen's button is Next Floor after a win and Retry after a
+		-- loss, and both send the plain replay vote: the server moves the lobby up a floor
+		-- itself. Only a fixed floor (Tower floor on the Mode tab) has to go back to be opened
+		-- again, since the vote would climb past it.
+		if after == "Replay" and won and (tonumber(Config.TowerFloor) or 0) > 0 then
 			after = "Lobby"
 		end
 	end
@@ -8617,6 +8626,10 @@ local function finishMatch()
 		local args = { ... }
 		task.spawn(function()
 			local ok, a, b = invoke(table.unpack(args))
+			if args[1] == "set_game_finished_vote" then
+				-- (false = the server was not taking votes yet: asked again in a few seconds.)
+				Match.voteRefused = ok and a == false
+			end
 			voteLog(tostring(args[1]) .. " " .. tostring(args[2]) .. " -> " .. tostring(ok) .. " " .. tostring(a) .. " " .. tostring(b))
 		end)
 	end
@@ -8771,7 +8784,14 @@ local function finishMatch()
 		deadline = os.clock() + 20
 		while AA.alive and os.clock() < deadline and gameFinished() do
 			task.wait(0.5)
+			-- A vote the server turned down (Misty Tower's Next Floor, cast 0.3 s after the
+			-- win, came back false and the floor then sat 23 s on the result screen) is cast
+			-- again after four seconds, not twenty.
+			if Match.voteRefused and deadline - os.clock() > 4 and os.clock() - started > 3 then
+				deadline = os.clock() + 1
+			end
 		end
+		Match.voteRefused = nil
 		if AA.alive and gameFinished() and Config.AutoJoin then
 			if after == "Next" and os.clock() - started > 35 then
 				after = "Replay"
