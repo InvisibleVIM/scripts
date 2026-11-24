@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v280", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v281", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -395,6 +395,7 @@ local Config = {
 	SellRare = false,
 	SellEpic = false,
 	AntiAfk = true,
+	VisualGradeOnly = false,
 	NoClip = false,
 	ClickTeleport = false,
 	ClickTeleportKey = "LeftControl",
@@ -21187,7 +21188,13 @@ do
 	---What a shown number is multiplied by when a stat goes from its real value to the picked
 	---one. The game's own formulas (calculate_total_stat_multiplier): damage x potency,
 	---range x range stat, cooldown x (1 - (speed - 1)).
+	---USER: "add a toggle for the visuals that won't change the actual value of the damage number
+	---it'll just change the SSS and %". With Config.VisualGradeOnly the letter and the % are the
+	---picked ones and every number worked out from them (damage, range, cooldown) stays real.
 	function Visual.ratio(key, real, want)
+		if Config.VisualGradeOnly then
+			return 1
+		end
 		if key == "speed_stat" then
 			return math.max(2 - want, 0.01) / math.max(2 - real, 0.01)
 		end
@@ -21407,6 +21414,48 @@ do
 			end
 		end
 	end
+	---The game turns a unit's rolls into its numbers in one place
+	---(TraitServiceCore.calculate_total_stat_multiplier), and every window that shows damage,
+	---range or cooldown goes through it. With "letters and % only" on, that one function is handed
+	---the unit's real rolls, so the windows keep the real numbers while the letters and the %
+	---(read straight from the profile copy) show the picked ones.
+	function Visual.hook()
+		local core = Core.Trait
+		if type(core) ~= "table" or type(core.calculate_total_stat_multiplier) ~= "function" then
+			return
+		end
+		local env = getgenv()
+		-- (A copy of this script that was replaced without detaching leaves its wrapper behind.)
+		local original = env.AAStatOriginal or core.calculate_total_stat_multiplier
+		env.AAStatOriginal = original
+		local function wrapper(record, ...)
+			if Config.VisualGradeOnly and AA.alive and next(Visual.saved) then
+				local ok, real = pcall(AA.realRecord, record)
+				if ok and real then
+					record = real
+				end
+			end
+			return original(record, ...)
+		end
+		local ok = pcall(function()
+			if isreadonly and setreadonly and isreadonly(core) then
+				setreadonly(core, false)
+			end
+			core.calculate_total_stat_multiplier = wrapper
+		end)
+		Visual.hooked = ok and core.calculate_total_stat_multiplier == wrapper
+	end
+	function Visual.unhook()
+		local core = Core.Trait
+		local original = getgenv().AAStatOriginal
+		if type(core) == "table" and original then
+			pcall(function()
+				core.calculate_total_stat_multiplier = original
+			end)
+		end
+		getgenv().AAStatOriginal = nil
+		Visual.hooked = nil
+	end
 	---Back to the real stats for one unit.
 	function Visual.reset(uuid)
 		local orig = Visual.orig[uuid]
@@ -21467,6 +21516,7 @@ do
 		Visual.save()
 	end
 	Visual.load()
+	pcall(Visual.hook)
 end
 
 -- The pages. Three groups in the list: Farm (what it plays and how), Account (units, summons,
@@ -23200,6 +23250,20 @@ do
 				statusLine.Text = picked.label .. " shows its real stats again."
 			end)
 			statusLine = UI.note(page, "Nothing changed yet.")
+			toggle(page, "Letters and % only", "VisualGradeOnly")
+			hint(page, "On: only the stat letter and its % change. The damage, range and cooldown numbers stay the unit's real ones. Off: those numbers are also shown as if the roll were real (a unit at +20% shown as +30% shows more damage). Either way nothing changes how the unit fights. Reopen a game window to see the switch take effect there.")
+			do
+				local last
+				task.spawn(function()
+					while AA.alive do
+						if last ~= Config.VisualGradeOnly then
+							last = Config.VisualGradeOnly
+							pcall(showUnit)
+						end
+						task.wait(0.5)
+					end
+				end)
+			end
 			for index, stat in ipairs(Visual.STATS) do
 				heading(page, stat.name, index == 3 and "left" or "right")
 				lines[stat.key] = infoLine(page, 44)
@@ -23991,6 +24055,9 @@ function AA.detach()
 	AA.alive = false
 	saveSettings()
 	pcall(AA.noClipRestore)
+	pcall(function()
+		AA.Visual.unhook()
+	end)
 	pcall(function()
 		if AA.universal then
 			AA.universal.stop()
