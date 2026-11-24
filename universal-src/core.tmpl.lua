@@ -208,6 +208,22 @@ function PotentUniversal.install(host)
 				human.JumpPower, human.JumpHeight = U.saved.jump.power, U.saved.jump.height
 				U.saved.jump = nil
 			end
+			-- No ragdoll: the tumbling states are switched off on your own humanoid.
+			if Config.UNoRagdoll then
+				U.ragdollOff = human
+				for _, state in ipairs({ Enum.HumanoidStateType.Ragdoll, Enum.HumanoidStateType.FallingDown }) do
+					human:SetStateEnabled(state, false)
+					if human:GetState() == state then
+						human:ChangeState(Enum.HumanoidStateType.GettingUp)
+					end
+				end
+			elseif U.ragdollOff then
+				pcall(function()
+					U.ragdollOff:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, true)
+					U.ragdollOff:SetStateEnabled(Enum.HumanoidStateType.FallingDown, true)
+				end)
+				U.ragdollOff = nil
+			end
 			if Config.UBhop and human.MoveDirection.Magnitude > 0 and human.FloorMaterial ~= Enum.Material.Air then
 				human:ChangeState(Enum.HumanoidStateType.Jumping)
 			end
@@ -488,6 +504,11 @@ function PotentUniversal.install(host)
 					entry.line:Remove()
 				end)
 			end
+			for _, bone in ipairs(entry.bones or {}) do
+				pcall(function()
+					bone:Remove()
+				end)
+			end
 			U.esp[player] = nil
 		end
 	end
@@ -554,11 +575,19 @@ function PotentUniversal.install(host)
 						entry.bar.Size = UDim2.fromScale(share, 1)
 						entry.bar.BackgroundColor3 = Color3.fromRGB(255, 70, 70):Lerp(Color3.fromRGB(80, 220, 110), share)
 					end
-					entry.root, entry.color = head, color
+					entry.root, entry.color, entry.model = head, color, model
 				end
 			end
 		end
 	end
+	local BONES = {
+		{ "Head", "UpperTorso" }, { "UpperTorso", "LowerTorso" },
+		{ "UpperTorso", "LeftUpperArm" }, { "LeftUpperArm", "LeftLowerArm" }, { "LeftLowerArm", "LeftHand" },
+		{ "UpperTorso", "RightUpperArm" }, { "RightUpperArm", "RightLowerArm" }, { "RightLowerArm", "RightHand" },
+		{ "LowerTorso", "LeftUpperLeg" }, { "LeftUpperLeg", "LeftLowerLeg" }, { "LeftLowerLeg", "LeftFoot" },
+		{ "LowerTorso", "RightUpperLeg" }, { "RightUpperLeg", "RightLowerLeg" }, { "RightLowerLeg", "RightFoot" },
+		{ "Head", "Torso" }, { "Torso", "Left Arm" }, { "Torso", "Right Arm" }, { "Torso", "Left Leg" }, { "Torso", "Right Leg" },
+	}
 	---Tracers: a line from the bottom of the screen to every ESP player (needs the Drawing API).
 	local function tracerStep()
 		local can = Drawing ~= nil and Config.UEsp and Config.UEspTracers
@@ -582,6 +611,40 @@ function PotentUniversal.install(host)
 			elseif entry.line then
 				entry.line.Visible = false
 			end
+			-- Skeletons: a line along every limb (R15 and R6 rigs).
+			local bonesOn = Drawing ~= nil and Config.UEsp and Config.UEspSkeleton and entry.model and entry.model.Parent
+			if bonesOn then
+				entry.bones = entry.bones or {}
+				local index = 0
+				for _, pair in ipairs(BONES) do
+					local from, to = entry.model:FindFirstChild(pair[1]), entry.model:FindFirstChild(pair[2])
+					if from and to then
+						index += 1
+						local bone = entry.bones[index]
+						if not bone then
+							local okBone, made = pcall(Drawing.new, "Line")
+							if not okBone then
+								break
+							end
+							made.Thickness = 1.5
+							entry.bones[index] = made
+							bone = made
+						end
+						local a, aOn = camera:WorldToViewportPoint(from.Position)
+						local b, bOn = camera:WorldToViewportPoint(to.Position)
+						bone.Visible = aOn and bOn
+						bone.Color = entry.color
+						bone.From, bone.To = Vector2.new(a.X, a.Y), Vector2.new(b.X, b.Y)
+					end
+				end
+				for extra = index + 1, #entry.bones do
+					entry.bones[extra].Visible = false
+				end
+			elseif entry.bones then
+				for _, bone in ipairs(entry.bones) do
+					bone.Visible = false
+				end
+			end
 		end
 	end
 	---Marks: NPCs, tools, proximity prompts, click detectors and search results get an outline and
@@ -600,6 +663,14 @@ function PotentUniversal.install(host)
 		{ key = "UEspPrompt", color = Color3.fromRGB(120, 255, 140), find = function(object)
 			if object:IsA("ProximityPrompt") and object.Parent then
 				return object.Parent, (object.ActionText ~= "" and object.ActionText or "Prompt") .. (object.ObjectText ~= "" and (": " .. object.ObjectText) or "")
+			end
+		end },
+		{ key = "UEspTouch", color = Color3.fromRGB(255, 110, 110), find = function(object)
+			if object:IsA("TouchTransmitter") and object.Parent and not object.Parent:FindFirstAncestorOfClass("Tool") then
+				local model = object.Parent:FindFirstAncestorOfClass("Model")
+				if not (model and model:FindFirstChildOfClass("Humanoid")) then
+					return object.Parent, "Touch: " .. object.Parent.Name
+				end
 			end
 		end },
 		{ key = "UEspClick", color = Color3.fromRGB(230, 130, 255), find = function(object)
@@ -770,6 +841,76 @@ function PotentUniversal.install(host)
 		bar.BorderSizePixel = 1
 		bar.Parent = cross
 	end
+	-- Direction indicator: an arrow for where you are moving relative to where you look, and how fast.
+	local compass = Instance.new("Frame")
+	compass.Name = "PotentDirection"
+	compass.AnchorPoint = Vector2.new(0.5, 1)
+	compass.Position = UDim2.new(0.5, 0, 1, -90)
+	compass.Size = UDim2.fromOffset(70, 70)
+	compass.BackgroundColor3 = Color3.fromRGB(18, 18, 18)
+	compass.BackgroundTransparency = 0.4
+	compass.BorderSizePixel = 0
+	compass.Visible = false
+	compass.ZIndex = 298
+	compass.Parent = host.gui
+	Instance.new("UICorner", compass).CornerRadius = UDim.new(1, 0)
+	local arrow = Instance.new("TextLabel")
+	arrow.AnchorPoint = Vector2.new(0.5, 0.5)
+	arrow.Position = UDim2.fromScale(0.5, 0.42)
+	arrow.Size = UDim2.fromOffset(40, 40)
+	arrow.BackgroundTransparency = 1
+	arrow.Font = Enum.Font.GothamBold
+	arrow.Text = "^"
+	arrow.TextSize = 30
+	arrow.TextColor3 = Color3.fromRGB(255, 255, 255)
+	arrow.ZIndex = 299
+	arrow.Parent = compass
+	local pace = Instance.new("TextLabel")
+	pace.AnchorPoint = Vector2.new(0.5, 1)
+	pace.Position = UDim2.new(0.5, 0, 1, -6)
+	pace.Size = UDim2.fromOffset(60, 14)
+	pace.BackgroundTransparency = 1
+	pace.Font = Enum.Font.GothamMedium
+	pace.TextSize = 11
+	pace.TextColor3 = Color3.fromRGB(230, 230, 230)
+	pace.ZIndex = 299
+	pace.Parent = compass
+	local function compassStep()
+		compass.Visible = Config.UDirection == true
+		local part = root()
+		if not compass.Visible or not part then
+			return
+		end
+		local velocity = part.AssemblyLinearVelocity
+		local flat = Vector3.new(velocity.X, 0, velocity.Z)
+		local look = workspace.CurrentCamera.CFrame.LookVector
+		local speed = flat.Magnitude
+		pace.Text = string.format("%d studs/s", speed)
+		arrow.Visible = speed > 0.5
+		if speed > 0.5 then
+			local turn = math.atan2(flat.X, flat.Z) - math.atan2(look.X, look.Z)
+			arrow.Rotation = -math.deg(turn)
+		end
+	end
+	-- Camera roll and the steady camera run right after the game's own camera each frame.
+	local ROLL_STEP = "PotentUniversalCamera" .. tostring(math.random(1e6))
+	pcall(function()
+		runService:BindToRenderStep(ROLL_STEP, Enum.RenderPriority.Camera.Value + 1, function()
+			if not alive() then
+				return
+			end
+			if Config.UNoShake then
+				local human = humanoid()
+				if human and human.CameraOffset ~= Vector3.zero then
+					human.CameraOffset = Vector3.zero
+				end
+			end
+			if Config.URollOn and not freecam.on then
+				local camera = workspace.CurrentCamera
+				camera.CFrame = camera.CFrame * CFrame.Angles(0, 0, math.rad(tonumber(Config.URoll) or 0))
+			end
+		end)
+	end)
 	local frames, frameClock, fps = 0, os.clock(), 0
 	function U.ping()
 		local ok, value = pcall(function()
@@ -811,6 +952,7 @@ function PotentUniversal.install(host)
 		pcall(freecam.step, dt)
 		pcall(selfStep)
 		pcall(tracerStep)
+		pcall(compassStep)
 	end)
 	hook(runService.Stepped, function()
 		if alive() then
@@ -1054,6 +1196,7 @@ function PotentUniversal.install(host)
 		UI.slider(page, "Jump power", "UJump", 50, 500, 5, whole, "Games that use jump height get the matching height.")
 		UI.toggle(page, "Set gravity", "UGravityOn")
 		UI.slider(page, "Gravity", "UGravity", 5, 196, 1, whole, "The game's normal is 196.")
+		UI.toggle(page, "Direction indicator", "UDirection", "A small dial at the bottom of the screen: which way you are moving compared with where you look, and how fast.")
 		UI.toggle(page, "Spin", "USpin")
 		UI.slider(page, "Spin speed", "USpinSpeed", 1, 60, 1, whole)
 		UI.button(page, "Reset movement values", function()
@@ -1164,6 +1307,7 @@ function PotentUniversal.install(host)
 		UI.toggle(page, "Distance", "UEspDistance")
 		UI.toggle(page, "Health bars", "UEspHealth")
 		UI.toggle(page, "Tracers", "UEspTracers", Drawing and "A line from the bottom of the screen to each player." or "Your executor has no Drawing API: this one does nothing here.")
+		UI.toggle(page, "Skeletons", "UEspSkeleton", Drawing and "A line along every limb." or "Your executor has no Drawing API: this one does nothing here.")
 		UI.toggle(page, "Team colours", "UEspTeam", "Off: everyone is red.")
 		UI.toggle(page, "Hide teammates", "UEspTeamCheck")
 		UI.slider(page, "Range", "UEspRange", 100, 5000, 100, function(value)
@@ -1174,6 +1318,7 @@ function PotentUniversal.install(host)
 		UI.toggle(page, "Tools on the ground", "UEspTool")
 		UI.toggle(page, "Proximity prompts", "UEspPrompt")
 		UI.toggle(page, "Click detectors", "UEspClick")
+		UI.toggle(page, "Touch triggers", "UEspTouch", "Parts that fire something when touched: kill bricks, checkpoints, pads.")
 		UI.heading(page, "Light and aim", "right")
 		UI.toggle(page, "Fullbright", "UFullbright", "Daylight, no fog, no shadows.")
 		UI.toggle(page, "Remove fog", "UNoFog")
@@ -1195,6 +1340,11 @@ function PotentUniversal.install(host)
 		UI.slider(page, "Sensitivity", "USens", 0.1, 5, 0.1, function(value)
 			return string.format("%.1fx", value)
 		end)
+		UI.toggle(page, "Roll the camera", "URollOn")
+		UI.slider(page, "Roll", "URoll", -180, 180, 5, function(value)
+			return whole(value) .. " deg"
+		end)
+		UI.toggle(page, "Steady camera", "UNoShake", "Cancels shake that a game does by nudging your character's camera offset. Shake a game applies straight to the camera itself cannot be told apart from normal movement and stays.")
 		UI.heading(page, "Free camera", "right", "The camera leaves your character: W A S D, E up, Q down, hold right mouse to look, Shift to go faster.")
 		UI.toggle(page, "Free camera", "UFreecam")
 		UI.slider(page, "Camera speed", "UFreecamSpeed", 10, 400, 10, function(value)
@@ -1215,6 +1365,7 @@ function PotentUniversal.install(host)
 		UI.slider(page, "Animation speed", "UAnimSpeed", 0.1, 5, 0.1, function(value)
 			return string.format("%.1fx", value)
 		end)
+		UI.toggle(page, "No ragdoll", "UNoRagdoll", "Switches the tumbling and falling-down states off on your character. Games that ragdoll you with their own physics are not affected.")
 		UI.heading(page, "Actions", "right")
 		UI.button(page, "Sit", function()
 			local human = humanoid()
@@ -1427,6 +1578,46 @@ function PotentUniversal.install(host)
 			return value >= 1000 and "No cap" or whole(value)
 		end)
 		UI.toggle(page, "Hide the game's GUI", "UHideGui", "Every game screen is hidden until you switch this off. This menu stays.")
+		UI.heading(page, "One game screen", "right", "Hide a single piece of the game's interface, for you only.")
+		UI.cycler(page, "Screen", function()
+			local options = {}
+			local playerGui = me:FindFirstChildOfClass("PlayerGui")
+			for _, gui in ipairs(playerGui and playerGui:GetChildren() or {}) do
+				if gui:IsA("ScreenGui") then
+					table.insert(options, { id = gui.Name, name = gui.Name .. (gui.Enabled and "" or " (hidden)"), current = gui.Name == U.guiPick })
+				end
+			end
+			table.sort(options, function(a, b)
+				return a.name:lower() < b.name:lower()
+			end)
+			return options
+		end, function()
+			return U.guiPick or "Pick one"
+		end, function(option)
+			U.guiPick = option.id
+		end)
+		UI.button(page, "Hide or show it", function()
+			local playerGui = me:FindFirstChildOfClass("PlayerGui")
+			local gui = playerGui and U.guiPick and playerGui:FindFirstChild(U.guiPick)
+			if not gui or not gui:IsA("ScreenGui") then
+				return "Pick a screen first"
+			end
+			U.guiOff = U.guiOff or {}
+			gui.Enabled = not gui.Enabled
+			U.guiOff[gui] = (not gui.Enabled) or nil
+			pcall(UI.refreshAll)
+			return gui.Enabled and "Shown" or "Hidden"
+		end)
+		UI.button(page, "Show them all again", function()
+			for gui in pairs(U.guiOff or {}) do
+				if gui.Parent then
+					gui.Enabled = true
+				end
+			end
+			U.guiOff = nil
+			pcall(UI.refreshAll)
+			return "All shown"
+		end)
 		UI.heading(page, "Comfort", "right")
 		if not host.ownsAfk then
 			UI.toggle(page, "Anti-AFK", "UAntiAfk", "Keeps Roblox from kicking you for standing still.")
@@ -1503,9 +1694,18 @@ function PotentUniversal.install(host)
 		for key, value in pairs(kept) do
 			Config[key] = value
 		end
+		pcall(function()
+			runService:UnbindFromRenderStep(ROLL_STEP)
+		end)
+		for gui in pairs(U.guiOff or {}) do
+			if gui.Parent then
+				gui.Enabled = true
+			end
+		end
 		holder:Destroy()
 		meter:Destroy()
 		cross:Destroy()
+		compass:Destroy()
 	end
 	return U
 end
