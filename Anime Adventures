@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v271", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v272", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -313,6 +313,8 @@ local Config = {
 	-- Misty Tower: 0 climbs (the next floor not cleared yet); a number plays that floor.
 	TowerFloor = 0,
 	MatchVillage = false,
+	-- With a matchmaking switch on: keep queueing instead of starting alone after 45 s.
+	MatchOnly = false,
 	MatchTower = false,
 	SummonTen = true,
 	SummonStopMythic = true,
@@ -8567,6 +8569,15 @@ local function finishMatch()
 			after = "Replay"
 		end
 	end
+	-- USER (v272): "when i'm doing matchmaking ... after the match ends it should queue into
+	-- another match with other people. not start a match with me alone". Players are only found
+	-- from the lobby, and a rematch keeps whoever has not left (usually nobody). So with this
+	-- kind's matchmaking switch on, Auto goes back to queue again. An After a match picked by
+	-- hand (Replay, Next) is still obeyed.
+	if Config.AfterGame == "Auto" and Config.AutoJoin and (after == "Replay" or after == "Next" or after == "Castle") and not (AA.Party and AA.Party.on()) and AA.matchmakingOn(kind, id) then
+		after = "Lobby"
+		Match.requeue = true
+	end
 	if kind == "Misty Tower" then
 		if won then
 			local world = tostring(id):match("^(.-)_%d+$")
@@ -10721,6 +10732,12 @@ local function joinGame()
 				AA.waitForTeleport(45)
 			end
 			invoke("leave_matchmaking")
+			if Config.MatchOnly then
+				-- Never alone: queue again instead of starting it solo.
+				status = "Nobody in the queue yet: looking again"
+				task.wait(2)
+				return false
+			end
 			AA.queueFailed = AA.queueFailed or {}
 			AA.queueFailed[queueId] = os.clock()
 			task.wait(1)
@@ -19619,9 +19636,10 @@ do
 			AA.Party.label = UI.note(page, AA.Party.text)
 			hint(page, "Set one account to Leader and the other to Member, each with the other's name. The leader's Mode, difficulty and After a match decide everything; the member's are ignored while the party is on, and in a match it votes what the leader voted. Join this player's lobby is ignored while the party is on.")
 			toggle(page, "Jump into any portal that opens", "PortalInstant", "The moment someone in the lobby opens a portal you are put in it. Works with Join matches off.")
+			toggle(page, "Never start a queued match alone", "MatchOnly", "For the kinds switched on below. On: when nobody is found in 45 seconds it keeps queueing. Off: it starts the stage alone and tries the queue again ten minutes later.")
 			UI.note(page, "Use the game's matchmaking for:")
 			toggle(page, "Daily Challenge", "MatchDaily")
-			hint(page, "Each switch queues that kind of match with other players; off means you start it alone. If nobody is found in 45 seconds the stage starts alone anyway.\n\nOther players can only be found from the lobby: a rematch inside the match keeps whoever is still there. So with a switch on, pick Lobby under After a match to queue again after every match; on Auto the rematch starts right where you are with whoever is still there.")
+			hint(page, "Each switch queues that kind of match with other players; off means you start it alone. If nobody is found in 45 seconds the stage starts alone, unless Never start a queued match alone is on.\n\nOther players can only be found from the lobby, so with a switch on and After a match on Auto, the script goes back to the lobby after every match of that kind and queues again. Pick Replay under After a match to stay with whoever is still in the match instead.")
 			toggle(page, "Half-hour challenges", "MatchChallenge")
 			toggle(page, "Infinite", "MatchInfinite")
 			toggle(page, "Legend stages", "MatchLegend")
