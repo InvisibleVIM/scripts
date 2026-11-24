@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v272", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v273", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -2004,8 +2004,13 @@ do
 			return
 		end
 		Village.keptAt = os.clock()
+		local function log(text)
+			pcall(AA.appendLog, ACCOUNT_FOLDER .. "/village.txt", os.date("%m-%d %H:%M:%S ") .. "upkeep: " .. text .. "\n")
+		end
 		local ok, village = invoke("get_swordsmith_village")
 		if not ok or type(village) ~= "table" then
+			log("the village did not answer (" .. tostring(village) .. ")")
+			Village.keptAt = os.clock() - 110
 			return
 		end
 		Village.state = village
@@ -2023,7 +2028,9 @@ do
 		if Config.VillageSell and swords > 0 then
 			local before = Village.coins()
 			refresh(invoke("request_village_collect"))
+			task.wait(0.3)
 			note("villageSell", { swords = swords, coins = Village.coins() - before })
+			log("sold " .. swords .. " swords for " .. (Village.coins() - before) .. " Dawn Coins")
 		end
 		local keep = math.max(tonumber(Config.VillageKeepOre) or 0, 0)
 		if Config.VillageUpgrade then
@@ -2043,8 +2050,11 @@ do
 				end
 				local okUp, now = invoke("request_village_upgrade", best.key)
 				if not okUp or type(now) ~= "table" then
+					log("upgrade " .. best.key .. " refused (" .. tostring(now) .. ")")
 					break
 				end
+				log(best.key .. " upgraded to Lv " .. best.level .. " for " .. best.cost .. " ore")
+				task.wait(0.3)
 				refresh(okUp, now)
 				note("villageUpgrade", { what = best.key, level = best.level, cost = best.cost })
 			end
@@ -2056,6 +2066,7 @@ do
 				local okAdd, now = invoke("request_village_add_ore", spare)
 				refresh(okAdd, now)
 				note("villageOre", { ore = spare })
+				log("put " .. spare .. " ore in the forge -> " .. (okAdd and type(now) == "table" and "ok" or ("refused (" .. tostring(now) .. ")")))
 			end
 		end
 	end
@@ -11345,7 +11356,6 @@ local function claimRewards()
 			invoke("claim_summer2_map_board_lines")
 		end
 	end
-	pcall(AA.Village.upkeep)
 	if Config.AutoQuests then
 		-- Quests an NPC hands out (v268: Lovey's and Misty's in Misty Village pay Dawn Coins, ore
 		-- and Star Remnants). The dialogue's [Accept Quest] is one request; finished ones are paid
@@ -12229,6 +12239,18 @@ local function lobbyLoop()
 	end
 	local lastClaim, lastJoin = -math.huge, -math.huge
 	task.wait(1)
+	-- USER (v273): "make sure that every time it goes to the lobby it actually does the other
+	-- stuff too. like upgrading the forge/smith. putting ore in the forge. and selling forged
+	-- swords". The village upkeep sat inside the reward claims, which only run while no join is
+	-- under way: a lobby visit that queues straight away never reached it (104 ore sat unspent
+	-- with both switches on). It now runs first thing on every lobby visit, before joining.
+	do
+		local okKeep, errKeep = pcall(AA.Village.upkeep)
+		if not okKeep then
+			AA.errors.village = tostring(errKeep)
+		end
+		setthreadidentity(8)
+	end
 	while AA.alive do
 		if Config.AutoEquipBest and not AA.joining then
 			-- When the collection changes, or the next match favours other damage types.
@@ -12281,6 +12303,7 @@ local function lobbyLoop()
 				lastClaim = os.clock()
 				pcall(claimRewards)
 			end
+			pcall(AA.Village.upkeep)
 			pcall(summonStep)
 			pcall(AA.snipeStep)
 			if os.clock() - (AA.lastUnitStep or 0) > 30 then
@@ -19653,7 +19676,7 @@ do
 			only({ "Cursed Womb", "Tournament", "None" }, UI.note(page, "This mode has no settings of its own."))
 			do
 				-- Misty Village and its tower (Update 21.5).
-				segmented(page, "Stage", "VillageStage", { "Auto", "Day", "Night" }, "Auto: the night stage while it is night, the day stage otherwise. Night: waits for nightfall (or plays your fallback mode). The night stage opens after one clear of the day stage.", { Auto = "Day ore and coins, night coins", Day = "Scarlet Ore every wave", Night = "Dawn Coins only" })
+				segmented(page, "Stage", "VillageStage", { "Auto", "Day", "Night" }, "Auto: the night stage while it is night, the day stage otherwise. Night: waits for nightfall (or plays your fallback mode). The night stage opens after one clear of the day stage.")
 				only({ "Misty Village" })
 				toggle(page, "Play the Blood Moon when it is up", "VillageBloodMoon", "A night in four. Three times the Dawn Coins, harder enemies.")
 				only({ "Misty Village" })
