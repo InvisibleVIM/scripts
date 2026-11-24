@@ -67,6 +67,7 @@ def aa():
     for k,_,_,d in gen.TOGGLES:
         if k not in skip: row.append(f"{k} = {gen.lua(d)}")
         row.append(f'K_{k} = {gen.lua(gen.DEFAULT_BINDS.get(k,"None"))}')
+        row.append(f'P_{k} = false')
     for k,v in gen.VALUES.items():
         if k not in skip: row.append(f"{k} = {gen.lua(v)}")
     lines=["\t"+", ".join(row[i:i+6])+"," for i in range(0,len(row),6)]

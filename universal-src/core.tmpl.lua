@@ -10,7 +10,10 @@ local PotentUniversal = {}
 PotentUniversal.DEFAULTS = {
 --@DEFAULTS@
 }
--- Every switch, in menu order. Each one can have a key (settings key "K_" .. key).
+-- The keys a game starts with until you set your own there.
+PotentUniversal.BINDS = { --@BINDS@ }
+-- Every switch, in menu order. Each one can have a key (settings key "K_" .. key), and can show
+-- that key beside itself (settings key "P_" .. key).
 PotentUniversal.TOGGLES = --@TOGGLES@
 ---host: { UI, Config, connections, alive = function, gui = ScreenGui, ownsClip, ownsAfk }
 function PotentUniversal.install(host)
@@ -88,6 +91,166 @@ function PotentUniversal.install(host)
 	local holder = Instance.new("Folder")
 	holder.Name = "PotentUniversal"
 	holder.Parent = host.gui
+
+	-- Keys are kept per game (the universe id, so a game's sub-places share them); which switches
+	-- show their key beside them (P_ settings) is the same everywhere. USER: "the toggles i've
+	-- chosen to have the keybind button next to should save for all games but the actual keybinds
+	-- should only save per game". The K_ settings are the keys of the game you are in: read from
+	-- UBinds when the script loads, written back whenever one changes.
+	local GAME = tostring(game.GameId)
+	local function bindsRead()
+		local ok, all = pcall(function()
+			return httpService:JSONDecode(Config.UBinds)
+		end)
+		return (ok and type(all) == "table") and all or {}
+	end
+	do
+		local mine = bindsRead()[GAME]
+		for _, entry in ipairs(PotentUniversal.TOGGLES) do
+			local name = "K_" .. entry.key
+			if type(mine) == "table" then
+				Config[name] = type(mine[name]) == "string" and mine[name] or "None"
+			else
+				Config[name] = PotentUniversal.BINDS[entry.key] or "None"
+			end
+		end
+		Config.UPanicKey = type(mine) == "table" and type(mine.UPanicKey) == "string" and mine.UPanicKey or "End"
+	end
+	local function bindsStep()
+		local now = { UPanicKey = Config.UPanicKey }
+		for _, entry in ipairs(PotentUniversal.TOGGLES) do
+			now["K_" .. entry.key] = Config["K_" .. entry.key]
+		end
+		local text = httpService:JSONEncode(now)
+		if text ~= U.bindsText then
+			local first = U.bindsText == nil
+			U.bindsText = text
+			local all = bindsRead()
+			if not first or all[GAME] == nil then
+				all[GAME] = now
+				Config.UBinds = httpService:JSONEncode(all)
+			end
+		end
+	end
+	local KEY_NAMES = { None = "Not set", LeftControl = "L Ctrl", RightControl = "R Ctrl", LeftShift = "L Shift", RightShift = "R Shift", LeftAlt = "L Alt", RightAlt = "R Alt" }
+	---Click a button, press a key: stored under the settings key. Backspace clears, Escape keeps.
+	local function capture(button, settingKey, done)
+		UI.capturing = true
+		button.Text = "Press a key"
+		local connection
+		connection = input.InputBegan:Connect(function(pressed)
+			if pressed.UserInputType ~= Enum.UserInputType.Keyboard then
+				return
+			end
+			connection:Disconnect()
+			if pressed.KeyCode == Enum.KeyCode.Backspace then
+				Config[settingKey] = "None"
+			elseif pressed.KeyCode ~= Enum.KeyCode.Escape then
+				Config[settingKey] = pressed.KeyCode.Name
+			end
+			task.defer(function()
+				UI.capturing = false
+			end)
+			pcall(UI.refreshAll)
+			if done then
+				done()
+			end
+		end)
+	end
+	local function small(parent, width)
+		local button = Instance.new("TextButton")
+		button.AnchorPoint = Vector2.new(1, 0)
+		button.Size = UDim2.fromOffset(width, 22)
+		button.BackgroundColor3 = UI.roles and UI.roles.Control or Color3.fromRGB(40, 40, 40)
+		button.BorderSizePixel = 0
+		button.AutoButtonColor = false
+		button.Font = Enum.Font.GothamMedium
+		button.TextSize = 12
+		button.TextColor3 = UI.roles and UI.roles.Font or Color3.fromRGB(240, 240, 240)
+		button.TextTruncate = Enum.TextTruncate.AtEnd
+		button.ZIndex = 5
+		button.Parent = parent
+		Instance.new("UICorner", button).CornerRadius = UDim.new(0, 6)
+		return button
+	end
+	---A switch row. With its P_ setting on, the switch's key sits beside it and can be set there.
+	local function switch(page, text, key, note)
+		local row = UI.toggle(page, text, key, note)
+		if typeof(row) ~= "Instance" then
+			return row
+		end
+		local keyButton = small(row, 66)
+		keyButton.Position = UDim2.new(1, -44, 0, 0)
+		-- The row's caption gives up the room the button takes.
+		local captionFrame, captionSize
+		for _, child in ipairs(row:GetChildren()) do
+			if child:IsA("GuiObject") and child ~= keyButton and child.Size.X.Scale == 1 then
+				captionFrame, captionSize = child, child.Size
+			end
+		end
+		local function refresh()
+			local shown = Config["P_" .. key] == true
+			keyButton.Visible = shown
+			local name = tostring(Config["K_" .. key] or "None")
+			keyButton.Text = KEY_NAMES[name] or name
+			keyButton.BackgroundColor3 = UI.roles and UI.roles.Control or keyButton.BackgroundColor3
+			keyButton.TextColor3 = UI.roles and (name == "None" and UI.roles.Muted or UI.roles.Font) or keyButton.TextColor3
+			if captionFrame then
+				captionFrame.Size = shown and UDim2.new(captionSize.X.Scale, captionSize.X.Offset - 72, captionSize.Y.Scale, captionSize.Y.Offset) or captionSize
+			end
+		end
+		keyButton.MouseButton1Click:Connect(function()
+			capture(keyButton, "K_" .. key, refresh)
+		end)
+		table.insert(UI.refreshers, refresh)
+		refresh()
+		return row
+	end
+	---A slider whose number can also be typed (click the number). A typed value may go past the
+	---slider's ends; dragging the slider brings it back inside them.
+	local function slide(page, text, key, minValue, maxValue, step, format, note)
+		local row = UI.slider(page, text, key, minValue, maxValue, step, format, note)
+		if typeof(row) ~= "Instance" then
+			return row
+		end
+		local shown
+		for _, object in ipairs(row:GetDescendants()) do
+			if object:IsA("TextLabel") and object.AnchorPoint.X == 1 and object.TextXAlignment == Enum.TextXAlignment.Right then
+				shown = object
+			end
+		end
+		if not shown then
+			return row
+		end
+		local box = Instance.new("TextBox")
+		box.AnchorPoint, box.Position, box.Size = shown.AnchorPoint, shown.Position, shown.Size
+		box.BackgroundTransparency = 1
+		box.ClearTextOnFocus = false
+		box.Text = ""
+		box.PlaceholderText = ""
+		box.FontFace = shown.FontFace
+		box.TextSize = shown.TextSize
+		box.TextColor3 = shown.TextColor3
+		box.TextXAlignment = Enum.TextXAlignment.Right
+		box.ZIndex = shown.ZIndex + 1
+		box.Parent = shown.Parent
+		box.Focused:Connect(function()
+			shown.TextTransparency = 1
+			box.TextColor3 = shown.TextColor3
+			box.Text = tostring(Config[key])
+			box.CursorPosition = #box.Text + 1
+		end)
+		box.FocusLost:Connect(function()
+			local typed = tonumber((box.Text:gsub("[^%d%.%-]", "")))
+			if typed and typed == typed and math.abs(typed) < 1e9 then
+				Config[key] = typed
+			end
+			box.Text = ""
+			shown.TextTransparency = 0
+			pcall(UI.refreshAll)
+		end)
+		return row
+	end
 
 	-- Fly (Infinite Yield's sFLY / NOFLY) ---------------------------------------------------
 	local fly = { on = false }
@@ -968,6 +1131,7 @@ function PotentUniversal.install(host)
 			pcall(espStep)
 			pcall(meterStep)
 			pcall(ruleStep)
+			pcall(bindsStep)
 			task.wait(0.15)
 		end
 	end)
@@ -1175,30 +1339,30 @@ function PotentUniversal.install(host)
 	do
 		local page = UI.makePage("Movement", "Flying, walking through walls, speed and jumping.", "Universal")
 		UI.heading(page, "Fly", "left", "Infinite Yield's fly: W A S D to move, E up, Q down.")
-		UI.toggle(page, "Fly", "UFly")
-		UI.slider(page, "Fly speed", "UFlySpeed", 0.5, 10, 0.5, function(value)
+		switch(page, "Fly", "UFly")
+		slide(page, "Fly speed", "UFlySpeed", 0.5, 10, 0.5, function(value)
 			return string.format("%d studs/s", value * 50)
 		end)
-		UI.toggle(page, "Vehicle fly", "UFlyVehicle", "Leaves your character sitting, so the seat (and the vehicle) flies with you.")
+		switch(page, "Vehicle fly", "UFlyVehicle", "Leaves your character sitting, so the seat (and the vehicle) flies with you.")
 		UI.heading(page, "Through things", "left")
-		UI.toggle(page, "No clip", "NoClip", "Your character walks through walls and scenery. The floor still holds you.")
-		UI.toggle(page, "Click teleport", "ClickTeleport", "Hold the key below and click: your character is put where you clicked.")
+		switch(page, "No clip", "NoClip", "Your character walks through walls and scenery. The floor still holds you.")
+		switch(page, "Click teleport", "ClickTeleport", "Hold the key below and click: your character is put where you clicked.")
 		UI.keybind(page, "Click teleport key", "ClickTeleportKey", "Hold this while you click.")
 		UI.heading(page, "In the air", "left")
-		UI.toggle(page, "Infinite jump", "UInfJump", "Jump again in mid-air, as often as you like.")
-		UI.toggle(page, "Bunny hop", "UBhop", "Jumps the moment you land while you are moving.")
-		UI.toggle(page, "Air walk", "UAirWalk", "A see-through slab under your feet at the height you switch it on.")
-		UI.toggle(page, "Float", "UFloat", "Holds your height; you can still move sideways.")
+		switch(page, "Infinite jump", "UInfJump", "Jump again in mid-air, as often as you like.")
+		switch(page, "Bunny hop", "UBhop", "Jumps the moment you land while you are moving.")
+		switch(page, "Air walk", "UAirWalk", "A see-through slab under your feet at the height you switch it on.")
+		switch(page, "Float", "UFloat", "Holds your height; you can still move sideways.")
 		UI.heading(page, "Walk and jump", "right")
-		UI.toggle(page, "Set walk speed", "USpeedOn")
-		UI.slider(page, "Walk speed", "USpeed", 16, 300, 1, whole)
-		UI.toggle(page, "Set jump power", "UJumpOn")
-		UI.slider(page, "Jump power", "UJump", 50, 500, 5, whole, "Games that use jump height get the matching height.")
-		UI.toggle(page, "Set gravity", "UGravityOn")
-		UI.slider(page, "Gravity", "UGravity", 5, 196, 1, whole, "The game's normal is 196.")
-		UI.toggle(page, "Direction indicator", "UDirection", "A small dial at the bottom of the screen: which way you are moving compared with where you look, and how fast.")
-		UI.toggle(page, "Spin", "USpin")
-		UI.slider(page, "Spin speed", "USpinSpeed", 1, 60, 1, whole)
+		switch(page, "Set walk speed", "USpeedOn")
+		slide(page, "Walk speed", "USpeed", 16, 300, 1, whole)
+		switch(page, "Set jump power", "UJumpOn")
+		slide(page, "Jump power", "UJump", 50, 500, 5, whole, "Games that use jump height get the matching height.")
+		switch(page, "Set gravity", "UGravityOn")
+		slide(page, "Gravity", "UGravity", 5, 196, 1, whole, "The game's normal is 196.")
+		switch(page, "Direction indicator", "UDirection", "A small dial at the bottom of the screen: which way you are moving compared with where you look, and how fast.")
+		switch(page, "Spin", "USpin")
+		slide(page, "Spin speed", "USpinSpeed", 1, 60, 1, whole)
 		UI.button(page, "Reset movement values", function()
 			for _, key in ipairs({ "USpeedOn", "UJumpOn", "UGravityOn", "USpin", "UFloat", "UAirWalk", "UBhop", "UInfJump", "UFly" }) do
 				Config[key] = false
@@ -1301,71 +1465,71 @@ function PotentUniversal.install(host)
 	do
 		local page = UI.makePage("ESP", "ESP, lighting and a crosshair.", "Universal")
 		UI.heading(page, "Player ESP", "left", "Seen through walls.")
-		UI.toggle(page, "Player ESP", "UEsp")
-		UI.toggle(page, "Outlines (chams)", "UEspChams")
-		UI.toggle(page, "Names", "UEspNames")
-		UI.toggle(page, "Distance", "UEspDistance")
-		UI.toggle(page, "Health bars", "UEspHealth")
-		UI.toggle(page, "Tracers", "UEspTracers", Drawing and "A line from the bottom of the screen to each player." or "Your executor has no Drawing API: this one does nothing here.")
-		UI.toggle(page, "Skeletons", "UEspSkeleton", Drawing and "A line along every limb." or "Your executor has no Drawing API: this one does nothing here.")
-		UI.toggle(page, "Team colours", "UEspTeam", "Off: everyone is red.")
-		UI.toggle(page, "Hide teammates", "UEspTeamCheck")
-		UI.slider(page, "Range", "UEspRange", 100, 5000, 100, function(value)
+		switch(page, "Player ESP", "UEsp")
+		switch(page, "Outlines (chams)", "UEspChams")
+		switch(page, "Names", "UEspNames")
+		switch(page, "Distance", "UEspDistance")
+		switch(page, "Health bars", "UEspHealth")
+		switch(page, "Tracers", "UEspTracers", Drawing and "A line from the bottom of the screen to each player." or "Your executor has no Drawing API: this one does nothing here.")
+		switch(page, "Skeletons", "UEspSkeleton", Drawing and "A line along every limb." or "Your executor has no Drawing API: this one does nothing here.")
+		switch(page, "Team colours", "UEspTeam", "Off: everyone is red.")
+		switch(page, "Hide teammates", "UEspTeamCheck")
+		slide(page, "Range", "UEspRange", 100, 5000, 100, function(value)
 			return whole(value) .. " studs"
 		end)
 		UI.heading(page, "Other ESP", "right", "Up to 150 of each, looked for again every two seconds.")
-		UI.toggle(page, "NPCs", "UEspNpc", "Anything with a humanoid that is not a player.")
-		UI.toggle(page, "Tools on the ground", "UEspTool")
-		UI.toggle(page, "Proximity prompts", "UEspPrompt")
-		UI.toggle(page, "Click detectors", "UEspClick")
-		UI.toggle(page, "Touch triggers", "UEspTouch", "Parts that fire something when touched: kill bricks, checkpoints, pads.")
+		switch(page, "NPCs", "UEspNpc", "Anything with a humanoid that is not a player.")
+		switch(page, "Tools on the ground", "UEspTool")
+		switch(page, "Proximity prompts", "UEspPrompt")
+		switch(page, "Click detectors", "UEspClick")
+		switch(page, "Touch triggers", "UEspTouch", "Parts that fire something when touched: kill bricks, checkpoints, pads.")
 		UI.heading(page, "Light and aim", "right")
-		UI.toggle(page, "Fullbright", "UFullbright", "Daylight, no fog, no shadows.")
-		UI.toggle(page, "Remove fog", "UNoFog")
-		UI.toggle(page, "Crosshair", "UCrosshair")
-		UI.slider(page, "Crosshair size", "UCrosshairSize", 3, 30, 1, whole)
+		switch(page, "Fullbright", "UFullbright", "Daylight, no fog, no shadows.")
+		switch(page, "Remove fog", "UNoFog")
+		switch(page, "Crosshair", "UCrosshair")
+		slide(page, "Crosshair size", "UCrosshairSize", 3, 30, 1, whole)
 	end
 	do
 		local page = UI.makePage("Camera", "Field of view, zoom and a free camera.", "Universal")
 		UI.heading(page, "View", "left")
-		UI.toggle(page, "Set field of view", "UFovOn")
-		UI.slider(page, "Field of view", "UFov", 30, 120, 1, whole)
-		UI.toggle(page, "Set max zoom", "UZoomOn", "How far the camera can zoom out (Infinite Yield's maxzoom).")
-		UI.slider(page, "Max zoom", "UZoom", 50, 10000, 50, function(value)
+		switch(page, "Set field of view", "UFovOn")
+		slide(page, "Field of view", "UFov", 30, 120, 1, whole)
+		switch(page, "Set max zoom", "UZoomOn", "How far the camera can zoom out (Infinite Yield's maxzoom).")
+		slide(page, "Max zoom", "UZoom", 50, 10000, 50, function(value)
 			return whole(value) .. " studs"
 		end)
-		UI.toggle(page, "Allow third person", "UThirdPerson", "For games that lock you in first person.")
-		UI.toggle(page, "First person", "UFirstPerson")
-		UI.toggle(page, "Set mouse sensitivity", "USensOn")
-		UI.slider(page, "Sensitivity", "USens", 0.1, 5, 0.1, function(value)
+		switch(page, "Allow third person", "UThirdPerson", "For games that lock you in first person.")
+		switch(page, "First person", "UFirstPerson")
+		switch(page, "Set mouse sensitivity", "USensOn")
+		slide(page, "Sensitivity", "USens", 0.1, 5, 0.1, function(value)
 			return string.format("%.1fx", value)
 		end)
-		UI.toggle(page, "Roll the camera", "URollOn")
-		UI.slider(page, "Roll", "URoll", -180, 180, 5, function(value)
+		switch(page, "Roll the camera", "URollOn")
+		slide(page, "Roll", "URoll", -180, 180, 5, function(value)
 			return whole(value) .. " deg"
 		end)
-		UI.toggle(page, "Steady camera", "UNoShake", "Cancels shake that a game does by nudging your character's camera offset. Shake a game applies straight to the camera itself cannot be told apart from normal movement and stays.")
+		switch(page, "Steady camera", "UNoShake", "Cancels shake that a game does by nudging your character's camera offset. Shake a game applies straight to the camera itself cannot be told apart from normal movement and stays.")
 		UI.heading(page, "Free camera", "right", "The camera leaves your character: W A S D, E up, Q down, hold right mouse to look, Shift to go faster.")
-		UI.toggle(page, "Free camera", "UFreecam")
-		UI.slider(page, "Camera speed", "UFreecamSpeed", 10, 400, 10, function(value)
+		switch(page, "Free camera", "UFreecam")
+		slide(page, "Camera speed", "UFreecamSpeed", 10, 400, 10, function(value)
 			return whole(value) .. " studs/s"
 		end)
 	end
 	do
 		local page = UI.makePage("Character", "How your own character looks and moves, on your screen only.", "Universal")
 		UI.heading(page, "Look", "left", "Only you see these.")
-		UI.toggle(page, "Hide my character", "UHideSelf", "For screenshots.")
-		UI.slider(page, "How hidden", "USelfAlpha", 0.1, 1, 0.1, function(value)
+		switch(page, "Hide my character", "UHideSelf", "For screenshots.")
+		slide(page, "How hidden", "USelfAlpha", 0.1, 1, 0.1, function(value)
 			return string.format("%d%%", value * 100)
 		end)
-		UI.toggle(page, "Hide my accessories", "UNoAccessories")
+		switch(page, "Hide my accessories", "UNoAccessories")
 		UI.heading(page, "Animations", "left")
-		UI.toggle(page, "Stop my animations", "UNoAnim")
-		UI.toggle(page, "Set animation speed", "UAnimSpeedOn")
-		UI.slider(page, "Animation speed", "UAnimSpeed", 0.1, 5, 0.1, function(value)
+		switch(page, "Stop my animations", "UNoAnim")
+		switch(page, "Set animation speed", "UAnimSpeedOn")
+		slide(page, "Animation speed", "UAnimSpeed", 0.1, 5, 0.1, function(value)
 			return string.format("%.1fx", value)
 		end)
-		UI.toggle(page, "No ragdoll", "UNoRagdoll", "Switches the tumbling and falling-down states off on your character. Games that ragdoll you with their own physics are not affected.")
+		switch(page, "No ragdoll", "UNoRagdoll", "Switches the tumbling and falling-down states off on your character. Games that ragdoll you with their own physics are not affected.")
 		UI.heading(page, "Actions", "right")
 		UI.button(page, "Sit", function()
 			local human = humanoid()
@@ -1392,18 +1556,18 @@ function PotentUniversal.install(host)
 	do
 		local page = UI.makePage("World", "Things switched off or removed on your screen only.", "Universal")
 		UI.heading(page, "Graphics", "left", "Put back when the switch goes off.")
-		UI.toggle(page, "X-ray", "UXray", "The map goes see-through; characters stay solid.")
-		UI.toggle(page, "No particles", "UNoParticles", "Particles, trails, beams, fire and smoke.")
-		UI.toggle(page, "No textures", "UNoTextures", "Decals and textures.")
-		UI.toggle(page, "No shadows", "UNoShadows")
-		UI.toggle(page, "No screen effects", "UNoEffects", "Blur, bloom, depth of field, colour correction and sun rays.")
+		switch(page, "X-ray", "UXray", "The map goes see-through; characters stay solid.")
+		switch(page, "No particles", "UNoParticles", "Particles, trails, beams, fire and smoke.")
+		switch(page, "No textures", "UNoTextures", "Decals and textures.")
+		switch(page, "No shadows", "UNoShadows")
+		switch(page, "No screen effects", "UNoEffects", "Blur, bloom, depth of field, colour correction and sun rays.")
 		UI.button(page, "Low graphics: all five on", function()
 			Config.UNoParticles, Config.UNoTextures, Config.UNoShadows, Config.UNoEffects, Config.UNoFog = true, true, true, true, true
 			pcall(UI.refreshAll)
 			return "On"
 		end)
 		UI.heading(page, "Delete", "left")
-		UI.toggle(page, "Click delete", "UClickDelete", "Hold the key below and click a part: it is gone, for you only.")
+		switch(page, "Click delete", "UClickDelete", "Hold the key below and click a part: it is gone, for you only.")
 		UI.keybind(page, "Delete key", "UDeleteKey", "Hold this while you click.")
 		UI.button(page, "Undo the last delete", function()
 			local last = table.remove(U.deleted)
@@ -1524,7 +1688,7 @@ function PotentUniversal.install(host)
 			teleportTo(part.Position)
 			return "Teleported"
 		end)
-		UI.toggle(page, "Follow them", "UFollow", "Keeps you right behind the picked player.")
+		switch(page, "Follow them", "UFollow", "Keeps you right behind the picked player.")
 		UI.heading(page, "Copy", "right")
 		UI.button(page, "Copy username", function()
 			local player = U.picked()
@@ -1538,7 +1702,7 @@ function PotentUniversal.install(host)
 			local player = U.picked()
 			return player and copy(player.UserId) or "Pick a player first"
 		end)
-		UI.toggle(page, "Join and leave notices", "UJoinNotes", "A note whenever someone joins or leaves the server.")
+		switch(page, "Join and leave notices", "UJoinNotes", "A note whenever someone joins or leaves the server.")
 		task.spawn(function()
 			while alive() and page.Parent do
 				local player = U.picked()
@@ -1571,13 +1735,13 @@ function PotentUniversal.install(host)
 			return copy(game.JobId)
 		end)
 		UI.heading(page, "On screen", "right")
-		UI.toggle(page, "Show FPS", "UFps", "A small tag at the top right of the screen.")
-		UI.toggle(page, "Show ping", "UPing")
-		UI.toggle(page, "Set an FPS cap", "UFpsCapOn", setfpscap and "The slider at its top end means no cap." or "Your executor has no setfpscap: this one does nothing here.")
-		UI.slider(page, "FPS cap", "UFpsCap", 30, 1000, 10, function(value)
+		switch(page, "Show FPS", "UFps", "A small tag at the top right of the screen.")
+		switch(page, "Show ping", "UPing")
+		switch(page, "Set an FPS cap", "UFpsCapOn", setfpscap and "The slider at its top end means no cap." or "Your executor has no setfpscap: this one does nothing here.")
+		slide(page, "FPS cap", "UFpsCap", 30, 1000, 10, function(value)
 			return value >= 1000 and "No cap" or whole(value)
 		end)
-		UI.toggle(page, "Hide the game's GUI", "UHideGui", "Every game screen is hidden until you switch this off. This menu stays.")
+		switch(page, "Hide the game's GUI", "UHideGui", "Every game screen is hidden until you switch this off. This menu stays.")
 		UI.heading(page, "One game screen", "right", "Hide a single piece of the game's interface, for you only.")
 		UI.cycler(page, "Screen", function()
 			local options = {}
@@ -1620,9 +1784,9 @@ function PotentUniversal.install(host)
 		end)
 		UI.heading(page, "Comfort", "right")
 		if not host.ownsAfk then
-			UI.toggle(page, "Anti-AFK", "UAntiAfk", "Keeps Roblox from kicking you for standing still.")
+			switch(page, "Anti-AFK", "UAntiAfk", "Keeps Roblox from kicking you for standing still.")
 		end
-		UI.toggle(page, "Movement off when you die", "UOffOnDeath", "Fly, float, air walk, spin, bunny hop, free camera and follow are switched off on death. Off: they carry on after you respawn.")
+		switch(page, "Movement off when you die", "UOffOnDeath", "Fly, float, air walk, spin, bunny hop, free camera and follow are switched off on death. Off: they carry on after you respawn.")
 		UI.button(page, "Panic: everything off", function()
 			return U.panic()
 		end)
@@ -1644,7 +1808,7 @@ function PotentUniversal.install(host)
 		end)
 	end
 	do
-		local page = UI.makePage("Keybinds", "A key for every switch. Click a box and press a key; Backspace clears it.", "Universal")
+		local page = UI.makePage("Keybinds", "A key for every switch, kept separately for every game. Click a box and press a key; Backspace clears it. Beside switch puts the key next to the switch on its own page, in every game.", "Universal")
 		UI.heading(page, "Panic", "left")
 		UI.keybind(page, "Everything off", "UPanicKey", "Switches every Universal feature off at once.")
 		local seen = {}
@@ -1654,7 +1818,31 @@ function PotentUniversal.install(host)
 				UI.heading(page, entry.page)
 			end
 			if not (host.ownsAfk and entry.key == "UAntiAfk") then
-				UI.keybind(page, entry.name, "K_" .. entry.key)
+				local row = UI.keybind(page, entry.name, "K_" .. entry.key)
+				if typeof(row) == "Instance" then
+					-- "Beside switch": the key also shows next to the switch itself, on its own page.
+					local pin = small(row, 86)
+					pin.Position = UDim2.new(1, -112, 0, 4)
+					for _, child in ipairs(row:GetChildren()) do
+						if child:IsA("GuiObject") and child ~= pin and child.Size.X.Scale == 1 then
+							child.Size = UDim2.new(1, child.Size.X.Offset - 92, child.Size.Y.Scale, child.Size.Y.Offset)
+						end
+					end
+					local function refresh()
+						local on = Config["P_" .. entry.key] == true
+						pin.Text = on and "Beside switch" or "Menu only"
+						if UI.roles then
+							pin.BackgroundColor3 = on and UI.roles.Accent or UI.roles.Control
+							pin.TextColor3 = on and (UI.onAccent and UI.onAccent() or UI.roles.Font) or UI.roles.Muted
+						end
+					end
+					pin.MouseButton1Click:Connect(function()
+						Config["P_" .. entry.key] = not Config["P_" .. entry.key]
+						pcall(UI.refreshAll)
+					end)
+					table.insert(UI.refreshers, refresh)
+					refresh()
+				end
 			end
 		end
 	end
