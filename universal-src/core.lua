@@ -282,11 +282,22 @@ function PotentUniversal.install(host)
 		return button
 	end
 	---A switch row. With its P_ setting on, the switch's key sits beside it and can be set there.
+	---USER: "add the ? thing next to settings that may be confusing and put a short description of
+	---what the setting does when you hover over the ?". Descriptions are a "?" beside the row,
+	---never a line of text under its name.
+	local function tip(page, note)
+		if note and note ~= "" and UI.hint then
+			UI.hint(page, note)
+		end
+	end
 	local function switch(page, text, key, note)
-		local row = UI.toggle(page, text, key, note)
+		local row = UI.toggle(page, text, key)
 		if typeof(row) ~= "Instance" then
 			return row
 		end
+		tip(page, note)
+		local mark = row:FindFirstChild("Tip")
+		local markAt = mark and mark.Position
 		local keyButton = small(row, 66)
 		keyButton.Position = UDim2.new(1, -44, 0, 0)
 		-- The row's caption gives up the room the button takes.
@@ -303,6 +314,10 @@ function PotentUniversal.install(host)
 			keyButton.Text = KEY_NAMES[name] or name
 			keyButton.BackgroundColor3 = UI.roles and UI.roles.Control or keyButton.BackgroundColor3
 			keyButton.TextColor3 = UI.roles and (name == "None" and UI.roles.Muted or UI.roles.Font) or keyButton.TextColor3
+			if mark then
+				-- The "?" steps left of the key button.
+				mark.Position = shown and UDim2.new(markAt.X.Scale, markAt.X.Offset - 72, markAt.Y.Scale, markAt.Y.Offset) or markAt
+			end
 			if captionFrame then
 				captionFrame.Size = shown and UDim2.new(captionSize.X.Scale, captionSize.X.Offset - 72, captionSize.Y.Scale, captionSize.Y.Offset) or captionSize
 			end
@@ -317,10 +332,11 @@ function PotentUniversal.install(host)
 	---A slider whose number can also be typed (click the number). A typed value may go past the
 	---slider's ends; dragging the slider brings it back inside them.
 	local function slide(page, text, key, minValue, maxValue, step, format, note)
-		local row = UI.slider(page, text, key, minValue, maxValue, step, format, note)
+		local row = UI.slider(page, text, key, minValue, maxValue, step, format)
 		if typeof(row) ~= "Instance" then
 			return row
 		end
+		tip(page, note)
 		local shown
 		for _, object in ipairs(row:GetDescendants()) do
 			if object:IsA("TextLabel") and object.AnchorPoint.X == 1 and object.TextXAlignment == Enum.TextXAlignment.Right then
@@ -1450,7 +1466,7 @@ function PotentUniversal.install(host)
 	do
 		local page = UI.makePage("Movement", "Flying, walking through walls, speed and jumping.", "Universal")
 		UI.heading(page, "Fly", "left", "Infinite Yield's fly: W A S D to move, E up, Q down.")
-		switch(page, "Fly", "UFly")
+		switch(page, "Fly", "UFly", "W A S D to move, E up, Q down. Switches itself off when the script loads.")
 		slide(page, "Fly speed", "UFlySpeed", 0.5, 10, 0.5, function(value)
 			return string.format("%d studs/s", value * 50)
 		end)
@@ -1458,21 +1474,22 @@ function PotentUniversal.install(host)
 		UI.heading(page, "Through things", "left")
 		switch(page, "No clip", "NoClip", "Your character walks through walls and scenery. The floor still holds you.")
 		switch(page, "Click teleport", "ClickTeleport", "Hold the key below and click: your character is put where you clicked.")
-		UI.keybind(page, "Click teleport key", "ClickTeleportKey", "Hold this while you click.")
+		UI.keybind(page, "Click teleport key", "ClickTeleportKey")
+		tip(page, "Hold this key and click: you are put where you clicked. Click teleport must be on.")
 		UI.heading(page, "In the air", "left")
 		switch(page, "Infinite jump", "UInfJump", "Jump again in mid-air, as often as you like.")
 		switch(page, "Bunny hop", "UBhop", "Jumps the moment you land while you are moving.")
 		switch(page, "Air walk", "UAirWalk", "A see-through slab under your feet at the height you switch it on.")
 		switch(page, "Float", "UFloat", "Holds your height; you can still move sideways.")
 		UI.heading(page, "Walk and jump", "right")
-		switch(page, "Set walk speed", "USpeedOn")
+		switch(page, "Set walk speed", "USpeedOn", "On: your walk speed is held at the value below. Off: the game's own speed comes back.")
 		slide(page, "Walk speed", "USpeed", 16, 300, 1, whole)
-		switch(page, "Set jump power", "UJumpOn")
+		switch(page, "Set jump power", "UJumpOn", "On: your jump is held at the value below. Off: the game's own jump comes back.")
 		slide(page, "Jump power", "UJump", 50, 500, 5, whole, "Games that use jump height get the matching height.")
-		switch(page, "Set gravity", "UGravityOn")
+		switch(page, "Set gravity", "UGravityOn", "On: gravity is held at the value below, for you only. Off: the game's own gravity comes back.")
 		slide(page, "Gravity", "UGravity", 5, 196, 1, whole, "The game's normal is 196.")
 		switch(page, "Direction indicator", "UDirection", "A small dial at the bottom of the screen: which way you are moving compared with where you look, and how fast.")
-		switch(page, "Spin", "USpin")
+		switch(page, "Spin", "USpin", "Turns your character round on the spot.")
 		slide(page, "Spin speed", "USpinSpeed", 1, 60, 1, whole)
 		UI.button(page, "Reset movement values", function()
 			for _, key in ipairs({ "USpeedOn", "UJumpOn", "UGravityOn", "USpin", "UFloat", "UAirWalk", "UBhop", "UInfJump", "UFly" }) do
@@ -1577,51 +1594,51 @@ function PotentUniversal.install(host)
 		local page = UI.makePage("ESP", "ESP, lighting and a crosshair.", "Universal")
 		UI.heading(page, "Player ESP", "left", "Seen through walls.")
 		switch(page, "Player ESP", "UEsp")
-		switch(page, "Outlines (chams)", "UEspChams")
+		switch(page, "Outlines (chams)", "UEspChams", "A coloured glow over each player that shows through walls.")
 		switch(page, "Names", "UEspNames")
 		switch(page, "Distance", "UEspDistance")
 		switch(page, "Health bars", "UEspHealth")
 		switch(page, "Tracers", "UEspTracers", Drawing and "A line from the bottom of the screen to each player." or "Your executor has no Drawing API: this one does nothing here.")
 		switch(page, "Skeletons", "UEspSkeleton", Drawing and "A line along every limb." or "Your executor has no Drawing API: this one does nothing here.")
 		switch(page, "Team colours", "UEspTeam", "Off: everyone is red.")
-		switch(page, "Hide teammates", "UEspTeamCheck")
+		switch(page, "Hide teammates", "UEspTeamCheck", "Players on your own team are not marked.")
 		slide(page, "Range", "UEspRange", 100, 5000, 100, function(value)
 			return whole(value) .. " studs"
-		end)
+		end, "Players farther away than this are not marked.")
 		UI.heading(page, "Other ESP", "right", "Up to 150 of each, looked for again every two seconds.")
 		switch(page, "NPCs", "UEspNpc", "Anything with a humanoid that is not a player.")
-		switch(page, "Tools on the ground", "UEspTool")
-		switch(page, "Proximity prompts", "UEspPrompt")
-		switch(page, "Click detectors", "UEspClick")
+		switch(page, "Tools on the ground", "UEspTool", "Tools lying in the world that you can pick up.")
+		switch(page, "Proximity prompts", "UEspPrompt", "Things you use by holding a key near them: doors, pickups, shops.")
+		switch(page, "Click detectors", "UEspClick", "Parts that do something when you click them with the mouse.")
 		switch(page, "Touch triggers", "UEspTouch", "Parts that fire something when touched: kill bricks, checkpoints, pads.")
 		UI.heading(page, "Light and aim", "right")
 		switch(page, "Fullbright", "UFullbright", "Daylight, no fog, no shadows.")
-		switch(page, "Remove fog", "UNoFog")
+		switch(page, "Remove fog", "UNoFog", "Only the fog goes; the lighting stays as the game set it.")
 		switch(page, "Crosshair", "UCrosshair")
 		slide(page, "Crosshair size", "UCrosshairSize", 3, 30, 1, whole)
 	end
 	do
 		local page = UI.makePage("Camera", "Field of view, zoom and a free camera.", "Universal")
 		UI.heading(page, "View", "left")
-		switch(page, "Set field of view", "UFovOn")
+		switch(page, "Set field of view", "UFovOn", "On: the camera's field of view is held at the value below. Roblox's normal is 70.")
 		slide(page, "Field of view", "UFov", 30, 120, 1, whole)
 		switch(page, "Set max zoom", "UZoomOn", "How far the camera can zoom out (Infinite Yield's maxzoom).")
 		slide(page, "Max zoom", "UZoom", 50, 10000, 50, function(value)
 			return whole(value) .. " studs"
 		end)
 		switch(page, "Allow third person", "UThirdPerson", "For games that lock you in first person.")
-		switch(page, "First person", "UFirstPerson")
-		switch(page, "Set mouse sensitivity", "USensOn")
+		switch(page, "First person", "UFirstPerson", "Locks the camera inside your character's head.")
+		switch(page, "Set mouse sensitivity", "USensOn", "On: how fast the camera turns with the mouse is held at the value below. 1 is normal.")
 		slide(page, "Sensitivity", "USens", 0.1, 5, 0.1, function(value)
 			return string.format("%.1fx", value)
 		end)
-		switch(page, "Roll the camera", "URollOn")
+		switch(page, "Roll the camera", "URollOn", "Tilts the view sideways by the angle below.")
 		slide(page, "Roll", "URoll", -180, 180, 5, function(value)
 			return whole(value) .. " deg"
 		end)
 		switch(page, "Steady camera", "UNoShake", "Cancels shake that a game does by nudging your character's camera offset. Shake a game applies straight to the camera itself cannot be told apart from normal movement and stays.")
 		UI.heading(page, "Free camera", "right", "The camera leaves your character: W A S D, E up, Q down, hold right mouse to look, Shift to go faster.")
-		switch(page, "Free camera", "UFreecam")
+		switch(page, "Free camera", "UFreecam", "Your character stays where it is while the camera flies. Switches itself off when the script loads.")
 		slide(page, "Camera speed", "UFreecamSpeed", 10, 400, 10, function(value)
 			return whole(value) .. " studs/s"
 		end)
@@ -1632,11 +1649,11 @@ function PotentUniversal.install(host)
 		switch(page, "Hide my character", "UHideSelf", "For screenshots.")
 		slide(page, "How hidden", "USelfAlpha", 0.1, 1, 0.1, function(value)
 			return string.format("%d%%", value * 100)
-		end)
-		switch(page, "Hide my accessories", "UNoAccessories")
+		end, "100% is fully invisible; lower leaves you faintly visible.")
+		switch(page, "Hide my accessories", "UNoAccessories", "Hats, hair and other accessories on your character, for you only.")
 		UI.heading(page, "Animations", "left")
-		switch(page, "Stop my animations", "UNoAnim")
-		switch(page, "Set animation speed", "UAnimSpeedOn")
+		switch(page, "Stop my animations", "UNoAnim", "Stops every animation playing on your character.")
+		switch(page, "Set animation speed", "UAnimSpeedOn", "On: your animations play at the speed below. 1 is normal.")
 		slide(page, "Animation speed", "UAnimSpeed", 0.1, 5, 0.1, function(value)
 			return string.format("%.1fx", value)
 		end)
@@ -1679,7 +1696,8 @@ function PotentUniversal.install(host)
 		end)
 		UI.heading(page, "Delete", "left")
 		switch(page, "Click delete", "UClickDelete", "Hold the key below and click a part: it is gone, for you only.")
-		UI.keybind(page, "Delete key", "UDeleteKey", "Hold this while you click.")
+		UI.keybind(page, "Delete key", "UDeleteKey")
+		tip(page, "Hold this key and click a part to delete it. Click delete must be on.")
 		UI.button(page, "Undo the last delete", function()
 			local last = table.remove(U.deleted)
 			if not last then
@@ -1847,7 +1865,7 @@ function PotentUniversal.install(host)
 		end)
 		UI.heading(page, "On screen", "right")
 		switch(page, "Show FPS", "UFps", "A small tag at the top right of the screen.")
-		switch(page, "Show ping", "UPing")
+		switch(page, "Show ping", "UPing", "Added to the same tag as the FPS, at the top right of the screen.")
 		switch(page, "Set an FPS cap", "UFpsCapOn", setfpscap and "The slider at its top end means no cap." or "Your executor has no setfpscap: this one does nothing here.")
 		slide(page, "FPS cap", "UFpsCap", 30, 1000, 10, function(value)
 			return value >= 1000 and "No cap" or whole(value)
@@ -1921,7 +1939,8 @@ function PotentUniversal.install(host)
 	do
 		local page = UI.makePage("Keybinds", "A key for every switch, kept separately for every game. Click a box and press a key; Backspace clears it. Beside switch puts the key next to the switch on its own page, in every game.", "Universal")
 		UI.heading(page, "Panic", "left")
-		UI.keybind(page, "Everything off", "UPanicKey", "Switches every Universal feature off at once.")
+		UI.keybind(page, "Everything off", "UPanicKey")
+		tip(page, "Switches every Universal feature off at once, except Anti-AFK. Your keys and the ESP option switches stay as they are.")
 		local seen = {}
 		for _, entry in ipairs(PotentUniversal.TOGGLES) do
 			if not seen[entry.page] then
