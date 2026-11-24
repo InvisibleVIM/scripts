@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v273", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v274", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -1279,8 +1279,7 @@ function AA.lostWave(levelId)
 	end
 	return nil
 end
----A stage lost in its first waves is played without skipping until two waves past that point:
----skipping brings the next wave while the last one is still on the road.
+---Should the skip vote be held back right now? (Only "Wait for bosses" does that.)
 function AA.holdSkip()
 	-- Behind on the road right now (AA.roadBusy, defined with the enemy scan): no skipping.
 	-- Only with "Wait for bosses" switched on (Battle tab, off by default).
@@ -1290,11 +1289,10 @@ function AA.holdSkip()
 			return true, nil, why
 		end
 	end
-	local _, _, lostLow = AA.lostWave(AA.Match and AA.Match.levelId)
-	if lostLow and lostLow <= 8 then
-		local wave = workspace:FindFirstChild("_wave_num")
-		return (wave and wave.Value or 0) <= lostLow + 2, lostLow
-	end
+	-- USER (v274): "after i lose a match of something it makes it so that it doesnt skip
+	-- waves? pretty sure that's useless. remove it". A stage lost in its first eight waves
+	-- used to be played without skipping until two waves past that point, for a day. Gone:
+	-- skipping is only ever held by Wait for bosses above.
 	return false
 end
 ---Lost three or more times in the last day.
@@ -19424,6 +19422,11 @@ do
 			end
 
 			heading(page, "Relic progress", "right")
+			-- USER (v274): the card is only there while Relic is the mode (or a fallback of it).
+			local relicBox = UI.current[page] and UI.current[page].box
+			if relicBox then
+				relicBox.Visible = Config.Mode == "Relic" or Config.Otherwise == "Relic"
+			end
 			view.relic = UI.list(page)
 			hint(page, "The relic picked on the Mode tab: every material against what you hold, counted from your inventory every few seconds. A crafted ingredient (ingots) is followed by what its missing copies still need. Ready to craft means the Golden King can make it now, after any ingots are made.")
 			task.spawn(function()
@@ -19431,6 +19434,9 @@ do
 					local ok, plan, why = pcall(AA.Relic.plan)
 					local rows = {}
 					local chain = Config.Mode == "Relic" or Config.Otherwise == "Relic" or ((Config.Mode == "Challenge" or Config.Mode == "Daily") and Config.ChallengeFallback == "Relic")
+					if relicBox then
+						relicBox.Visible = chain
+					end
 					if not ok or not plan then
 						rows = { { note = (ok and why == "none") and "No relic picked yet: choose Relic as the mode on the Mode tab, then the relic." or "Reading your inventory." } }
 					else
