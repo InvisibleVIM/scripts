@@ -5,16 +5,17 @@ TOGGLES = [
  ("UAirWalk","Air walk","Movement",False),("UFloat","Float","Movement",False),("UGravityOn","Gravity","Movement",False),("USpin","Spin","Movement",False),("UDirection","Direction indicator","Movement",False),
  ("UFollow","Follow player","Players",False),("UJoinNotes","Join and leave notices","Players",False),
  ("UEsp","Player ESP","ESP",False),("UEspChams","ESP outlines","ESP",True),("UEspNames","ESP names","ESP",True),("UEspDistance","ESP distance","ESP",True),("UEspHealth","ESP health bars","ESP",True),("UEspTracers","ESP tracers","ESP",False),("UEspSkeleton","ESP skeletons","ESP",False),("UEspTeam","ESP team colours","ESP",True),("UEspTeamCheck","ESP hides teammates","ESP",False),
- ("UEspNpc","NPC ESP","ESP",False),("UEspTool","Tool ESP","ESP",False),("UEspPrompt","Prompt ESP","ESP",False),("UEspClick","Click detector ESP","ESP",False),("UEspTouch","Touch trigger ESP","ESP",False),
+ ("UEspNpc","NPC ESP","ESP",False),
  ("UFullbright","Fullbright","ESP",False),("UNoFog","Remove fog","ESP",False),("UCrosshair","Crosshair","ESP",False),
  ("UFovOn","Field of view","Camera",False),("UZoomOn","Max zoom","Camera",False),("UThirdPerson","Allow third person","Camera",False),("UFirstPerson","First person","Camera",False),("UFreecam","Free camera","Camera",False),("USensOn","Mouse sensitivity","Camera",False),("URollOn","Camera roll","Camera",False),("UNoShake","Steady camera","Camera",False),
  ("UHideSelf","Hide my character","Character",False),("UNoAccessories","Hide my accessories","Character",False),("UNoAnim","Stop my animations","Character",False),("UAnimSpeedOn","Animation speed","Character",False),("UNoRagdoll","No ragdoll","Character",False),
  ("UXray","X-ray","World",False),("UNoParticles","No particles","World",False),("UNoTextures","No textures","World",False),("UNoShadows","No shadows","World",False),("UNoEffects","No screen effects","World",False),("UClickDelete","Click delete","World",False),
+ ("UEspTouch","Touch trigger ESP","World",False),("UEspPrompt","Prompt ESP","World",False),("UEspClick","Click detector ESP","World",False),("UEspTool","Tool ESP","World",False),
  ("UFps","Show FPS","Server",False),("UPing","Show ping","Server",False),("UFpsCapOn","FPS cap","Server",False),("UHideGui","Hide the game's GUI","Server",False),("UAntiAfk","Anti-AFK","Server",True),("UOffOnDeath","Movement off on death","Server",False),
 ]
 VALUES = {
  "UFlySpeed":1,"UFlyKeyHold":False,"ClickTeleportKey":"LeftControl","USpeed":50,"UJump":100,"UGravity":60,"USpinSpeed":10,
- "UEspRange":2000,"UCrosshairSize":8,"UFov":90,"UZoom":2000,"UFreecamSpeed":60,"USens":1,"USelfAlpha":1,"UAnimSpeed":1,"URoll":0,
+ "UEspRange":2000,"UEspObjRange":500,"UCrosshairSize":8,"UFov":90,"UZoom":2000,"UFreecamSpeed":60,"USens":1,"USelfAlpha":1,"UAnimSpeed":1,"URoll":0,
  "UDeleteKey":"LeftAlt","UFpsCap":240,"UWaypoints":"{}","UPanicKey":"End","MenuSet":"Game","UBinds":"{}","UBindsRev":1,
 }
 DEFAULT_BINDS = {}

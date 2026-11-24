@@ -845,9 +845,12 @@ function PotentUniversal.install(host)
 		end
 	end
 	---Marks: NPCs, tools, proximity prompts, click detectors and search results get an outline and
-	---a name. Looked for again every two seconds, at most 150 of each.
+	---a name. Looked for again every two seconds. Only those inside the range are marked (the
+	---player ESP range for NPCs, the object range for the rest), nearest first, at most MARK_CAP of
+	---each. USER: "esp all touch triggers in a 500 stud radius. (let me change the range)".
+	local MARK_CAP = 500
 	local MARKS = {
-		{ key = "UEspNpc", color = Color3.fromRGB(255, 170, 60), find = function(object)
+		{ key = "UEspNpc", range = "UEspRange", color = Color3.fromRGB(255, 170, 60), find = function(object)
 			if object:IsA("Humanoid") and object.Parent and object.Parent:IsA("Model") and not players:GetPlayerFromCharacter(object.Parent) then
 				return object.Parent, object.Parent.Name
 			end
@@ -880,6 +883,9 @@ function PotentUniversal.install(host)
 		for _, entry in ipairs(U.marks[key] or {}) do
 			entry.highlight:Destroy()
 			entry.board:Destroy()
+			if entry.edge then
+				entry.edge:Destroy()
+			end
 		end
 		U.marks[key] = nil
 	end
@@ -887,15 +893,29 @@ function PotentUniversal.install(host)
 		markClear(key)
 		local list = {}
 		for index, item in ipairs(found) do
-			if index > 150 then
+			if index > MARK_CAP then
 				break
 			end
-			local highlight = Instance.new("Highlight")
-			highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-			highlight.FillTransparency = 0.85
-			highlight.FillColor, highlight.OutlineColor = color, color
-			highlight.Adornee = item.object
-			highlight.Parent = holder
+			-- Roblox draws only about 31 Highlights at a time, so single parts get a see-through
+			-- box instead: those have no limit. Models keep the Highlight.
+			local highlight
+			if item.object:IsA("BasePart") then
+				highlight = Instance.new("BoxHandleAdornment")
+				highlight.Size = item.object.Size
+				highlight.AlwaysOnTop = true
+				highlight.ZIndex = 5
+				highlight.Transparency = 0.7
+				highlight.Color3 = color
+				highlight.Adornee = item.object
+				highlight.Parent = holder
+			else
+				highlight = Instance.new("Highlight")
+				highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+				highlight.FillTransparency = 0.85
+				highlight.FillColor, highlight.OutlineColor = color, color
+				highlight.Adornee = item.object
+				highlight.Parent = holder
+			end
 			local board, text = tag(holder)
 			board.StudsOffset = Vector3.new(0, 1.5, 0)
 			board.Adornee = item.object
@@ -922,11 +942,19 @@ function PotentUniversal.install(host)
 		for _, kind in ipairs(wanted) do
 			found[kind.key] = {}
 		end
+		local part = root()
+		local from = part and part.Position or workspace.CurrentCamera.CFrame.Position
 		for index, object in ipairs(workspace:GetDescendants()) do
 			for _, kind in ipairs(wanted) do
 				local target, name = kind.find(object)
 				if target then
-					table.insert(found[kind.key], { object = target, name = name })
+					local okSpot, spot = pcall(function()
+						return target:IsA("BasePart") and target.Position or target:GetPivot().Position
+					end)
+					local away = okSpot and (spot - from).Magnitude or 0
+					if away <= (tonumber(Config[kind.range or "UEspObjRange"]) or 500) then
+						table.insert(found[kind.key], { object = target, name = name, away = away })
+					end
 				end
 			end
 			if index % 4000 == 0 then
@@ -934,6 +962,9 @@ function PotentUniversal.install(host)
 			end
 		end
 		for _, kind in ipairs(wanted) do
+			table.sort(found[kind.key], function(a, b)
+				return a.away < b.away
+			end)
 			markSet(kind.key, kind.color, found[kind.key])
 		end
 	end
@@ -1515,12 +1546,8 @@ function PotentUniversal.install(host)
 		slide(page, "Range", "UEspRange", 100, 5000, 100, function(value)
 			return whole(value) .. " studs"
 		end, "Players farther away than this are not marked.")
-		UI.heading(page, "Other ESP", "right", "Up to 150 of each, looked for again every two seconds.")
-		switch(page, "NPCs", "UEspNpc", "Anything with a humanoid that is not a player.")
-		switch(page, "Tools on the ground", "UEspTool", "Tools lying in the world that you can pick up.")
-		switch(page, "Proximity prompts", "UEspPrompt", "Things you use by holding a key near them: doors, pickups, shops.")
-		switch(page, "Click detectors", "UEspClick", "Parts that do something when you click them with the mouse.")
-		switch(page, "Touch triggers", "UEspTouch", "Parts that fire something when touched: kill bricks, checkpoints, pads.")
+		UI.heading(page, "NPC ESP", "right", "Touch triggers, prompts, click detectors and tools are on the World tab.")
+		switch(page, "NPCs", "UEspNpc", "Anything with a humanoid that is not a player. Uses the player ESP range and is looked for again every two seconds.")
 		UI.heading(page, "Light and aim", "right")
 		switch(page, "Fullbright", "UFullbright", "Daylight, no fog, no shadows.")
 		switch(page, "Remove fog", "UNoFog", "Only the fog goes; the lighting stays as the game set it.")
@@ -1593,6 +1620,14 @@ function PotentUniversal.install(host)
 	end
 	do
 		local page = UI.makePage("World", "Things switched off or removed on your screen only.", "Universal")
+		UI.heading(page, "Object ESP", "left", "Pick what to mark. Everything of that kind inside the range is boxed and named through walls.")
+		switch(page, "Touch triggers", "UEspTouch", "Parts that fire something when touched: kill bricks, checkpoints, pads.")
+		switch(page, "Proximity prompts", "UEspPrompt", "Things you use by holding a key near them: doors, pickups, shops.")
+		switch(page, "Click detectors", "UEspClick", "Parts that do something when you click them with the mouse.")
+		switch(page, "Tools on the ground", "UEspTool", "Tools lying in the world that you can pick up.")
+		slide(page, "Range", "UEspObjRange", 50, 5000, 50, function(value)
+			return whole(value) .. " studs"
+		end, "Only things within this many studs of you are marked. It follows you: the list is redone every two seconds. Click the number to type any distance. The nearest " .. MARK_CAP .. " of each kind are shown.")
 		UI.heading(page, "Graphics", "left", "Put back when the switch goes off.")
 		switch(page, "X-ray", "UXray", "The map goes see-through; characters stay solid.")
 		switch(page, "No particles", "UNoParticles", "Particles, trails, beams, fire and smoke.")
@@ -1647,7 +1682,7 @@ function PotentUniversal.install(host)
 			end
 			U.found = found
 			markSet("search", Color3.fromRGB(255, 235, 90), found)
-			findLine.Text = #found .. " found" .. (#found > 150 and " (first 150 marked)." or ".")
+			findLine.Text = #found .. " found" .. (#found > MARK_CAP and " (first " .. MARK_CAP .. " marked)." or ".")
 			return #found .. " found"
 		end)
 		UI.button(page, "Teleport to the nearest", function()
