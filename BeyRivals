@@ -344,7 +344,7 @@ end
 -- ============================================================
 local PotentUniversal = {}
 PotentUniversal.DEFAULTS = {
-	UFly = false, K_UFly = "F", P_UFly = false, UFlyVehicle = false, K_UFlyVehicle = "None", P_UFlyVehicle = false,
+	UFly = false, K_UFly = "None", P_UFly = false, UFlyVehicle = false, K_UFlyVehicle = "None", P_UFlyVehicle = false,
 	NoClip = false, K_NoClip = "None", P_NoClip = false, ClickTeleport = false, K_ClickTeleport = "None", P_ClickTeleport = false,
 	USpeedOn = false, K_USpeedOn = "None", P_USpeedOn = false, UJumpOn = false, K_UJumpOn = "None", P_UJumpOn = false,
 	UInfJump = false, K_UInfJump = "None", P_UInfJump = false, UBhop = false, K_UBhop = "None", P_UBhop = false,
@@ -362,7 +362,7 @@ PotentUniversal.DEFAULTS = {
 	UNoFog = false, K_UNoFog = "None", P_UNoFog = false, UCrosshair = false, K_UCrosshair = "None", P_UCrosshair = false,
 	UFovOn = false, K_UFovOn = "None", P_UFovOn = false, UZoomOn = false, K_UZoomOn = "None", P_UZoomOn = false,
 	UThirdPerson = false, K_UThirdPerson = "None", P_UThirdPerson = false, UFirstPerson = false, K_UFirstPerson = "None", P_UFirstPerson = false,
-	UFreecam = false, K_UFreecam = "P", P_UFreecam = false, USensOn = false, K_USensOn = "None", P_USensOn = false,
+	UFreecam = false, K_UFreecam = "None", P_UFreecam = false, USensOn = false, K_USensOn = "None", P_USensOn = false,
 	URollOn = false, K_URollOn = "None", P_URollOn = false, UNoShake = false, K_UNoShake = "None", P_UNoShake = false,
 	UHideSelf = false, K_UHideSelf = "None", P_UHideSelf = false, UNoAccessories = false, K_UNoAccessories = "None", P_UNoAccessories = false,
 	UNoAnim = false, K_UNoAnim = "None", P_UNoAnim = false, UAnimSpeedOn = false, K_UAnimSpeedOn = "None", P_UAnimSpeedOn = false,
@@ -376,10 +376,10 @@ PotentUniversal.DEFAULTS = {
 	USpeed = 50, UJump = 100, UGravity = 60, USpinSpeed = 10, UEspRange = 2000, UCrosshairSize = 8,
 	UFov = 90, UZoom = 2000, UFreecamSpeed = 60, USens = 1, USelfAlpha = 1, UAnimSpeed = 1,
 	URoll = 0, UDeleteKey = "LeftAlt", UFpsCap = 240, UWaypoints = "{}", UPanicKey = "End", MenuSet = "Game",
-	UBinds = "{}",
+	UBinds = "{}", UBindsRev = 1,
 }
 -- The keys a game starts with until you set your own there.
-PotentUniversal.BINDS = { UFly = "F", UFreecam = "P" }
+PotentUniversal.BINDS = {  }
 -- Every switch, in menu order. Each one can have a key (settings key "K_" .. key), and can show
 -- that key beside itself (settings key "P_" .. key).
 PotentUniversal.TOGGLES = {
@@ -529,6 +529,24 @@ function PotentUniversal.install(host)
 			return httpService:JSONDecode(Config.UBinds)
 		end)
 		return (ok and type(all) == "table") and all or {}
+	end
+	-- USER: "nothing should be keybinded in a game i haven't set up until i set the keybind for it
+	-- ... Keep panic keybinded on end though." Earlier builds wrote Fly = F and Free camera = P into
+	-- every game they loaded in; those two are cleared once from what was saved.
+	if Config.UBindsRev ~= 2 then
+		local all = bindsRead()
+		for _, saved in pairs(all) do
+			if type(saved) == "table" then
+				if saved.K_UFly == "F" then
+					saved.K_UFly = "None"
+				end
+				if saved.K_UFreecam == "P" then
+					saved.K_UFreecam = "None"
+				end
+			end
+		end
+		Config.UBinds = httpService:JSONEncode(all)
+		Config.UBindsRev = 2
 	end
 	do
 		local mine = bindsRead()[GAME]
@@ -1575,9 +1593,12 @@ function PotentUniversal.install(host)
 			end
 		end
 	end)
+	local PANIC_KEEPS = { UAntiAfk = true, UEspChams = true, UEspNames = true, UEspDistance = true, UEspHealth = true, UEspTracers = true, UEspSkeleton = true, UEspTeam = true, UEspTeamCheck = true, UOffOnDeath = true }
 	function U.panic()
+		-- Turns every feature off and leaves Anti-AFK, the keys and the option switches (what ESP
+		-- draws, and so on) as they are, so a feature switched back on looks the way it did.
 		for _, entry in ipairs(PotentUniversal.TOGGLES) do
-			if entry.key ~= "UAntiAfk" then
+			if not PANIC_KEEPS[entry.key] then
 				Config[entry.key] = false
 			end
 		end

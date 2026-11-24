@@ -15,9 +15,9 @@ TOGGLES = [
 VALUES = {
  "UFlySpeed":1,"UFlyKeyHold":False,"ClickTeleportKey":"LeftControl","USpeed":50,"UJump":100,"UGravity":60,"USpinSpeed":10,
  "UEspRange":2000,"UCrosshairSize":8,"UFov":90,"UZoom":2000,"UFreecamSpeed":60,"USens":1,"USelfAlpha":1,"UAnimSpeed":1,"URoll":0,
- "UDeleteKey":"LeftAlt","UFpsCap":240,"UWaypoints":"{}","UPanicKey":"End","MenuSet":"Game","UBinds":"{}",
+ "UDeleteKey":"LeftAlt","UFpsCap":240,"UWaypoints":"{}","UPanicKey":"End","MenuSet":"Game","UBinds":"{}","UBindsRev":1,
 }
-DEFAULT_BINDS = {"UFly":"F","UFreecam":"P"}
+DEFAULT_BINDS = {}
 SESSION_OFF = ["UFly","UFreecam","UFollow","UAirWalk","UFloat","USpin","UClickDelete","UHideGui"]
 def lua(v):
     if isinstance(v,bool): return "true" if v else "false"

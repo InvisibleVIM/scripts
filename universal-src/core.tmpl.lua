@@ -104,6 +104,24 @@ function PotentUniversal.install(host)
 		end)
 		return (ok and type(all) == "table") and all or {}
 	end
+	-- USER: "nothing should be keybinded in a game i haven't set up until i set the keybind for it
+	-- ... Keep panic keybinded on end though." Earlier builds wrote Fly = F and Free camera = P into
+	-- every game they loaded in; those two are cleared once from what was saved.
+	if Config.UBindsRev ~= 2 then
+		local all = bindsRead()
+		for _, saved in pairs(all) do
+			if type(saved) == "table" then
+				if saved.K_UFly == "F" then
+					saved.K_UFly = "None"
+				end
+				if saved.K_UFreecam == "P" then
+					saved.K_UFreecam = "None"
+				end
+			end
+		end
+		Config.UBinds = httpService:JSONEncode(all)
+		Config.UBindsRev = 2
+	end
 	do
 		local mine = bindsRead()[GAME]
 		for _, entry in ipairs(PotentUniversal.TOGGLES) do
@@ -1149,9 +1167,12 @@ function PotentUniversal.install(host)
 			end
 		end
 	end)
+	local PANIC_KEEPS = { UAntiAfk = true, UEspChams = true, UEspNames = true, UEspDistance = true, UEspHealth = true, UEspTracers = true, UEspSkeleton = true, UEspTeam = true, UEspTeamCheck = true, UOffOnDeath = true }
 	function U.panic()
+		-- Turns every feature off and leaves Anti-AFK, the keys and the option switches (what ESP
+		-- draws, and so on) as they are, so a feature switched back on looks the way it did.
 		for _, entry in ipairs(PotentUniversal.TOGGLES) do
-			if entry.key ~= "UAntiAfk" then
+			if not PANIC_KEEPS[entry.key] then
 				Config[entry.key] = false
 			end
 		end
