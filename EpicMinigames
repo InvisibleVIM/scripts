@@ -15,7 +15,7 @@ if not shared then
 end
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local BeyRivals = { connections = {}, toggleRefreshers = {}, segmentRefreshers = {}, VERSION = "em-3", alive = true }
+local BeyRivals = { connections = {}, toggleRefreshers = {}, segmentRefreshers = {}, VERSION = "em-4", alive = true }
 if shared.EpicMinigames then
 	pcall(shared.EpicMinigames.detach)
 end
@@ -5546,6 +5546,68 @@ local create, statusLabel, panel, nextOrder, makePage, rowBase, rowLabel, headin
 		end
 	end
 
+	---Tools and scripts that only turn up part-way through a round (Juggernaut hands out its
+	---launcher ten seconds in, after the first snapshot): saved the first time each is seen.
+	function Recorder.late(model, name)
+		local folder = FOLDER .. "/rec"
+		if not isfolder(folder) then
+			return
+		end
+		local function keep(object, label)
+			local key = "late|" .. name .. "|" .. label
+			if Recorder.seen[key] then
+				return
+			end
+			Recorder.seen[key] = true
+			local path = folder .. "/" .. safeName(name) .. "__late__" .. safeName(label) .. ".lua"
+			if isfile(path) then
+				return
+			end
+			local ok, text = pcall(decompile, object)
+			writefile(path, "-- " .. object:GetFullName() .. "\n" .. (ok and text or "-- could not be read"))
+		end
+		local function tool(item)
+			local key = "latetool|" .. name .. "|" .. item.Name
+			if Recorder.seen[key] or Recorder.seen["tool" .. item.Name] then
+				return
+			end
+			Recorder.seen[key] = true
+			local lines = { "# tool " .. item.Name .. " in " .. name }
+			describe(item, "", 5, lines, 60)
+			writefile(folder .. "/" .. safeName(name) .. "__tool__" .. safeName(item.Name) .. ".txt", table.concat(lines, "\n"))
+			for _, object in ipairs(item:GetDescendants()) do
+				if object:IsA("LocalScript") or object:IsA("ModuleScript") then
+					keep(object, item.Name .. "_" .. object.Name)
+				end
+			end
+		end
+		for _, place in ipairs({ localPlayer:FindFirstChild("Backpack"), character() }) do
+			for _, item in ipairs(place and place:GetChildren() or {}) do
+				if item:IsA("Tool") then
+					tool(item)
+				end
+			end
+		end
+		local gui = localPlayer:FindFirstChild("PlayerGui")
+		for _, object in ipairs(gui and gui:GetChildren() or {}) do
+			if object:IsA("LocalScript") and object.Name ~= "showguis" then
+				keep(object, "gui_" .. object.Name)
+			end
+		end
+		-- (Some minigames put their script in your character: Hurdle Hurry has none anywhere else.)
+		local usual = { GearEquipping = true, itemsLocal = true, Emoting = true, Animate = true, normalcam = true, forwardcam = true, normalforwardcam = true, stubbornforwardcam = true, unfpscam = true }
+		for _, object in ipairs(character() and character():GetChildren() or {}) do
+			if object:IsA("LocalScript") and not usual[object.Name] then
+				keep(object, "char_" .. object.Name)
+			end
+		end
+		for _, object in ipairs(model:GetDescendants()) do
+			if object:IsA("LocalScript") or object:IsA("ModuleScript") then
+				keep(object, "map_" .. object.Name)
+			end
+		end
+	end
+
 	----------------------------------------------------------------------------------------------
 	-- Watching the other players. Every player in the round leaves a trail of where they stood
 	-- and where they jumped. The generic brains follow a good player's trail on foot, which
@@ -5905,6 +5967,68 @@ local create, statusLabel, panel, nextOrder, makePage, rowBase, rowLabel, headin
 		end
 	end
 
+	-- Hurdle Hurry. You are carried down your lane on your own (walk speed is 0, about 18 studs a
+	-- second) and the only thing to do is jump. Each lane (`Lanes.L<n>`) holds its hurdles in
+	-- `Hurdles`; the bar is the 7-wide part and its top is level with your waist. A jump at the
+	-- game's own jump power is above the bar from 0.07 s to 0.44 s after take-off, so the jump is
+	-- timed to put the top of the arc (0.255 s) over the bar. USER: "jump over the hurdles on this one".
+	EM.handlers["Hurdle Hurry"] = function(round)
+		local lanes = round.model:WaitForChild("Lanes", 8)
+		local bars = {}
+		local function barsOf(lane)
+			if not bars[lane] then
+				local list = {}
+				local folder = lane:FindFirstChild("Hurdles")
+				for _, hurdle in ipairs(folder and folder:GetChildren() or {}) do
+					for _, piece in ipairs(hurdle:GetChildren()) do
+						if piece:IsA("BasePart") and piece.Transparency < 1 and math.max(piece.Size.X, piece.Size.Z) >= 6 then
+							table.insert(list, piece)
+							break
+						end
+					end
+				end
+				bars[lane] = list
+			end
+			return bars[lane]
+		end
+		local jumps, lastJump = 0, 0
+		while round.live() do
+			local part, human = root(), humanoid()
+			if part and human and lanes then
+				local velocity = flat(part.AssemblyLinearVelocity)
+				local speed = velocity.Magnitude
+				if speed > 4 then
+					local heading = velocity.Unit
+					-- Take-off point: top of the arc over the bar, plus the time the jump takes to start.
+					local takeOff = speed * (0.255 + 0.05)
+					local nearest
+					-- (Every lane is looked at; only a bar straight ahead of you counts.)
+					for _, lane in ipairs(lanes:GetChildren()) do
+						for _, bar in ipairs(barsOf(lane)) do
+							if bar.Parent then
+								local to = flat(bar.Position - part.Position)
+								local ahead = to:Dot(heading)
+								if ahead > 0 and ahead < 60 and (to - heading * ahead).Magnitude < 4 and (not nearest or ahead < nearest) then
+									nearest = ahead
+								end
+							end
+						end
+					end
+					round.detail = nearest and ("next hurdle in %d studs, %d jumped"):format(nearest, jumps) or (jumps .. " jumped, no hurdle ahead")
+					if nearest and nearest <= takeOff and nearest > takeOff - speed * 0.12 and human.FloorMaterial ~= Enum.Material.Air and os.clock() - lastJump > 0.3 then
+						human.Jump = true
+						jumps += 1
+						lastJump = os.clock()
+					end
+				else
+					round.detail = "waiting for the start"
+				end
+			end
+			runService.Heartbeat:Wait()
+		end
+		log("Hurdle Hurry: jumped " .. jumps .. " hurdles")
+	end
+
 	---Which brain plays this minigame, or nil when it is left to you.
 	function EM.pick(name)
 		if not Config.EmAuto then
@@ -6001,6 +6125,10 @@ local create, statusLabel, panel, nextOrder, makePage, rowBase, rowLabel, headin
 					end
 					local elapsed = os.clock() - round.t0
 					if Config.EmRecord then
+						if os.clock() - (round.lateAt or 0) > 1.5 then
+							round.lateAt = os.clock()
+							pcall(Recorder.late, model, name)
+						end
 						if elapsed > 10 then
 							pcall(Recorder.snapshot, model, name, "t10")
 						end
@@ -6130,7 +6258,7 @@ end)()
 		toggle(page, "Survival minigames", "EmSurvive")
 		hint(page, "For the game's Other and Luck minigames: stays beside the player with the best win streak, a moment behind them, and steps out of the way of anything moving at you.")
 		toggle(page, "Minigames with their own handler", "EmSpecial")
-		hint(page, "Uses a handler written for that minigame when there is one. So far: Paint to Perfection (clicks your easel until it matches the board). More are added from the recordings below.")
+		hint(page, "Uses a handler written for that minigame when there is one. So far: Paint to Perfection (clicks your easel until it matches the board) and Hurdle Hurry (jumps each hurdle in your lane). More are added from the recordings below.")
 		heading(page, "Left to you", "left")
 		UI.note(page, "Versus, Team and Controller minigames (fights, tools, vehicles) are not played for you yet.")
 		heading(page, "Rounds", "right")
