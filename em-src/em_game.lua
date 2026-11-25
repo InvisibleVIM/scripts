@@ -399,6 +399,54 @@
 			human.Jump = true
 		end
 	end
+	---Walk to a place by a route the game's own pathfinder works out (round houses and fences,
+	---jumping where it says to), a step at a time. Returns true once you are there. Call it over
+	---and over; `tag` names the destination so a new one starts a new route.
+	local pathService = game:GetService("PathfindingService")
+	function Move.path(round, goal, tag, near)
+		local part = root()
+		if not part then
+			return false
+		end
+		local state = round.route
+		local now = os.clock()
+		if not state or state.tag ~= tag or state.redo or now - state.at > 6 then
+			state = { tag = tag, at = now, index = 2, spot = part.Position, moved = now }
+			round.route = state
+			local path = pathService:CreatePath({ AgentRadius = 2, AgentHeight = 5, AgentCanJump = true, WaypointSpacing = 6 })
+			local ok = pcall(function()
+				path:ComputeAsync(part.Position, goal)
+			end)
+			if ok and path.Status == Enum.PathStatus.Success then
+				state.points = path:GetWaypoints()
+			end
+			part = root()
+			if not part then
+				return false
+			end
+		end
+		local point = state.points and state.points[state.index]
+		while point and flat(point.Position - part.Position).Magnitude < 3 do
+			state.index += 1
+			point = state.points[state.index]
+		end
+		if point then
+			Move.to(point.Position)
+			if point.Action == Enum.PathWaypointAction.Jump then
+				Move.jump()
+			end
+		else
+			Move.to(goal)
+		end
+		-- Not getting anywhere: hop, and work the route out again from here.
+		if (part.Position - state.spot).Magnitude > 2 then
+			state.spot, state.moved = part.Position, now
+		elseif now - state.moved > 1 then
+			Move.jump()
+			state.redo = now - state.moved > 2
+		end
+		return flat(goal - part.Position).Magnitude < (near or 4)
+	end
 	---Is there something to stand on under this point?
 	function Move.ground(position, depth)
 		local params = RaycastParams.new()
@@ -667,6 +715,70 @@
 			if not clicked then
 				task.wait(0.15)
 			end
+		end
+	end
+
+	-- Cake Delivery. You are handed a cake, a tool named after a house number, and the doors are
+	-- parts of the minigame with that number written on them (a SurfaceGui label). Walking the
+	-- cake into the door with the same number delivers it; `cakecount` suggests more than one
+	-- cake a round, so it keeps going for as long as you are holding one. USER: "do this minigame".
+	EM.handlers["Cake Delivery"] = function(round)
+		local model = round.model
+		local delivered, lastNumber = 0, nil
+		local function doorFor(number)
+			for _, object in ipairs(model:GetChildren()) do
+				if object:IsA("BasePart") then
+					local face = object:FindFirstChildOfClass("SurfaceGui")
+					local label = face and face:FindFirstChildOfClass("TextLabel")
+					if label and label.Text == number then
+						return object
+					end
+				end
+			end
+			return nil
+		end
+		while round.live() do
+			local body, human = character(), humanoid()
+			local cake
+			for _, place in ipairs({ body, localPlayer:FindFirstChild("Backpack") }) do
+				for _, item in ipairs(place and place:GetChildren() or {}) do
+					if item:IsA("Tool") and tonumber(item.Name) then
+						cake = item
+					end
+				end
+			end
+			if cake and body and human then
+				if cake.Parent ~= body and not Move.yours() then
+					human:EquipTool(cake)
+				end
+				if lastNumber and lastNumber ~= cake.Name then
+					delivered += 1
+				end
+				lastNumber = cake.Name
+				local door = doorFor(cake.Name)
+				if door then
+					local part = root()
+					round.detail = ("cake %s, door %d studs away, %d delivered"):format(cake.Name, part and (door.Position - part.Position).Magnitude or 0, delivered)
+					-- The door is set into a wall: walk to just in front of whichever face is nearer
+					-- to you, then straight into it.
+					local front = door.Position + door.CFrame.LookVector * 3
+					local back = door.Position - door.CFrame.LookVector * 3
+					local stand = part and (back - part.Position).Magnitude < (front - part.Position).Magnitude and back or front
+					if Move.path(round, stand, "door" .. cake.Name, 3.5) then
+						Move.to(door.Position)
+					end
+				else
+					round.detail = "cake " .. cake.Name .. ": no door with that number yet"
+				end
+			else
+				if lastNumber then
+					delivered += 1
+					lastNumber = nil
+					log("Cake Delivery: delivered " .. delivered)
+				end
+				round.detail = delivered > 0 and (delivered .. " delivered, waiting for the next cake") or "waiting for a cake"
+			end
+			task.wait(0.1)
 		end
 	end
 
