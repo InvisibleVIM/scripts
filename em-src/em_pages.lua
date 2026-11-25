@@ -45,7 +45,7 @@
 		toggle(page, "Survival minigames", "EmSurvive")
 		hint(page, "For the game's Other and Luck minigames: stays beside the player with the best win streak, a moment behind them, and steps out of the way of anything moving at you.")
 		toggle(page, "Minigames with their own handler", "EmSpecial")
-		hint(page, "Uses a handler written for that minigame when there is one. None are written yet: they are added from the recordings below.")
+		hint(page, "Uses a handler written for that minigame when there is one. So far: Paint to Perfection (clicks your easel until it matches the board). More are added from the recordings below.")
 		heading(page, "Left to you", "left")
 		UI.note(page, "Versus, Team and Controller minigames (fights, tools, vehicles) are not played for you yet.")
 		heading(page, "Rounds", "right")

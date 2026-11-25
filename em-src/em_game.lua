@@ -539,6 +539,75 @@
 		end
 	end
 
+	----------------------------------------------------------------------------------------------
+	-- Handlers written for one minigame each.
+	----------------------------------------------------------------------------------------------
+
+	-- Paint to Perfection. The painting to copy is `tpaint` (p1..p16 on the board); your easel is
+	-- the model named after your player number, with the same sixteen cells under `paper`. A
+	-- click on a cell moves it on to its next colour, and `pwon` goes true when all sixteen
+	-- match. Nothing is assumed about the order of the colours: each cell is clicked until it
+	-- shows the wanted one. USER: "do this ... this minigame".
+	EM.handlers["Paint to Perfection"] = function(round)
+		local model = round.model
+		local clicks, started = 0, os.clock()
+		local tries = {}
+		local reported = false
+		while round.live() do
+			local target = model:FindFirstChild("tpaint")
+			local easel = model:FindFirstChild(tostring(mine("playernum", 0)))
+			local paper = easel and easel:FindFirstChild("paper")
+			local allowed = model:FindFirstChild("canpaint")
+			local part = root()
+			local clicked = false
+			if target and paper and part and (not allowed or allowed.Value) then
+				local wrong, nextCell, nextDetector = 0, nil, nil
+				for index = 1, 16 do
+					local cell, want = paper:FindFirstChild("p" .. index), target:FindFirstChild("p" .. index)
+					if cell and want and cell.BrickColor ~= want.BrickColor then
+						wrong += 1
+						local detector = cell:FindFirstChildOfClass("ClickDetector")
+						if detector and not nextCell and (tries[cell] or 0) < 40 then
+							nextCell, nextDetector = cell, detector
+						end
+					end
+				end
+				round.detail = wrong == 0 and "painting matches" or (wrong .. " cells to go")
+				if wrong == 0 and not reported then
+					reported = true
+					log(("Paint to Perfection: matched in %.1fs with %d clicks"):format(os.clock() - started, clicks))
+				elseif wrong > 0 then
+					reported = false
+				end
+				if nextCell then
+					local reach = math.min(nextDetector.MaxActivationDistance, 28)
+					local gap = (nextCell.Position - part.Position).Magnitude
+					if gap > reach - 2 then
+						-- Walk up to the easel first: a click from out of reach does nothing.
+						Move.to(nextCell.Position + flat(part.Position - nextCell.Position).Unit * 5)
+					elseif fireclickdetector then
+						local before = nextCell.BrickColor
+						fireclickdetector(nextDetector)
+						clicks += 1
+						tries[nextCell] = (tries[nextCell] or 0) + 1
+						clicked = true
+						local waited = 0
+						while waited < 0.5 and nextCell.BrickColor == before do
+							waited += task.wait()
+						end
+						-- (About eight clicks a second, the pace of someone clicking quickly.)
+						task.wait(0.07 + math.random() * 0.07)
+					else
+						round.detail = "this executor cannot click for you"
+					end
+				end
+			end
+			if not clicked then
+				task.wait(0.15)
+			end
+		end
+	end
+
 	---Which brain plays this minigame, or nil when it is left to you.
 	function EM.pick(name)
 		if not Config.EmAuto then
