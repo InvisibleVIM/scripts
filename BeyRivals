@@ -1664,6 +1664,27 @@ function PotentUniversal.install(host)
 	hook(me.OnTeleport, function(state)
 		leaving = state ~= Enum.TeleportState.Failed
 		U.leaving = leaving
+		if leaving then
+			-- Everything drawn on the world goes at once. The crashes of 2026-11-24/25 only ever
+			-- came when leaving the lobby (9 of ~110, against 0 of ~60 leaving a match) and began
+			-- minutes after Touch trigger ESP was first switched on: the lobby is full of touch
+			-- triggers and a match has none. Boxes, outlines and name tags that point at parts of
+			-- a place being closed are the one thing that fits both facts.
+			local marksGone, espGone = 0, 0
+			for key, list in pairs(U.marks) do
+				marksGone += #list
+				pcall(markClear, key)
+			end
+			for player in pairs(U.esp) do
+				espGone += 1
+				pcall(espClear, player)
+			end
+			pcall(function()
+				if appendfile then
+					appendfile("PotentTeleports.txt", ("%s %s place %s marks %d esp %d\n"):format(os.date("!%Y-%m-%d %H:%M:%S"), tostring(state.Name), tostring(game.PlaceId), marksGone, espGone))
+				end
+			end)
+		end
 		if type(host.onLeaving) == "function" then
 			pcall(host.onLeaving, leaving)
 		end
