@@ -45,7 +45,7 @@
 		toggle(page, "Survival minigames", "EmSurvive")
 		hint(page, "For the game's Other and Luck minigames: stays beside the player with the best win streak, a moment behind them, and steps out of the way of anything moving at you.")
 		toggle(page, "Minigames with their own handler", "EmSpecial")
-		hint(page, "Uses a handler written for that minigame when there is one. So far: Paint to Perfection (clicks your easel until it matches the board) Hurdle Hurry (jumps each hurdle in your lane) and Cake Delivery (walks your cake to the door with its number). More are added from the recordings below.")
+		hint(page, "Uses a handler written for that minigame when there is one. So far: Paint to Perfection (clicks your easel until it matches the board) Hurdle Hurry (jumps each hurdle in your lane) Cake Delivery (walks your cake to the door with its number), Block Hunt (marks the other team's blocks through walls and walks to them; hiding is yours) and Fishing Frenzy (moves your mouse onto the next fish and away from sharks). More are added from the recordings below.")
 		heading(page, "Left to you", "left")
 		UI.note(page, "Versus, Team and Controller minigames (fights, tools, vehicles) are not played for you yet.")
 		heading(page, "Rounds", "right")

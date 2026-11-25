@@ -15,7 +15,7 @@ if not shared then
 end
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local BeyRivals = { connections = {}, toggleRefreshers = {}, segmentRefreshers = {}, VERSION = "em-6", alive = true }
+local BeyRivals = { connections = {}, toggleRefreshers = {}, segmentRefreshers = {}, VERSION = "em-7", alive = true }
 if shared.EpicMinigames then
 	pcall(shared.EpicMinigames.detach)
 end
@@ -6118,6 +6118,181 @@ local create, statusLabel, panel, nextOrder, makePage, rowBase, rowLabel, headin
 		end
 	end
 
+	-- Block Hunt, the finding half. USER: "pathfind/collect and esp the other teams blocks". Each
+	-- team hides its blocks in its own map, then the teams swap maps (`collecting` goes true)
+	-- and a block is found by walking into it. The other team's dropped blocks are ordinary
+	-- parts in `DroppedBlueBlocks` / `DroppedRedBlocks`: each gets a box and a distance tag you
+	-- can see through walls, and the nearest is walked to by a worked-out route, then the next.
+	-- Hiding is not done here.
+	EM.handlers["Block Hunt"] = function(round)
+		local model = round.model
+		local given, marks = {}, {}
+		local target, since
+		local function unmark(block)
+			local mark = marks[block]
+			if mark then
+				mark.box:Destroy()
+				mark.tag:Destroy()
+				marks[block] = nil
+			end
+		end
+		local function mark(block, colour)
+			if marks[block] or not EM.gui then
+				return
+			end
+			local box = Instance.new("BoxHandleAdornment")
+			box.Adornee, box.Size, box.AlwaysOnTop, box.ZIndex = block, block.Size + Vector3.new(0.4, 0.4, 0.4), true, 5
+			box.Color3, box.Transparency = colour, 0.45
+			box.Parent = EM.gui
+			local tag = Instance.new("BillboardGui")
+			tag.Adornee, tag.AlwaysOnTop, tag.Size, tag.StudsOffset = block, true, UDim2.fromOffset(120, 20), Vector3.new(0, 2.2, 0)
+			local text = Instance.new("TextLabel")
+			text.BackgroundTransparency, text.Size, text.TextColor3, text.TextStrokeTransparency = 1, UDim2.fromScale(1, 1), colour, 0.3
+			text.Font, text.TextSize, text.Text = Enum.Font.GothamBold, 13, "block"
+			text.Parent = tag
+			tag.Parent = EM.gui
+			marks[block] = { box = box, tag = tag, text = text }
+		end
+		while round.live() do
+			local collecting = model:FindFirstChild("collecting")
+			local theirs = mine("team", "") == "red" and "Blue" or "Red"
+			local folder = model:FindFirstChild("Dropped" .. theirs .. "Blocks")
+			local part = root()
+			if collecting and collecting.Value and folder and part then
+				for block in pairs(marks) do
+					if block.Parent ~= folder then
+						unmark(block)
+					end
+				end
+				for _, block in ipairs(folder:GetChildren()) do
+					if block:IsA("BasePart") then
+						mark(block, theirs == "Blue" and Color3.fromRGB(70, 140, 255) or Color3.fromRGB(255, 80, 80))
+						marks[block].text.Text = ("block  %d studs"):format((block.Position - part.Position).Magnitude)
+					end
+				end
+				if target and (target.Parent ~= folder or os.clock() - since > 12) then
+					-- Gone (someone found it) or cannot be reached: leave it for now.
+					if target.Parent == folder then
+						given[target] = os.clock()
+					end
+					target = nil
+				end
+				if not target then
+					local best
+					for _, block in ipairs(folder:GetChildren()) do
+						if block:IsA("BasePart") and (not given[block] or os.clock() - given[block] > 20) then
+							local gap = (block.Position - part.Position).Magnitude
+							if not best or gap < best then
+								best, target = gap, block
+							end
+						end
+					end
+					since = os.clock()
+				end
+				if target then
+					round.detail = ("going for a block %d studs away, %d left"):format((target.Position - part.Position).Magnitude, #folder:GetChildren())
+					if Move.path(round, target.Position, "block" .. tostring(target.Position), 5) then
+						Move.to(target.Position)
+						if target.Position.Y - part.Position.Y > 2 then
+							Move.jump()
+						end
+					end
+				else
+					round.detail = "no blocks left to find"
+				end
+			else
+				target = nil
+				round.detail = "hiding the blocks is left to you"
+			end
+			task.wait(0.1)
+		end
+		for block in pairs(marks) do
+			unmark(block)
+		end
+	end
+
+	-- Fishing Frenzy. USER: "fishing frenzy follows mouse". Your spot (`Spots.Spot<n>`) has a
+	-- `Hook` that follows the mouse up and down, and fish swim past it in `LiveFish`: Fish,
+	-- FishGold (worth more) and Shark (to be avoided). The code that moves the hook could not
+	-- be found, so the real mouse pointer is moved instead: onto the point on screen where the
+	-- next fish will cross the line. Only while the Roblox window is the one in front.
+	EM.handlers["Fishing Frenzy"] = function(round)
+		local spots = round.model:WaitForChild("Spots", 8)
+		local seen = {}
+		local catches, wasHooked = 0, false
+		local offset = Vector2.zero
+		while round.live() do
+			local spot = spots and spots:FindFirstChild("Spot" .. tostring(mine("playernum", 0)))
+			local hook = spot and spot:FindFirstChild("Hook")
+			local fishes = spot and spot:FindFirstChild("LiveFish")
+			local camera = workspace.CurrentCamera
+			if hook and fishes and camera and mousemoveabs and (not isrbxactive or isrbxactive()) then
+				local hooked = hook:FindFirstChild("Hooked")
+				if hooked and hooked.Value and not wasHooked then
+					catches += 1
+				end
+				wasHooked = hooked and hooked.Value or false
+				local now = os.clock()
+				local best, bestScore
+				local sharks = {}
+				for _, fish in ipairs(fishes:GetChildren()) do
+					if fish:IsA("BasePart") then
+						local record = seen[fish]
+						if not record then
+							record = { pos = fish.Position, t = now, vel = Vector3.zero }
+							seen[fish] = record
+						elseif now - record.t > 0.08 then
+							record.vel = (fish.Position - record.pos) / (now - record.t)
+							record.pos, record.t = fish.Position, now
+						end
+						local run = flat(record.vel)
+						if run.Magnitude > 0.5 then
+							-- Seconds until this one crosses the hook's line.
+							local eta = flat(hook.Position - fish.Position):Dot(run.Unit) / run.Magnitude
+							if fish.Name:find("^Shark") then
+								if eta > -0.4 and eta < 1 then
+									table.insert(sharks, fish.Position.Y)
+								end
+							elseif eta > 0.12 and eta < 4 then
+								local score = eta - (fish.Name:find("Gold") and 1.5 or 0)
+								if not bestScore or score < bestScore then
+									best, bestScore = fish, score
+								end
+							end
+						end
+					end
+				end
+				local wantY = best and best.Position.Y or hook.Position.Y
+				for _, sharkY in ipairs(sharks) do
+					if math.abs(sharkY - wantY) < 2.5 then
+						-- A shark is about to pass at this height: get out of its way instead.
+						wantY = sharkY + (wantY >= sharkY and 3.5 or -3.5)
+						best = nil
+					end
+				end
+				round.detail = (best and ("lining up on " .. (best.Name:find("Gold") and "a gold fish" or "a fish")) or (#sharks > 0 and "keeping clear of a shark" or "waiting for a fish")) .. ", " .. catches .. " hooked"
+				if not (hooked and hooked.Value) then
+					local point, onScreen = camera:WorldToViewportPoint(Vector3.new(hook.Position.X, wantY, hook.Position.Z))
+					if onScreen then
+						local want = Vector2.new(point.X, point.Y)
+						mousemoveabs(want.X + offset.X, want.Y + offset.Y)
+						task.wait()
+						-- (Where the pointer really ended up tells how this executor counts the top bar.)
+						local got = userInputService:GetMouseLocation()
+						local miss = want - got
+						if miss.Magnitude > 2 and miss.Magnitude < 120 then
+							offset += miss
+						end
+					end
+				end
+			else
+				round.detail = "click the Roblox window: the mouse is only moved while it is in front"
+			end
+			task.wait(0.03)
+		end
+		log("Fishing Frenzy: " .. catches .. " hooked")
+	end
+
 	-- Hurdle Hurry. You are carried down your lane on your own (walk speed is 0, about 18 studs a
 	-- second) and the only thing to do is jump. Each lane (`Lanes.L<n>`) holds its hurdles in
 	-- `Hurdles`; the bar is the 7-wide part and its top is level with your waist. A jump at the
@@ -6409,7 +6584,7 @@ end)()
 		toggle(page, "Survival minigames", "EmSurvive")
 		hint(page, "For the game's Other and Luck minigames: stays beside the player with the best win streak, a moment behind them, and steps out of the way of anything moving at you.")
 		toggle(page, "Minigames with their own handler", "EmSpecial")
-		hint(page, "Uses a handler written for that minigame when there is one. So far: Paint to Perfection (clicks your easel until it matches the board) Hurdle Hurry (jumps each hurdle in your lane) and Cake Delivery (walks your cake to the door with its number). More are added from the recordings below.")
+		hint(page, "Uses a handler written for that minigame when there is one. So far: Paint to Perfection (clicks your easel until it matches the board) Hurdle Hurry (jumps each hurdle in your lane) Cake Delivery (walks your cake to the door with its number), Block Hunt (marks the other team's blocks through walls and walks to them; hiding is yours) and Fishing Frenzy (moves your mouse onto the next fish and away from sharks). More are added from the recordings below.")
 		heading(page, "Left to you", "left")
 		UI.note(page, "Versus, Team and Controller minigames (fights, tools, vehicles) are not played for you yet.")
 		heading(page, "Rounds", "right")
