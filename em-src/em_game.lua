@@ -1046,6 +1046,95 @@
 		log("The Sweeper: " .. jumps .. " jumps")
 	end
 
+	-- Just Jump. USER: "jump over the rope". You cannot walk here (walk speed 0); a skipping rope
+	-- made of short `rope` pieces (`map.rope`) turns about a level line through `rstart` and
+	-- skims the ground under everyone once a turn (about 1.2 s a turn at first, then faster).
+	-- The line it turns about is found from how the pieces move, the piece level with you is
+	-- followed round, and the jump is timed so you are in the air as it passes your feet.
+	EM.handlers["Just Jump"] = function(round)
+		local map = round.model:WaitForChild("map", 8)
+		local rope = map and map:WaitForChild("rope", 8)
+		local pivot = rope and rope:WaitForChild("rstart", 5)
+		local before = {}
+		local axis, lastAngle, lastTime, turn = nil, nil, nil, 0
+		local jumps, lastJump = 0, 0
+		while round.live() do
+			local part, human = root(), humanoid()
+			if rope and pivot and part and human then
+				local centre = pivot.Position
+				local pieces = {}
+				for _, piece in ipairs(rope:GetChildren()) do
+					if piece:IsA("BasePart") and piece ~= pivot and piece.Name == "rope" then
+						table.insert(pieces, piece)
+					end
+				end
+				-- The line the rope turns about: at right angles to how any piece moves round it.
+				if not axis then
+					for _, piece in ipairs(pieces) do
+						local old = before[piece]
+						local arm = piece.Position - centre
+						if old and (arm - old).Magnitude > 0.6 and arm.Magnitude > 3 then
+							local normal = old:Cross(arm)
+							if normal.Magnitude > 1 then
+								axis = normal.Unit
+								break
+							end
+						elseif not old then
+							before[piece] = arm
+						end
+					end
+				end
+				if axis and #pieces > 0 then
+					local side = axis:Cross(Vector3.yAxis)
+					side = side.Magnitude > 0.1 and side.Unit or axis:Cross(Vector3.xAxis).Unit
+					local up = side:Cross(axis)
+					local function around(offset)
+						return math.atan2(offset:Dot(up), offset:Dot(side))
+					end
+					local feet = part.Position - Vector3.new(0, 3, 0) - centre
+					local along = feet:Dot(axis)
+					local nearest, gap
+					for _, piece in ipairs(pieces) do
+						local d = math.abs((piece.Position - centre):Dot(axis) - along)
+						if not gap or d < gap then
+							nearest, gap = piece, d
+						end
+					end
+					local angle = around(nearest.Position - centre)
+					local now = os.clock()
+					if lastAngle and round.ropePiece == nearest then
+						local dt = now - lastTime
+						if dt > 0.012 then
+							local change = (angle - lastAngle + math.pi) % (2 * math.pi) - math.pi
+							turn = turn * 0.6 + (change / dt) * 0.4
+							lastAngle, lastTime = angle, now
+						end
+					else
+						lastAngle, lastTime, round.ropePiece = angle, now, nearest
+					end
+					if math.abs(turn) > 0.3 then
+						local ahead = (around(feet) - angle) % (2 * math.pi)
+						if turn < 0 then
+							ahead = 2 * math.pi - ahead
+						end
+						local eta = ahead / math.abs(turn)
+						local lead = 0.255 + 0.05
+						round.detail = ("rope in %.1fs, one turn every %.1fs, %d jumps"):format(eta, 2 * math.pi / math.abs(turn), jumps)
+						if eta <= lead and eta > lead - 0.18 and human.FloorMaterial ~= Enum.Material.Air and now - lastJump > 0.3 then
+							human.Jump = true
+							jumps += 1
+							lastJump = now
+						end
+					else
+						round.detail = "waiting for the rope to swing"
+					end
+				end
+			end
+			runService.Heartbeat:Wait()
+		end
+		log("Just Jump: " .. jumps .. " jumps")
+	end
+
 	-- Hurdle Hurry. You are carried down your lane on your own (walk speed is 0, about 18 studs a
 	-- second) and the only thing to do is jump. Each lane (`Lanes.L<n>`) holds its hurdles in
 	-- `Hurdles`; the bar is the 7-wide part and its top is level with your waist. A jump at the
