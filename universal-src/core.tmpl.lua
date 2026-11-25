@@ -36,7 +36,17 @@ function PotentUniversal.install(host)
 	for _, key in ipairs({ --@SESSION_OFF@ }) do
 		Config[key] = false
 	end
+	-- A teleport is under way: the place is being taken apart while the next one loads. Four crashes
+	-- on 2026-11-24 all came 1.5 s into a lobby -> match teleport (one inside Roblox's own teardown,
+	-- "HardAssert (Invalid Facet Access)", one in executor memory on the thread that was closing the
+	-- old place). The cause is not proven; what is certain is that nothing here has any business
+	-- reading or writing a place that is being closed, so from the moment a teleport starts every
+	-- loop and every signal handler stands still. A failed teleport lets them carry on.
+	local leaving = false
 	local function alive()
+		return host.alive() and not leaving
+	end
+	local function running()
 		return host.alive()
 	end
 	local function hook(signal, fn)
@@ -959,6 +969,9 @@ function PotentUniversal.install(host)
 			end
 			if index % 4000 == 0 then
 				task.wait()
+				if leaving then
+					return
+				end
 			end
 		end
 		for _, kind in ipairs(wanted) do
@@ -1010,6 +1023,11 @@ function PotentUniversal.install(host)
 							if not Config[key] then
 								return
 							end
+							if leaving then
+								-- (Not finished: done again from the start if the teleport fails.)
+								U["rule" .. key] = nil
+								return
+							end
 							pcall(ruleApply, key, rule, object)
 							if index % 3000 == 0 then
 								task.wait()
@@ -1029,6 +1047,9 @@ function PotentUniversal.install(host)
 		end
 	end
 	hook(workspace.DescendantAdded, function(object)
+		if not alive() then
+			return
+		end
 		for key, rule in pairs(RULES) do
 			if Config[key] and rule.where ~= "effects" then
 				pcall(ruleApply, key, rule, object)
@@ -1188,7 +1209,11 @@ function PotentUniversal.install(host)
 		end
 	end)
 	task.spawn(function()
-		while alive() do
+		while running() do
+			if leaving then
+				task.wait(0.5)
+				continue
+			end
 			pcall(bodyStep)
 			pcall(cameraStep)
 			pcall(animStep)
@@ -1201,9 +1226,20 @@ function PotentUniversal.install(host)
 		end
 	end)
 	task.spawn(function()
-		while alive() do
+		while running() do
+			if leaving then
+				task.wait(0.5)
+				continue
+			end
 			pcall(markStep)
 			task.wait(0.5)
+		end
+	end)
+	hook(me.OnTeleport, function(state)
+		leaving = state ~= Enum.TeleportState.Failed
+		U.leaving = leaving
+		if type(host.onLeaving) == "function" then
+			pcall(host.onLeaving, leaving)
 		end
 	end)
 	hook(input.JumpRequest, function()
@@ -1522,7 +1558,11 @@ function PotentUniversal.install(host)
 			return "Pick a waypoint first"
 		end)
 		task.spawn(function()
-			while alive() and page.Parent do
+			while running() and page.Parent do
+				if leaving then
+					task.wait(0.5)
+					continue
+				end
 				local part = root()
 				spot.Text = part and string.format("%.0f, %.0f, %.0f", part.Position.X, part.Position.Y, part.Position.Z) or "?"
 				local look = part and part.CFrame.LookVector
@@ -1778,7 +1818,11 @@ function PotentUniversal.install(host)
 		end)
 		switch(page, "Join and leave notices", "UJoinNotes", "A note whenever someone joins or leaves the server.")
 		task.spawn(function()
-			while alive() and page.Parent do
+			while running() and page.Parent do
+				if leaving then
+					task.wait(0.5)
+					continue
+				end
 				local player = U.picked()
 				local model = player and player.Character
 				local human = model and model:FindFirstChildOfClass("Humanoid")
@@ -1865,7 +1909,11 @@ function PotentUniversal.install(host)
 			return U.panic()
 		end)
 		task.spawn(function()
-			while alive() and page.Parent do
+			while running() and page.Parent do
+				if leaving then
+					task.wait(0.5)
+					continue
+				end
 				fpsRow.Text = string.format("%d", fps)
 				physics.Text = string.format("%d", workspace:GetRealPhysicsFPS())
 				local ping = U.ping()
