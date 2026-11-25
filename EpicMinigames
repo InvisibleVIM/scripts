@@ -15,7 +15,7 @@ if not shared then
 end
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local BeyRivals = { connections = {}, toggleRefreshers = {}, segmentRefreshers = {}, VERSION = "em-5", alive = true }
+local BeyRivals = { connections = {}, toggleRefreshers = {}, segmentRefreshers = {}, VERSION = "em-6", alive = true }
 if shared.EpicMinigames then
 	pcall(shared.EpicMinigames.detach)
 end
@@ -5468,6 +5468,21 @@ local create, statusLabel, panel, nextOrder, makePage, rowBase, rowLabel, headin
 			end
 		end
 	end
+	---Code that runs on this side and can be read: local scripts, modules, and plain Scripts set
+	---to run on the client (Fishing Frenzy, Hurdle Hurry and Juggernaut are written that way,
+	---which is why their code was missed at first).
+	local function clientCode(object)
+		if object:IsA("LocalScript") or object:IsA("ModuleScript") then
+			return true
+		end
+		if object:IsA("Script") then
+			local ok, context = pcall(function()
+				return object.RunContext
+			end)
+			return ok and context == Enum.RunContext.Client
+		end
+		return false
+	end
 	local function safeName(text)
 		return (tostring(text):gsub("[^%w]", "_"))
 	end
@@ -5523,7 +5538,7 @@ local create, statusLabel, panel, nextOrder, makePage, rowBase, rowLabel, headin
 			writefile(folder .. "/" .. safeName(name) .. "__src" .. count .. ".lua", "-- " .. label .. "\n" .. (ok and text or "-- could not be read"))
 		end
 		for _, object in ipairs(model:GetDescendants()) do
-			if object:IsA("LocalScript") or object:IsA("ModuleScript") then
+			if clientCode(object) then
 				source(object, object:GetFullName())
 			end
 		end
@@ -5576,7 +5591,7 @@ local create, statusLabel, panel, nextOrder, makePage, rowBase, rowLabel, headin
 			describe(item, "", 5, lines, 60)
 			writefile(folder .. "/" .. safeName(name) .. "__tool__" .. safeName(item.Name) .. ".txt", table.concat(lines, "\n"))
 			for _, object in ipairs(item:GetDescendants()) do
-				if object:IsA("LocalScript") or object:IsA("ModuleScript") then
+				if clientCode(object) then
 					keep(object, item.Name .. "_" .. object.Name)
 				end
 			end
@@ -5589,21 +5604,45 @@ local create, statusLabel, panel, nextOrder, makePage, rowBase, rowLabel, headin
 			end
 		end
 		local gui = localPlayer:FindFirstChild("PlayerGui")
+		local ours = { Shiftlock = true, QuestMarkers = true, MenuGui = true, FrontGui = true, GameGui = true, SpectateGui = true, ProximityPrompts = true, SoundFX = true }
 		for _, object in ipairs(gui and gui:GetChildren() or {}) do
-			if object:IsA("LocalScript") and object.Name ~= "showguis" then
+			if clientCode(object) and object.Name ~= "showguis" then
 				keep(object, "gui_" .. object.Name)
+			elseif not ours[object.Name] and not object:IsA("BillboardGui") then
+				-- A screen the minigame put up: its buttons may carry the code.
+				for _, inner in ipairs(object:GetDescendants()) do
+					if clientCode(inner) then
+						keep(inner, "gui_" .. object.Name .. "_" .. inner.Name)
+					end
+				end
 			end
 		end
 		-- (Some minigames put their script in your character: Hurdle Hurry has none anywhere else.)
 		local usual = { GearEquipping = true, itemsLocal = true, Emoting = true, Animate = true, normalcam = true, forwardcam = true, normalforwardcam = true, stubbornforwardcam = true, unfpscam = true }
 		for _, object in ipairs(character() and character():GetChildren() or {}) do
-			if object:IsA("LocalScript") and not usual[object.Name] then
+			if clientCode(object) and not usual[object.Name] then
 				keep(object, "char_" .. object.Name)
 			end
 		end
 		for _, object in ipairs(model:GetDescendants()) do
-			if object:IsA("LocalScript") or object:IsA("ModuleScript") then
+			if clientCode(object) then
 				keep(object, "map_" .. object.Name)
+			end
+		end
+		-- Some minigames keep their client code and parts in ReplicatedStorage.TempMinigameStorage
+		-- for the length of the round (Deadly Dogfight's planes come from there).
+		local temp = RS:FindFirstChild("TempMinigameStorage")
+		if temp then
+			if not Recorder.seen["temp|" .. name] and #temp:GetChildren() > 0 then
+				Recorder.seen["temp|" .. name] = true
+				local lines = { "# TempMinigameStorage during " .. name }
+				describe(temp, "", 4, lines, 40)
+				writefile(folder .. "/" .. safeName(name) .. "__temp.txt", table.concat(lines, "\n"))
+			end
+			for _, object in ipairs(temp:GetDescendants()) do
+				if clientCode(object) then
+					keep(object, "temp_" .. object.Name)
+				end
 			end
 		end
 	end
