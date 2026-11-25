@@ -15,7 +15,7 @@ if not shared then
 end
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local BeyRivals = { connections = {}, toggleRefreshers = {}, segmentRefreshers = {}, VERSION = "em-9", alive = true }
+local BeyRivals = { connections = {}, toggleRefreshers = {}, segmentRefreshers = {}, VERSION = "em-10", alive = true }
 if shared.EpicMinigames then
 	pcall(shared.EpicMinigames.detach)
 end
@@ -6432,6 +6432,84 @@ local create, statusLabel, panel, nextOrder, makePage, rowBase, rowLabel, headin
 		log("Just Jump: " .. jumps .. " jumps")
 	end
 
+	-- Toxic Reactions. USER: "go to the platform with the right color". Four 20x20 platforms in a
+	-- row (models `red`, `blue`, `yellow`, `green`, each holding a part of the same name) sit
+	-- over acid; the sign (`sign.whatcolour`) has one part per colour and shows the safe one
+	-- (Transparency 0, the rest 1); the other three platforms then sink under the acid and come
+	-- back. So: walk onto the platform the sign is showing, and between calls wait at the join
+	-- in the middle of the row, where no platform is more than a platform and a half away.
+	EM.handlers["Toxic Reactions"] = function(round)
+		local model = round.model
+		local COLOURS = { "red", "blue", "yellow", "green" }
+		local moves, lastSafe = 0, nil
+		while round.live() do
+			local part = root()
+			local sign = model:FindFirstChild("sign")
+			local board = sign and sign:FindFirstChild("whatcolour")
+			if part and board then
+				local safe
+				for _, colour in ipairs(COLOURS) do
+					local face = board:FindFirstChild(colour)
+					if face and face.Transparency < 0.5 then
+						safe = colour
+					end
+				end
+				local tops = {}
+				for _, colour in ipairs(COLOURS) do
+					local holder = model:FindFirstChild(colour)
+					local top = holder and holder:FindFirstChild(colour)
+					if top and top:IsA("BasePart") then
+						tops[colour] = top
+					end
+				end
+				local goal
+				if safe and tops[safe] then
+					if safe ~= lastSafe then
+						lastSafe = safe
+						moves += 1
+						round.calledAt, round.sankNoted = os.clock(), false
+					end
+					-- (How long the sign gives you before the others sink, for the log.)
+					if not round.sankNoted and round.calledAt then
+						for colour, other in pairs(tops) do
+							if colour ~= safe and tops[safe].Position.Y - other.Position.Y > 1 then
+								round.sankNoted = true
+								log(("Toxic Reactions: %s called, the others sank %.1fs later, you were %d studs from it"):format(safe, os.clock() - round.calledAt, flat(tops[safe].Position - part.Position).Magnitude))
+								break
+							end
+						end
+					end
+					-- The nearest point that is well onto the safe platform.
+					local top = tops[safe]
+					local reach = Vector3.new(math.max(top.Size.X / 2 - 5, 0), 0, math.max(top.Size.Z / 2 - 5, 0))
+					local offset = top.CFrame:PointToObjectSpace(part.Position)
+					local inside = Vector3.new(math.clamp(offset.X, -reach.X, reach.X), top.Size.Y / 2, math.clamp(offset.Z, -reach.Z, reach.Z))
+					goal = top.CFrame:PointToWorldSpace(inside)
+					round.detail = ("%s is safe, %d studs to go"):format(safe, flat(goal - part.Position).Magnitude)
+					if top.Position.Y + top.Size.Y / 2 - (part.Position.Y - 3) > 1.2 and flat(goal - part.Position).Magnitude < 8 then
+						Move.jump()
+					end
+				else
+					lastSafe = nil
+					local sum, count = Vector3.zero, 0
+					for _, top in pairs(tops) do
+						sum += top.Position
+						count += 1
+					end
+					if count > 0 then
+						goal = sum / count
+						round.detail = "waiting in the middle for the next colour"
+					end
+				end
+				if goal and flat(goal - part.Position).Magnitude > 1.5 then
+					Move.to(Vector3.new(goal.X, part.Position.Y, goal.Z))
+				end
+			end
+			task.wait(0.05)
+		end
+		log("Toxic Reactions: followed " .. moves .. " colour calls")
+	end
+
 	-- Hurdle Hurry. You are carried down your lane on your own (walk speed is 0, about 18 studs a
 	-- second) and the only thing to do is jump. Each lane (`Lanes.L<n>`) holds its hurdles in
 	-- `Hurdles`; the bar is the 7-wide part and its top is level with your waist. A jump at the
@@ -6723,7 +6801,7 @@ end)()
 		toggle(page, "Survival minigames", "EmSurvive")
 		hint(page, "For the game's Other and Luck minigames: stays beside the player with the best win streak, a moment behind them, and steps out of the way of anything moving at you.")
 		toggle(page, "Minigames with their own handler", "EmSpecial")
-		hint(page, "Uses a handler written for that minigame when there is one. So far: Paint to Perfection (clicks your easel until it matches the board) Hurdle Hurry (jumps each hurdle in your lane) Cake Delivery (walks your cake to the door with its number), Block Hunt (marks the other team's blocks through walls and walks to them; hiding is yours) Fishing Frenzy (moves your mouse onto the next fish and away from sharks) The Sweeper (jumps the bar each time it comes round) and Just Jump (jumps the rope each turn). More are added from the recordings below.")
+		hint(page, "Uses a handler written for that minigame when there is one. So far: Paint to Perfection (clicks your easel until it matches the board) Hurdle Hurry (jumps each hurdle in your lane) Cake Delivery (walks your cake to the door with its number), Block Hunt (marks the other team's blocks through walls and walks to them; hiding is yours) Fishing Frenzy (moves your mouse onto the next fish and away from sharks) The Sweeper (jumps the bar each time it comes round) Just Jump (jumps the rope each turn) and Toxic Reactions (walks to the platform whose colour the sign shows). More are added from the recordings below.")
 		heading(page, "Left to you", "left")
 		UI.note(page, "Versus, Team and Controller minigames (fights, tools, vehicles) are not played for you yet.")
 		heading(page, "Rounds", "right")
