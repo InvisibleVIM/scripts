@@ -996,6 +996,56 @@
 		log("Fishing Frenzy: " .. catches .. " hooked")
 	end
 
+	-- The Sweeper. USER: "jump over sweeper". A bar (`sweeper.a`, 128 long, 2 thick, lying just
+	-- above the floor) turns about the middle of the platform, faster as the round goes on, and
+	-- both of its arms sweep. Its long side is the part's RightVector. How fast it turns is
+	-- measured, the time until the nearer arm reaches you is worked out from your angle, and
+	-- the jump is timed so the top of it (0.255 s after take-off) is when the bar is under you.
+	EM.handlers["The Sweeper"] = function(round)
+		local sweeper = round.model:WaitForChild("sweeper", 8)
+		local bar = sweeper and sweeper:WaitForChild("a", 5)
+		local lastAngle, lastTime, turn = nil, nil, 0
+		local jumps, lastJump = 0, 0
+		while round.live() do
+			local part, human = root(), humanoid()
+			if bar and bar.Parent and part and human then
+				local axis = bar.CFrame.RightVector
+				local angle = math.atan2(axis.Z, axis.X)
+				local now = os.clock()
+				if lastAngle then
+					local dt = now - lastTime
+					if dt > 0.012 then
+						-- (The bar looks the same every half turn, so the change is taken within a quarter turn either way.)
+						local change = (angle - lastAngle + math.pi / 2) % math.pi - math.pi / 2
+						turn = turn * 0.6 + (change / dt) * 0.4
+						lastAngle, lastTime = angle, now
+					end
+				else
+					lastAngle, lastTime = angle, now
+				end
+				local out = flat(part.Position - bar.Position)
+				if math.abs(turn) > 0.05 and out.Magnitude > 1 then
+					local ahead = (math.atan2(out.Z, out.X) - angle) % math.pi
+					if turn < 0 then
+						ahead = math.pi - ahead
+					end
+					local eta = ahead / math.abs(turn)
+					local lead = 0.255 + 0.05
+					round.detail = ("bar in %.1fs, turning %d degrees a second, %d jumps"):format(eta, math.deg(math.abs(turn)), jumps)
+					if eta <= lead and eta > lead - 0.16 and human.FloorMaterial ~= Enum.Material.Air and now - lastJump > 0.3 then
+						human.Jump = true
+						jumps += 1
+						lastJump = now
+					end
+				else
+					round.detail = "waiting for the bar to start"
+				end
+			end
+			runService.Heartbeat:Wait()
+		end
+		log("The Sweeper: " .. jumps .. " jumps")
+	end
+
 	-- Hurdle Hurry. You are carried down your lane on your own (walk speed is 0, about 18 studs a
 	-- second) and the only thing to do is jump. Each lane (`Lanes.L<n>`) holds its hurdles in
 	-- `Hurdles`; the bar is the 7-wide part and its top is level with your waist. A jump at the
