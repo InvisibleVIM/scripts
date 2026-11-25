@@ -15,7 +15,7 @@ if not shared then
 end
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local BeyRivals = { connections = {}, toggleRefreshers = {}, segmentRefreshers = {}, VERSION = "universal-1", alive = true }
+local BeyRivals = { connections = {}, toggleRefreshers = {}, segmentRefreshers = {}, VERSION = "universal-2", alive = true }
 if shared.PotentUniversal then
 	pcall(shared.PotentUniversal.detach)
 end
@@ -5231,7 +5231,8 @@ BeyRivals.ui = UI
 			pcall(UI.classify, object)
 		end
 		UI.selectTab(pages[firstTab] and firstTab or UI.order[1])
-		panel.Visible = not Config.HideOnExecute
+		-- Always starts closed, with no notice: the menu key opens it.
+		panel.Visible = false
 
 		table.insert(BeyRivals.connections, userInputService.InputBegan:Connect(function(input)
 			if UI.capturing or userInputService:GetFocusedTextBox() then
@@ -5242,9 +5243,6 @@ BeyRivals.ui = UI
 				UI.showTip(nil)
 			end
 		end))
-		if Config.HideOnExecute then
-			UI.toast("Potent Universal is running", (SHORT_KEYS[Config.MenuKey] or tostring(Config.MenuKey)) .. " opens the menu.", 6)
-		end
 	end
 end)()
 local create, statusLabel, panel, nextOrder, makePage, rowBase, rowLabel, heading, toggle, slider, segmented, hint, cycler, button = UI.create, UI.statusLabel, UI.panel, UI.nextOrder, UI.makePage, UI.rowBase, UI.rowLabel, UI.heading, UI.toggle, UI.slider, UI.segmented, UI.hint, UI.cycler, UI.button
@@ -5255,7 +5253,6 @@ do
 	local page = makePage("Settings", "The script itself: the menu and staying connected.", "Menu")
 	heading(page, "Menu", "left")
 	UI.keybind(page, "Show or hide the menu", "MenuKey")
-	toggle(page, "Start hidden", "HideOnExecute", "The menu stays closed when the script loads.")
 	toggle(page, "No notices", "MuteNotifications", "Hides the script's own pop-up notices.")
 	heading(page, "Script", "right")
 	button(page, "Unload the script", function()

@@ -26,7 +26,13 @@ def rep(a,b):
     out=out.replace(a,b)
 rep('Text = "Bey Rivals", FontFace = CODE_BOLD','Text = "Potent Universal", FontFace = CODE_BOLD')
 rep('for _, group in ipairs({ "Play", "Account", "Menu" }) do','for _, group in ipairs({ "Universal", "Menu" }) do')
-rep('UI.toast("Bey Rivals is running"','UI.toast("Potent Universal is running"')
+# USER: "universal should always start hidden and have no notifications".
+rep('		panel.Visible = not Config.HideOnExecute','		-- Always starts closed, with no notice: the menu key opens it.\n		panel.Visible = false')
+rep('''		if Config.HideOnExecute then
+			UI.toast("Bey Rivals is running", (SHORT_KEYS[Config.MenuKey] or tostring(Config.MenuKey)) .. " opens the menu.", 6)
+		end
+''','')
+rep('	toggle(page, "Start hidden", "HideOnExecute", "The menu stays closed when the script loads.")\n','')
 rep('	local SHORT_KEYS = { RightControl','	local SHORT_KEYS = { None = "Not set", RightControl')
 rep('''				if input.KeyCode ~= Enum.KeyCode.Escape then
 					Config[key] = input.KeyCode.Name
