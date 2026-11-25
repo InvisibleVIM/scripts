@@ -1680,8 +1680,12 @@ function PotentUniversal.install(host)
 				pcall(espClear, player)
 			end
 			pcall(function()
-				if appendfile then
-					appendfile("PotentTeleports.txt", ("%s %s place %s marks %d esp %d\n"):format(os.date("!%Y-%m-%d %H:%M:%S"), tostring(state.Name), tostring(game.PlaceId), marksGone, espGone))
+				-- (appendfile refuses a file that does not exist yet.)
+				local line = ("%s %s place %s marks %d esp %d\n"):format(os.date("!%Y-%m-%d %H:%M:%S"), tostring(state.Name), tostring(game.PlaceId), marksGone, espGone)
+				if appendfile and isfile and isfile("PotentTeleports.txt") then
+					appendfile("PotentTeleports.txt", line)
+				else
+					writefile("PotentTeleports.txt", line)
 				end
 			end)
 		end
