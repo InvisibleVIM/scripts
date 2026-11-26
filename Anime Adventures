@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v285", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v286", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -343,6 +343,9 @@ local Config = {
 	VillageForge = false,
 	VillageUpgrade = false,
 	VillageKeepOre = 0,
+	-- v286: my own defences are placed for me; shrines (tougher enemies for Dawn Coins) only on request.
+	VillagePlace = true,
+	VillageShrines = false,
 	-- The Village Shop a won Misty floor ends with (v284): bought with Scarlet Ore, off by default.
 	VillageShop = false,
 	-- v285: a priority list (ids, first = wanted most); only what is on it is bought.
@@ -5390,6 +5393,478 @@ local function placeUnit(entry, focus)
 	return false
 end
 
+-- Placing my own Misty Village defences (v286). USER: "the script should also place defenses.
+-- defenses that buff units should be placed near units. for the bamboo defenses they should be
+-- placed before/after all paths diverge/converge and the spike traps should be placed right
+-- before the bamboo defense... figure out optimal placements for other stuff".
+-- A defence is placed like a unit: spawn_unit(unit_uuid, CFrame), free of charge. The equipped
+-- ones are session.defense_units[slot] = { item_id, g, d (durability), placed, unit_uuid }.
+-- Barricade and spike trap are road units: within PlacementCore.ROAD_DISTANCE (2.5) of the
+-- road's middle line, facing along it. Everything else stands on ground like a ground unit.
+do
+	local Village = AA.Village
+	local ROAD = { swordsmith_barricade = true, swordsmith_spike_trap = true }
+	local SHRINE = { swordsmith_rare_blood_shrine = true, swordsmith_biwa_shrine = true, swordsmith_blue_lily_shrine = true }
+	local CLEAR = 4.3 -- two hitboxes of radius 2 and a little air
+	local SPIKE_BACK = 4.5 -- a spike trap this far up the road from its barricade
+	local function state()
+		local s = Match.defense
+		if not s or s.started ~= Match.startedAt then
+			s = { started = Match.startedAt, fails = {}, bad = {}, at = 0 }
+			Match.defense = s
+		end
+		return s
+	end
+	---The road, lane by lane, in walking order: lanes[lane] = { point, ... } (a point every stud).
+	local function lanes()
+		local points = Match.pathPoints
+		if Match.defLanes and Match.defLanesFor == points and Match.defLanesCount == #points then
+			return Match.defLanes
+		end
+		local list = {}
+		for _, point in ipairs(points) do
+			list[point.lane] = list[point.lane] or {}
+			table.insert(list[point.lane], point)
+		end
+		Match.defLanes, Match.defLanesFor, Match.defLanesCount = list, points, #points
+		return list
+	end
+	---The stretch every enemy walks: on a map with several roads, the points of the first open
+	---road that every other open road also passes (within the road's own half width). One road:
+	---all of it. Returns the points and the index to stay close to: where the roads have just
+	---come together, or, when they start as one, the last point before they split.
+	local function choke()
+		local all = lanes()
+		local live = {}
+		for lane in pairs(all) do
+			if not AA.laneDead(lane) then
+				table.insert(live, lane)
+			end
+		end
+		table.sort(live)
+		local first = all[live[1]]
+		if not first then
+			return {}, 1, live
+		end
+		if #live == 1 then
+			return first, nil, live
+		end
+		local shared, anchor = {}, nil
+		local runStarted, firstRunEnd
+		for index, point in ipairs(first) do
+			local met = {}
+			local count = 0
+			pathWithin(point.position.X, point.position.Z, 2.5, function(other)
+				if other.lane ~= point.lane and not met[other.lane] and table.find(live, other.lane) then
+					met[other.lane] = true
+					count += 1
+				end
+			end)
+			if count >= #live - 1 then
+				table.insert(shared, point)
+				if #shared == 1 then
+					runStarted = index
+				end
+				if runStarted == 1 and not firstRunEnd and index == #shared then
+					anchor = #shared -- still the opening stretch: the split is after this one
+				end
+			elseif runStarted == 1 then
+				firstRunEnd = true
+			end
+		end
+		if runStarted and runStarted > 1 then
+			anchor = 1 -- the roads meet here
+		end
+		if #shared == #first then
+			anchor = nil -- one road in all but name
+		end
+		return shared, anchor, live
+	end
+	local function towerCircles()
+		local list = {}
+		for _, unit in ipairs(myUnits()) do
+			local range = unit._stats:FindFirstChild("range")
+			local id = unit._stats:FindFirstChild("id")
+			local data = id and Units[id.Value]
+			local reach = range and tonumber(range.Value) or (type(data) == "table" and tonumber(data.range)) or 0
+			if reach > 0 then
+				table.insert(list, { position = unit:GetPivot().Position, range = reach })
+			end
+		end
+		return list
+	end
+	local function covered(position, circles)
+		local count = 0
+		for _, circle in ipairs(circles) do
+			local dx, dz = circle.position.X - position.X, circle.position.Z - position.Z
+			if dx * dx + dz * dz <= circle.range * circle.range then
+				count += 1
+			end
+		end
+		return count
+	end
+	---Every defence standing on the field (mine, the other player's, the floor's own).
+	local function standing()
+		local list = {}
+		for _, unit in ipairs(scanField(true).defenses or {}) do
+			local id = unit._stats:FindFirstChild("id")
+			local position = unit:GetPivot().Position
+			if id and position.Y < 1000 then
+				table.insert(list, { id = id.Value, position = position, unit = unit })
+			end
+		end
+		for _, made in ipairs(state().made or {}) do
+			if os.clock() - made.at < 6 then
+				table.insert(list, { id = made.id, position = made.position })
+			end
+		end
+		return list
+	end
+	local function clear(position, taken, gap)
+		for _, other in ipairs(taken) do
+			local dx, dz = other.X - position.X, other.Z - position.Z
+			if dx * dx + dz * dz < gap * gap then
+				return false
+			end
+		end
+		return true
+	end
+	local function flat(a, b)
+		local dx, dz = a.X - b.X, a.Z - b.Z
+		return math.sqrt(dx * dx + dz * dz)
+	end
+	---The road's surface under a path point (the nodes float above it), and which way it runs.
+	local function roadSpot(list, index)
+		local point = list[index]
+		local a, b = list[math.max(index - 1, 1)].position, list[math.min(index + 1, #list)].position
+		local direction = Vector3.new(b.X - a.X, 0, b.Z - a.Z)
+		if direction.Magnitude < 0.01 then
+			return nil
+		end
+		local params = RaycastParams.new()
+		params.FilterType = Enum.RaycastFilterType.Include
+		local road, terrain = workspace:FindFirstChild("_road"), workspace:FindFirstChild("_terrain")
+		params.FilterDescendantsInstances = { road, terrain }
+		local hit = workspace:Raycast(point.position + Vector3.new(0, 30, 0), Vector3.new(0, -90, 0), params)
+		if not hit then
+			return nil
+		end
+		return Vector3.new(point.position.X, hit.Position.Y, point.position.Z), direction.Unit
+	end
+	---Where each of the given defences should go, without placing anything:
+	---{ { slot, id, uuid, position, direction, why }, ... }. `owned` is session.defense_units.
+	function Village.planDefenses(owned, night)
+		local plan = {}
+		if not Match.spots then
+			-- (The spot list is made the first time a unit is placed; a script loaded into a
+			-- match whose units are all down has none yet.)
+			buildSpots()
+		end
+		local circles = towerCircles()
+		local field = standing()
+		local taken = placedUnitPositions()
+		for _, entry in ipairs(field) do
+			table.insert(taken, entry.position)
+		end
+		local bad = state().bad
+		local function usable(id)
+			local info = Village.defenseData and Village.defenseData[id]
+			return not (type(info) == "table" and info.night_only and not night) and (not SHRINE[id] or Config.VillageShrines)
+		end
+		local want = { road = {}, spike = {}, aura = {}, incense = {}, shrine = {} }
+		local slots = {}
+		for slot in pairs(owned) do
+			table.insert(slots, slot)
+		end
+		table.sort(slots, function(a, b)
+			return tostring(a) < tostring(b)
+		end)
+		for _, slot in ipairs(slots) do
+			local d = owned[slot]
+			if type(d) == "table" and not d.placed and (tonumber(d.d) or 0) > 0 and d.unit_uuid and usable(d.item_id) and (state().fails[d.unit_uuid] or 0) < 3 then
+				local row = { slot = slot, id = d.item_id, uuid = d.unit_uuid }
+				if d.item_id == "swordsmith_barricade" then
+					table.insert(want.road, row)
+				elseif d.item_id == "swordsmith_spike_trap" then
+					table.insert(want.spike, row)
+				elseif d.item_id == "swordsmith_wisteria_incense" then
+					table.insert(want.incense, row)
+				elseif SHRINE[d.item_id] then
+					table.insert(want.shrine, row)
+				else
+					table.insert(want.aura, row)
+				end
+			end
+		end
+		local function add(row, position, direction, why)
+			row.position, row.direction, row.why = position, direction, why
+			table.insert(plan, row)
+			table.insert(taken, position)
+			table.insert(field, { id = row.id, position = position })
+		end
+		-- 1. Barricades: on the stretch every enemy walks, where the most of my towers reach
+		-- the ground just up the road from it (that is where a knocked-back enemy stands), and
+		-- among equals the shared point nearest my towers. Ten studs apart, so a spike trap fits between two.
+		local stretch = choke()
+		-- Between equals, the shared point nearest my towers: on a map whose roads split and
+		-- join, that is the end of a shared stretch, right before a split or right after a join.
+		local middle
+		for _, circle in ipairs(circles) do
+			middle = (middle or Vector3.zero) + circle.position / #circles
+		end
+		local function roadScore(index)
+			local up = stretch[math.max(index - 4, 1)].position
+			return covered(up, circles) * 2 + covered(stretch[index].position, circles)
+		end
+		if #stretch > 30 and (#want.road > 0 or #want.spike > 0) then
+			for _, row in ipairs(want.road) do
+				local best, bestScore, bestSpot, bestDirection
+				for index = 14, #stretch - 8 do
+					local point = stretch[index]
+					if not bad[spotKey(point.position)] and clear(point.position, taken, CLEAR) then
+						local near = false
+						for _, entry in ipairs(field) do
+							if entry.id == "swordsmith_barricade" and flat(entry.position, point.position) < 10 then
+								near = true
+							end
+						end
+						if not near then
+							local score = roadScore(index) * 1000 - (middle and flat(middle, point.position) or index)
+							if not bestScore or score > bestScore then
+								local position, direction = roadSpot(stretch, index)
+								if position then
+									best, bestScore, bestSpot, bestDirection = index, score, position, direction
+								end
+							end
+						end
+					end
+				end
+				if best then
+					add(row, bestSpot, bestDirection, string.format("barricade at %d%% of the shared road, %d towers reach the ground before it", math.floor(stretch[best].progress * 100), covered(stretch[math.max(best - 4, 1)].position, circles)))
+				end
+			end
+			-- 2. Spike traps: right before a barricade (mine, another player's or the floor's)
+			-- that has none yet; spare ones where the most towers reach.
+			local all = lanes()
+			for _, row in ipairs(want.spike) do
+				local placedIt = false
+				-- My own barricades first, the floor's own after them.
+				local order = {}
+				for _, entry in ipairs(field) do
+					table.insert(order, (entry.unit and entry.unit:GetAttribute("_preset_defense")) and #order + 1 or 1, entry)
+				end
+				for _, entry in ipairs(order) do
+					if entry.id == "swordsmith_barricade" and not placedIt then
+						-- The road point of this barricade, on whichever road it stands.
+						local bestLane, bestIndex, bestGap
+						for lane, list in pairs(all) do
+							for index, point in ipairs(list) do
+								local gap = flat(point.position, entry.position)
+								if not bestGap or gap < bestGap then
+									bestLane, bestIndex, bestGap = lane, index, gap
+								end
+							end
+						end
+						-- Has it a spike trap on the ground before it already? (One after it
+						-- belongs to the next barricade down the road.)
+						local hasSpike = bestGap == nil or bestGap >= 3
+						if not hasSpike then
+							for back = 3, 8 do
+								local before = all[bestLane][bestIndex - back]
+								for _, other in ipairs(field) do
+									if before and other.id == "swordsmith_spike_trap" and flat(other.position, before.position) < 1.6 then
+										hasSpike = true
+									end
+								end
+							end
+						end
+						if not hasSpike then
+							do
+								local list = all[bestLane]
+								for back = math.floor(SPIKE_BACK + 0.5), math.floor(SPIKE_BACK + 0.5) + 2 do
+									local index = bestIndex - back
+									if index >= 1 and not placedIt and not bad[spotKey(list[index].position)] and clear(list[index].position, taken, CLEAR) then
+										local position, direction = roadSpot(list, index)
+										if position then
+											add(row, position, direction, "spike trap before a barricade")
+											placedIt = true
+										end
+									end
+								end
+							end
+						end
+					end
+				end
+				if not placedIt then
+					local bestScore, bestSpot, bestDirection
+					for index = 14, #stretch - 8 do
+						local point = stretch[index]
+						if not bad[spotKey(point.position)] and clear(point.position, taken, CLEAR) then
+							-- Spare ones queue up by the barricades.
+							local away
+							for _, entry in ipairs(field) do
+								if entry.id == "swordsmith_barricade" then
+									away = math.min(away or math.huge, flat(entry.position, point.position))
+								end
+							end
+							local score = covered(point.position, circles) * 1000 - (away or (middle and flat(middle, point.position)) or index)
+							if not bestScore or score > bestScore then
+								local position, direction = roadSpot(stretch, index)
+								if position then
+									bestScore, bestSpot, bestDirection = score, position, direction
+								end
+							end
+						end
+					end
+					if bestSpot then
+						add(row, bestSpot, bestDirection, "spare spike trap where the towers reach")
+					end
+				end
+			end
+		end
+		local ground = Match.spots and Match.spots.ground or {}
+		local function groundPick(score, minGap, maxGap)
+			local bestScore, bestSpot
+			for _, spot in ipairs(ground) do
+				if not spot.road and spot.gap >= minGap and spot.gap <= maxGap and not bad[spotKey(spot.position)] and not Match.badSpots[spotKey(spot.position)] then
+					local value = score(spot)
+					if value and (not bestScore or value > bestScore) and clear(spot.position, taken, CLEAR) then
+						bestScore, bestSpot = value, spot
+					end
+				end
+			end
+			return bestSpot, bestScore
+		end
+		-- 3. Auras (whetstone, war drum, watchtower, sun lamp, ore cart): the ground spot whose
+		-- circle holds the most of my towers. Kept back from the kerb (5+ studs when that costs
+		-- no tower) so the road-side spots stay free for units.
+		if #circles > 0 then
+			for _, row in ipairs(want.aura) do
+				local data = Units[row.id]
+				local reach = type(data) == "table" and tonumber(data.range) or 24
+				local spot, value = groundPick(function(spot)
+					local inside = 0
+					for _, circle in ipairs(circles) do
+						if flat(circle.position, spot.position) <= reach - 1 then
+							inside += 1
+						end
+					end
+					if inside == 0 then
+						return nil
+					end
+					return inside * 100 + math.min(spot.gap, 8)
+				end, 3, 36)
+				if spot then
+					add(row, spot.position, nil, string.format("%s around %d of %d towers", tostring(type(data) == "table" and data.name or row.id), math.floor(value / 100), #circles))
+				end
+			end
+		end
+		-- 4. Wisteria Incense (hurts enemies inside 12 studs): beside the road, on the ground
+		-- before a barricade when there is one (enemies are held there), else over the most road
+		-- that my towers also reach.
+		for _, row in ipairs(want.incense) do
+			local data = Units[row.id]
+			local reach = (type(data) == "table" and tonumber(data.range) or 12) - 1
+			local spot = groundPick(function(spot)
+				local value = 0
+				pathWithin(spot.position.X, spot.position.Z, reach, function(point)
+					value += 1 + covered(point.position, circles)
+				end)
+				for _, entry in ipairs(field) do
+					if entry.id == "swordsmith_barricade" and flat(entry.position, spot.position) <= reach - 3 then
+						value += 400
+					end
+				end
+				return value > 0 and value or nil
+			end, 2.5, 9)
+			if spot then
+				add(row, spot.position, nil, "incense over the road")
+			end
+		end
+		-- 5. Shrines (night stages; enemies inside get tougher and each one killed there pays
+		-- Dawn Coins): over the road my towers cover best, so the kills happen inside. Only
+		-- with their own switch on.
+		if #circles > 0 then
+			for _, row in ipairs(want.shrine) do
+				local data = Units[row.id]
+				local reach = (type(data) == "table" and tonumber(data.range) or 21) - 1
+				local spot = groundPick(function(spot)
+					local value = 0
+					pathWithin(spot.position.X, spot.position.Z, reach, function(point)
+						value += covered(point.position, circles)
+					end)
+					return value > 0 and value or nil
+				end, 4, 14)
+				if spot then
+					add(row, spot.position, nil, "shrine over the kill zone")
+				end
+			end
+		end
+		return plan
+	end
+	---One defence a call, at most one a second. True while there was something to do.
+	function Village.placeDefenses()
+		local s = state()
+		if os.clock() - s.at < 1 then
+			return false
+		end
+		local live = session()
+		local owned = live and rawget(live, "defense_units")
+		if type(owned) ~= "table" or next(owned) == nil then
+			return false
+		end
+		s.at = os.clock()
+		if Village.defenseData == nil then
+			Village.defenseData = gameRequire(replicatedStorage.src.Data.Defenses) or false
+		end
+		-- Wait for the first towers: every placement is judged by what they reach. (The ore
+		-- cart makes units in its circle cheaper to place, so nothing waits long.)
+		local towers = #myUnits()
+		if towers < 1 or (towers < 3 and currentWave() < 3) then
+			return false
+		end
+		local level = AA.readLevelData and select(2, pcall(AA.readLevelData))
+		local night = type(level) == "table" and (level._night == true or level.__testing_defenses == true)
+		local plan = Village.planDefenses(owned, night)
+		local row = plan[1]
+		if not row then
+			return false
+		end
+		local function count()
+			local d = owned[row.slot]
+			if type(d) == "table" and d.placed then
+				return true
+			end
+			for _, unit in ipairs(scanField(true).defenses or {}) do
+				local uuid = unit._stats:FindFirstChild("uuid")
+				if uuid and uuid.Value == row.uuid then
+					return true
+				end
+			end
+			return false
+		end
+		local cf = row.direction and CFrame.lookAt(row.position, row.position + row.direction) or CFrame.new(row.position)
+		AA.lastMessage = nil
+		invoke("spawn_unit", row.uuid, cf)
+		s.made = s.made or {}
+		table.insert(s.made, { id = row.id, position = row.position, at = os.clock() })
+		local deadline = os.clock() + 1.5
+		while os.clock() < deadline and not count() do
+			task.wait(0.1)
+			owned = rawget(session() or {}, "defense_units") or owned
+		end
+		local ok = count()
+		note(ok and "defense" or "defensefail", { id = row.id, x = math.floor(row.position.X), z = math.floor(row.position.Z), why = row.why, msg = not ok and AA.lastMessage or nil })
+		pcall(AA.appendLog, ACCOUNT_FOLDER .. "/village.txt", os.date("%m-%d %H:%M:%S ") .. "place: " .. tostring(row.id) .. " " .. (ok and "placed" or ("refused (" .. tostring(AA.lastMessage) .. ")")) .. ", " .. tostring(row.why) .. "\n")
+		if not ok then
+			s.fails[row.uuid] = (s.fails[row.uuid] or 0) + 1
+			s.bad[spotKey(row.position)] = true
+			table.remove(s.made)
+		end
+		return true
+	end
+end
+
 local function upgradeUnit(unit)
 	local level = unit._stats.upgrade.Value
 	invoke("upgrade_unit_ingame", unit)
@@ -7305,6 +7780,15 @@ local function matchStep()
 			table.remove(log, 1)
 		end
 		Match.incomeRecent = (#log > 1 and now - log[1].t >= 30) and ((Match.earned or 0) - log[1].earned) / (now - log[1].t) or nil
+	end
+	if Config.VillagePlace and Config.AutoPlace and AA.Village.placeDefenses then
+		local okDefense, busy = pcall(AA.Village.placeDefenses)
+		if okDefense and busy then
+			status = "Placing a defence"
+			return
+		elseif not okDefense then
+			AA.errors.defenses = tostring(busy)
+		end
 	end
 	local action, money = planAction()
 	if not action then
@@ -22094,6 +22578,10 @@ do
 				toggle(page, "Upgrade the forge and the smith", "VillageUpgrade", "Spends Scarlet Ore on the cheaper next level first: a faster forge, better sword grades.")
 				only({ "Misty Village", "Misty Tower" })
 				slider(page, "Scarlet Ore to keep", "VillageKeepOre", 0, 2000, 10, number, "The forge and the upgrades never take your ore below this (defences are repaired and bought with ore).")
+				only({ "Misty Village", "Misty Tower" })
+				toggle(page, "Place my defences", "VillagePlace", "Places the defences you have equipped, free of charge, once your first units are down.\n\nBamboo Barricade: on the stretch of road every enemy walks, where your units reach the ground just before it.\nSpike Trap: right before a barricade.\nWhetstone, War Drum, Watchtower, Sun Lamp, Ore Cart: where their circle holds the most of your units.\nWisteria Incense: beside the road before a barricade.\n\nBroken ones are skipped. Needs Place units on.")
+				only({ "Misty Village", "Misty Tower" })
+				toggle(page, "Place shrines too", "VillageShrines", "Night stages only. A shrine makes the enemies in its circle tougher (more health, speed or healing) and pays Dawn Coins for each one killed there. Off: your shrines stay in the bag.")
 				only({ "Misty Village", "Misty Tower" })
 				toggle(page, "Buy defences from the Village Shop", "VillageShop", "The shop that opens when you win a floor: up to three defences for Scarlet Ore, and only ones your ore can pay for. Buys what is on the list below and nothing else, top of the list first, and stops at 20 held. Ore in the forge is not ore in your pocket: with Put Scarlet Ore in the forge on, the shop has nothing to offer after a visit to the lobby.")
 				only({ "Misty Village", "Misty Tower" })
