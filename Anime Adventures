@@ -38,7 +38,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v283", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v284", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -343,6 +343,9 @@ local Config = {
 	VillageForge = false,
 	VillageUpgrade = false,
 	VillageKeepOre = 0,
+	-- The Village Shop a won Misty floor ends with (v284): bought with Scarlet Ore, off by default.
+	VillageShop = false,
+	VillageShopSkip = "[]",
 	-- Misty Tower: 0 climbs (the next floor not cleared yet); a number plays that floor.
 	TowerFloor = 0,
 	MatchVillage = false,
@@ -2102,6 +2105,109 @@ do
 			end
 		end
 	end
+	---Every defence the Village Shop can sell, dearest first: { id, name, note (price), price }.
+	function Village.defenses()
+		if Village.defenseList then
+			return Village.defenseList
+		end
+		local list = {}
+		local items = gameRequire(replicatedStorage.src.Data.Items)
+		local prices = type(Core.Settings.DEFENSE_PRICES) == "table" and Core.Settings.DEFENSE_PRICES or {}
+		for id, info in pairs(type(items) == "table" and items or {}) do
+			if type(info) == "table" and info.item_group == "Defenses" then
+				local price = tonumber(prices[info.rarity]) or 0
+				table.insert(list, { id = id, name = tostring(info.name or id), price = price, note = tostring(price) })
+			end
+		end
+		table.sort(list, function(a, b)
+			if a.price ~= b.price then
+				return a.price > b.price
+			end
+			return a.name < b.name
+		end)
+		if #list > 0 then
+			Village.defenseList = list
+		end
+		return list
+	end
+	function Village.shopSkip()
+		if Village.skipText ~= Config.VillageShopSkip then
+			local set = {}
+			local ok, list = pcall(function()
+				return httpService:JSONDecode(Config.VillageShopSkip)
+			end)
+			for _, id in ipairs(ok and type(list) == "table" and list or {}) do
+				set[tostring(id)] = true
+			end
+			Village.skipText, Village.skipSet = Config.VillageShopSkip, set
+		end
+		return Village.skipSet
+	end
+	---How many defences are held (the game stops at MAX_DEFENSE_SLOTS and then asks which one
+	---the new one replaces, a choice left to the user).
+	function Village.held()
+		local count = 0
+		local items = Village.defenseData == nil and gameRequire(replicatedStorage.src.Data.Defenses) or Village.defenseData
+		local unique = (profile().inventory or {}).unique_items
+		for _, item in pairs(type(unique) == "table" and unique or {}) do
+			if type(item) == "table" and type(items) == "table" and items[item.item_id] then
+				count += 1
+			end
+		end
+		return count
+	end
+	---The shop that opens when a floor is won offers up to three defences, only ones the ore
+	---carried can pay for. Buys the ticked ones, dearest first: request_buy_village_shop(index,
+	---item_id). The window itself is left open for the user (closing it throws the offers away).
+	function Village.shop(offers)
+		if not Config.VillageShop or Village.shopping or type(offers) ~= "table" then
+			return
+		end
+		Village.shopping = true
+		local function log(text)
+			pcall(AA.appendLog, ACCOUNT_FOLDER .. "/village.txt", os.date("%m-%d %H:%M:%S ") .. "shop: " .. text .. "\n")
+		end
+		local ok, problem = pcall(function()
+			local cap = setting("MAX_DEFENSE_SLOTS", 20)
+			local tried = {}
+			for _ = 1, 3 do
+				local list = Village.last and Village.last.village_shop_changed and Village.last.village_shop_changed[1] or offers
+				if type(list) ~= "table" or not Config.VillageShop then
+					break
+				end
+				local skip = Village.shopSkip()
+				local best, bestIndex
+				for index, offer in pairs(list) do
+					local price = type(offer) == "table" and tonumber(offer.price)
+					if price and not skip[tostring(offer.item_id)] and not tried[tostring(index) .. tostring(offer.item_id)] and price <= Village.ore() and (not best or price > best.price) then
+						best, bestIndex = offer, index
+					end
+				end
+				if not best then
+					break
+				end
+				if Village.held() >= cap then
+					log("holding " .. cap .. " defences already, nothing bought")
+					break
+				end
+				tried[tostring(bestIndex) .. tostring(best.item_id)] = true
+				local before, stamp = Village.ore(), Village.last and Village.last.village_shop_changed
+				local okBuy, answer = invoke("request_buy_village_shop", bestIndex, best.item_id)
+				-- The server sends the offers again after a buy; wait for that or for the ore to drop.
+				local waited = 0
+				while waited < 2 and Village.ore() == before and (Village.last and Village.last.village_shop_changed) == stamp do
+					waited += task.wait(0.1)
+				end
+				local paid = before - Village.ore()
+				note("villageShop", { item = best.item_id, price = best.price, paid = paid, ok = okBuy and paid > 0 })
+				log(string.format("%s for %d ore -> %s", tostring(best.item_id), best.price, paid > 0 and ("bought, " .. Village.ore() .. " ore left") or ("not bought (" .. tostring(answer) .. ")")))
+			end
+		end)
+		if not ok then
+			log("failed: " .. tostring(problem))
+		end
+		Village.shopping = false
+	end
 	-- What the server says about defences and the in-match Village Shop, kept in
 	-- accounts/<id>/village.txt (the first matches are how their shapes were learned).
 	do
@@ -2123,6 +2229,9 @@ do
 						end
 						AA.appendLog(ACCOUNT_FOLDER .. "/village.txt", os.date("%m-%d %H:%M:%S ") .. name .. " " .. table.concat(parts, " | "):sub(1, 1500) .. "\n")
 					end)
+					if name == "village_shop_changed" and type(args[1]) == "table" then
+						task.spawn(Village.shop, args[1])
+					end
 				end))
 			end
 		end
@@ -21969,6 +22078,31 @@ do
 				toggle(page, "Upgrade the forge and the smith", "VillageUpgrade", "Spends Scarlet Ore on the cheaper next level first: a faster forge, better sword grades.")
 				only({ "Misty Village", "Misty Tower" })
 				slider(page, "Scarlet Ore to keep", "VillageKeepOre", 0, 2000, 10, number, "The forge and the upgrades never take your ore below this (defences are repaired and bought with ore).")
+				only({ "Misty Village", "Misty Tower" })
+				toggle(page, "Buy defences from the Village Shop", "VillageShop", "The shop that opens when you win a floor: up to three defences for Scarlet Ore, and only ones your ore can pay for. Buys the ticked ones, dearest first, and stops at 20 held. Ore in the forge is not ore in your pocket: with Put Scarlet Ore in the forge on, the shop has nothing to offer after a visit to the lobby.")
+				only({ "Misty Village", "Misty Tower" })
+				only({ "Misty Village", "Misty Tower" }, UI.subhead(page, "Defences to buy", "The number is the price in Scarlet Ore. Untick one and it is never bought.").Parent)
+				local _, shopGrid = UI.chips(page, {
+					perRow = 2,
+					get = function()
+						return AA.Village.defenses()
+					end,
+					isOn = function(id)
+						return AA.Village.shopSkip()[id] ~= true
+					end,
+					toggle = function(id)
+						local set = table.clone(AA.Village.shopSkip())
+						set[id] = not set[id] or nil
+						local list = {}
+						for _, entry in ipairs(AA.Village.defenses()) do
+							if set[entry.id] then
+								table.insert(list, entry.id)
+							end
+						end
+						Config.VillageShopSkip = httpService:JSONEncode(list)
+					end,
+				})
+				only({ "Misty Village", "Misty Tower" }, shopGrid)
 				only({ "Misty Village", "Misty Tower" })
 				local villageLine = UI.note(page, "")
 				only({ "Misty Village", "Misty Tower" }, villageLine)
