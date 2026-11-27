@@ -1638,14 +1638,18 @@
 	-- lane, model.Lanes.A<playernum>; the black line is 238 rope pieces on its AtchPart
 	-- (Line1..LineN, Attachment0 -> Attachment1, half a stud each along +Z, weaving up to five
 	-- studs either side of the lane's middle for about 120 studs). The game carries you
-	-- forward, so this only steers sideways: it reads where the line is a moment ahead of you
-	-- (as far as you are carried in a tenth of a second) and walks sideways toward it, gently
-	-- when close so it does not wobble across. The log gets the speeds and how far off it was.
+	-- forward, and sideways you follow the mouse (USER: "my character moves forward by the game
+	-- and left and right by my mouse"; walking does nothing there, WalkSpeed is 0: em-20
+	-- "steered" by walking and never moved you). So this moves the real mouse pointer onto the
+	-- line a moment ahead of you, and leans it a little further over while you are still off
+	-- the line, which corrects for however the game turns the pointer into a position. Only
+	-- while the Roblox window is in front. The log gets how far off the line it was.
 	EM.handlers["Drawing the Line"] = function(round)
 		local model = round.model
 		local points, count = {}, -1
 		local samples, off, worst = 0, 0, 0
 		local lastPos, lastTime, carried, walk = nil, nil, 0, 0
+		local lean, offset = 0, Vector2.zero
 		local function build()
 			local lanes = model:FindFirstChild("Lanes")
 			local lane = lanes and lanes:FindFirstChild("A" .. tostring(mine("playernum", 0)))
@@ -1721,19 +1725,35 @@
 					off += here
 					worst = math.max(worst, here)
 				end
-				if not Move.yours() then
-					local wanted = lineX(z + math.max(carried, 0) * 0.1) - part.Position.X
-					-- Full sideways speed until it is within a tenth of a second's walk, then
-					-- in proportion, so it settles on the line.
-					local reach = math.max(human.WalkSpeed, 1) * 0.1
-					Move.steer(Vector3.new(math.clamp(wanted / reach, -1, 1), 0, 0))
+				local camera = workspace.CurrentCamera
+				if camera and mousemoveabs and (not isrbxactive or isrbxactive()) and z >= points[1].Z - 3 and z <= points[#points].Z then
+					-- Where the line is a moment ahead, plus a lean that grows while you sit to
+					-- one side of the line and fades when you are on it.
+					local ahead = z + math.max(carried, 0) * 0.15
+					local miss = lineX(z) - part.Position.X
+					lean = math.clamp(lean * 0.9 + miss * 0.25, -6, 6)
+					local aim = Vector3.new(lineX(ahead) + lean, points[1].Y, ahead + 4)
+					local point, onScreen = camera:WorldToViewportPoint(aim)
+					if onScreen then
+						local want = Vector2.new(point.X, point.Y)
+						mousemoveabs(want.X + offset.X, want.Y + offset.Y)
+						runService.Heartbeat:Wait()
+						-- (Where the pointer really ended up tells how this executor counts the top bar.)
+						local got = userInputService:GetMouseLocation()
+						local slip = want - got
+						if slip.Magnitude > 2 and slip.Magnitude < 120 then
+							offset += slip
+						end
+					end
+					round.detail = ("on the line to within %.1f studs"):format(math.abs(miss))
+				elseif isrbxactive and not isrbxactive() then
+					round.detail = "click the Roblox window: the mouse is only moved while it is in front"
 				end
 			end
 			runService.Heartbeat:Wait()
 		end
-		Move.steer(nil)
 		if samples > 0 then
-			log(("Drawing the Line: walk speed %d, carried forward at %.1f studs/s, on average %.2f studs off the line, at worst %.1f"):format(walk, carried, off / samples, worst))
+			log(("Drawing the Line: carried forward at %.1f studs/s, on average %.2f studs off the line, at worst %.1f"):format(carried, off / samples, worst))
 		end
 	end
 
