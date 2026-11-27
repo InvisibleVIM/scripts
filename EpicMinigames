@@ -15,7 +15,7 @@ if not shared then
 end
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local BeyRivals = { connections = {}, toggleRefreshers = {}, segmentRefreshers = {}, VERSION = "em-16", alive = true }
+local BeyRivals = { connections = {}, toggleRefreshers = {}, segmentRefreshers = {}, VERSION = "em-17", alive = true }
 if shared.EpicMinigames then
 	pcall(shared.EpicMinigames.detach)
 end
@@ -2305,7 +2305,7 @@ for key, value in pairs(PotentUniversal.DEFAULTS) do
 	Config[key] = value
 end
 -- Epic Minigames settings.
-for key, value in pairs({ EmAuto = true, EmRace = true, EmSurvive = true, EmSpecial = true, EmJoin = true, EmRecord = true, EmDaily = true, EmPlaytime = true }) do
+for key, value in pairs({ EmAuto = true, EmRace = true, EmSurvive = true, EmSpecial = true, EmJoin = true, EmRecord = true, EmDaily = true, EmPlaytime = true, EmFistReach = 10 }) do
 	Config[key] = value
 end
 Config.AntiAfk = false
@@ -6813,6 +6813,50 @@ local create, statusLabel, panel, nextOrder, makePage, rowBase, rowLabel, headin
 		log(("Timestamp Trace: %d rounds timed"):format(goes))
 	end
 
+	-- Backstreet Brawl. USER: "increase my hitting range for the fist in brawls". The fist is a
+	-- tool called Punch: a server SwordScript and a Handle that hits whatever it touches. A
+	-- touch is reported by the client that owns the part, so a player inside the chosen reach
+	-- (Config.EmFistReach studs, 0 = off) is reported as touched by the Handle with
+	-- firetouchinterest. You still walk, aim and click yourself; only the reach is longer.
+	-- Nothing here hides from the game's own checks: if the server measures the distance
+	-- itself, the far touches simply do nothing (the log line says how many landed).
+	EM.handlers["Backstreet Brawl"] = function(round)
+		local touches, landed = 0, 0
+		local watch = {}
+		while round.live() do
+			local reach = tonumber(Config.EmFistReach) or 0
+			local model, part = character(), root()
+			local punch = model and model:FindFirstChild("Punch")
+			local handle = punch and punch:FindFirstChild("Handle")
+			if reach > 0 and handle and part and firetouchinterest then
+				for _, player in ipairs(playersService:GetPlayers()) do
+					local theirs = player.Character
+					local torso = theirs and (theirs:FindFirstChild("HumanoidRootPart") or theirs:FindFirstChild("Torso"))
+					local human = theirs and theirs:FindFirstChildOfClass("Humanoid")
+					local inround = player:FindFirstChild("inround")
+					if player ~= localPlayer and torso and human and human.Health > 0 and inround and inround.Value then
+						local gap = (torso.Position - part.Position).Magnitude
+						if gap <= reach then
+							pcall(firetouchinterest, handle, torso, 0)
+							pcall(firetouchinterest, handle, torso, 1)
+							touches += 1
+							-- Did a touch from beyond arm's length take health off them?
+							local seen = watch[human]
+							if seen and gap > 5 and human.Health < seen - 0.5 then
+								landed += 1
+							end
+							watch[human] = human.Health
+						else
+							watch[human] = nil
+						end
+					end
+				end
+			end
+			task.wait(0.1)
+		end
+		log(("Backstreet Brawl: reach %d studs, %d touches sent, %d times someone beyond arm's length lost health"):format(tonumber(Config.EmFistReach) or 0, touches, landed))
+	end
+
 	-- Hurdle Hurry. You are carried down your lane on your own (walk speed is 0, about 18 studs a
 	-- second) and the only thing to do is jump. Each lane (`Lanes.L<n>`) holds its hurdles in
 	-- `Hurdles`; the bar is the 7-wide part and its top is level with your waist. A jump at the
@@ -7101,6 +7145,9 @@ end)()
 		hint(page, "The main switch. Off: you play everything and it only records and collects rewards.")
 		toggle(page, "Minigames with their own handler", "EmSpecial")
 		hint(page, "Uses a handler written for that minigame when there is one. So far: Paint to Perfection (clicks your easel until it matches the board) Balloon Platoon (shoots the balloon of the called colour) Accurate Archery (shoots the targets, golden ones first) Eagle Observation (counts every eagle) Cannon Cooldown (steps on your team's pads until they are green) Timestamp Trace (stops your timer on the big clock's time) Hurdle Hurry (jumps each hurdle in your lane) Cake Delivery (walks your cake to the door with its number), Block Hunt (marks the other team's blocks through walls and walks to them; hiding is yours) Fishing Frenzy (moves your mouse onto the next fish and away from sharks) The Sweeper (jumps the bar each time it comes round) Just Jump (jumps the rope each turn) and Toxic Reactions (walks to the platform whose colour the sign shows). More are added from the recordings below.")
+		UI.slider(page, "Fist reach in brawls", "EmFistReach", 0, 20, 1, function(v)
+			return v == 0 and "Off" or (tostring(v) .. " studs")
+		end, "Backstreet Brawl: your punch counts on anyone this close, not only those you touch. You still click to punch. 0 leaves the fist as the game made it.")
 		heading(page, "Left to you", "left")
 		UI.note(page, "Every minigame without a handler of its own. Nothing follows other players any more.")
 		heading(page, "Rounds", "right")

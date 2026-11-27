@@ -1516,6 +1516,50 @@
 		log(("Timestamp Trace: %d rounds timed"):format(goes))
 	end
 
+	-- Backstreet Brawl. USER: "increase my hitting range for the fist in brawls". The fist is a
+	-- tool called Punch: a server SwordScript and a Handle that hits whatever it touches. A
+	-- touch is reported by the client that owns the part, so a player inside the chosen reach
+	-- (Config.EmFistReach studs, 0 = off) is reported as touched by the Handle with
+	-- firetouchinterest. You still walk, aim and click yourself; only the reach is longer.
+	-- Nothing here hides from the game's own checks: if the server measures the distance
+	-- itself, the far touches simply do nothing (the log line says how many landed).
+	EM.handlers["Backstreet Brawl"] = function(round)
+		local touches, landed = 0, 0
+		local watch = {}
+		while round.live() do
+			local reach = tonumber(Config.EmFistReach) or 0
+			local model, part = character(), root()
+			local punch = model and model:FindFirstChild("Punch")
+			local handle = punch and punch:FindFirstChild("Handle")
+			if reach > 0 and handle and part and firetouchinterest then
+				for _, player in ipairs(playersService:GetPlayers()) do
+					local theirs = player.Character
+					local torso = theirs and (theirs:FindFirstChild("HumanoidRootPart") or theirs:FindFirstChild("Torso"))
+					local human = theirs and theirs:FindFirstChildOfClass("Humanoid")
+					local inround = player:FindFirstChild("inround")
+					if player ~= localPlayer and torso and human and human.Health > 0 and inround and inround.Value then
+						local gap = (torso.Position - part.Position).Magnitude
+						if gap <= reach then
+							pcall(firetouchinterest, handle, torso, 0)
+							pcall(firetouchinterest, handle, torso, 1)
+							touches += 1
+							-- Did a touch from beyond arm's length take health off them?
+							local seen = watch[human]
+							if seen and gap > 5 and human.Health < seen - 0.5 then
+								landed += 1
+							end
+							watch[human] = human.Health
+						else
+							watch[human] = nil
+						end
+					end
+				end
+			end
+			task.wait(0.1)
+		end
+		log(("Backstreet Brawl: reach %d studs, %d touches sent, %d times someone beyond arm's length lost health"):format(tonumber(Config.EmFistReach) or 0, touches, landed))
+	end
+
 	-- Hurdle Hurry. You are carried down your lane on your own (walk speed is 0, about 18 studs a
 	-- second) and the only thing to do is jump. Each lane (`Lanes.L<n>`) holds its hurdles in
 	-- `Hurdles`; the bar is the 7-wide part and its top is level with your waist. A jump at the
