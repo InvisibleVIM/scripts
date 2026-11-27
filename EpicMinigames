@@ -15,7 +15,7 @@ if not shared then
 end
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local BeyRivals = { connections = {}, toggleRefreshers = {}, segmentRefreshers = {}, VERSION = "em-28", alive = true }
+local BeyRivals = { connections = {}, toggleRefreshers = {}, segmentRefreshers = {}, VERSION = "em-29", alive = true }
 if shared.EpicMinigames then
 	pcall(shared.EpicMinigames.detach)
 end
@@ -6742,7 +6742,30 @@ local create, statusLabel, panel, nextOrder, makePage, rowBase, rowLabel, headin
 			local flight = 2 / math.max(speed, 0.001) / 60
 			task.wait(math.clamp(flight * 0.4, 0.25, 1.5))
 			if round.live() and bridge.Parent then
-				bridge:FireServer()
+				-- Count it the way Space does, through the game's own key listener, so the
+				-- counter on the screen and the camera flash happen too. (em-13 only sent the
+				-- count: it saw 24 of 24 eagles and sent 24, but the number on the screen never
+				-- moved, so it looked broken and any Space pressed on top made the total wrong.)
+				local done = false
+				if getconnections and debug and debug.getconstants then
+					for _, connection in ipairs(getconnections(userInputService.InputBegan)) do
+						local fn = connection.Function
+						local ok, constants = pcall(debug.getconstants, fn)
+						if ok and type(constants) == "table" and table.find(constants, "Space") and table.find(constants, "ButtonA") and table.find(constants, "FireServer") then
+							task.spawn(fn, { KeyCode = Enum.KeyCode.Space, UserInputType = Enum.UserInputType.Keyboard, UserInputState = Enum.UserInputState.Begin }, false)
+							done = true
+							break
+						end
+					end
+				end
+				if not done then
+					bridge:FireServer()
+					local counter = model:FindFirstChild("Counter")
+					local label = counter and counter:FindFirstChild("Count", true)
+					if label and tonumber(label.Text) then
+						label.Text = tostring(tonumber(label.Text) + 1)
+					end
+				end
 				counted += 1
 			end
 		end)
@@ -6750,7 +6773,8 @@ local create, statusLabel, panel, nextOrder, makePage, rowBase, rowLabel, headin
 			task.wait(0.2)
 		end
 		connection:Disconnect()
-		log(("Eagle Observation: %d eagles seen, %d counted, %d other animals let pass"):format(eagles, counted, others))
+		local shown = model:FindFirstChild("Counter") and model.Counter:FindFirstChild("Count", true)
+		log(("Eagle Observation: %d eagles seen, %d counted, %d other animals let pass, the screen's counter says %s (more than counted means Space was pressed too)"):format(eagles, counted, others, tostring(shown and shown.Text)))
 	end
 
 	-- Cannon Cooldown (team). USER: "this one you have to step on the pads and turn them
