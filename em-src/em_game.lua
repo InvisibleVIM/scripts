@@ -1399,6 +1399,73 @@
 		log(("Eagle Observation: %d eagles seen, %d counted, %d other animals let pass"):format(eagles, counted, others))
 	end
 
+	-- Cannon Cooldown (team). USER: "this one you have to step on the pads and turn them
+	-- green". Your side's pads are the models in tbpads (blue) or trpads (red), each with a
+	-- `pad` part you stand on; bpads / rpads count the ones still to do. Walks to the nearest
+	-- pad that is not green yet, stands on it until it turns, then the next. A pad that will
+	-- not turn in a second and a half is left for six seconds (someone else's, or a dud).
+	EM.handlers["Cannon Cooldown"] = function(round)
+		local model = round.model
+		local stepped, target, since, noted = 0, nil, 0, false
+		local skip = {}
+		local function green(part)
+			local c = part.Color
+			return c.G > 0.45 and c.G > c.R * 1.25 and c.G > c.B * 1.25
+		end
+		while round.live() do
+			local part = root()
+			local blue = mine("team", "") == "blue"
+			local folder = model:FindFirstChild(blue and "tbpads" or "trpads")
+			if part and folder then
+				if target and (not target.Parent or green(target)) then
+					if target.Parent then
+						stepped += 1
+						if not noted and target ~= nil then
+							noted = true
+							log(("Cannon Cooldown: a pad turns %s when stepped on (it was %s)"):format(tostring(target.BrickColor), tostring(round.padBefore)))
+						end
+					end
+					target = nil
+				end
+				if target and os.clock() - since > 1.5 and flat(target.Position - part.Position).Magnitude < 1.5 then
+					skip[target] = os.clock()
+					target = nil
+				end
+				if not target then
+					local best
+					for _, holder in ipairs(folder:GetChildren()) do
+						local pad = holder:FindFirstChild("pad")
+						if pad and pad:IsA("BasePart") and not green(pad) and os.clock() - (skip[pad] or 0) > 6 then
+							local gap = flat(pad.Position - part.Position).Magnitude
+							if not best or gap < best then
+								best, target = gap, pad
+							end
+						end
+					end
+					if target then
+						since = os.clock()
+						round.padBefore = target.BrickColor
+					end
+				end
+				if target then
+					local gap = flat(target.Position - part.Position).Magnitude
+					if gap > 1.5 then
+						since = os.clock()
+						if gap > 14 then
+							Move.path(round, target.Position, target, 2)
+						else
+							Move.to(target.Position)
+						end
+					else
+						Move.to(target.Position)
+					end
+				end
+			end
+			task.wait(0.05)
+		end
+		log(("Cannon Cooldown: %d pads turned green by you"):format(stepped))
+	end
+
 	-- Hurdle Hurry. You are carried down your lane on your own (walk speed is 0, about 18 studs a
 	-- second) and the only thing to do is jump. Each lane (`Lanes.L<n>`) holds its hurdles in
 	-- `Hurdles`; the bar is the 7-wide part and its top is level with your waist. A jump at the
