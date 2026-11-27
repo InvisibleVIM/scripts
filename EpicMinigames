@@ -15,7 +15,7 @@ if not shared then
 end
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local BeyRivals = { connections = {}, toggleRefreshers = {}, segmentRefreshers = {}, VERSION = "em-10", alive = true }
+local BeyRivals = { connections = {}, toggleRefreshers = {}, segmentRefreshers = {}, VERSION = "em-12", alive = true }
 if shared.EpicMinigames then
 	pcall(shared.EpicMinigames.detach)
 end
@@ -6510,6 +6510,151 @@ local create, statusLabel, panel, nextOrder, makePage, rowBase, rowLabel, headin
 		log("Toxic Reactions: followed " .. moves .. " colour calls")
 	end
 
+	-- Balloon Platoon. USER: "make handler for this." Everyone stands in a room (E1, E2...,
+	-- Character.RoomNumber) with a bow; grey balloons named Red, Magenta, Blue, Green, Teal and
+	-- Yellow float up, the room's `colour` value names the one to pop and `ready` opens the
+	-- bows. The bow's own script casts a ray from its FirePart at the mouse (against the room's
+	-- map and balloons) and sends WepRemoteEvent "fired" (part, point, normal) and, when the
+	-- part is a balloon, "hit" (part, point); one shot every 0.8 s. This sends the same two
+	-- messages for the balloon whose name is the called colour, and only when that same ray
+	-- reaches it, so nothing is sent that the bow would not send itself.
+	EM.handlers["Balloon Platoon"] = function(round)
+		local model = round.model
+		local shots, hits, lastShot, called, calledAt = 0, 0, 0, nil, 0
+		local done = {}
+		local SHADES = {
+			Red = Color3.new(1, 0, 0), Magenta = Color3.new(1, 0, 0.75), Blue = Color3.new(0, 0, 1),
+			Green = Color3.new(0, 1, 0), Teal = Color3.new(0, 0.8, 0.8), Yellow = Color3.new(1, 1, 0),
+		}
+		while round.live() do
+			local character = character()
+			local number = character and character:FindFirstChild("RoomNumber")
+			local room = number and model:FindFirstChild("E" .. tostring(number.Value))
+			local bow = character and character:FindFirstChild("Bow_BP")
+			local colour = room and room:FindFirstChild("colour")
+			local ready = room and room:FindFirstChild("ready")
+			local remote = bow and bow:FindFirstChild("WepRemoteEvent")
+			local firePart = bow and bow:FindFirstChild("FirePart")
+			local bloons = room and room:FindFirstChild("Bloons")
+			if colour and ready and remote and firePart and bloons then
+				local want = tostring(colour.Value)
+				-- USER: "you shoot the one that the color at the top shows". The room's flag at
+				-- the top carries that colour; when the value is empty but the flag is lit, the
+				-- balloon name nearest to the flag's colour is the one.
+				local flag = room:FindFirstChild("Flag")
+				if want == "" and flag and flag:IsA("BasePart") and flag.Transparency < 0.5 then
+					local bestGap
+					for name, shade in pairs(SHADES) do
+						local gap = (Vector3.new(shade.R, shade.G, shade.B) - Vector3.new(flag.Color.R, flag.Color.G, flag.Color.B)).Magnitude
+						if not bestGap or gap < bestGap then
+							want, bestGap = name, gap
+						end
+					end
+				end
+				if want ~= called then
+					called, calledAt = want, os.clock()
+				end
+				-- A quarter of a second to "see" the colour, and the bow's own reload.
+				if want ~= "" and ready.Value and os.clock() - calledAt > 0.25 and os.clock() - lastShot > 0.85 and not Move.yours() then
+					local params = RaycastParams.new()
+					params.FilterType = Enum.RaycastFilterType.Include
+					params.FilterDescendantsInstances = { room:FindFirstChild("map"), bloons }
+					for _, bloon in ipairs(bloons:GetChildren()) do
+						if bloon:IsA("BasePart") and bloon.Name == want and not done[bloon] and bloon.Transparency < 1 then
+							local origin = firePart.Position
+							local direction = bloon.Position - origin
+							local hit = direction.Magnitude > 1 and workspace:Raycast(origin, direction.Unit * 500, params)
+							if hit and hit.Instance == bloon then
+								done[bloon] = true
+								lastShot = os.clock()
+								shots += 1
+								remote:FireServer("fired", bloon, hit.Position, hit.Normal)
+								remote:FireServer("hit", bloon, hit.Position)
+								hits += 1
+								log(("Balloon Platoon: %s called, shot %.2fs later from %d studs"):format(want, os.clock() - calledAt, math.floor(direction.Magnitude)))
+								break
+							end
+						end
+					end
+				end
+			end
+			task.wait(0.05)
+		end
+		log(("Balloon Platoon: %d shots at the called colour"):format(shots))
+	end
+
+	-- Accurate Archery. USER: "shoot the targets. prioritize golden ones". model.targets holds
+	-- archerytarget models (rings "1" bullseye to "5", `alive`, `golden`). The bow's script
+	-- casts a ray from its FirePart at the mouse (past the other players and the aim helpers),
+	-- sends WepRemoteEvent "fired" (part, point, normal), flies the arrow a frame per 7 studs
+	-- and then sends "hit" (target model, point); one shot every 0.8 s. Same messages here,
+	-- aimed at the bullseye, and only when that ray really reaches the target.
+	EM.handlers["Accurate Archery"] = function(round)
+		local model = round.model
+		local shots, gold, lastShot = 0, 0, 0
+		local done = {}
+		while round.live() do
+			local character = character()
+			local bow = character and character:FindFirstChild("Bow")
+			local remote = bow and bow:FindFirstChild("WepRemoteEvent")
+			local firePart = bow and bow:FindFirstChild("FirePart")
+			local targets = model:FindFirstChild("targets")
+			if remote and firePart and targets and os.clock() - lastShot > 0.85 and not Move.yours() then
+				local ignore = { character, model:FindFirstChild("aimignore") }
+				for _, child in ipairs(model:GetChildren()) do
+					if child.Name:sub(1, 7) == "campart" then
+						table.insert(ignore, child)
+					end
+				end
+				for _, player in ipairs(playersService:GetPlayers()) do
+					if player.Character and player.Character ~= character then
+						table.insert(ignore, player.Character)
+					end
+				end
+				local params = RaycastParams.new()
+				params.FilterType = Enum.RaycastFilterType.Exclude
+				params.FilterDescendantsInstances = ignore
+				-- Golden first, then the nearest; a target is tried once.
+				local list = {}
+				for _, target in ipairs(targets:GetChildren()) do
+					local alive, bull = target:FindFirstChild("alive"), target:FindFirstChild("1")
+					if target.Name == "archerytarget" and alive and alive.Value and bull and bull:IsA("BasePart") and bull.Transparency < 1 and not done[target] then
+						local golden = target:FindFirstChild("golden")
+						table.insert(list, { target = target, bull = bull, golden = golden and golden.Value == true, gap = (bull.Position - firePart.Position).Magnitude })
+					end
+				end
+				table.sort(list, function(a, b)
+					if a.golden ~= b.golden then
+						return a.golden
+					end
+					return a.gap < b.gap
+				end)
+				for _, entry in ipairs(list) do
+					local origin = firePart.Position
+					local hit = entry.gap > 1 and workspace:Raycast(origin, (entry.bull.Position - origin).Unit * 500, params)
+					if hit and hit.Instance.Parent == entry.target then
+						done[entry.target] = true
+						lastShot = os.clock()
+						shots += 1
+						gold += entry.golden and 1 or 0
+						remote:FireServer("fired", hit.Instance, hit.Position, hit.Normal)
+						-- The arrow's flight, as the bow does it: a frame for every 7 studs.
+						for _ = 1, math.max(math.ceil(entry.gap / 7) - 1, 0) do
+							runService.RenderStepped:Wait()
+						end
+						if entry.target.Parent and round.live() then
+							remote:FireServer("hit", entry.target, hit.Position)
+						end
+						break
+					end
+				end
+			end
+			task.wait(0.03)
+		end
+		local score = character() and character():FindFirstChild("targethits")
+		log(("Accurate Archery: %d shots (%d golden), the game counts %s for you"):format(shots, gold, tostring(score and score.Value)))
+	end
+
 	-- Hurdle Hurry. You are carried down your lane on your own (walk speed is 0, about 18 studs a
 	-- second) and the only thing to do is jump. Each lane (`Lanes.L<n>`) holds its hurdles in
 	-- `Hurdles`; the bar is the 7-wide part and its top is level with your waist. A jump at the
@@ -6801,7 +6946,7 @@ end)()
 		toggle(page, "Survival minigames", "EmSurvive")
 		hint(page, "For the game's Other and Luck minigames: stays beside the player with the best win streak, a moment behind them, and steps out of the way of anything moving at you.")
 		toggle(page, "Minigames with their own handler", "EmSpecial")
-		hint(page, "Uses a handler written for that minigame when there is one. So far: Paint to Perfection (clicks your easel until it matches the board) Hurdle Hurry (jumps each hurdle in your lane) Cake Delivery (walks your cake to the door with its number), Block Hunt (marks the other team's blocks through walls and walks to them; hiding is yours) Fishing Frenzy (moves your mouse onto the next fish and away from sharks) The Sweeper (jumps the bar each time it comes round) Just Jump (jumps the rope each turn) and Toxic Reactions (walks to the platform whose colour the sign shows). More are added from the recordings below.")
+		hint(page, "Uses a handler written for that minigame when there is one. So far: Paint to Perfection (clicks your easel until it matches the board) Balloon Platoon (shoots the balloon of the called colour) Accurate Archery (shoots the targets, golden ones first) Hurdle Hurry (jumps each hurdle in your lane) Cake Delivery (walks your cake to the door with its number), Block Hunt (marks the other team's blocks through walls and walks to them; hiding is yours) Fishing Frenzy (moves your mouse onto the next fish and away from sharks) The Sweeper (jumps the bar each time it comes round) Just Jump (jumps the rope each turn) and Toxic Reactions (walks to the platform whose colour the sign shows). More are added from the recordings below.")
 		heading(page, "Left to you", "left")
 		UI.note(page, "Versus, Team and Controller minigames (fights, tools, vehicles) are not played for you yet.")
 		heading(page, "Rounds", "right")
