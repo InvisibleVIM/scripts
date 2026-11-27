@@ -1,5 +1,19 @@
 local loadToken = {}
 getgenv().AnimeAdventuresLoadToken = loadToken
+-- Start-up trail (v287): one line per stage in PotentBoot.txt, so a crash right after a join can
+-- be placed (the game still crashed inside the executor two to four seconds into about one
+-- match join in twenty). Read the last line before the crash time.
+local function crumb(stage)
+	pcall(function()
+		local line = string.format("%s %.2f %s %s AA %s\n", os.date("%Y-%m-%d %H:%M:%S"), os.clock(), tostring(game.PlaceId), tostring(game.JobId):sub(1, 8), stage)
+		if isfile("PotentBoot.txt") and #readfile("PotentBoot.txt") < 300000 then
+			appendfile("PotentBoot.txt", line)
+		else
+			writefile("PotentBoot.txt", line)
+		end
+	end)
+end
+crumb("start")
 -- Wait until the game is actually ready (works for autoexec and late manual runs).
 if not game:IsLoaded() then
 	game.Loaded:Wait()
@@ -15,15 +29,46 @@ do
 	end
 	player:WaitForChild("_stats", 60)
 	player:WaitForChild("_settings", 30)
+	crumb("children")
 	-- The game builds its client session (profile, collection) a moment after join.
+	-- v287: no garbage-collector scans here any more. This used to ask filtergc for the
+	-- session table twice a second from the moment the place had loaded, and then ran eight
+	-- more whole-heap scans for the data tables, all while the game was still starting its
+	-- seven hundred modules. Every crash dump of the last three days ends inside the
+	-- executor two to four seconds after a match join, which is exactly then. The same
+	-- tables come from the game's own Loader with no scan at all.
+	-- First let the game's client finish building its interface (the count of its screens
+	-- stops growing), so asking the Loader for a service never loads one before the game does.
+	local gui = player:WaitForChild("PlayerGui", 30)
 	local deadline = os.clock() + 40
+	local count, since = -1, os.clock()
 	while os.clock() < deadline do
-		local ok, found = pcall(filtergc, "table", { Keys = { "profile_data", "collection", "inventory" } }, true)
-		if ok and found then
+		local n = gui and #gui:GetChildren() or 0
+		if n ~= count then
+			count, since = n, os.clock()
+		elseif n >= 8 and os.clock() - since >= 1.5 then
+			break
+		end
+		task.wait(0.25)
+	end
+	crumb("interface " .. tostring(count))
+	local loaderModule = src and src:FindFirstChild("Loader")
+	deadline = os.clock() + 30
+	while os.clock() < deadline do
+		local ready = false
+		pcall(function()
+			setthreadidentity(2)
+			local loader = require(loaderModule)
+			local service = loader.load_client_service(nil, "GUIService")
+			ready = type(service) == "table" and type(service.session) == "table" and rawget(service.session, "profile_data") ~= nil
+		end)
+		setthreadidentity(8)
+		if ready then
 			break
 		end
 		task.wait(0.5)
 	end
+	crumb("session")
 	task.wait(1)
 end
 if getgenv().AnimeAdventuresLoadToken ~= loadToken then
@@ -38,7 +83,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v286", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v287", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -499,14 +544,54 @@ local function gameRequire(module)
 	return ok and result or nil
 end
 
----Loaded game data tables (Units, Levels, Worlds) live in the Loader's module environments.
+---The game's Loader module and the services it hands out, with no garbage-collector scan
+---(v287; checked live: each is the very table the old filtergc search returned).
+local GameLoader = gameRequire(replicatedStorage.src.Loader)
+local function loaderService(kind, name, probe)
+	local fn = type(GameLoader) == "table" and rawget(GameLoader, kind)
+	if type(fn) ~= "function" then
+		return nil
+	end
+	setthreadidentity(2)
+	local ok, service = pcall(fn, nil, name)
+	setthreadidentity(8)
+	if ok and type(service) == "table" and (probe == nil or service[probe] ~= nil) then
+		return service
+	end
+	return nil
+end
+---Loaded game data tables (Units, Levels, Worlds): the data modules themselves; the scan of
+---the garbage collector is only the last resort when a module is missing.
 local function findData(key, probe)
+	local module = replicatedStorage.src.Data:FindFirstChild(key)
+	local value = module and module:IsA("ModuleScript") and gameRequire(module)
+	if type(value) == "table" and value[probe] ~= nil then
+		return value
+	end
+	-- Services by their Loader name ("...Core" are shared rule modules, the rest client ones).
+	if GameLoader and not module then
+		local service = loaderService(key:sub(-4) == "Core" and "load_core_service" or "load_client_service", key)
+		if service then
+			-- The Loader's answer is final: the service exists, with or without the probed
+			-- member. (One caller asked for a member the match build doesn't have, and the old
+			-- code then scanned the whole heap twice a second for the rest of the match.)
+			return service[probe] ~= nil and service or nil
+		end
+	end
+	-- Last resort, and at most once a minute for the same thing.
+	local scanKey = tostring(key) .. "/" .. tostring(probe)
+	AA.scanned = AA.scanned or {}
+	if AA.scanned[scanKey] and os.clock() - AA.scanned[scanKey] < 60 then
+		return nil
+	end
+	AA.scanned[scanKey] = os.clock()
+	crumb("gc scan for " .. scanKey)
 	local ok, list = pcall(filtergc, "table", { Keys = { key } }, false)
 	if ok and list then
 		for _, holder in ipairs(list) do
-			local value = rawget(holder, key)
-			if type(value) == "table" and value[probe] ~= nil then
-				return value
+			local found = rawget(holder, key)
+			if type(found) == "table" and found[probe] ~= nil then
+				return found
 			end
 		end
 	end
@@ -516,6 +601,7 @@ end
 local Units = findData("Units", "zoro")
 local Levels = findData("Levels", "namek_level_1")
 local Worlds = findData("Worlds", "namek")
+crumb("data")
 local Order = gameRequire(replicatedStorage.src.Data.WorldLevelOrder) or {}
 local Banners = gameRequire(replicatedStorage.src.Data.Banners) or {}
 local Attacks = gameRequire(replicatedStorage.src.Data.Attacks) or {}
@@ -527,11 +613,11 @@ end
 -- The game's own rule code (shared by client and server): unit stat multipliers, placement and
 -- upgrade prices, unlock checks. Asking it beats re-deriving the rules from the data tables.
 local Core = {
-	Unit = findData("UnitServiceCore", "calculate_static_stat_multiplier"),
-	Trait = findData("TraitServiceCore", "has_trait"),
-	Level = findData("LevelServiceCore", "calculate_level_damage_increase"),
-	Progress = findData("ProgressionServiceCore", "check_if_unlocked_level"),
-	Loader = findData("Loader", "get_assets_path"),
+	Unit = loaderService("load_core_service", "UnitServiceCore", "calculate_static_stat_multiplier") or findData("UnitServiceCore", "calculate_static_stat_multiplier"),
+	Trait = loaderService("load_core_service", "TraitServiceCore", "has_trait") or findData("TraitServiceCore", "has_trait"),
+	Level = loaderService("load_core_service", "LevelServiceCore", "calculate_level_damage_increase") or findData("LevelServiceCore", "calculate_level_damage_increase"),
+	Progress = loaderService("load_core_service", "ProgressionServiceCore", "check_if_unlocked_level") or findData("ProgressionServiceCore", "check_if_unlocked_level"),
+	Loader = (type(GameLoader) == "table" and GameLoader.get_assets_path ~= nil and GameLoader) or findData("Loader", "get_assets_path"),
 	Settings = gameRequire(replicatedStorage.src.Data.GameplaySettings) or {},
 	RawLevels = Levels,
 }
@@ -663,8 +749,14 @@ local function session()
 	if Session and rawget(Session, "profile_data") then
 		return Session
 	end
-	local ok, found = pcall(filtergc, "table", { Keys = { "profile_data", "collection", "inventory" } }, true)
-	Session = ok and found or nil
+	-- From the game's own GUIService (v287); the collector scan only if that ever fails.
+	local service = loaderService("load_client_service", "GUIService")
+	local found = service and type(service.session) == "table" and rawget(service.session, "profile_data") ~= nil and service.session or nil
+	if not found then
+		local ok, scanned = pcall(filtergc, "table", { Keys = { "profile_data", "collection", "inventory" } }, true)
+		found = ok and scanned or nil
+	end
+	Session = found
 	return Session
 end
 
@@ -24843,6 +24935,7 @@ AA.Stats = Stats
 AA.getStatus = function()
 	return status
 end
+crumb("ready " .. tostring(AA.VERSION))
 shared.AnimeAdventures = AA
 getgenv().AnimeAdventuresConfig = Config
 
