@@ -83,7 +83,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v287", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v288", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -9361,6 +9361,16 @@ local function finishMatch()
 		-- the lobby is the only way on.
 		task.wait(1.5)
 		portalNext = AA.portalChoose(data.portal_group)
+		-- USER (v288): "it should start another portal that i picked right after finishing the
+		-- one im doing ... in the same game". The result screen only offers portals of the
+		-- running one's group, and v287 answered a picked portal of another group (or a match
+		-- whose level has no group) either with the lobby or with a vote the server turned down
+		-- for three minutes ("it just sits there"). The picked portal is asked for anyway; if the
+		-- server will not take it the lobby follows within seconds, not minutes.
+		if not portalNext then
+			portalNext = AA.portalChoose()
+		end
+		Match.portalCross = portalNext and not (data.portal_group and portalNext.group == data.portal_group) or nil
 		after = portalNext and "Replay" or "Lobby"
 	elseif kind == "Portal" and after == "Replay" then
 		-- A portal match is never replayed by a plain vote: that would spend another use of
@@ -9392,7 +9402,7 @@ local function finishMatch()
 				-- (false = the server was not taking votes yet: asked again in a few seconds.)
 				Match.voteRefused = ok and a == false
 			end
-			voteLog(tostring(args[1]) .. " " .. tostring(args[2]) .. " -> " .. tostring(ok) .. " " .. tostring(a) .. " " .. tostring(b))
+			voteLog(tostring(args[1]) .. " " .. tostring(args[2]) .. ((portalNext and args[3]) and (" with " .. tostring(portalNext.id) .. (Match.portalCross and " (not this portal's group)" or "")) or "") .. " -> " .. tostring(ok) .. " " .. tostring(a) .. " " .. tostring(b))
 		end)
 	end
 	local function castVote()
@@ -9543,7 +9553,7 @@ local function finishMatch()
 	local started = os.clock()
 	Match.voting = true
 	while AA.alive and gameFinished() and after ~= "Lobby" and Config.AutoJoin and os.clock() - started < 180 do
-		deadline = os.clock() + 20
+		deadline = os.clock() + (portalNext and (Match.portalCross and 8 or 15) or 20)
 		while AA.alive and os.clock() < deadline and gameFinished() do
 			task.wait(0.5)
 			-- A vote the server turned down (Misty Tower's Next Floor, cast 0.3 s after the
@@ -9552,6 +9562,15 @@ local function finishMatch()
 			if Match.voteRefused and deadline - os.clock() > 4 and os.clock() - started > 3 then
 				deadline = os.clock() + 1
 			end
+		end
+		-- A portal the server will not start from here: no use asking again. One of another
+		-- group gets a single vote; one of the same group gets a second, then the lobby.
+		if portalNext and AA.alive and gameFinished() and (Match.portalCross or os.clock() - started > 30) then
+			voteLog("the server did not start " .. tostring(portalNext.id) .. " from the result screen" .. (Match.voteRefused and " (vote refused)" or ""))
+			after = "Lobby"
+			Match.lastAfter = "Lobby"
+			Match.voteRefused = nil
+			break
 		end
 		Match.voteRefused = nil
 		if AA.alive and gameFinished() and Config.AutoJoin then
