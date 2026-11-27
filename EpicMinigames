@@ -15,7 +15,7 @@ if not shared then
 end
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local BeyRivals = { connections = {}, toggleRefreshers = {}, segmentRefreshers = {}, VERSION = "em-15", alive = true }
+local BeyRivals = { connections = {}, toggleRefreshers = {}, segmentRefreshers = {}, VERSION = "em-16", alive = true }
 if shared.EpicMinigames then
 	pcall(shared.EpicMinigames.detach)
 end
@@ -6763,6 +6763,56 @@ local create, statusLabel, panel, nextOrder, makePage, rowBase, rowLabel, headin
 		log(("Cannon Cooldown: %d pads turned green by you"):format(stepped))
 	end
 
+	-- Timestamp Trace. USER: "click space when the timer infront of me is at the time behind
+	-- me". Rooms Map<n> (Character.RoomNumber): the big clock behind you
+	-- (Map.bigtimer.timer SurfaceGui TextLabel, e.g. "06.3") is the time to match, the small
+	-- timer on your stand runs from the server's "go" on model.event. The game's own script
+	-- answers "go" with event:FireServer("start", tick()) and Space with ("stop", tick()).
+	-- This waits out the big clock's seconds from the same "go" and sends the same "stop".
+	EM.handlers["Timestamp Trace"] = function(round)
+		local model = round.model
+		local event = model:WaitForChild("event", 5)
+		if not event then
+			return
+		end
+		local function target()
+			local number = character() and character():FindFirstChild("RoomNumber")
+			local map = number and model:FindFirstChild("Map" .. tostring(number.Value))
+			local big = map and map:FindFirstChild("bigtimer")
+			local label = big and big:FindFirstChildWhichIsA("TextLabel", true)
+			return label and tonumber((label.Text:gsub("[^%d%.]", "")))
+		end
+		local goes, run = 0, 0
+		local connection = event.OnClientEvent:Connect(function(kind)
+			if kind ~= "go" then
+				return
+			end
+			local started = tick()
+			run += 1
+			local mine = run
+			goes += 1
+			local want
+			while round.live() and run == mine do
+				want = target() or want
+				if want and want > 0 and tick() - started >= want - 0.004 then
+					local now = tick()
+					event:FireServer("stop", now)
+					log(("Timestamp Trace: the clock said %.1f, stopped at %.3f"):format(want, now - started))
+					break
+				end
+				if tick() - started > 60 then
+					break
+				end
+				runService.Heartbeat:Wait()
+			end
+		end)
+		while round.live() do
+			task.wait(0.2)
+		end
+		connection:Disconnect()
+		log(("Timestamp Trace: %d rounds timed"):format(goes))
+	end
+
 	-- Hurdle Hurry. You are carried down your lane on your own (walk speed is 0, about 18 studs a
 	-- second) and the only thing to do is jump. Each lane (`Lanes.L<n>`) holds its hurdles in
 	-- `Hurdles`; the bar is the 7-wide part and its top is level with your waist. A jump at the
@@ -6838,9 +6888,9 @@ local create, statusLabel, panel, nextOrder, makePage, rowBase, rowLabel, headin
 		-- Racing minigames without a handler are the user's to play. USER: "following the person
 		-- in the 'lead' basically never works. stop that." (The log agreed: every race it
 		-- "won" was 64-98% steered by the user.) Brain.race is kept but no longer chosen.
-		if (category == "Other" or category == "Luck") and Config.EmSurvive then
-			return Brain.survive, "stay with a good player"
-		end
+		-- The same for "stay with a good player" (Other and Luck minigames): USER, asked whether
+		-- it should go as well: "turn it off too". Brain.survive is kept but no longer chosen.
+		-- Only minigames with their own handler are played for the user now.
 		return nil
 	end
 
@@ -7049,12 +7099,10 @@ end)()
 		heading(page, "Play for me", "left", "It only walks and jumps, the way you would. Touch W, A, S, D or Space and it lets go for a moment.")
 		toggle(page, "Play minigames for me", "EmAuto")
 		hint(page, "The main switch. Off: you play everything and it only records and collects rewards.")
-		toggle(page, "Survival minigames", "EmSurvive")
-		hint(page, "For the game's Other and Luck minigames: stays beside the player with the best win streak, a moment behind them, and steps out of the way of anything moving at you.")
 		toggle(page, "Minigames with their own handler", "EmSpecial")
-		hint(page, "Uses a handler written for that minigame when there is one. So far: Paint to Perfection (clicks your easel until it matches the board) Balloon Platoon (shoots the balloon of the called colour) Accurate Archery (shoots the targets, golden ones first) Eagle Observation (counts every eagle) Cannon Cooldown (steps on your team's pads until they are green) Hurdle Hurry (jumps each hurdle in your lane) Cake Delivery (walks your cake to the door with its number), Block Hunt (marks the other team's blocks through walls and walks to them; hiding is yours) Fishing Frenzy (moves your mouse onto the next fish and away from sharks) The Sweeper (jumps the bar each time it comes round) Just Jump (jumps the rope each turn) and Toxic Reactions (walks to the platform whose colour the sign shows). More are added from the recordings below.")
+		hint(page, "Uses a handler written for that minigame when there is one. So far: Paint to Perfection (clicks your easel until it matches the board) Balloon Platoon (shoots the balloon of the called colour) Accurate Archery (shoots the targets, golden ones first) Eagle Observation (counts every eagle) Cannon Cooldown (steps on your team's pads until they are green) Timestamp Trace (stops your timer on the big clock's time) Hurdle Hurry (jumps each hurdle in your lane) Cake Delivery (walks your cake to the door with its number), Block Hunt (marks the other team's blocks through walls and walks to them; hiding is yours) Fishing Frenzy (moves your mouse onto the next fish and away from sharks) The Sweeper (jumps the bar each time it comes round) Just Jump (jumps the rope each turn) and Toxic Reactions (walks to the platform whose colour the sign shows). More are added from the recordings below.")
 		heading(page, "Left to you", "left")
-		UI.note(page, "Versus, Team and Controller minigames (fights, tools, vehicles) are not played for you yet.")
+		UI.note(page, "Every minigame without a handler of its own. Nothing follows other players any more.")
 		heading(page, "Rounds", "right")
 		toggle(page, "Stay in the rounds", "EmJoin")
 		hint(page, "The game marks you AFK after a minute without input and stops putting you in minigames. This puts you back in.")

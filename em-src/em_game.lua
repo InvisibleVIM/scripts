@@ -1466,6 +1466,56 @@
 		log(("Cannon Cooldown: %d pads turned green by you"):format(stepped))
 	end
 
+	-- Timestamp Trace. USER: "click space when the timer infront of me is at the time behind
+	-- me". Rooms Map<n> (Character.RoomNumber): the big clock behind you
+	-- (Map.bigtimer.timer SurfaceGui TextLabel, e.g. "06.3") is the time to match, the small
+	-- timer on your stand runs from the server's "go" on model.event. The game's own script
+	-- answers "go" with event:FireServer("start", tick()) and Space with ("stop", tick()).
+	-- This waits out the big clock's seconds from the same "go" and sends the same "stop".
+	EM.handlers["Timestamp Trace"] = function(round)
+		local model = round.model
+		local event = model:WaitForChild("event", 5)
+		if not event then
+			return
+		end
+		local function target()
+			local number = character() and character():FindFirstChild("RoomNumber")
+			local map = number and model:FindFirstChild("Map" .. tostring(number.Value))
+			local big = map and map:FindFirstChild("bigtimer")
+			local label = big and big:FindFirstChildWhichIsA("TextLabel", true)
+			return label and tonumber((label.Text:gsub("[^%d%.]", "")))
+		end
+		local goes, run = 0, 0
+		local connection = event.OnClientEvent:Connect(function(kind)
+			if kind ~= "go" then
+				return
+			end
+			local started = tick()
+			run += 1
+			local mine = run
+			goes += 1
+			local want
+			while round.live() and run == mine do
+				want = target() or want
+				if want and want > 0 and tick() - started >= want - 0.004 then
+					local now = tick()
+					event:FireServer("stop", now)
+					log(("Timestamp Trace: the clock said %.1f, stopped at %.3f"):format(want, now - started))
+					break
+				end
+				if tick() - started > 60 then
+					break
+				end
+				runService.Heartbeat:Wait()
+			end
+		end)
+		while round.live() do
+			task.wait(0.2)
+		end
+		connection:Disconnect()
+		log(("Timestamp Trace: %d rounds timed"):format(goes))
+	end
+
 	-- Hurdle Hurry. You are carried down your lane on your own (walk speed is 0, about 18 studs a
 	-- second) and the only thing to do is jump. Each lane (`Lanes.L<n>`) holds its hurdles in
 	-- `Hurdles`; the bar is the 7-wide part and its top is level with your waist. A jump at the
@@ -1541,9 +1591,9 @@
 		-- Racing minigames without a handler are the user's to play. USER: "following the person
 		-- in the 'lead' basically never works. stop that." (The log agreed: every race it
 		-- "won" was 64-98% steered by the user.) Brain.race is kept but no longer chosen.
-		if (category == "Other" or category == "Luck") and Config.EmSurvive then
-			return Brain.survive, "stay with a good player"
-		end
+		-- The same for "stay with a good player" (Other and Luck minigames): USER, asked whether
+		-- it should go as well: "turn it off too". Brain.survive is kept but no longer chosen.
+		-- Only minigames with their own handler are played for the user now.
 		return nil
 	end
 
