@@ -1560,6 +1560,78 @@
 		log(("Backstreet Brawl: reach %d studs, %d touches sent, %d times someone beyond arm's length lost health"):format(tonumber(Config.EmFistReach) or 0, touches, landed))
 	end
 
+	-- Drawing the Line. USER: "make a handler for this. i have to trace the line on the
+	-- ground". Each player has a lane, model.Lanes.A<playernum>; the black line is 238 rope
+	-- pieces on its AtchPart (Line1..LineN, Attachment0 -> Attachment1, half a stud each,
+	-- weaving up to five studs either side of the lane's middle for about 120 studs). You walk
+	-- it. This finds the piece you are on and keeps walking to the point a stud ahead of it,
+	-- so the feet stay on the line through the bends. The log gets how far off it was.
+	EM.handlers["Drawing the Line"] = function(round)
+		local model = round.model
+		local points, count, index = {}, -1, 1
+		local samples, off, worst = 0, 0, 0
+		local function build()
+			local lanes = model:FindFirstChild("Lanes")
+			local lane = lanes and lanes:FindFirstChild("A" .. tostring(mine("playernum", 0)))
+			local holder = lane and lane:FindFirstChild("AtchPart")
+			if not holder then
+				return
+			end
+			local ropes = 0
+			for _, child in ipairs(holder:GetChildren()) do
+				if child:IsA("RopeConstraint") then
+					ropes += 1
+				end
+			end
+			if ropes == count then
+				return
+			end
+			count = ropes
+			local list = {}
+			for number = 1, ropes + 50 do
+				local rope = holder:FindFirstChild("Line" .. number)
+				if rope and rope:IsA("RopeConstraint") and rope.Attachment0 and rope.Attachment1 then
+					if #list == 0 then
+						table.insert(list, rope.Attachment0.WorldPosition)
+					end
+					table.insert(list, rope.Attachment1.WorldPosition)
+				end
+			end
+			points = list
+		end
+		local nextBuild = 0
+		while round.live() do
+			if os.clock() > nextBuild then
+				nextBuild = os.clock() + 1
+				build()
+			end
+			local part = root()
+			if part and #points > 3 then
+				-- The piece under you: the nearest point, looked for around the last one so
+				-- that a bend doubling back never throws you onto a later stretch.
+				local best, bestGap
+				for i = math.max(index - 6, 1), math.min(index + 24, #points) do
+					local gap = flat(points[i] - part.Position).Magnitude
+					if not bestGap or gap < bestGap then
+						best, bestGap = i, gap
+					end
+				end
+				index = best
+				samples += 1
+				off += bestGap
+				worst = math.max(worst, bestGap)
+				local goal = points[math.min(index + 2, #points)]
+				if index < #points then
+					Move.to(Vector3.new(goal.X, part.Position.Y, goal.Z))
+				end
+			end
+			runService.Heartbeat:Wait()
+		end
+		if samples > 0 then
+			log(("Drawing the Line: reached piece %d of %d, on average %.2f studs off the line, at worst %.1f"):format(index, #points, off / samples, worst))
+		end
+	end
+
 	-- Hurdle Hurry. You are carried down your lane on your own (walk speed is 0, about 18 studs a
 	-- second) and the only thing to do is jump. Each lane (`Lanes.L<n>`) holds its hurdles in
 	-- `Hurdles`; the bar is the 7-wide part and its top is level with your waist. A jump at the
