@@ -426,6 +426,33 @@
 		end
 		return false
 	end
+	---Hold a walking direction (a world vector, nil to let go). The game's own control script
+	---tells the humanoid "no input" on every frame, which wipes a Humanoid:Move made from
+	---anywhere else, so this one is repeated on every frame right after it (render priority
+	---Input + 1). Minigames that read left/right off the humanoid (the horse race, the line)
+	---see it as if you were holding the key.
+	function Move.steer(direction)
+		Move.held = direction
+		if not Move.bound then
+			Move.bound = true
+			-- (A copy of this script that was replaced leaves its own binding behind.)
+			pcall(function()
+				runService:UnbindFromRenderStep("EpicMinigamesSteer")
+			end)
+			pcall(function()
+				runService:BindToRenderStep("EpicMinigamesSteer", Enum.RenderPriority.Input.Value + 1, function()
+					local human = humanoid()
+					if Move.held and human and not Move.yours() then
+						human:Move(Move.held, false)
+						Move.wasHeld = true
+					elseif Move.wasHeld and human and not Move.yours() then
+						Move.wasHeld = false
+						human:Move(Vector3.zero, false)
+					end
+				end)
+			end)
+		end
+	end
 	function Move.stop()
 		local human, part = humanoid(), root()
 		if human and part and not Move.yours() then
@@ -1660,15 +1687,12 @@
 					-- Full sideways speed until it is within a tenth of a second's walk, then
 					-- in proportion, so it settles on the line.
 					local reach = math.max(human.WalkSpeed, 1) * 0.1
-					human:Move(Vector3.new(math.clamp(wanted / reach, -1, 1), 0, 0), false)
+					Move.steer(Vector3.new(math.clamp(wanted / reach, -1, 1), 0, 0))
 				end
 			end
 			runService.Heartbeat:Wait()
 		end
-		local human = humanoid()
-		if human and not Move.yours() then
-			human:Move(Vector3.zero, false)
-		end
+		Move.steer(nil)
 		if samples > 0 then
 			log(("Drawing the Line: walk speed %d, carried forward at %.1f studs/s, on average %.2f studs off the line, at worst %.1f"):format(walk, carried, off / samples, worst))
 		end
@@ -1722,6 +1746,162 @@
 			task.wait(done and 0.03 or 0.06)
 		end
 		log(("Cube Factory: %d clicks, about %d codes matched"):format(clicks, codes))
+	end
+
+	-- Stallion Stampede. USER: "clicking whips the horse. don't let the meter go to max or the
+	-- horse stops. go for the power ups. jump over the hurdles" and "it moves forward on its
+	-- own. i only steer left and right". From the game's own LocalControlScript:
+	--  * the horse runs the track by itself at 60 * (1 + whip + boost). A click sets whip to 1,
+	--    fading to 0 over 3 s, and adds 0.275 to the meter; one click per 0.8 s. The meter
+	--    drains 0.1 a second (not during those 0.8 s). At 1 the horse stops for 2.5 s.
+	--  * the meter is the width of HorseGui.WhipBar.bar. So: click whenever it is at 0.69 or
+	--    less (0.69 + 0.275 stays under 1), which is also as often as it can be kept up.
+	--  * you sit in a lane, 0.1 to 0.9 across the 80-stud track, moved by left/right at one
+	--    track width a second. Power-ups (model.powerups: `on`, `power` = boost for +100%
+	--    speed over 6 s, or happy for an empty meter) are picked up by running through them.
+	--  * hurdles are the parts named "hurdle" (the full width of the track, 7 studs high);
+	--    the horse jumps when the game's Jump is asked for while it is on the ground.
+	EM.handlers["Stallion Stampede"] = function(round)
+		local model = round.model
+		local whips, jumps, taken, lastWhip, lastJump = 0, 0, 0, 0, 0
+		local wasOn = {}
+		local function horse()
+			local control = localPlayer.PlayerGui:FindFirstChild("LocalControlScript")
+			local value = control and control:FindFirstChild("Horse")
+			return value and value.Value, control
+		end
+		---The game's own click handler, so no real mouse click is needed (a real one lands
+		---wherever the pointer happens to be).
+		local function whip(control)
+			if getconnections then
+				for _, connection in ipairs(getconnections(userInputService.InputBegan)) do
+					local fn = connection.Function
+					local ok, owner = pcall(function()
+						return fn and getfenv(fn).script
+					end)
+					if ok and owner == control then
+						task.spawn(fn, { UserInputType = Enum.UserInputType.MouseButton1, KeyCode = Enum.KeyCode.Unknown, UserInputState = Enum.UserInputState.Begin }, false)
+						return true
+					end
+				end
+			end
+			if mouse1click and isrbxactive and isrbxactive() then
+				mouse1click()
+				return true
+			end
+			return false
+		end
+		local function across(node, position)
+			local offset = node.CFrame:PointToObjectSpace(position)
+			return (offset.Z + node.Size.Z / 2) / node.Size.Z
+		end
+		local function nodeAt(position)
+			local nodes = model:FindFirstChild("track") and model.track:FindFirstChild("nodes")
+			local best, bestGap
+			for _, node in ipairs(nodes and nodes:GetChildren() or {}) do
+				if node:IsA("BasePart") then
+					local offset = node.CFrame:PointToObjectSpace(position)
+					local half = node.Size / 2
+					local gap = Vector3.new(math.max(math.abs(offset.X) - half.X, 0), 0, math.max(math.abs(offset.Z) - half.Z, 0)).Magnitude
+					if not bestGap or gap < bestGap then
+						best, bestGap = node, gap
+					end
+				end
+			end
+			return best
+		end
+		while round.live() do
+			local mount, control = horse()
+			local rider = humanoid()
+			local body = mount and mount:FindFirstChild("HumanoidRootPart")
+			local horseoid = mount and mount:FindFirstChild("Horseoid")
+			local started = model:FindFirstChild("started")
+			if body and horseoid and rider and control and started and started.Value then
+				local now = os.clock()
+				local velocity = flat(body.AssemblyLinearVelocity)
+				local speed = velocity.Magnitude
+				-- 1. The whip.
+				local gui = localPlayer.PlayerGui:FindFirstChild("HorseGui")
+				local bar = gui and gui:FindFirstChild("WhipBar") and gui.WhipBar:FindFirstChild("bar")
+				local meter = bar and bar.Size.X.Scale or 1
+				if meter <= 0.69 and now - lastWhip > 0.9 and speed > 5 then
+					if whip(control) then
+						lastWhip = now
+						whips += 1
+					end
+				end
+				-- 2. Hurdles: be at the top of the jump as the horse reaches one.
+				if speed > 10 and now - lastJump > 0.6 then
+					local rise = horseoid.UseJumpPower and horseoid.JumpPower / workspace.Gravity or math.sqrt(2 * horseoid.JumpHeight / workspace.Gravity)
+					local heading = velocity.Unit
+					for _, part in ipairs(model:GetDescendants()) do
+						if part.Name == "hurdle" and part:IsA("BasePart") then
+							local to = flat(part.Position - body.Position)
+							local ahead = to:Dot(heading)
+							-- (Its thin side faces along the track; it spans the width.)
+							local face = flat(part.CFrame.LookVector)
+							local gap = math.abs(to:Dot(face))
+							local side = (to - face * to:Dot(face)).Magnitude
+							if ahead > 0 and side < part.Size.X / 2 + 2 and gap < speed * rise + 4 and gap > 2 then
+								local params = RaycastParams.new()
+								params.FilterType = Enum.RaycastFilterType.Exclude
+								params.FilterDescendantsInstances = { mount, character() }
+								local ground = workspace:Raycast(body.Position, Vector3.new(0, -5, 0), params)
+								if ground and ground.Instance.CanCollide then
+									horseoid:ChangeState(Enum.HumanoidStateType.Jumping)
+									lastJump = now
+									jumps += 1
+								end
+								break
+							end
+						end
+					end
+				end
+				-- 3. Power-ups: the nearest live one ahead; move across to its lane.
+				local steer
+				local powerups = model:FindFirstChild("powerups")
+				if powerups and speed > 10 then
+					local heading = velocity.Unit
+					local best, bestGap
+					for _, power in ipairs(powerups:GetChildren()) do
+						local on = power:FindFirstChild("on")
+						if on and power:IsA("BasePart") then
+							if wasOn[power] and not on.Value and (power.Position - body.Position).Magnitude < 40 then
+								taken += 1
+							end
+							wasOn[power] = on.Value
+							if on.Value then
+								local to = flat(power.Position - body.Position)
+								local gap = to.Magnitude
+								if gap < 260 and gap > 6 and to.Unit:Dot(heading) > 0.5 and (not bestGap or gap < bestGap) then
+									best, bestGap = power, gap
+								end
+							end
+						end
+					end
+					local here, there = nodeAt(body.Position), best and nodeAt(best.Position)
+					if here and there then
+						local want = math.clamp(across(there, best.Position), 0.1, 0.9)
+						local have = across(here, body.Position)
+						if math.abs(want - have) > 0.03 then
+							-- More "across" is the node's +Z; the game reads left/right off the
+							-- camera, so push along the camera's right when that points the same way.
+							local right = flat(workspace.CurrentCamera.CFrame.RightVector)
+							local positive = flat(here.CFrame:VectorToWorldSpace(Vector3.zAxis))
+							local sign = (want > have and 1 or -1) * (right:Dot(positive) >= 0 and 1 or -1)
+							steer = right.Unit * sign
+						end
+					end
+				end
+				Move.steer(steer)
+			else
+				Move.steer(nil)
+			end
+			task.wait(0.03)
+		end
+		Move.steer(nil)
+		local laps = character() and character():FindFirstChild("lap")
+		log(("Stallion Stampede: %d whips, %d hurdle jumps, %d power-ups, lap %s"):format(whips, jumps, taken, tostring(laps and laps.Value)))
 	end
 
 	-- Hurdle Hurry. You are carried down your lane on your own (walk speed is 0, about 18 studs a
