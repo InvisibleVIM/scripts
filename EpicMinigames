@@ -15,7 +15,7 @@ if not shared then
 end
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local BeyRivals = { connections = {}, toggleRefreshers = {}, segmentRefreshers = {}, VERSION = "em-18", alive = true }
+local BeyRivals = { connections = {}, toggleRefreshers = {}, segmentRefreshers = {}, VERSION = "em-19", alive = true }
 if shared.EpicMinigames then
 	pcall(shared.EpicMinigames.detach)
 end
@@ -6352,7 +6352,6 @@ local create, statusLabel, panel, nextOrder, makePage, rowBase, rowLabel, headin
 		local map = round.model:WaitForChild("map", 8)
 		local rope = map and map:WaitForChild("rope", 8)
 		local pivot = rope and rope:WaitForChild("rstart", 5)
-		local before = {}
 		local axis, lastAngle, lastTime, turn = nil, nil, nil, 0
 		local jumps, lastJump = 0, 0
 		while round.live() do
@@ -6365,21 +6364,29 @@ local create, statusLabel, panel, nextOrder, makePage, rowBase, rowLabel, headin
 						table.insert(pieces, piece)
 					end
 				end
-				-- The line the rope turns about: at right angles to how any piece moves round it.
-				if not axis then
-					for _, piece in ipairs(pieces) do
-						local old = before[piece]
-						local arm = piece.Position - centre
-						if old and (arm - old).Magnitude > 0.6 and arm.Magnitude > 3 then
-							local normal = old:Cross(arm)
-							if normal.Magnitude > 1 then
-								axis = normal.Unit
-								break
+				-- The line the rope turns about runs through its two ends: the rope is an arch
+				-- of pieces, and the two that are furthest apart are its ends, which stay put.
+				-- (em-19. It used to take the cross product of one piece's old and new arm from
+				-- the pivot; that is only the axis for a piece level with the pivot, and for
+				-- any other it pointed somewhere else, so every angle after it was wrong. The
+				-- round it ran alone it made 5 jumps and was out in 17 seconds.)
+				if not axis and #pieces >= 2 then
+					local far, a, b = 0, nil, nil
+					for _, one in ipairs(pieces) do
+						for _, two in ipairs(pieces) do
+							local span = (one.Position - two.Position).Magnitude
+							if span > far then
+								far, a, b = span, one, two
 							end
-						elseif not old then
-							before[piece] = arm
 						end
 					end
+					if a and far > 6 then
+						axis = (b.Position - a.Position).Unit
+						round.ropeEnd = a
+					end
+				end
+				if round.ropeEnd and round.ropeEnd.Parent then
+					centre = round.ropeEnd.Position
 				end
 				if axis and #pieces > 0 then
 					local side = axis:Cross(Vector3.yAxis)
@@ -6429,7 +6436,7 @@ local create, statusLabel, panel, nextOrder, makePage, rowBase, rowLabel, headin
 			end
 			runService.Heartbeat:Wait()
 		end
-		log("Just Jump: " .. jumps .. " jumps")
+		log(("Just Jump: %d jumps, the rope was turning once every %.1fs at the end"):format(jumps, math.abs(turn) > 0.01 and 2 * math.pi / math.abs(turn) or 0))
 	end
 
 	-- Toxic Reactions. USER: "go to the platform with the right color". Four 20x20 platforms in a
