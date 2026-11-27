@@ -1674,6 +1674,56 @@
 		end
 	end
 
+	-- Cube Factory (team). USER: "click the squares to make the inner color the same as the
+	-- outer color". Your control panel is the rpartspawner / bpartspawner model whose `num` is
+	-- your playernum: four squares button1..4, each a part with a ClickDetector (the inner
+	-- colour, red or green) and a `glow` child (the outer colour). A click flips the inner
+	-- one; all four matching makes a cube and deals a new code. Clicks the ones that differ,
+	-- one at a time, waiting for each to flip.
+	EM.handlers["Cube Factory"] = function(round)
+		local model = round.model
+		local clicks, codes, wasDone = 0, 0, false
+		local function panel()
+			local number = mine("playernum", 0)
+			for _, child in ipairs(model:GetChildren()) do
+				local num = child:FindFirstChild("num")
+				if num and num.Value == number and child:FindFirstChild("button1") then
+					return child
+				end
+			end
+			return nil
+		end
+		while round.live() do
+			local mineIs = panel()
+			local done = mineIs ~= nil
+			if mineIs and fireclickdetector then
+				for index = 1, 4 do
+					local button = mineIs:FindFirstChild("button" .. index)
+					local glow = button and button:FindFirstChild("glow")
+					local detector = button and button:FindFirstChildOfClass("ClickDetector")
+					if button and glow and detector and button.BrickColor ~= glow.BrickColor then
+						done = false
+						local before = button.BrickColor
+						pcall(fireclickdetector, detector)
+						clicks += 1
+						-- Wait for the flip (or for a new code) before touching anything else.
+						local deadline = os.clock() + 0.5
+						while os.clock() < deadline and button.BrickColor == before and round.live() do
+							task.wait(0.03)
+						end
+						break
+					end
+				end
+			end
+			if done and not wasDone then
+				codes += 1
+			end
+			wasDone = done
+			task.wait(done and 0.03 or 0.06)
+		end
+		log(("Cube Factory: %d clicks, about %d codes matched"):format(clicks, codes))
+	end
+
 	-- Hurdle Hurry. You are carried down your lane on your own (walk speed is 0, about 18 studs a
 	-- second) and the only thing to do is jump. Each lane (`Lanes.L<n>`) holds its hurdles in
 	-- `Hurdles`; the bar is the 7-wide part and its top is level with your waist. A jump at the

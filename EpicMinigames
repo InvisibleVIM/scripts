@@ -15,7 +15,7 @@ if not shared then
 end
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local BeyRivals = { connections = {}, toggleRefreshers = {}, segmentRefreshers = {}, VERSION = "em-20", alive = true }
+local BeyRivals = { connections = {}, toggleRefreshers = {}, segmentRefreshers = {}, VERSION = "em-21", alive = true }
 if shared.EpicMinigames then
 	pcall(shared.EpicMinigames.detach)
 end
@@ -6971,6 +6971,56 @@ local create, statusLabel, panel, nextOrder, makePage, rowBase, rowLabel, headin
 		end
 	end
 
+	-- Cube Factory (team). USER: "click the squares to make the inner color the same as the
+	-- outer color". Your control panel is the rpartspawner / bpartspawner model whose `num` is
+	-- your playernum: four squares button1..4, each a part with a ClickDetector (the inner
+	-- colour, red or green) and a `glow` child (the outer colour). A click flips the inner
+	-- one; all four matching makes a cube and deals a new code. Clicks the ones that differ,
+	-- one at a time, waiting for each to flip.
+	EM.handlers["Cube Factory"] = function(round)
+		local model = round.model
+		local clicks, codes, wasDone = 0, 0, false
+		local function panel()
+			local number = mine("playernum", 0)
+			for _, child in ipairs(model:GetChildren()) do
+				local num = child:FindFirstChild("num")
+				if num and num.Value == number and child:FindFirstChild("button1") then
+					return child
+				end
+			end
+			return nil
+		end
+		while round.live() do
+			local mineIs = panel()
+			local done = mineIs ~= nil
+			if mineIs and fireclickdetector then
+				for index = 1, 4 do
+					local button = mineIs:FindFirstChild("button" .. index)
+					local glow = button and button:FindFirstChild("glow")
+					local detector = button and button:FindFirstChildOfClass("ClickDetector")
+					if button and glow and detector and button.BrickColor ~= glow.BrickColor then
+						done = false
+						local before = button.BrickColor
+						pcall(fireclickdetector, detector)
+						clicks += 1
+						-- Wait for the flip (or for a new code) before touching anything else.
+						local deadline = os.clock() + 0.5
+						while os.clock() < deadline and button.BrickColor == before and round.live() do
+							task.wait(0.03)
+						end
+						break
+					end
+				end
+			end
+			if done and not wasDone then
+				codes += 1
+			end
+			wasDone = done
+			task.wait(done and 0.03 or 0.06)
+		end
+		log(("Cube Factory: %d clicks, about %d codes matched"):format(clicks, codes))
+	end
+
 	-- Hurdle Hurry. You are carried down your lane on your own (walk speed is 0, about 18 studs a
 	-- second) and the only thing to do is jump. Each lane (`Lanes.L<n>`) holds its hurdles in
 	-- `Hurdles`; the bar is the 7-wide part and its top is level with your waist. A jump at the
@@ -7258,7 +7308,7 @@ end)()
 		toggle(page, "Play minigames for me", "EmAuto")
 		hint(page, "The main switch. Off: you play everything and it only records and collects rewards.")
 		toggle(page, "Minigames with their own handler", "EmSpecial")
-		hint(page, "Uses a handler written for that minigame when there is one. So far: Paint to Perfection (clicks your easel until it matches the board) Balloon Platoon (shoots the balloon of the called colour) Accurate Archery (shoots the targets, golden ones first) Eagle Observation (counts every eagle) Cannon Cooldown (steps on your team's pads until they are green) Timestamp Trace (stops your timer on the big clock's time) Drawing the Line (steers you along the line in your lane) Hurdle Hurry (jumps each hurdle in your lane) Cake Delivery (walks your cake to the door with its number), Block Hunt (marks the other team's blocks through walls and walks to them; hiding is yours) Fishing Frenzy (moves your mouse onto the next fish and away from sharks) The Sweeper (jumps the bar each time it comes round) Just Jump (jumps the rope each turn) and Toxic Reactions (walks to the platform whose colour the sign shows). More are added from the recordings below.")
+		hint(page, "Uses a handler written for that minigame when there is one. So far: Paint to Perfection (clicks your easel until it matches the board) Balloon Platoon (shoots the balloon of the called colour) Accurate Archery (shoots the targets, golden ones first) Eagle Observation (counts every eagle) Cannon Cooldown (steps on your team's pads until they are green) Timestamp Trace (stops your timer on the big clock's time) Drawing the Line (steers you along the line in your lane) Cube Factory (clicks your panel's squares until inner matches outer) Hurdle Hurry (jumps each hurdle in your lane) Cake Delivery (walks your cake to the door with its number), Block Hunt (marks the other team's blocks through walls and walks to them; hiding is yours) Fishing Frenzy (moves your mouse onto the next fish and away from sharks) The Sweeper (jumps the bar each time it comes round) Just Jump (jumps the rope each turn) and Toxic Reactions (walks to the platform whose colour the sign shows). More are added from the recordings below.")
 		UI.slider(page, "Fist reach in brawls", "EmFistReach", 0, 20, 1, function(v)
 			return v == 0 and "Off" or (tostring(v) .. " studs")
 		end, "Backstreet Brawl: your punch counts on anyone this close, not only those you touch. You still click to punch. 0 leaves the fist as the game made it.")
