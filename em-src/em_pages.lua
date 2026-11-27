@@ -40,8 +40,6 @@
 		heading(page, "Play for me", "left", "It only walks and jumps, the way you would. Touch W, A, S, D or Space and it lets go for a moment.")
 		toggle(page, "Play minigames for me", "EmAuto")
 		hint(page, "The main switch. Off: you play everything and it only records and collects rewards.")
-		toggle(page, "Racing minigames", "EmRace")
-		hint(page, "Follows the player in front along the exact path they ran, jumping where they jumped. It cannot come first this way, but it finishes courses it has never seen.")
 		toggle(page, "Survival minigames", "EmSurvive")
 		hint(page, "For the game's Other and Luck minigames: stays beside the player with the best win streak, a moment behind them, and steps out of the way of anything moving at you.")
 		toggle(page, "Minigames with their own handler", "EmSpecial")

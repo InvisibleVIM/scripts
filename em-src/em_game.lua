@@ -1471,9 +1471,9 @@
 			return special, "its own handler"
 		end
 		local category = EM.category(name)
-		if category == "Racing" and Config.EmRace then
-			return Brain.race, "follow the leader"
-		end
+		-- Racing minigames without a handler are the user's to play. USER: "following the person
+		-- in the 'lead' basically never works. stop that." (The log agreed: every race it
+		-- "won" was 64-98% steered by the user.) Brain.race is kept but no longer chosen.
 		if (category == "Other" or category == "Luck") and Config.EmSurvive then
 			return Brain.survive, "stay with a good player"
 		end
