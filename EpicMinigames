@@ -15,7 +15,7 @@ if not shared then
 end
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local BeyRivals = { connections = {}, toggleRefreshers = {}, segmentRefreshers = {}, VERSION = "em-22", alive = true }
+local BeyRivals = { connections = {}, toggleRefreshers = {}, segmentRefreshers = {}, VERSION = "em-23", alive = true }
 if shared.EpicMinigames then
 	pcall(shared.EpicMinigames.detach)
 end
@@ -7201,6 +7201,60 @@ local create, statusLabel, panel, nextOrder, makePage, rowBase, rowLabel, headin
 		log(("Stallion Stampede: %d whips, %d hurdle jumps, %d power-ups, lap %s"):format(whips, jumps, taken, tostring(laps and laps.Value)))
 	end
 
+	-- Minefield March. USER: "see if you can see the mines before they're stepped on. if you
+	-- can esp them". You can: every mine is in the model from the start, map.mines.mine.main
+	-- (an 8 x 6 x 6 touch part), invisible until someone sets it off. Each hidden one gets a
+	-- red slab on the ground that shows through everything; one that has gone off loses it.
+	-- You walk the field yourself.
+	EM.handlers["Minefield March"] = function(round)
+		local model = round.model
+		local holder = Instance.new("Folder")
+		holder.Name = "EpicMinigamesMines"
+		holder.Parent = EM.gui
+		local boxes = {}
+		local most = 0
+		while round.live() do
+			local map = model:FindFirstChild("map")
+			local mines = map and map:FindFirstChild("mines")
+			local hidden = 0
+			for _, mine in ipairs(mines and mines:GetChildren() or {}) do
+				local main = mine:FindFirstChild("main")
+				if main and main:IsA("BasePart") then
+					local live = main.Transparency > 0.5
+					if live then
+						hidden += 1
+					end
+					if live and not boxes[main] then
+						local box = Instance.new("BoxHandleAdornment")
+						box.Adornee = main
+						box.Size = Vector3.new(main.Size.X, 0.4, main.Size.Z)
+						box.CFrame = CFrame.new(0, -main.Size.Y / 2 + 0.3, 0)
+						box.Color3 = Color3.fromRGB(255, 40, 40)
+						box.Transparency = 0.45
+						box.AlwaysOnTop = true
+						box.ZIndex = 5
+						box.Parent = holder
+						boxes[main] = box
+					elseif not live and boxes[main] then
+						boxes[main]:Destroy()
+						boxes[main] = nil
+					end
+				end
+			end
+			for main, box in pairs(boxes) do
+				if not main.Parent then
+					box:Destroy()
+					boxes[main] = nil
+				end
+			end
+			most = math.max(most, hidden)
+			round.detail = hidden .. " mines still hidden"
+			task.wait(0.25)
+		end
+		holder:Destroy()
+		log(("Minefield March: %d hidden mines were marked"):format(most))
+	end
+
 	-- Hurdle Hurry. You are carried down your lane on your own (walk speed is 0, about 18 studs a
 	-- second) and the only thing to do is jump. Each lane (`Lanes.L<n>`) holds its hurdles in
 	-- `Hurdles`; the bar is the 7-wide part and its top is level with your waist. A jump at the
@@ -7488,7 +7542,7 @@ end)()
 		toggle(page, "Play minigames for me", "EmAuto")
 		hint(page, "The main switch. Off: you play everything and it only records and collects rewards.")
 		toggle(page, "Minigames with their own handler", "EmSpecial")
-		hint(page, "Uses a handler written for that minigame when there is one. So far: Paint to Perfection (clicks your easel until it matches the board) Balloon Platoon (shoots the balloon of the called colour) Accurate Archery (shoots the targets, golden ones first) Eagle Observation (counts every eagle) Cannon Cooldown (steps on your team's pads until they are green) Timestamp Trace (stops your timer on the big clock's time) Drawing the Line (steers you along the line in your lane) Cube Factory (clicks your panel's squares until inner matches outer) Stallion Stampede (whips under the limit, jumps hurdles, steers to power-ups) Hurdle Hurry (jumps each hurdle in your lane) Cake Delivery (walks your cake to the door with its number), Block Hunt (marks the other team's blocks through walls and walks to them; hiding is yours) Fishing Frenzy (moves your mouse onto the next fish and away from sharks) The Sweeper (jumps the bar each time it comes round) Just Jump (jumps the rope each turn) and Toxic Reactions (walks to the platform whose colour the sign shows). More are added from the recordings below.")
+		hint(page, "Uses a handler written for that minigame when there is one. So far: Paint to Perfection (clicks your easel until it matches the board) Balloon Platoon (shoots the balloon of the called colour) Accurate Archery (shoots the targets, golden ones first) Eagle Observation (counts every eagle) Cannon Cooldown (steps on your team's pads until they are green) Timestamp Trace (stops your timer on the big clock's time) Drawing the Line (steers you along the line in your lane) Cube Factory (clicks your panel's squares until inner matches outer) Stallion Stampede (whips under the limit, jumps hurdles, steers to power-ups) Minefield March (shows the hidden mines; you walk) Hurdle Hurry (jumps each hurdle in your lane) Cake Delivery (walks your cake to the door with its number), Block Hunt (marks the other team's blocks through walls and walks to them; hiding is yours) Fishing Frenzy (moves your mouse onto the next fish and away from sharks) The Sweeper (jumps the bar each time it comes round) Just Jump (jumps the rope each turn) and Toxic Reactions (walks to the platform whose colour the sign shows). More are added from the recordings below.")
 		UI.slider(page, "Fist reach in brawls", "EmFistReach", 0, 20, 1, function(v)
 			return v == 0 and "Off" or (tostring(v) .. " studs")
 		end, "Backstreet Brawl: your punch counts on anyone this close, not only those you touch. You still click to punch. 0 leaves the fist as the game made it.")

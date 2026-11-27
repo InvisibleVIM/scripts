@@ -1904,6 +1904,60 @@
 		log(("Stallion Stampede: %d whips, %d hurdle jumps, %d power-ups, lap %s"):format(whips, jumps, taken, tostring(laps and laps.Value)))
 	end
 
+	-- Minefield March. USER: "see if you can see the mines before they're stepped on. if you
+	-- can esp them". You can: every mine is in the model from the start, map.mines.mine.main
+	-- (an 8 x 6 x 6 touch part), invisible until someone sets it off. Each hidden one gets a
+	-- red slab on the ground that shows through everything; one that has gone off loses it.
+	-- You walk the field yourself.
+	EM.handlers["Minefield March"] = function(round)
+		local model = round.model
+		local holder = Instance.new("Folder")
+		holder.Name = "EpicMinigamesMines"
+		holder.Parent = EM.gui
+		local boxes = {}
+		local most = 0
+		while round.live() do
+			local map = model:FindFirstChild("map")
+			local mines = map and map:FindFirstChild("mines")
+			local hidden = 0
+			for _, mine in ipairs(mines and mines:GetChildren() or {}) do
+				local main = mine:FindFirstChild("main")
+				if main and main:IsA("BasePart") then
+					local live = main.Transparency > 0.5
+					if live then
+						hidden += 1
+					end
+					if live and not boxes[main] then
+						local box = Instance.new("BoxHandleAdornment")
+						box.Adornee = main
+						box.Size = Vector3.new(main.Size.X, 0.4, main.Size.Z)
+						box.CFrame = CFrame.new(0, -main.Size.Y / 2 + 0.3, 0)
+						box.Color3 = Color3.fromRGB(255, 40, 40)
+						box.Transparency = 0.45
+						box.AlwaysOnTop = true
+						box.ZIndex = 5
+						box.Parent = holder
+						boxes[main] = box
+					elseif not live and boxes[main] then
+						boxes[main]:Destroy()
+						boxes[main] = nil
+					end
+				end
+			end
+			for main, box in pairs(boxes) do
+				if not main.Parent then
+					box:Destroy()
+					boxes[main] = nil
+				end
+			end
+			most = math.max(most, hidden)
+			round.detail = hidden .. " mines still hidden"
+			task.wait(0.25)
+		end
+		holder:Destroy()
+		log(("Minefield March: %d hidden mines were marked"):format(most))
+	end
+
 	-- Hurdle Hurry. You are carried down your lane on your own (walk speed is 0, about 18 studs a
 	-- second) and the only thing to do is jump. Each lane (`Lanes.L<n>`) holds its hurdles in
 	-- `Hurdles`; the bar is the 7-wide part and its top is level with your waist. A jump at the
