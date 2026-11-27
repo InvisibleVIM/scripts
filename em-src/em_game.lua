@@ -1568,15 +1568,18 @@
 	end
 
 	-- Drawing the Line. USER: "make a handler for this. i have to trace the line on the
-	-- ground". Each player has a lane, model.Lanes.A<playernum>; the black line is 238 rope
-	-- pieces on its AtchPart (Line1..LineN, Attachment0 -> Attachment1, half a stud each,
-	-- weaving up to five studs either side of the lane's middle for about 120 studs). You walk
-	-- it. This finds the piece you are on and keeps walking to the point a stud ahead of it,
-	-- so the feet stay on the line through the bends. The log gets how far off it was.
+	-- ground", then: "yea the game walks me forward in drawing the line." Each player has a
+	-- lane, model.Lanes.A<playernum>; the black line is 238 rope pieces on its AtchPart
+	-- (Line1..LineN, Attachment0 -> Attachment1, half a stud each along +Z, weaving up to five
+	-- studs either side of the lane's middle for about 120 studs). The game carries you
+	-- forward, so this only steers sideways: it reads where the line is a moment ahead of you
+	-- (as far as you are carried in a tenth of a second) and walks sideways toward it, gently
+	-- when close so it does not wobble across. The log gets the speeds and how far off it was.
 	EM.handlers["Drawing the Line"] = function(round)
 		local model = round.model
-		local points, count, index = {}, -1, 1
+		local points, count = {}, -1
 		local samples, off, worst = 0, 0, 0
+		local lastPos, lastTime, carried, walk = nil, nil, 0, 0
 		local function build()
 			local lanes = model:FindFirstChild("Lanes")
 			local lane = lanes and lanes:FindFirstChild("A" .. tostring(mine("playernum", 0)))
@@ -1604,7 +1607,30 @@
 					table.insert(list, rope.Attachment1.WorldPosition)
 				end
 			end
+			table.sort(list, function(a, b)
+				return a.Z < b.Z
+			end)
 			points = list
+		end
+		---Where the line is (its X) at this Z, between the two points either side of it.
+		local function lineX(z)
+			local low, high = 1, #points
+			if z <= points[1].Z then
+				return points[1].X
+			elseif z >= points[high].Z then
+				return points[high].X
+			end
+			while high - low > 1 do
+				local middle = math.floor((low + high) / 2)
+				if points[middle].Z <= z then
+					low = middle
+				else
+					high = middle
+				end
+			end
+			local a, b = points[low], points[high]
+			local span = b.Z - a.Z
+			return span > 0.001 and (a.X + (b.X - a.X) * (z - a.Z) / span) or a.X
 		end
 		local nextBuild = 0
 		while round.live() do
@@ -1612,30 +1638,39 @@
 				nextBuild = os.clock() + 1
 				build()
 			end
-			local part = root()
-			if part and #points > 3 then
-				-- The piece under you: the nearest point, looked for around the last one so
-				-- that a bend doubling back never throws you onto a later stretch.
-				local best, bestGap
-				for i = math.max(index - 6, 1), math.min(index + 24, #points) do
-					local gap = flat(points[i] - part.Position).Magnitude
-					if not bestGap or gap < bestGap then
-						best, bestGap = i, gap
-					end
+			local part, human = root(), humanoid()
+			if part and human and #points > 3 then
+				local now = os.clock()
+				if lastPos and now - lastTime > 0.05 then
+					carried = carried * 0.7 + ((part.Position.Z - lastPos.Z) / (now - lastTime)) * 0.3
+					lastPos, lastTime = part.Position, now
+				elseif not lastPos then
+					lastPos, lastTime = part.Position, now
 				end
-				index = best
-				samples += 1
-				off += bestGap
-				worst = math.max(worst, bestGap)
-				local goal = points[math.min(index + 2, #points)]
-				if index < #points then
-					Move.to(Vector3.new(goal.X, part.Position.Y, goal.Z))
+				walk = math.max(walk, human.WalkSpeed)
+				local z = part.Position.Z
+				if z >= points[1].Z - 1 and z <= points[#points].Z + 1 then
+					local here = math.abs(lineX(z) - part.Position.X)
+					samples += 1
+					off += here
+					worst = math.max(worst, here)
+				end
+				if not Move.yours() then
+					local wanted = lineX(z + math.max(carried, 0) * 0.1) - part.Position.X
+					-- Full sideways speed until it is within a tenth of a second's walk, then
+					-- in proportion, so it settles on the line.
+					local reach = math.max(human.WalkSpeed, 1) * 0.1
+					human:Move(Vector3.new(math.clamp(wanted / reach, -1, 1), 0, 0), false)
 				end
 			end
 			runService.Heartbeat:Wait()
 		end
+		local human = humanoid()
+		if human and not Move.yours() then
+			human:Move(Vector3.zero, false)
+		end
 		if samples > 0 then
-			log(("Drawing the Line: reached piece %d of %d, on average %.2f studs off the line, at worst %.1f"):format(index, #points, off / samples, worst))
+			log(("Drawing the Line: walk speed %d, carried forward at %.1f studs/s, on average %.2f studs off the line, at worst %.1f"):format(walk, carried, off / samples, worst))
 		end
 	end
 
