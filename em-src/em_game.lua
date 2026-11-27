@@ -1573,28 +1573,36 @@
 		log(("Timestamp Trace: %d rounds timed"):format(goes))
 	end
 
-	-- Backstreet Brawl. USER: "increase my hitting range for the fist in brawls". The fist is a
-	-- tool called Punch: a server SwordScript and a Handle that hits whatever it touches. A
+	-- Melee reach. USER: "increase my hitting range for the fist in brawls", then for Castle
+	-- Clash: "for this one increase the range of my sword same as the fist". The fist (tool
+	-- Punch, Backstreet Brawl) and the sword (tool Sword, Castle Clash and Solo Swordsman) are
+	-- the same kind of weapon: a server script and a Handle that hits whatever it touches. A
 	-- touch is reported by the client that owns the part, so a player inside the chosen reach
 	-- (Config.EmFistReach studs, 0 = off) is reported as touched by the Handle with
 	-- firetouchinterest. You still walk, aim and click yourself; only the reach is longer.
-	-- Nothing here hides from the game's own checks: if the server measures the distance
-	-- itself, the far touches simply do nothing (the log line says how many landed).
-	EM.handlers["Backstreet Brawl"] = function(round)
+	-- Team-mates are left alone (the sword can hurt them: CanTeamkill is on). Nothing here
+	-- hides from the game's own checks: if the server measures the distance itself, the far
+	-- touches simply do nothing (the log line says how many landed).
+	local function meleeReach(round, toolName)
 		local touches, landed = 0, 0
 		local watch = {}
+		local flag = round.model:FindFirstChild("isteamgame")
+		local teams = flag ~= nil and flag.Value == true
 		while round.live() do
 			local reach = tonumber(Config.EmFistReach) or 0
 			local model, part = character(), root()
-			local punch = model and model:FindFirstChild("Punch")
-			local handle = punch and punch:FindFirstChild("Handle")
+			local weapon = model and model:FindFirstChild(toolName)
+			local handle = weapon and weapon:FindFirstChild("Handle")
 			if reach > 0 and handle and part and firetouchinterest then
+				local myTeam = mine("team", "")
 				for _, player in ipairs(playersService:GetPlayers()) do
 					local theirs = player.Character
 					local torso = theirs and (theirs:FindFirstChild("HumanoidRootPart") or theirs:FindFirstChild("Torso"))
 					local human = theirs and theirs:FindFirstChildOfClass("Humanoid")
 					local inround = player:FindFirstChild("inround")
-					if player ~= localPlayer and torso and human and human.Health > 0 and inround and inround.Value then
+					local team = player:FindFirstChild("team")
+					local friend = teams and team and team.Value == myTeam
+					if player ~= localPlayer and not friend and torso and human and human.Health > 0 and inround and inround.Value then
 						local gap = (torso.Position - part.Position).Magnitude
 						if gap <= reach then
 							pcall(firetouchinterest, handle, torso, 0)
@@ -1614,9 +1622,17 @@
 			end
 			task.wait(0.1)
 		end
-		log(("Backstreet Brawl: reach %d studs, %d touches sent, %d times someone beyond arm's length lost health"):format(tonumber(Config.EmFistReach) or 0, touches, landed))
+		log(("%s: reach %d studs with the %s, %d touches sent, %d times someone beyond arm's length lost health"):format(round.name or "Melee", tonumber(Config.EmFistReach) or 0, toolName, touches, landed))
 	end
-
+	EM.handlers["Backstreet Brawl"] = function(round)
+		meleeReach(round, "Punch")
+	end
+	EM.handlers["Castle Clash"] = function(round)
+		meleeReach(round, "Sword")
+	end
+	EM.handlers["Solo Swordsman"] = function(round)
+		meleeReach(round, "Sword")
+	end
 	-- Drawing the Line. USER: "make a handler for this. i have to trace the line on the
 	-- ground", then: "yea the game walks me forward in drawing the line." Each player has a
 	-- lane, model.Lanes.A<playernum>; the black line is 238 rope pieces on its AtchPart
