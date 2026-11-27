@@ -1358,6 +1358,47 @@
 		log(("Accurate Archery: %d shots (%d golden), the game counts %s for you"):format(shots, gold, tostring(score and score.Value)))
 	end
 
+	-- Eagle Observation. USER: "space for every eagle". Birds and wolves fly past a camera and
+	-- you count the eagles: Space sends model.Bridge:FireServer() (one count). The server tells
+	-- the client about every animal through the same Bridge: ("Eagle", { gull = template model,
+	-- cf, spd }) for birds, where the template is model.Eagle or model.Seagull, and ("Wolf",
+	-- ...) for wolves. One count per bird whose template is the Eagle, sent while it is in
+	-- flight (it crosses 180 studs in 2 / spd frames). Don't press Space yourself as well.
+	EM.handlers["Eagle Observation"] = function(round)
+		local model = round.model
+		local bridge = model:WaitForChild("Bridge", 5)
+		if not bridge then
+			return
+		end
+		local eagles, others, counted = 0, 0, 0
+		local connection = bridge.OnClientEvent:Connect(function(kind, info)
+			if kind ~= "Eagle" or type(info) ~= "table" then
+				if kind == "Wolf" then
+					others += 1
+				end
+				return
+			end
+			local template = info.gull
+			if typeof(template) ~= "Instance" or template.Name ~= "Eagle" then
+				others += 1
+				return
+			end
+			eagles += 1
+			local speed = tonumber(info.spd) or 0.02
+			local flight = 2 / math.max(speed, 0.001) / 60
+			task.wait(math.clamp(flight * 0.4, 0.25, 1.5))
+			if round.live() and bridge.Parent then
+				bridge:FireServer()
+				counted += 1
+			end
+		end)
+		while round.live() do
+			task.wait(0.2)
+		end
+		connection:Disconnect()
+		log(("Eagle Observation: %d eagles seen, %d counted, %d other animals let pass"):format(eagles, counted, others))
+	end
+
 	-- Hurdle Hurry. You are carried down your lane on your own (walk speed is 0, about 18 studs a
 	-- second) and the only thing to do is jump. Each lane (`Lanes.L<n>`) holds its hurdles in
 	-- `Hurdles`; the bar is the 7-wide part and its top is level with your waist. A jump at the
