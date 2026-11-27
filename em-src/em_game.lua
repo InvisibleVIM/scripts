@@ -1981,6 +1981,78 @@
 		log(("Minefield March: %d hidden mines were marked"):format(most))
 	end
 
+	-- Pivot Paintings. USER: "check if you can see pivot paintings. make a handler. you have to
+	-- click the images and they rotate. align them all to make the full image. add a time for
+	-- this so i can set how long it takes the handler to finish it". It can be seen: your
+	-- painting is model.Areas.<playernum>.D1.Tiles, fifteen parts each with a `rotations`
+	-- number that counts its quarter turns; a tile is upright when that is a multiple of 4.
+	-- A click in the game is rotateTile:FireServer(tile, you) plus turning the tile a quarter
+	-- on your own screen (the server does not send your own turn back to you). The handler
+	-- does the same, tile by tile, re-reading the number after every click, and spreads the
+	-- clicks evenly over Config.EmPaintSeconds.
+	EM.handlers["Pivot Paintings"] = function(round)
+		local model = round.model
+		local remote = model:WaitForChild("rotateTile", 5)
+		local clicks, startedAt, planned, gap = 0, nil, 0, 0.3
+		local function tiles()
+			local areas = model:FindFirstChild("Areas")
+			local area = areas and areas:FindFirstChild(tostring(mine("playernum", 0)))
+			local folder = area and area:FindFirstChild("Tiles", true)
+			local list = {}
+			for _, tile in ipairs(folder and folder:GetChildren() or {}) do
+				local turns = tile:FindFirstChild("rotations")
+				if tile:IsA("BasePart") and turns then
+					table.insert(list, { tile = tile, turns = turns, order = tonumber(tile.Name) or 0 })
+				end
+			end
+			table.sort(list, function(a, b)
+				return a.order < b.order
+			end)
+			return list
+		end
+		local function owing(entry)
+			return (4 - entry.turns.Value % 4) % 4
+		end
+		local finished = false
+		while round.live() and remote do
+			local list = tiles()
+			local total = 0
+			for _, entry in ipairs(list) do
+				total += owing(entry)
+			end
+			if #list > 0 and total > 0 then
+				finished = false
+				if not startedAt then
+					-- The whole job, spread over the time the user chose.
+					startedAt, planned = os.clock(), total
+					gap = math.max((tonumber(Config.EmPaintSeconds) or 10) / total, 0.05)
+					log(("Pivot Paintings: %d tiles, %d quarter turns to make, one every %.2fs"):format(#list, total, gap))
+				end
+				for _, entry in ipairs(list) do
+					if owing(entry) > 0 then
+						local before = entry.turns.Value
+						local tile = entry.tile
+						tile.CFrame = tile.CFrame * CFrame.Angles(0, 0, math.pi / 2)
+						remote:FireServer(tile, localPlayer)
+						clicks += 1
+						-- Wait for the server's count to move, and for the next click's turn.
+						local sent = os.clock()
+						while round.live() and (os.clock() - sent < gap or (entry.turns.Value == before and os.clock() - sent < 0.8)) do
+							task.wait(0.03)
+						end
+						break
+					end
+				end
+			else
+				if #list > 0 and startedAt and not finished then
+					finished = true
+					log(("Pivot Paintings: all upright after %.1fs and %d clicks (%d were planned)"):format(os.clock() - startedAt, clicks, planned))
+				end
+				task.wait(0.2)
+			end
+		end
+	end
+
 	-- Hurdle Hurry. You are carried down your lane on your own (walk speed is 0, about 18 studs a
 	-- second) and the only thing to do is jump. Each lane (`Lanes.L<n>`) holds its hurdles in
 	-- `Hurdles`; the bar is the 7-wide part and its top is level with your waist. A jump at the

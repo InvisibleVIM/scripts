@@ -15,7 +15,7 @@ if not shared then
 end
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local BeyRivals = { connections = {}, toggleRefreshers = {}, segmentRefreshers = {}, VERSION = "em-24", alive = true }
+local BeyRivals = { connections = {}, toggleRefreshers = {}, segmentRefreshers = {}, VERSION = "em-25", alive = true }
 if shared.EpicMinigames then
 	pcall(shared.EpicMinigames.detach)
 end
@@ -2305,7 +2305,7 @@ for key, value in pairs(PotentUniversal.DEFAULTS) do
 	Config[key] = value
 end
 -- Epic Minigames settings.
-for key, value in pairs({ EmAuto = true, EmRace = true, EmSurvive = true, EmSpecial = true, EmJoin = true, EmRecord = true, EmDaily = true, EmPlaytime = true, EmFistReach = 10, EmArcheryLimit = 100 }) do
+for key, value in pairs({ EmAuto = true, EmRace = true, EmSurvive = true, EmSpecial = true, EmJoin = true, EmRecord = true, EmDaily = true, EmPlaytime = true, EmFistReach = 10, EmArcheryLimit = 100, EmPaintSeconds = 10 }) do
 	Config[key] = value
 end
 Config.AntiAfk = false
@@ -7278,6 +7278,78 @@ local create, statusLabel, panel, nextOrder, makePage, rowBase, rowLabel, headin
 		log(("Minefield March: %d hidden mines were marked"):format(most))
 	end
 
+	-- Pivot Paintings. USER: "check if you can see pivot paintings. make a handler. you have to
+	-- click the images and they rotate. align them all to make the full image. add a time for
+	-- this so i can set how long it takes the handler to finish it". It can be seen: your
+	-- painting is model.Areas.<playernum>.D1.Tiles, fifteen parts each with a `rotations`
+	-- number that counts its quarter turns; a tile is upright when that is a multiple of 4.
+	-- A click in the game is rotateTile:FireServer(tile, you) plus turning the tile a quarter
+	-- on your own screen (the server does not send your own turn back to you). The handler
+	-- does the same, tile by tile, re-reading the number after every click, and spreads the
+	-- clicks evenly over Config.EmPaintSeconds.
+	EM.handlers["Pivot Paintings"] = function(round)
+		local model = round.model
+		local remote = model:WaitForChild("rotateTile", 5)
+		local clicks, startedAt, planned, gap = 0, nil, 0, 0.3
+		local function tiles()
+			local areas = model:FindFirstChild("Areas")
+			local area = areas and areas:FindFirstChild(tostring(mine("playernum", 0)))
+			local folder = area and area:FindFirstChild("Tiles", true)
+			local list = {}
+			for _, tile in ipairs(folder and folder:GetChildren() or {}) do
+				local turns = tile:FindFirstChild("rotations")
+				if tile:IsA("BasePart") and turns then
+					table.insert(list, { tile = tile, turns = turns, order = tonumber(tile.Name) or 0 })
+				end
+			end
+			table.sort(list, function(a, b)
+				return a.order < b.order
+			end)
+			return list
+		end
+		local function owing(entry)
+			return (4 - entry.turns.Value % 4) % 4
+		end
+		local finished = false
+		while round.live() and remote do
+			local list = tiles()
+			local total = 0
+			for _, entry in ipairs(list) do
+				total += owing(entry)
+			end
+			if #list > 0 and total > 0 then
+				finished = false
+				if not startedAt then
+					-- The whole job, spread over the time the user chose.
+					startedAt, planned = os.clock(), total
+					gap = math.max((tonumber(Config.EmPaintSeconds) or 10) / total, 0.05)
+					log(("Pivot Paintings: %d tiles, %d quarter turns to make, one every %.2fs"):format(#list, total, gap))
+				end
+				for _, entry in ipairs(list) do
+					if owing(entry) > 0 then
+						local before = entry.turns.Value
+						local tile = entry.tile
+						tile.CFrame = tile.CFrame * CFrame.Angles(0, 0, math.pi / 2)
+						remote:FireServer(tile, localPlayer)
+						clicks += 1
+						-- Wait for the server's count to move, and for the next click's turn.
+						local sent = os.clock()
+						while round.live() and (os.clock() - sent < gap or (entry.turns.Value == before and os.clock() - sent < 0.8)) do
+							task.wait(0.03)
+						end
+						break
+					end
+				end
+			else
+				if #list > 0 and startedAt and not finished then
+					finished = true
+					log(("Pivot Paintings: all upright after %.1fs and %d clicks (%d were planned)"):format(os.clock() - startedAt, clicks, planned))
+				end
+				task.wait(0.2)
+			end
+		end
+	end
+
 	-- Hurdle Hurry. You are carried down your lane on your own (walk speed is 0, about 18 studs a
 	-- second) and the only thing to do is jump. Each lane (`Lanes.L<n>`) holds its hurdles in
 	-- `Hurdles`; the bar is the 7-wide part and its top is level with your waist. A jump at the
@@ -7565,7 +7637,10 @@ end)()
 		toggle(page, "Play minigames for me", "EmAuto")
 		hint(page, "The main switch. Off: you play everything and it only records and collects rewards.")
 		toggle(page, "Minigames with their own handler", "EmSpecial")
-		hint(page, "Uses a handler written for that minigame when there is one. So far: Paint to Perfection (clicks your easel until it matches the board) Balloon Platoon (shoots the balloon of the called colour) Accurate Archery (shoots the targets, golden ones first) Eagle Observation (counts every eagle) Cannon Cooldown (steps on your team's pads until they are green) Timestamp Trace (stops your timer on the big clock's time) Drawing the Line (steers you along the line in your lane) Cube Factory (clicks your panel's squares until inner matches outer) Stallion Stampede (whips under the limit, jumps hurdles, steers to power-ups) Minefield March (shows the hidden mines; you walk) Hurdle Hurry (jumps each hurdle in your lane) Cake Delivery (walks your cake to the door with its number), Block Hunt (marks the other team's blocks through walls and walks to them; hiding is yours) Fishing Frenzy (moves your mouse onto the next fish and away from sharks) The Sweeper (jumps the bar each time it comes round) Just Jump (jumps the rope each turn) and Toxic Reactions (walks to the platform whose colour the sign shows). More are added from the recordings below.")
+		hint(page, "Uses a handler written for that minigame when there is one. So far: Paint to Perfection (clicks your easel until it matches the board) Balloon Platoon (shoots the balloon of the called colour) Accurate Archery (shoots the targets, golden ones first) Eagle Observation (counts every eagle) Cannon Cooldown (steps on your team's pads until they are green) Timestamp Trace (stops your timer on the big clock's time) Drawing the Line (steers you along the line in your lane) Cube Factory (clicks your panel's squares until inner matches outer) Stallion Stampede (whips under the limit, jumps hurdles, steers to power-ups) Minefield March (shows the hidden mines; you walk) Pivot Paintings (turns every tile upright in the time you set) Hurdle Hurry (jumps each hurdle in your lane) Cake Delivery (walks your cake to the door with its number), Block Hunt (marks the other team's blocks through walls and walks to them; hiding is yours) Fishing Frenzy (moves your mouse onto the next fish and away from sharks) The Sweeper (jumps the bar each time it comes round) Just Jump (jumps the rope each turn) and Toxic Reactions (walks to the platform whose colour the sign shows). More are added from the recordings below.")
+		UI.slider(page, "Pivot Paintings time", "EmPaintSeconds", 0, 60, 1, function(v)
+			return v == 0 and "As fast as it goes" or (tostring(v) .. " s")
+		end, "Pivot Paintings: how long the handler takes to turn every tile upright. The clicks are spread evenly over it.")
 		UI.slider(page, "Archery score limit", "EmArcheryLimit", 0, 100, 1, function(v)
 			return v == 0 and "Don't shoot" or tostring(v)
 		end, "Accurate Archery: the handler stops shooting once your score reaches this. You can still shoot past it yourself.")
