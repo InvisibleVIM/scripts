@@ -26,7 +26,7 @@ for key, value in pairs(PotentUniversal.DEFAULTS) do
 	Config[key] = value
 end
 -- Epic Minigames settings.
-for key, value in pairs({ EmAuto = true, EmRace = true, EmSurvive = true, EmSpecial = true, EmJoin = true, EmRecord = true, EmDaily = true, EmPlaytime = true, EmFistReach = 10 }) do
+for key, value in pairs({ EmAuto = true, EmRace = true, EmSurvive = true, EmSpecial = true, EmJoin = true, EmRecord = true, EmDaily = true, EmPlaytime = true, EmFistReach = 10, EmArcheryLimit = 100 }) do
 	Config[key] = value
 end
 Config.AntiAfk = false

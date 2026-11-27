@@ -15,7 +15,7 @@ if not shared then
 end
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local BeyRivals = { connections = {}, toggleRefreshers = {}, segmentRefreshers = {}, VERSION = "em-23", alive = true }
+local BeyRivals = { connections = {}, toggleRefreshers = {}, segmentRefreshers = {}, VERSION = "em-24", alive = true }
 if shared.EpicMinigames then
 	pcall(shared.EpicMinigames.detach)
 end
@@ -2305,7 +2305,7 @@ for key, value in pairs(PotentUniversal.DEFAULTS) do
 	Config[key] = value
 end
 -- Epic Minigames settings.
-for key, value in pairs({ EmAuto = true, EmRace = true, EmSurvive = true, EmSpecial = true, EmJoin = true, EmRecord = true, EmDaily = true, EmPlaytime = true, EmFistReach = 10 }) do
+for key, value in pairs({ EmAuto = true, EmRace = true, EmSurvive = true, EmSpecial = true, EmJoin = true, EmRecord = true, EmDaily = true, EmPlaytime = true, EmFistReach = 10, EmArcheryLimit = 100 }) do
 	Config[key] = value
 end
 Config.AntiAfk = false
@@ -6633,7 +6633,23 @@ local create, statusLabel, panel, nextOrder, makePage, rowBase, rowLabel, headin
 			local remote = bow and bow:FindFirstChild("WepRemoteEvent")
 			local firePart = bow and bow:FindFirstChild("FirePart")
 			local targets = model:FindFirstChild("targets")
-			if remote and firePart and targets and os.clock() - lastShot > 0.85 and not Move.yours() then
+			-- The user's own ceiling: "make it so that the handler doesnt go above a limit i set.
+			-- 0-100". Counted on the game's own score (Character.targethits).
+			local score = character and character:FindFirstChild("targethits")
+			local limit = tonumber(Config.EmArcheryLimit) or 100
+			local under = not score or (tonumber(score.Value) or 0) < limit
+			-- A target that has gone down comes back up later as the same model, so "already
+			-- shot" only lasts until it is down. (em-12 never forgot one: it shot each target
+			-- once, about 22 of them, and then had nothing left to aim at.)
+			if targets then
+				for target in pairs(done) do
+					local alive = target:FindFirstChild("alive")
+					if not target.Parent or (alive and not alive.Value) or os.clock() - done[target] > 2.5 then
+						done[target] = nil
+					end
+				end
+			end
+			if under and remote and firePart and targets and os.clock() - lastShot > 0.85 and not Move.yours() then
 				local ignore = { character, model:FindFirstChild("aimignore") }
 				for _, child in ipairs(model:GetChildren()) do
 					if child.Name:sub(1, 7) == "campart" then
@@ -6667,7 +6683,7 @@ local create, statusLabel, panel, nextOrder, makePage, rowBase, rowLabel, headin
 					local origin = firePart.Position
 					local hit = entry.gap > 1 and workspace:Raycast(origin, (entry.bull.Position - origin).Unit * 500, params)
 					if hit and hit.Instance.Parent == entry.target then
-						done[entry.target] = true
+						done[entry.target] = os.clock()
 						lastShot = os.clock()
 						shots += 1
 						gold += entry.golden and 1 or 0
@@ -6686,7 +6702,7 @@ local create, statusLabel, panel, nextOrder, makePage, rowBase, rowLabel, headin
 			task.wait(0.03)
 		end
 		local score = character() and character():FindFirstChild("targethits")
-		log(("Accurate Archery: %d shots (%d golden), the game counts %s for you"):format(shots, gold, tostring(score and score.Value)))
+		log(("Accurate Archery: %d shots (%d golden), the game counts %s for you, limit %s"):format(shots, gold, tostring(score and score.Value), tostring(Config.EmArcheryLimit)))
 	end
 
 	-- Eagle Observation. USER: "space for every eagle". Birds and wolves fly past a camera and
@@ -7543,6 +7559,9 @@ end)()
 		hint(page, "The main switch. Off: you play everything and it only records and collects rewards.")
 		toggle(page, "Minigames with their own handler", "EmSpecial")
 		hint(page, "Uses a handler written for that minigame when there is one. So far: Paint to Perfection (clicks your easel until it matches the board) Balloon Platoon (shoots the balloon of the called colour) Accurate Archery (shoots the targets, golden ones first) Eagle Observation (counts every eagle) Cannon Cooldown (steps on your team's pads until they are green) Timestamp Trace (stops your timer on the big clock's time) Drawing the Line (steers you along the line in your lane) Cube Factory (clicks your panel's squares until inner matches outer) Stallion Stampede (whips under the limit, jumps hurdles, steers to power-ups) Minefield March (shows the hidden mines; you walk) Hurdle Hurry (jumps each hurdle in your lane) Cake Delivery (walks your cake to the door with its number), Block Hunt (marks the other team's blocks through walls and walks to them; hiding is yours) Fishing Frenzy (moves your mouse onto the next fish and away from sharks) The Sweeper (jumps the bar each time it comes round) Just Jump (jumps the rope each turn) and Toxic Reactions (walks to the platform whose colour the sign shows). More are added from the recordings below.")
+		UI.slider(page, "Archery score limit", "EmArcheryLimit", 0, 100, 1, function(v)
+			return v == 0 and "Don't shoot" or tostring(v)
+		end, "Accurate Archery: the handler stops shooting once your score reaches this. You can still shoot past it yourself.")
 		UI.slider(page, "Fist reach in brawls", "EmFistReach", 0, 20, 1, function(v)
 			return v == 0 and "Off" or (tostring(v) .. " studs")
 		end, "Backstreet Brawl: your punch counts on anyone this close, not only those you touch. You still click to punch. 0 leaves the fist as the game made it.")

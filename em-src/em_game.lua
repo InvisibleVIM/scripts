@@ -1336,7 +1336,23 @@
 			local remote = bow and bow:FindFirstChild("WepRemoteEvent")
 			local firePart = bow and bow:FindFirstChild("FirePart")
 			local targets = model:FindFirstChild("targets")
-			if remote and firePart and targets and os.clock() - lastShot > 0.85 and not Move.yours() then
+			-- The user's own ceiling: "make it so that the handler doesnt go above a limit i set.
+			-- 0-100". Counted on the game's own score (Character.targethits).
+			local score = character and character:FindFirstChild("targethits")
+			local limit = tonumber(Config.EmArcheryLimit) or 100
+			local under = not score or (tonumber(score.Value) or 0) < limit
+			-- A target that has gone down comes back up later as the same model, so "already
+			-- shot" only lasts until it is down. (em-12 never forgot one: it shot each target
+			-- once, about 22 of them, and then had nothing left to aim at.)
+			if targets then
+				for target in pairs(done) do
+					local alive = target:FindFirstChild("alive")
+					if not target.Parent or (alive and not alive.Value) or os.clock() - done[target] > 2.5 then
+						done[target] = nil
+					end
+				end
+			end
+			if under and remote and firePart and targets and os.clock() - lastShot > 0.85 and not Move.yours() then
 				local ignore = { character, model:FindFirstChild("aimignore") }
 				for _, child in ipairs(model:GetChildren()) do
 					if child.Name:sub(1, 7) == "campart" then
@@ -1370,7 +1386,7 @@
 					local origin = firePart.Position
 					local hit = entry.gap > 1 and workspace:Raycast(origin, (entry.bull.Position - origin).Unit * 500, params)
 					if hit and hit.Instance.Parent == entry.target then
-						done[entry.target] = true
+						done[entry.target] = os.clock()
 						lastShot = os.clock()
 						shots += 1
 						gold += entry.golden and 1 or 0
@@ -1389,7 +1405,7 @@
 			task.wait(0.03)
 		end
 		local score = character() and character():FindFirstChild("targethits")
-		log(("Accurate Archery: %d shots (%d golden), the game counts %s for you"):format(shots, gold, tostring(score and score.Value)))
+		log(("Accurate Archery: %d shots (%d golden), the game counts %s for you, limit %s"):format(shots, gold, tostring(score and score.Value), tostring(Config.EmArcheryLimit)))
 	end
 
 	-- Eagle Observation. USER: "space for every eagle". Birds and wolves fly past a camera and
