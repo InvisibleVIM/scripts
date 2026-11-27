@@ -15,7 +15,7 @@ if not shared then
 end
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local BeyRivals = { connections = {}, toggleRefreshers = {}, segmentRefreshers = {}, VERSION = "em-27", alive = true }
+local BeyRivals = { connections = {}, toggleRefreshers = {}, segmentRefreshers = {}, VERSION = "em-28", alive = true }
 if shared.EpicMinigames then
 	pcall(shared.EpicMinigames.detach)
 end
@@ -7386,6 +7386,81 @@ local create, statusLabel, panel, nextOrder, makePage, rowBase, rowLabel, headin
 		end
 	end
 
+	-- Crag Clamber. USER: "make a handler for this. click the key on the next stone". You climb
+	-- your own cliff (Character.Ref -> Cliff<n>), stone C1, C2, ... each showing a key. The
+	-- whole thing runs on your side: the game's script picks the keys itself and puts a
+	-- picture of each on its stone (SGui.Icon.Image), so the picture tells the key:
+	-- W/D/A/S on odd stones, the arrow keys on even ones. The stone to press next is the one
+	-- with the lighter Aura. A right key climbs one stone, a wrong one drops one, and either
+	-- way the game takes no key for half a second. Presses the key through the game's own
+	-- key listener (found by the "WASD" it mentions); a real key press only as a fallback,
+	-- which needs the Roblox window in front.
+	EM.handlers["Crag Clamber"] = function(round)
+		local model = round.model
+		local KEYS = {
+			["2547314300"] = Enum.KeyCode.W, ["2547324078"] = Enum.KeyCode.D, ["2547323665"] = Enum.KeyCode.A, ["2547323874"] = Enum.KeyCode.S,
+			["2547266411"] = Enum.KeyCode.Up, ["2547286053"] = Enum.KeyCode.Left, ["2547284959"] = Enum.KeyCode.Down, ["2547285716"] = Enum.KeyCode.Right,
+		}
+		local VIRTUAL = { W = 0x57, A = 0x41, S = 0x53, D = 0x44, Up = 0x26, Left = 0x25, Down = 0x28, Right = 0x27 }
+		local presses, highest, lastPress, unknown = 0, 0, 0, 0
+		local listener
+		local function press(key)
+			if not listener and getconnections and debug and debug.getconstants then
+				for _, connection in ipairs(getconnections(userInputService.InputBegan)) do
+					local fn = connection.Function
+					local ok, constants = pcall(debug.getconstants, fn)
+					if ok and type(constants) == "table" and table.find(constants, "WASD") and table.find(constants, "^<v>") then
+						listener = fn
+						break
+					end
+				end
+			end
+			if listener then
+				task.spawn(listener, { KeyCode = key, UserInputType = Enum.UserInputType.Keyboard, UserInputState = Enum.UserInputState.Begin }, false)
+				return true
+			end
+			local code = VIRTUAL[key.Name]
+			if code and keypress and keyrelease and (not isrbxactive or isrbxactive()) then
+				keypress(code)
+				task.delay(0.05, keyrelease, code)
+				return true
+			end
+			return false
+		end
+		while round.live() do
+			local reference = character() and character():FindFirstChild("Ref")
+			local cliff = reference and reference.Value
+			local stones = cliff and cliff:FindFirstChild("Stones")
+			local running = model:FindFirstChild("running")
+			if stones and (not running or running.Value) and os.clock() - lastPress > 0.56 then
+				-- The next stone: the lighter Aura (the others are near black).
+				local nextStone, number
+				for _, stone in ipairs(stones:GetChildren()) do
+					local aura = stone:FindFirstChild("Aura")
+					local index = tonumber(stone.Name:match("%d+"))
+					if aura and index and aura.Color.R > 0.15 and aura.Color.R < 0.3 and (not number or index < number) then
+						nextStone, number = stone, index
+					end
+				end
+				local icon = nextStone and nextStone:FindFirstChild("Icon", true)
+				local id = icon and tostring(icon.Image):match("%d+$")
+				local key = id and KEYS[id]
+				if key then
+					if press(key) then
+						presses += 1
+						lastPress = os.clock()
+						highest = math.max(highest, number)
+						round.detail = ("stone %d of %d"):format(number, #stones:GetChildren())
+					end
+				elseif nextStone then
+					unknown += 1
+				end
+			end
+			task.wait(0.03)
+		end
+		log(("Crag Clamber: %d keys pressed, reached stone %d%s%s"):format(presses, highest, listener and "" or ", by real key presses", unknown > 20 and ", a stone's picture was not one I know" or ""))
+	end
+
 	-- Hurdle Hurry. You are carried down your lane on your own (walk speed is 0, about 18 studs a
 	-- second) and the only thing to do is jump. Each lane (`Lanes.L<n>`) holds its hurdles in
 	-- `Hurdles`; the bar is the 7-wide part and its top is level with your waist. A jump at the
@@ -7673,7 +7748,7 @@ end)()
 		toggle(page, "Play minigames for me", "EmAuto")
 		hint(page, "The main switch. Off: you play everything and it only records and collects rewards.")
 		toggle(page, "Minigames with their own handler", "EmSpecial")
-		hint(page, "Uses a handler written for that minigame when there is one. So far: Paint to Perfection (clicks your easel until it matches the board) Balloon Platoon (shoots the balloon of the called colour) Accurate Archery (shoots the targets, golden ones first) Eagle Observation (counts every eagle) Cannon Cooldown (steps on your team's pads until they are green) Timestamp Trace (stops your timer on the big clock's time) Drawing the Line (moves your mouse along the line in your lane) Cube Factory (clicks your panel's squares until inner matches outer) Stallion Stampede (whips under the limit, jumps hurdles, steers to power-ups) Minefield March (shows the hidden mines; you walk) Pivot Paintings (turns every tile upright in the time you set) Hurdle Hurry (jumps each hurdle in your lane) Cake Delivery (walks your cake to the door with its number), Block Hunt (marks the other team's blocks through walls and walks to them; hiding is yours) Fishing Frenzy (moves your mouse onto the next fish and away from sharks) The Sweeper (jumps the bar each time it comes round) Just Jump (jumps the rope each turn) and Toxic Reactions (walks to the platform whose colour the sign shows). More are added from the recordings below.")
+		hint(page, "Uses a handler written for that minigame when there is one. So far: Paint to Perfection (clicks your easel until it matches the board) Balloon Platoon (shoots the balloon of the called colour) Accurate Archery (shoots the targets, golden ones first) Eagle Observation (counts every eagle) Cannon Cooldown (steps on your team's pads until they are green) Timestamp Trace (stops your timer on the big clock's time) Drawing the Line (moves your mouse along the line in your lane) Cube Factory (clicks your panel's squares until inner matches outer) Stallion Stampede (whips under the limit, jumps hurdles, steers to power-ups) Minefield March (shows the hidden mines; you walk) Pivot Paintings (turns every tile upright in the time you set) Crag Clamber (presses the key on the next stone) Hurdle Hurry (jumps each hurdle in your lane) Cake Delivery (walks your cake to the door with its number), Block Hunt (marks the other team's blocks through walls and walks to them; hiding is yours) Fishing Frenzy (moves your mouse onto the next fish and away from sharks) The Sweeper (jumps the bar each time it comes round) Just Jump (jumps the rope each turn) and Toxic Reactions (walks to the platform whose colour the sign shows). More are added from the recordings below.")
 		UI.slider(page, "Pivot Paintings time", "EmPaintSeconds", 0, 60, 1, function(v)
 			return v == 0 and "As fast as it goes" or (tostring(v) .. " s")
 		end, "Pivot Paintings: how long the handler takes to turn every tile upright. The clicks are spread evenly over it.")

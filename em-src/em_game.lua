@@ -2089,6 +2089,81 @@
 		end
 	end
 
+	-- Crag Clamber. USER: "make a handler for this. click the key on the next stone". You climb
+	-- your own cliff (Character.Ref -> Cliff<n>), stone C1, C2, ... each showing a key. The
+	-- whole thing runs on your side: the game's script picks the keys itself and puts a
+	-- picture of each on its stone (SGui.Icon.Image), so the picture tells the key:
+	-- W/D/A/S on odd stones, the arrow keys on even ones. The stone to press next is the one
+	-- with the lighter Aura. A right key climbs one stone, a wrong one drops one, and either
+	-- way the game takes no key for half a second. Presses the key through the game's own
+	-- key listener (found by the "WASD" it mentions); a real key press only as a fallback,
+	-- which needs the Roblox window in front.
+	EM.handlers["Crag Clamber"] = function(round)
+		local model = round.model
+		local KEYS = {
+			["2547314300"] = Enum.KeyCode.W, ["2547324078"] = Enum.KeyCode.D, ["2547323665"] = Enum.KeyCode.A, ["2547323874"] = Enum.KeyCode.S,
+			["2547266411"] = Enum.KeyCode.Up, ["2547286053"] = Enum.KeyCode.Left, ["2547284959"] = Enum.KeyCode.Down, ["2547285716"] = Enum.KeyCode.Right,
+		}
+		local VIRTUAL = { W = 0x57, A = 0x41, S = 0x53, D = 0x44, Up = 0x26, Left = 0x25, Down = 0x28, Right = 0x27 }
+		local presses, highest, lastPress, unknown = 0, 0, 0, 0
+		local listener
+		local function press(key)
+			if not listener and getconnections and debug and debug.getconstants then
+				for _, connection in ipairs(getconnections(userInputService.InputBegan)) do
+					local fn = connection.Function
+					local ok, constants = pcall(debug.getconstants, fn)
+					if ok and type(constants) == "table" and table.find(constants, "WASD") and table.find(constants, "^<v>") then
+						listener = fn
+						break
+					end
+				end
+			end
+			if listener then
+				task.spawn(listener, { KeyCode = key, UserInputType = Enum.UserInputType.Keyboard, UserInputState = Enum.UserInputState.Begin }, false)
+				return true
+			end
+			local code = VIRTUAL[key.Name]
+			if code and keypress and keyrelease and (not isrbxactive or isrbxactive()) then
+				keypress(code)
+				task.delay(0.05, keyrelease, code)
+				return true
+			end
+			return false
+		end
+		while round.live() do
+			local reference = character() and character():FindFirstChild("Ref")
+			local cliff = reference and reference.Value
+			local stones = cliff and cliff:FindFirstChild("Stones")
+			local running = model:FindFirstChild("running")
+			if stones and (not running or running.Value) and os.clock() - lastPress > 0.56 then
+				-- The next stone: the lighter Aura (the others are near black).
+				local nextStone, number
+				for _, stone in ipairs(stones:GetChildren()) do
+					local aura = stone:FindFirstChild("Aura")
+					local index = tonumber(stone.Name:match("%d+"))
+					if aura and index and aura.Color.R > 0.15 and aura.Color.R < 0.3 and (not number or index < number) then
+						nextStone, number = stone, index
+					end
+				end
+				local icon = nextStone and nextStone:FindFirstChild("Icon", true)
+				local id = icon and tostring(icon.Image):match("%d+$")
+				local key = id and KEYS[id]
+				if key then
+					if press(key) then
+						presses += 1
+						lastPress = os.clock()
+						highest = math.max(highest, number)
+						round.detail = ("stone %d of %d"):format(number, #stones:GetChildren())
+					end
+				elseif nextStone then
+					unknown += 1
+				end
+			end
+			task.wait(0.03)
+		end
+		log(("Crag Clamber: %d keys pressed, reached stone %d%s%s"):format(presses, highest, listener and "" or ", by real key presses", unknown > 20 and ", a stone's picture was not one I know" or ""))
+	end
+
 	-- Hurdle Hurry. You are carried down your lane on your own (walk speed is 0, about 18 studs a
 	-- second) and the only thing to do is jump. Each lane (`Lanes.L<n>`) holds its hurdles in
 	-- `Hurdles`; the bar is the 7-wide part and its top is level with your waist. A jump at the
