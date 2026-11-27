@@ -1290,6 +1290,13 @@
 				end
 				if want ~= called then
 					called, calledAt = want, os.clock()
+					-- A new call: every balloon may be shot again (the game reuses them).
+					table.clear(done)
+				end
+				for bloon, at in pairs(done) do
+					if not bloon.Parent or os.clock() - at > 2 then
+						done[bloon] = nil
+					end
 				end
 				-- A quarter of a second to "see" the colour, and the bow's own reload.
 				if want ~= "" and ready.Value and os.clock() - calledAt > 0.25 and os.clock() - lastShot > 0.85 and not Move.yours() then
@@ -1302,7 +1309,7 @@
 							local direction = bloon.Position - origin
 							local hit = direction.Magnitude > 1 and workspace:Raycast(origin, direction.Unit * 500, params)
 							if hit and hit.Instance == bloon then
-								done[bloon] = true
+								done[bloon] = os.clock()
 								lastShot = os.clock()
 								shots += 1
 								remote:FireServer("fired", bloon, hit.Position, hit.Normal)
