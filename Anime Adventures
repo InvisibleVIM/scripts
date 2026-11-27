@@ -83,7 +83,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v288", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v289", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -3036,6 +3036,10 @@ end
 ---they intersect." (Two-road Sky Portal: roads 1 and 3 cross at 30% / 18% of their length and
 ---the team was built 160 studs on, where they run side by side into the base.) Nil with one
 ---live road. Worked out again when a road opens or closes.
+AA.USER_HUBS = {
+	-- Sky Portal (skypiea map), between roads 1 and 2 near their start.
+	Vector3.new(-1658.5, 183.4, -126.1),
+}
 function AA.laneHub()
 	local count = Match.laneCount or 1
 	if count <= 1 or not Match.pathGrid then
@@ -3053,6 +3057,26 @@ function AA.laneHub()
 	end
 	if Match.hubKey == key then
 		return Match.hub or nil
+	end
+	-- USER (v289), standing on the spot in a Sky Portal: "when there's only 2 paths in sky portal
+	-- and the two paths are the blue and green ones, units should be placed here, hitting both
+	-- paths." A spot the user has pointed out wins over the worked-out crossing whenever exactly
+	-- two roads are live and both of them pass it.
+	if lanes == 2 then
+		for _, spot in ipairs(AA.USER_HUBS) do
+			local near, met = {}, 0
+			pathWithin(spot.X, spot.Z, 20, function(other)
+				if live[other.lane] and not near[other.lane] then
+					near[other.lane] = true
+					met += 1
+				end
+			end)
+			if met == 2 then
+				Match.hubKey, Match.hub = key, spot
+				note("laneHub", { user = true, x = math.floor(spot.X), z = math.floor(spot.Z), live = lanes })
+				return spot
+			end
+		end
 	end
 	local best, bestMet, bestAt
 	if lanes >= 2 then
