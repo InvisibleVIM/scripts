@@ -83,7 +83,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v291", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v292", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -395,6 +395,15 @@ local Config = {
 	VillageShop = false,
 	-- v285: a priority list (ids, first = wanted most); only what is on it is bought.
 	VillageShopList = "[\"swordsmith_barricade\"]",
+	-- v292: equipped defences repaired with Scarlet Ore; spare ones sold (scrapped) by grade.
+	-- Both spend or destroy, so both are off until switched on.
+	VillageRepair = false,
+	VillageScrap = false,
+	VillageScrapKeepEquipped = true,
+	VillageScrapRules = "{}",
+	VillageRuleFor = "Every defence",
+	VillageRuleBelow = "Off",
+	VillageRuleKeep = 0,
 	-- Misty Tower: 0 climbs (the next floor not cleared yet); a number plays that floor.
 	TowerFloor = 0,
 	MatchVillage = false,
@@ -2072,18 +2081,9 @@ do
 		-- The night stages ask for one clear of the day stage.
 		-- (A night match in progress proves it is open, whatever this server's profile copy says.)
 		local nightOpen = Levels.swordsmith_night ~= nil and (done.swordsmith_day ~= nil or AA.myClears().swordsmith_day ~= nil or playing == "swordsmith_night" or playing == "swordsmith_blood_moon")
-		-- Auto gives a night up after two losses in it: the night stages are built for a full
-		-- lobby with defences (first solo run: lost on wave 7 of 20 with High Cost II up), and
-		-- every lost run is ten minutes the day stage would have paid ore and coins.
-		local lost = type(AA.progress.villageNight) == "table" and AA.progress.villageNight or {}
-		local hour = math.floor(workspace:GetServerTimeNow() / 3600)
-		-- USER (v291): "in the misty village blood moon. it should be turned off for that." A
-		-- Blood Moon night is played however many times it is lost, and its losses are not
-		-- counted against the night either.
-		local blood = Config.VillageBloodMoon and Levels.swordsmith_blood_moon ~= nil and Village.bloodMoon()
-		if night and pick == "Auto" and not blood and lost.hour == hour and (tonumber(lost.losses) or 0) >= 2 then
-			return Levels.swordsmith_day and "swordsmith_day" or nil
-		end
+		-- USER (v291, v292): "in the misty village blood moon. it should be turned off for that."
+		-- then "Do the same for night stages in misty village." Auto used to give a night up
+		-- after two losses in it and play the day stage. Gone: a night is played while it lasts.
 		if night and pick ~= "Day" and nightOpen then
 			if Config.VillageBloodMoon and Levels.swordsmith_blood_moon and Village.bloodMoon() then
 				return "swordsmith_blood_moon"
@@ -2132,7 +2132,7 @@ do
 	---Lobby upkeep, at most once every two minutes: sell the swords on the rack, upgrade, feed the
 	---forge. Each part has its own switch; ore under "keep" is never spent.
 	function Village.upkeep()
-		if not (Config.VillageSell or Config.VillageForge or Config.VillageUpgrade) then
+		if not (Config.VillageSell or Config.VillageForge or Config.VillageUpgrade or Config.VillageRepair or Config.VillageScrap) then
 			return
 		end
 		if os.clock() - (Village.keptAt or -1e9) < 120 then
@@ -2167,6 +2167,10 @@ do
 			note("villageSell", { swords = swords, coins = Village.coins() - before })
 			log("sold " .. swords .. " swords for " .. (Village.coins() - before) .. " Dawn Coins")
 		end
+		-- Defences before the forge and the upgrades get at the ore: spares sold first (that
+		-- pays ore), then the equipped ones repaired.
+		pcall(Village.scrap, log)
+		pcall(Village.repair, log)
 		local keep = math.max(tonumber(Config.VillageKeepOre) or 0, 0)
 		if Config.VillageUpgrade then
 			-- The cheaper of the two next levels first, while the ore covers it.
@@ -2269,6 +2273,281 @@ do
 			end
 		end
 		return count
+	end
+	Village.GRADES = { "C-", "C", "C+", "B-", "B", "B+", "A-", "A", "A+", "S-", "S", "S+", "SS", "SSS" }
+	function Village.gradeOrder(grade)
+		return table.find(Village.GRADES, tostring(grade)) or 0
+	end
+	---Every defence held: { uuid, id, name, rarity, grade, order, durability, max, xp, equipped }.
+	---(_unique_defense_data = { g = grade, d = durability left, x = xp, _e = equipped slot }.)
+	function Village.bag()
+		local defs = gameRequire(replicatedStorage.src.Data.Defenses)
+		local items = gameRequire(replicatedStorage.src.Data.Items)
+		local unique = (profile().inventory or {}).unique_items
+		local list = {}
+		for _, item in pairs(type(unique) == "table" and unique or {}) do
+			local def = type(item) == "table" and type(defs) == "table" and defs[item.item_id]
+			if def and item.uuid then
+				local data = type(item._unique_item_data) == "table" and item._unique_item_data._unique_defense_data
+				data = type(data) == "table" and data or {}
+				local max = type(def.durability) == "table" and tonumber(def.durability.max) or 1
+				local info = type(items) == "table" and items[item.item_id] or {}
+				table.insert(list, {
+					uuid = item.uuid, id = item.item_id, name = tostring(info.name or item.item_id), rarity = tostring(info.rarity),
+					grade = tostring(data.g), order = Village.gradeOrder(data.g),
+					durability = math.clamp(tonumber(data.d) or max, 0, max), max = max, xp = tonumber(data.x) or 0,
+					equipped = data._e ~= nil,
+				})
+			end
+		end
+		-- Best first: grade, then experience.
+		table.sort(list, function(a, b)
+			if a.name ~= b.name then
+				return a.name < b.name
+			end
+			if a.order ~= b.order then
+				return a.order > b.order
+			end
+			if a.xp ~= b.xp then
+				return a.xp > b.xp
+			end
+			return tostring(a.uuid) < tostring(b.uuid)
+		end)
+		return list
+	end
+	---The game's own sums (DefenseServiceCore.repair_ore / scrap_ore).
+	function Village.repairCost(entry)
+		local missing = entry.max - entry.durability
+		if missing <= 0 then
+			return 0
+		end
+		local table_ = type(Core.Settings.DEFENSE_REPAIR_ORE) == "table" and Core.Settings.DEFENSE_REPAIR_ORE or {}
+		return math.max(1, math.ceil((tonumber(table_[entry.rarity]) or 1) * missing / entry.max))
+	end
+	function Village.scrapValue(entry)
+		local table_ = type(Core.Settings.DEFENSE_SCRAP_ORE) == "table" and Core.Settings.DEFENSE_SCRAP_ORE or {}
+		local scale = math.max(entry.order - 1, 0) / (#Village.GRADES - 1)
+		return math.max(1, math.floor((tonumber(table_[entry.rarity]) or 1) * (1 + scale) + 0.5))
+	end
+	---What a defence does, from the game's data, with the range its grades cover.
+	function Village.describe(id)
+		Village.described = Village.described or {}
+		if Village.described[id] then
+			return Village.described[id]
+		end
+		local defs = gameRequire(replicatedStorage.src.Data.Defenses)
+		local def = type(defs) == "table" and defs[id]
+		if type(def) ~= "table" then
+			return ""
+		end
+		local function span(low, high, sign)
+			low, high = (tonumber(low) or 0) * sign * 100, (tonumber(high) or 0) * sign * 100
+			if math.abs(low - high) < 0.05 then
+				return ("%+d%%"):format(math.round(low))
+			end
+			return ("%+d%% to %+d%%"):format(math.round(low), math.round(high))
+		end
+		local text
+		if type(def.text) == "string" then
+			local fill = {}
+			for index, aura in ipairs(type(def.aura) == "table" and def.aura or {}) do
+				local value = type(aura.value) == "table" and aura.value or {}
+				fill[tostring(index)] = span(value[1], value[2], aura.negative and -1 or 1)
+			end
+			if type(def.placement_cost) == "table" then
+				fill.place = span(def.placement_cost[1], def.placement_cost[2], -1)
+			end
+			local blessing = def.blessing
+			if type(blessing) == "table" then
+				fill.value = blessing.stat == "regen" and ("%g%%"):format((tonumber(blessing.value) or 0) * 100) or span(blessing.value, blessing.value, 1)
+				if blessing.health then
+					fill.health = span(blessing.health, blessing.health, 1)
+				end
+				local reward = type(blessing.reward) == "table" and blessing.reward or {}
+				fill.reward = ("+%.1f%% to +%.1f%%"):format((tonumber(reward[1]) or 0) * 100, (tonumber(reward[2]) or 0) * 100)
+			end
+			text = def.text:gsub("{(%w+)}", function(key)
+				return fill[key] or "?"
+			end)
+		elseif type(def.knockback) == "table" then
+			text = ("Throws back every enemy that walks into it, bosses and flyers too (%g to %g by grade), again each time they come back."):format(tonumber(def.knockback[1]) or 0, tonumber(def.knockback[2]) or 0)
+		elseif type(def.trap) == "table" then
+			text = "A trap on the road: every enemy that steps on it is hit and bleeds for 10 seconds."
+		else
+			text = "Hurts the enemies inside its circle for as long as they are in it."
+		end
+		if type(def.damage) == "table" then
+			text ..= (" Damage %d%% to %d%% by grade."):format((tonumber(def.damage[1]) or 0) * 100 + 0.5, (tonumber(def.damage[2]) or 0) * 100 + 0.5)
+		end
+		if type(def.durability) == "table" then
+			text ..= def.durability.per == "time" and " Wears down with time on the field." or " Wears down with every enemy it touches."
+		end
+		if def.night_only then
+			text ..= " Night stages only."
+		end
+		text = text .. " Better grades are stronger."
+		Village.described[id] = text
+		return text
+	end
+	---The sell rules: { [defence id or "*"] = { below = grade or nil, keep = number } }.
+	function Village.rules()
+		if Village.rulesText ~= Config.VillageScrapRules then
+			local clean = {}
+			local ok, map = pcall(function()
+				return httpService:JSONDecode(Config.VillageScrapRules)
+			end)
+			for id, rule in pairs(ok and type(map) == "table" and map or {}) do
+				if type(id) == "string" and type(rule) == "table" then
+					local below = Village.gradeOrder(rule.below) > 0 and tostring(rule.below) or nil
+					local keep = math.clamp(math.floor(tonumber(rule.keep) or 0), 0, 20)
+					if below or keep > 0 then
+						clean[id] = { below = below, keep = keep }
+					end
+				end
+			end
+			Village.rulesText, Village.rulesMap = Config.VillageScrapRules, clean
+		end
+		return Village.rulesMap
+	end
+	function Village.setRule(id, below, keep)
+		local map = table.clone(Village.rules())
+		if below or (keep or 0) > 0 then
+			map[id] = { below = below, keep = keep or 0 }
+		else
+			map[id] = nil
+		end
+		Config.VillageScrapRules = httpService:JSONEncode(map)
+	end
+	function Village.ruleText(rule)
+		local parts = {}
+		if rule.below then
+			table.insert(parts, "Sells " .. rule.below .. " and below.")
+		end
+		if rule.keep > 0 then
+			table.insert(parts, ("Of the rest, keeps the best %d and sells the others."):format(rule.keep))
+		elseif rule.below then
+			table.insert(parts, "Keeps everything better.")
+		end
+		return table.concat(parts, " ")
+	end
+	---The defences the rules would sell now: { entry, ore, why }. A defence's own rule wins over
+	---"every defence". Equipped ones are never sold while that switch is on.
+	function Village.scrapPlan(bag)
+		local rules = Village.rules()
+		local groups, order = {}, {}
+		for _, entry in ipairs(bag or Village.bag()) do
+			if not groups[entry.id] then
+				groups[entry.id] = {}
+				table.insert(order, entry.id)
+			end
+			table.insert(groups[entry.id], entry)
+		end
+		local plan = {}
+		for _, id in ipairs(order) do
+			local rule = rules[id] or rules["*"]
+			if rule then
+				local floor = rule.below and Village.gradeOrder(rule.below) or 0
+				local kept = 0
+				-- (The bag is sorted best first within a defence.)
+				for _, entry in ipairs(groups[id]) do
+					local why
+					if entry.order > 0 and entry.order <= floor then
+						why = entry.grade .. " is " .. rule.below .. " or below"
+					elseif rule.keep > 0 then
+						if kept >= rule.keep then
+							why = ("past the best %d"):format(rule.keep)
+						else
+							kept += 1
+						end
+					end
+					if why and not (entry.equipped and Config.VillageScrapKeepEquipped) then
+						table.insert(plan, { entry = entry, ore = Village.scrapValue(entry), why = why })
+					end
+				end
+			end
+		end
+		return plan
+	end
+	function Village.scrapText()
+		local plan = Village.scrapPlan()
+		if #plan == 0 then
+			return "Nothing would be sold right now."
+		end
+		local counts, names, ore = {}, {}, 0
+		for _, row in ipairs(plan) do
+			local name = row.entry.name
+			if not counts[name] then
+				counts[name] = {}
+				table.insert(names, name)
+			end
+			table.insert(counts[name], row.entry.grade)
+			ore += row.ore
+		end
+		local parts = {}
+		for _, name in ipairs(names) do
+			table.insert(parts, ("%d %s (%s)"):format(#counts[name], name, table.concat(counts[name], ", ")))
+		end
+		return ("Would be sold now: %s, for %d Scarlet Ore."):format(table.concat(parts, "; "), ore)
+	end
+	---Sells what the rules say (request_discard_defense(uuid): the game's Discard, paid in ore).
+	function Village.scrap(log)
+		if not Config.VillageScrap then
+			return
+		end
+		local plan = Village.scrapPlan()
+		for _, row in ipairs(plan) do
+			if not (AA.alive and Config.VillageScrap) then
+				break
+			end
+			local before = Village.ore()
+			local ok, result = invoke("request_discard_defense", row.entry.uuid)
+			task.wait(0.4)
+			local gained = Village.ore() - before
+			note("villageScrap", { id = row.entry.id, grade = row.entry.grade, ore = gained, ok = ok and result ~= false })
+			log(("sold %s [%s] (%s) -> %s, %+d ore"):format(row.entry.name, row.entry.grade, row.why, (ok and result ~= false) and "ok" or ("refused (" .. tostring(result) .. ")"), gained))
+			if not ok or result == false then
+				break
+			end
+		end
+	end
+	---Repairs the equipped defences that are worn, cheapest first, while the ore pays for it (request_repair_defenses({ uuid, ... }), the game's Repair All).
+	function Village.repair(log)
+		if not Config.VillageRepair then
+			return
+		end
+		-- (Not held back by Scarlet Ore to keep: that line keeps ore from the forge and the
+		-- upgrades so that there is some for defences. First try: 1003 ore, keep 2000, eight
+		-- broken defences and "0 ore to spare".)
+		local budget = Village.ore()
+		local worn = {}
+		for _, entry in ipairs(Village.bag()) do
+			if entry.equipped and entry.durability < entry.max * 0.9 then
+				table.insert(worn, entry)
+			end
+		end
+		table.sort(worn, function(a, b)
+			return Village.repairCost(a) < Village.repairCost(b)
+		end)
+		local uuids, cost, names = {}, 0, {}
+		for _, entry in ipairs(worn) do
+			local price = Village.repairCost(entry)
+			if cost + price <= budget then
+				cost += price
+				table.insert(uuids, entry.uuid)
+				table.insert(names, ("%s [%s] %d%%"):format(entry.name, entry.grade, math.floor(entry.durability / entry.max * 100)))
+			end
+		end
+		if #uuids == 0 then
+			if #worn > 0 then
+				log(("%d worn defences, but only %d ore to spare"):format(#worn, math.max(budget, 0)))
+			end
+			return
+		end
+		local before = Village.ore()
+		local ok, result = invoke("request_repair_defenses", uuids)
+		task.wait(0.5)
+		note("villageRepair", { count = #uuids, cost = cost, ok = ok and result ~= false })
+		log(("repaired %d of %d worn defences for %d ore (%s) -> %s, ore %d -> %d"):format(#uuids, #worn, cost, table.concat(names, ", "), (ok and result ~= false) and "ok" or ("refused (" .. tostring(result) .. ")"), before, Village.ore()))
 	end
 	---The shop that opens when a floor is won offers up to three defences, only ones the ore
 	---carried can pay for. Buys the ones on the user's list, top of the list first: request_buy_village_shop(index,
@@ -9368,12 +9647,6 @@ local function finishMatch()
 		if after == "Replay" and won and (tonumber(Config.TowerFloor) or 0) > 0 then
 			after = "Lobby"
 		end
-	end
-	if kind == "Misty Village" and not won and not gaveUp and id == "swordsmith_night" then
-		local hour = math.floor(workspace:GetServerTimeNow() / 3600)
-		local lost = type(AA.progress.villageNight) == "table" and AA.progress.villageNight or {}
-		AA.progress.villageNight = { hour = hour, losses = (lost.hour == hour and (tonumber(lost.losses) or 0) or 0) + 1 }
-		pcall(AA.saveProgress)
 	end
 	if kind == "Misty Village" and after == "Replay" then
 		-- Day and night are different levels: the same one again only while it is still the
@@ -20433,6 +20706,7 @@ AA.ui = UI
 	---  marks(name, index) -> a muted word at the right; a second result of true paints it in the accent
 	---  tag(name, index) -> text, tone ("bad" | "good" | "accent"): a small label before the buttons
 	---  detail(name, index) -> a wrapped line under the name
+	---  action -> the icon of the row's button ("cross" unless given; "check" for a list to add from)
 	---  maxHeight -> past this height the list scrolls inside its own frame
 	function UI.editList(page, options)
 		local scrolls = options.maxHeight ~= nil
@@ -20538,7 +20812,7 @@ AA.ui = UI
 						UI.refreshAll()
 					end)
 				end
-				smallButton(top, "cross", 6, function()
+				smallButton(top, options.action or "cross", 6, function()
 					options.remove(index, row.name)
 					UI.refreshAll()
 				end)
@@ -22769,6 +23043,9 @@ do
 							local _, price = Village.defenseName(Village.shopList()[index])
 							return tostring(price) .. " ore"
 						end,
+						detail = function(_, index)
+							return Village.describe(Village.shopList()[index])
+						end,
 						remove = function(index)
 							local list = ids()
 							table.remove(list, index)
@@ -22781,27 +23058,148 @@ do
 						end,
 					})
 					only({ "Misty Village", "Misty Tower" }, shopHolder)
-					UI.dropdown(page, "Add a defence", function()
-						local names = {}
+					-- USER (v292): "when selecting which i want to buy it should say what they all do
+					-- under the defense name. similar to summer hunt cards".
+					only({ "Misty Village", "Misty Tower" }, UI.subhead(page, "Other defences", "Everything else the shop can offer, with what it does. The tick puts one at the bottom of your list.").Parent)
+					local function others()
+						local list = {}
 						for _, entry in ipairs(Village.defenses()) do
 							if not table.find(Village.shopList(), entry.id) then
+								table.insert(list, entry)
+							end
+						end
+						return list
+					end
+					local _, otherHolder = UI.editList(page, {
+						action = "check",
+						empty = "Every defence is on your list.",
+						get = function()
+							local names = {}
+							for _, entry in ipairs(others()) do
 								table.insert(names, entry.name)
 							end
+							return names
+						end,
+						marks = function(_, index)
+							local entry = others()[index]
+							return entry and (tostring(entry.price) .. " ore") or ""
+						end,
+						detail = function(_, index)
+							local entry = others()[index]
+							return entry and Village.describe(entry.id) or ""
+						end,
+						remove = function(index)
+							local entry = others()[index]
+							if entry then
+								local list = ids()
+								table.insert(list, entry.id)
+								Village.setShopList(list)
+							end
+						end,
+					})
+					only({ "Misty Village", "Misty Tower" }, otherHolder)
+					-- v292: repair and selling.
+					toggle(page, "Repair my equipped defences", "VillageRepair", "In the lobby: every equipped defence under 90% durability is repaired with Scarlet Ore, cheapest first. A full repair costs 5 to 100 ore by rarity (10 for a Bamboo Barricade or Spike Trap), less when it is only part worn. Done before the forge and the upgrades take any ore, and not held back by Scarlet Ore to keep (that ore is kept for exactly this).")
+					only({ "Misty Village", "Misty Tower" })
+					toggle(page, "Sell spare defences", "VillageScrap", "In the lobby: sells (the game's Discard, paid in Scarlet Ore) every defence the rules below point at. Nothing is sold without a rule. The line under the rules shows what would go right now, so set the rules first and switch this on when that line reads right.")
+					only({ "Misty Village", "Misty Tower" })
+					toggle(page, "Never sell equipped ones", "VillageScrapKeepEquipped", "On: a defence you have equipped is kept whatever the rules say. It still counts as one of the best you keep when it is among them.")
+					only({ "Misty Village", "Misty Tower" })
+					only({ "Misty Village", "Misty Tower" }, UI.subhead(page, "Sell rules", "One rule per defence, or one for every defence without its own. Pick the defence, the grade to sell at and below, and how many of the rest to keep, then press Save this rule. Example: Bamboo Barricade, A-, keep 3 sells every barricade graded A- or lower and all but the best three of the others.").Parent)
+					local function ruleId()
+						for _, entry in ipairs(Village.defenses()) do
+							if entry.name == Config.VillageRuleFor then
+								return entry.id
+							end
+						end
+						return "*"
+					end
+					UI.dropdown(page, "Rule for", function()
+						local names = { "Every defence" }
+						for _, entry in ipairs(Village.defenses()) do
+							table.insert(names, entry.name)
 						end
 						return names
 					end, function()
-						return "Pick a defence"
+						return Config.VillageRuleFor
 					end, function(name)
-						for _, entry in ipairs(Village.defenses()) do
-							if entry.name == name then
-								local list = ids()
-								if not table.find(list, entry.id) then
-									table.insert(list, entry.id)
-									Village.setShopList(list)
-								end
-							end
+						Config.VillageRuleFor = name
+						-- Show the rule that defence already has.
+						local rule = Village.rules()[ruleId()]
+						Config.VillageRuleBelow = rule and rule.below or "Off"
+						Config.VillageRuleKeep = rule and rule.keep or 0
+					end, "Every defence: used for any defence that has no rule of its own.")
+					only({ "Misty Village", "Misty Tower" })
+					UI.dropdown(page, "Sell this grade and below", function()
+						local names = { "Off" }
+						for _, grade in ipairs(Village.GRADES) do
+							table.insert(names, grade)
 						end
-					end, "Goes to the bottom of the list; use the arrow on a row to move it up.")
+						return names
+					end, function()
+						return Config.VillageRuleBelow
+					end, function(name)
+						Config.VillageRuleBelow = name
+					end, "Grades run C-, C, C+, B-, B, B+, A-, A, A+, S-, S, S+, SS, SSS. Off: no grade is sold outright.")
+					only({ "Misty Village", "Misty Tower" })
+					slider(page, "Keep the best", "VillageRuleKeep", 0, 20, 1, function(value)
+						return value == 0 and "All of them" or tostring(value)
+					end, "Of the ones above that grade: how many to keep, best grade first, then most experience. The others are sold. All of them: only the grade line sells.")
+					only({ "Misty Village", "Misty Tower" })
+					button(page, "Save this rule", function()
+						local below = Village.gradeOrder(Config.VillageRuleBelow) > 0 and Config.VillageRuleBelow or nil
+						Village.setRule(ruleId(), below, math.floor(tonumber(Config.VillageRuleKeep) or 0))
+						UI.refreshAll()
+					end)
+					only({ "Misty Village", "Misty Tower" })
+					local function ruleRows()
+						local rows = {}
+						for id, rule in pairs(Village.rules()) do
+							table.insert(rows, { id = id, name = id == "*" and "Every defence" or (Village.defenseName(id)), rule = rule })
+						end
+						table.sort(rows, function(a, b)
+							return a.name < b.name
+						end)
+						return rows
+					end
+					local _, ruleHolder = UI.editList(page, {
+						empty = "No rules. Nothing is sold.",
+						get = function()
+							local names = {}
+							for _, row in ipairs(ruleRows()) do
+								table.insert(names, row.name)
+							end
+							return names
+						end,
+						detail = function(_, index)
+							local row = ruleRows()[index]
+							return row and Village.ruleText(row.rule) or ""
+						end,
+						remove = function(index)
+							local row = ruleRows()[index]
+							if row then
+								Village.setRule(row.id, nil, 0)
+							end
+						end,
+					})
+					only({ "Misty Village", "Misty Tower" }, ruleHolder)
+					local scrapLine = UI.note(page, "")
+					only({ "Misty Village", "Misty Tower" }, scrapLine)
+					task.spawn(function()
+						while AA.alive and scrapLine.Parent do
+							pcall(function()
+								local bag = Village.bag()
+								local worn = 0
+								for _, entry in ipairs(bag) do
+									if entry.equipped and entry.durability < entry.max * 0.9 then
+										worn += 1
+									end
+								end
+								scrapLine.Text = ("%d defences held, %d equipped ones worn. %s"):format(#bag, worn, Village.scrapText())
+							end)
+							task.wait(2)
+						end
+					end)
 					only({ "Misty Village", "Misty Tower" })
 				end
 				local villageLine = UI.note(page, "")
