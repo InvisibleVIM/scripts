@@ -83,7 +83,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v294", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v295", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -384,6 +384,9 @@ local Config = {
 	-- day stage otherwise. Ore is only spent where a switch says so.
 	VillageStage = "Auto",
 	VillageBloodMoon = true,
+	-- v295: Stage = Blood plays Misty Village only while a Blood Moon is up; the fallback mode
+	-- plays the rest of the time. Leave: a fallback match is dropped the moment the moon rises.
+	VillageBloodLeave = false,
 	VillageSell = true,
 	VillageForge = false,
 	VillageUpgrade = false,
@@ -514,7 +517,7 @@ do
 	-- A saved choice that is no longer an option (an older version's) goes back to its default.
 	local choices = {
 		Mode = { "Story", "Level", "Infinite", "Legend", "Relic", "Raid", "Artifact", "Challenge", "Daily", "Missions", "Quests", "Summer", "Cursed Womb", "Tournament", "Castle", "Dungeon", "Portals", "Misty Village", "Misty Tower", "Kills" },
-		VillageStage = { "Auto", "Day", "Night" },
+		VillageStage = { "Auto", "Day", "Night", "Blood" },
 		AfterGame = { "Auto", "Next", "Replay", "Lobby" },
 		Difficulty = { "Normal", "Hard" },
 		PlaceStyle = { "Auto", "Front", "Normal" },
@@ -2069,7 +2072,41 @@ do
 		roll:NextNumber()
 		return roll:NextNumber() < setting("SWORDSMITH_BLOOD_MOON_CHANCE", 0.25)
 	end
-	---The stage to play now, or nil and why ("night": waiting for nightfall).
+	---Seconds until a Blood Moon is up (0 while one is), nil when none is in sight.
+	function Village.moonIn(now)
+		now = now or workspace:GetServerTimeNow()
+		if Village.bloodMoon(now) then
+			return 0
+		end
+		if workspace:GetAttribute("swordsmith_night") ~= nil or workspace:GetAttribute("swordsmith_blood_moon") ~= nil then
+			return nil
+		end
+		local day, night = setting("SWORDSMITH_DAY_LENGTH", 3600), setting("SWORDSMITH_NIGHT_LENGTH", 3600)
+		local offset = setting("SWORDSMITH_CLOCK_OFFSET", 0)
+		local cycle = math.floor((now - offset) / (day + night))
+		for ahead = 0, 80 do
+			local nightfall = (cycle + ahead) * (day + night) + offset + day
+			if nightfall > now and Village.bloodMoon(nightfall + 1) then
+				return nightfall - now
+			end
+		end
+		return nil
+	end
+	---"1 h 12 min" / "48 s".
+	function Village.span(seconds)
+		seconds = math.max(0, math.floor(seconds))
+		if seconds >= 3600 then
+			return string.format("%d h %02d min", seconds // 3600, seconds % 3600 // 60)
+		elseif seconds >= 60 then
+			return string.format("%d min", seconds // 60)
+		end
+		return string.format("%d s", seconds)
+	end
+	---Blood Moon only (v295) and the picked mode is Misty Village?
+	function Village.moonOnly()
+		return Config.Mode == "Misty Village" and Config.VillageStage == "Blood"
+	end
+	---The stage to play now, or nil and why ("night": waiting for nightfall, "bloodmoon": for a Blood Moon).
 	function Village.stage(done, playing)
 		done = done or completedLevels()
 		local pick = tostring(Config.VillageStage)
@@ -2084,6 +2121,19 @@ do
 		-- USER (v291, v292): "in the misty village blood moon. it should be turned off for that."
 		-- then "Do the same for night stages in misty village." Auto used to give a night up
 		-- after two losses in it and play the day stage. Gone: a night is played while it lasts.
+		-- USER (v295): "it only plays misty village if it's a blood moon ... it'll play [the other
+		-- mode] until it's blood moon and then play blood moon and go back to the other thing."
+		-- Nothing else of the village is played, so the fallback mode gets every other hour. (The
+		-- day stage only while the night stages are still locked behind its first clear.)
+		if pick == "Blood" then
+			if not nightOpen then
+				return Levels.swordsmith_day and "swordsmith_day" or nil
+			end
+			if night and Levels.swordsmith_blood_moon and Village.bloodMoon() then
+				return "swordsmith_blood_moon"
+			end
+			return nil, "bloodmoon"
+		end
 		if night and pick ~= "Day" and nightOpen then
 			if Config.VillageBloodMoon and Levels.swordsmith_blood_moon and Village.bloodMoon() then
 				return "swordsmith_blood_moon"
@@ -2679,6 +2729,10 @@ do
 	function Village.text()
 		local night, left = Village.clock()
 		local line = string.format("%s for %d:%02d more%s. %d Scarlet Ore, %d Dawn Coins.", night and "Night" or "Day", left // 60, math.floor(left % 60), (night and Village.bloodMoon()) and " (Blood Moon)" or "", Village.ore(), Village.coins())
+		local moon = Village.moonIn()
+		if moon and moon > 0 then
+			line ..= " Next Blood Moon in " .. Village.span(moon) .. "."
+		end
 		local village = Village.state
 		if type(village) == "table" then
 			local swords = 0
@@ -9457,6 +9511,22 @@ function AA.leaveForChallenge(kind)
 	return not Match.pendingAtStart
 end
 
+---The Blood Moon came up while the fallback's match is running (Blood Moon only, v295). With
+---"leave at once" on the match is dropped for it; off, it is finished first.
+function AA.leaveForMoon(kind)
+	if not Config.VillageBloodLeave or not Config.AutoJoin or Match.ended or kind == "Misty Village" or not AA.Village.moonOnly() then
+		return false
+	end
+	if AA.Party and AA.Party.on() then
+		return false
+	end
+	if os.clock() - (Match.moonCheck or 0) < 3 then
+		return false
+	end
+	Match.moonCheck = os.clock()
+	return AA.Village.stage() == "swordsmith_blood_moon"
+end
+
 ---The act after this one in the story order.
 function AA.nextStory(id)
 	local order = Order.LEVEL_ORDER or {}
@@ -9695,6 +9765,16 @@ local function finishMatch()
 		-- again, since the vote would climb past it.
 		if after == "Replay" and won and (tonumber(Config.TowerFloor) or 0) > 0 then
 			after = "Lobby"
+		end
+	end
+	if kind ~= "Misty Village" and Config.AfterGame == "Auto" and Config.AutoJoin and Config.Mode == "Misty Village" and (after == "Replay" or after == "Next" or after == "Castle") and not (AA.Party and AA.Party.on()) then
+		-- v295: this was the fallback's match (Night or Blood Moon only was waiting). The night
+		-- stage it waited for is up now: back to the lobby, which opens it. Only a night stage
+		-- counts, so a stale profile on this server can't send every match home for the day stage.
+		local waiting = AA.Village.stage()
+		if waiting == "swordsmith_blood_moon" or (waiting == "swordsmith_night" and Config.VillageStage == "Night") then
+			after = "Lobby"
+			Match.moonCall = waiting
 		end
 	end
 	if kind == "Misty Village" and after == "Replay" then
@@ -10292,6 +10372,11 @@ local function matchLoop()
 					status = "New challenge: leaving"
 					note("leave", { why = "challenge" })
 					local summary = { level = Match.levelId, won = false, wave = wave, left = true, at = os.time(), mode = matchKind(), picked = Config.Mode, time = math.floor(os.clock() - Match.startedAt), after = "Challenge" }
+					AA.leaveMatch(summary)
+				elseif AA.leaveForMoon(matchKind()) then
+					status = "Blood Moon: leaving"
+					note("leave", { why = "bloodmoon" })
+					local summary = { level = Match.levelId, won = false, wave = wave, left = true, at = os.time(), mode = matchKind(), picked = Config.Mode, time = math.floor(os.clock() - Match.startedAt), after = "Blood Moon" }
 					AA.leaveMatch(summary)
 				elseif Config.Mode == "Missions" and Config.AutoJoin and Match.missionOpen and not AA.dailyKillQuest(Match.levelId) and os.clock() - Match.startedAt > 30 then
 					-- The mission this run was for is complete: claim it and move on.
@@ -11187,6 +11272,11 @@ AA.chooseInner = function(modeOverride)
 		if id then
 			return id, "Hard", "stageportal"
 		end
+		if why == "bloodmoon" then
+			-- Under a minute to moonrise: no fallback match is started now, it would eat the moon.
+			local wait = AA.Village.moonIn()
+			return nil, nil, (wait and wait > 0 and wait <= 60) and "villagemoonsoon" or "villagemoon"
+		end
 		return nil, nil, why == "night" and "villagenight" or "locked"
 	elseif mode == "Misty Tower" then
 		local _, floor, id = AA.Village.tower()
@@ -11257,6 +11347,9 @@ chooseTarget = function(modeOverride)
 	if not id and kind == "relicwait" then
 		-- Relic mode could not read the inventory yet: wait for it, don't wander off to the
 		-- fallback on a guess.
+		return nil, nil, kind
+	end
+	if not id and kind == "villagemoonsoon" then
 		return nil, nil, kind
 	end
 	if not id and Config.Otherwise ~= "None" and Config.Otherwise ~= Config.Mode then
@@ -11841,7 +11934,7 @@ local function joinGame()
 		AA.saveProgress()
 	end
 	if not id then
-		status = kind == "relicwait" and "Relic: reading your inventory" or kind == "relicnone" and "Relic: pick a relic on the Mode tab" or kind == "reliclocked" and "Relic: no stage that drops the missing materials is open (clear the story acts before it, or it was lost three times today)" or kind == "relicdone" and "Relic: everything collected, and the mode set for after it has nothing to play" or kind == "quests" and "No quest the script can play right now (see the list on the Mode tab)" or kind == "wombkey" and "No Cursed Womb Key (drops in Haunted Academy infinite)" or kind == "portal" and "No portal items" or kind == "villagenight" and "Misty Village: waiting for night" or kind == "tower" and "Misty Tower: no tower is running" or kind == "towertop" and "Misty Tower: no floor left to play" or kind == "raid" and "Waiting for a raid" or (kind == "challenge" and "No challenge left" or ((kind == "artifact" or kind == "locked") and "Locked: clear the story first" or "Nothing to join"))
+		status = kind == "relicwait" and "Relic: reading your inventory" or kind == "relicnone" and "Relic: pick a relic on the Mode tab" or kind == "reliclocked" and "Relic: no stage that drops the missing materials is open (clear the story acts before it, or it was lost three times today)" or kind == "relicdone" and "Relic: everything collected, and the mode set for after it has nothing to play" or kind == "quests" and "No quest the script can play right now (see the list on the Mode tab)" or kind == "wombkey" and "No Cursed Womb Key (drops in Haunted Academy infinite)" or kind == "portal" and "No portal items" or kind == "villagenight" and "Misty Village: waiting for night" or kind == "villagemoonsoon" and "Blood Moon rises in under a minute: waiting for it" or kind == "villagemoon" and ("Misty Village: waiting for a Blood Moon" .. (AA.Village.moonIn() and (" (" .. AA.Village.span(AA.Village.moonIn()) .. ")") or "") .. ". Pick a mode under \"When that has nothing to play\" to play until then") or kind == "tower" and "Misty Tower: no tower is running" or kind == "towertop" and "Misty Tower: no floor left to play" or kind == "raid" and "Waiting for a raid" or (kind == "challenge" and "No challenge left" or ((kind == "artifact" or kind == "locked") and "Locked: clear the story first" or "Nothing to join"))
 		return false
 	end
 	do
@@ -23112,9 +23205,11 @@ do
 			only({ "Cursed Womb", "Tournament", "None" }, UI.note(page, "This mode has no settings of its own."))
 			do
 				-- Misty Village and its tower (Update 21.5).
-				segmented(page, "Stage", "VillageStage", { "Auto", "Day", "Night" }, "Auto: the night stage while it is night, the day stage otherwise. Night: waits for nightfall (or plays your fallback mode). The night stage opens after one clear of the day stage.")
+				segmented(page, "Stage", "VillageStage", { "Auto", "Day", "Night", "Blood" }, "Auto: the night stage while it is night, the day stage otherwise. Night: waits for nightfall (or plays your fallback mode). Blood: only the Blood Moon stage; the rest of the time your fallback mode (\"When that has nothing to play\") is played, and the script comes back for each Blood Moon. The night stages open after one clear of the day stage.")
 				only({ "Misty Village" })
-				toggle(page, "Play the Blood Moon when it is up", "VillageBloodMoon", "A night in four. Three times the Dawn Coins, harder enemies.")
+				toggle(page, "Play the Blood Moon when it is up", "VillageBloodMoon", "For Auto and Night. A night in four. Three times the Dawn Coins, harder enemies.")
+				only({ "Misty Village" })
+				toggle(page, "Leave a match when the Blood Moon rises", "VillageBloodLeave", "For Blood. The fallback match is dropped at moonrise and its rewards are lost. Off: it is finished first. Turn it on with Infinite as the fallback, or that run only ends when you lose.")
 				only({ "Misty Village" })
 				slider(page, "Tower floor", "TowerFloor", 0, 100, 1, function(value)
 					return value == 0 and "Climb" or ("Floor " .. tostring(value))
