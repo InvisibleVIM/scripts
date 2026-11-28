@@ -83,7 +83,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v289", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v290", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -9378,12 +9378,26 @@ local function finishMatch()
 			after = "Lobby"
 		end
 	end
-	local portalNext
+	local portalNext, portalWaited
 	if kind == "Portal" and after == "Replay" and Config.AutoJoin then
 		-- The next portal straight from the result screen (the game's own "replay with another
 		-- portal" button), no lobby in between. None left of that kind: nothing to replay, so
 		-- the lobby is the only way on.
 		task.wait(1.5)
+		-- USER (v290): "portals works now but only when i lose? when i win it should also go
+		-- onto the next selected portal". A won portal is used up, but it stays in the inventory
+		-- for a couple of seconds after the finish, and being the started one it was the first
+		-- choice: the vote named a portal that no longer existed. (All three chained matches in
+		-- the log were losses, where the portal keeps a try.) After a win the choice waits for
+		-- the inventory to drop the finished portal.
+		if won then
+			local before = #AA.portalItems()
+			local waited = 0
+			while waited < 6 and #AA.portalItems() >= before and gameFinished() do
+				waited += task.wait(0.25)
+			end
+			portalWaited = ("won: waited %.1f s for the finished portal to leave the inventory (%d -> %d portals)"):format(waited, before, #AA.portalItems())
+		end
 		portalNext = AA.portalChoose(data.portal_group)
 		-- USER (v288): "it should start another portal that i picked right after finishing the
 		-- one im doing ... in the same game". The result screen only offers portals of the
@@ -9417,6 +9431,9 @@ local function finishMatch()
 		pcall(function()
 			AA.appendLog(ACCOUNT_FOLDER .. "/votes.txt", os.date("%m-%d %H:%M:%S") .. string.format(" +%.1fs ", os.clock() - endedAt) .. tostring(id) .. " " .. text .. "\n")
 		end)
+	end
+	if portalWaited then
+		voteLog(portalWaited)
 	end
 	local function send(...)
 		local args = { ... }
@@ -9601,6 +9618,14 @@ local function finishMatch()
 			if after == "Next" and os.clock() - started > 35 then
 				after = "Replay"
 				Match.lastAfter = "Replay"
+			end
+			if portalNext then
+				-- From the inventory as it is now: the portal first asked for may be gone.
+				local fresh = AA.portalChoose(data.portal_group) or AA.portalChoose()
+				if fresh then
+					portalNext = fresh
+					Match.portalCross = not (data.portal_group and fresh.group == data.portal_group) or nil
+				end
 			end
 			note("revote", { after = after })
 			voteLog("still on the result screen: voting " .. after .. " again")
