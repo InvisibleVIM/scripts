@@ -83,7 +83,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v296", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v297", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -6005,12 +6005,13 @@ do
 			local id = unit._stats:FindFirstChild("id")
 			local position = unit:GetPivot().Position
 			if id and position.Y < 1000 then
-				table.insert(list, { id = id.Value, position = position, unit = unit })
+				local owner = unit._stats:FindFirstChild("player")
+				table.insert(list, { id = id.Value, position = position, unit = unit, mine = owner ~= nil and owner.Value == localPlayer })
 			end
 		end
 		for _, made in ipairs(state().made or {}) do
 			if os.clock() - made.at < 6 then
-				table.insert(list, { id = made.id, position = made.position })
+				table.insert(list, { id = made.id, position = made.position, mine = true })
 			end
 		end
 		return list
@@ -6058,8 +6059,11 @@ do
 		local circles = towerCircles()
 		local field = standing()
 		local taken = placedUnitPositions()
+		local towersAt = table.clone(taken)
+		local defencesAt = {}
 		for _, entry in ipairs(field) do
 			table.insert(taken, entry.position)
+			table.insert(defencesAt, entry.position)
 		end
 		local bad = state().bad
 		local function usable(id)
@@ -6095,7 +6099,8 @@ do
 			row.position, row.direction, row.why = position, direction, why
 			table.insert(plan, row)
 			table.insert(taken, position)
-			table.insert(field, { id = row.id, position = position })
+			table.insert(defencesAt, position)
+			table.insert(field, { id = row.id, position = position, mine = true })
 		end
 		-- 1. Barricades: on the stretch every enemy walks, where the most of my towers reach
 		-- the ground just up the road from it (that is where a knocked-back enemy stands), and
@@ -6124,7 +6129,7 @@ do
 		-- places take turns: one before the split, one after the join, and so on.
 		do
 			local first, runs = sharedRuns()
-			local SPIKE, PAIR = 5, 10
+			local SPIKE = 5
 			local slots = {}
 			if first and #runs > 0 then
 				local anchors = {}
@@ -6139,17 +6144,14 @@ do
 						table.insert(anchors, { at = low + SPIKE, step = 1, low = low, high = high, what = "after the roads join" })
 					end
 				end
-				local turn, more = 0, true
-				while more and #slots < 24 do
-					more = false
-					for _, anchor in ipairs(anchors) do
-						local barricade = anchor.at + anchor.step * turn * PAIR
-						if barricade - SPIKE >= anchor.low and barricade <= anchor.high then
-							table.insert(slots, { barricade = barricade, spike = barricade - SPIKE, what = anchor.what })
-							more = true
-						end
+				-- USER (v297): "you don't have to place them all at once? just put a barricade at
+				-- the start and spike trap. after it breaks replace it with another". One pair a
+				-- place; the others stay in the bag and take a place when its defence is gone.
+				for _, anchor in ipairs(anchors) do
+					local barricade = anchor.at
+					if barricade - SPIKE >= anchor.low and barricade <= anchor.high then
+						table.insert(slots, { barricade = barricade, spike = barricade - SPIKE, what = anchor.what, step = anchor.step })
 					end
-					turn += 1
 				end
 			end
 			local function has(id, position, within)
@@ -6160,10 +6162,13 @@ do
 				end
 				return false
 			end
-			local function put(row, index, why)
-				for _, nudge in ipairs({ 0, 1, -1 }) do
+			-- (A tower of mine was put 3.1 studs from a standing barricade and the server took
+			-- it, so towers only block a road spot inside 3 studs; the full gap would have left
+			-- the replacement nowhere to go. A step or two into the shared stretch otherwise.)
+			local function put(row, index, why, step)
+				for _, nudge in ipairs({ 0, step, step * 2, -step, step * 3 }) do
 					local point = first[index + nudge]
-					if point and not bad[spotKey(point.position)] and clear(point.position, taken, CLEAR) then
+					if point and not bad[spotKey(point.position)] and clear(point.position, towersAt, 3) and clear(point.position, defencesAt, CLEAR) then
 						local position, direction = roadSpot(first, index + nudge)
 						if position then
 							add(row, position, direction, string.format("%s (%d%% of the road)", why, math.floor(point.progress * 100)))
@@ -6179,7 +6184,7 @@ do
 					local done = false
 					for _, slot in ipairs(slots) do
 						if not done and not has("swordsmith_barricade", first[slot.barricade].position, 2.5) then
-							done = put(row, slot.barricade, "barricade " .. slot.what)
+							done = put(row, slot.barricade, "barricade " .. slot.what, slot.step)
 						end
 					end
 					if not done then
@@ -6192,14 +6197,25 @@ do
 					local done = false
 					for _, slot in ipairs(slots) do
 						if not done and has("swordsmith_barricade", first[slot.barricade].position, 2.5) and not has("swordsmith_spike_trap", first[slot.spike].position, 2.5) then
-							done = put(row, slot.spike, "spike trap five studs before the barricade " .. slot.what)
+							done = put(row, slot.spike, "spike trap five studs before the barricade " .. slot.what, slot.step)
 						end
 					end
 					if not done then
 						table.insert(left, row)
 					end
 				end
-				want.spike = left
+				-- The rest are the replacements: held back.
+				want.road, want.spike = {}, {}
+			else
+				-- One road: the same, one barricade and one spike trap of mine at a time.
+				local standingMine = {}
+				for _, entry in ipairs(field) do
+					if entry.mine then
+						standingMine[entry.id] = true
+					end
+				end
+				want.road = standingMine.swordsmith_barricade and {} or { want.road[1] }
+				want.spike = standingMine.swordsmith_spike_trap and {} or { want.spike[1] }
 			end
 		end
 		if #stretch > 30 and (#want.road > 0 or #want.spike > 0) then
