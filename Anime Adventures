@@ -83,7 +83,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v295", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v296", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -5936,6 +5936,45 @@ do
 		end
 		return shared, anchor, live
 	end
+	---The first open road and the stretches of it that every other open road shares, as index
+	---ranges { s, e } in walking order. Nothing when there is one road, or one road in all but name.
+	local function sharedRuns()
+		local all = lanes()
+		local live = {}
+		for lane in pairs(all) do
+			if not AA.laneDead(lane) then
+				table.insert(live, lane)
+			end
+		end
+		table.sort(live)
+		local first = all[live[1]]
+		if not first or #live < 2 then
+			return first, {}
+		end
+		local runs, open = {}, nil
+		for index, point in ipairs(first) do
+			local met, count = {}, 0
+			pathWithin(point.position.X, point.position.Z, 2.5, function(other)
+				if other.lane ~= point.lane and not met[other.lane] and table.find(live, other.lane) then
+					met[other.lane] = true
+					count += 1
+				end
+			end)
+			if count >= #live - 1 then
+				open = open or index
+			elseif open then
+				table.insert(runs, { s = open, e = index - 1 })
+				open = nil
+			end
+		end
+		if open then
+			table.insert(runs, { s = open, e = #first })
+		end
+		if #runs == 1 and runs[1].s == 1 and runs[1].e == #first then
+			return first, {}
+		end
+		return first, runs
+	end
 	local function towerCircles()
 		local list = {}
 		for _, unit in ipairs(myUnits()) do
@@ -6071,6 +6110,97 @@ do
 		local function roadScore(index)
 			local up = stretch[math.max(index - 4, 1)].position
 			return covered(up, circles) * 2 + covered(stretch[index].position, circles)
+		end
+		-- USER (v296): "bamboo barricades should go in places where they hit all enemies? So at
+		-- the start before the paths diverge. and near the end right after the paths converge.
+		-- Spike traps should be a bit before the bamboo barricades so that the enemies are
+		-- pushed back into the spike traps." v286 spread them along the shared road by tower
+		-- reach (live: 4%, 8%, 45%, 48%, 52%, 61%), and the spike of the barricade standing on
+		-- the join itself sat on one branch, where two roads in three never touch it.
+		-- Now: pairs (spike five studs up the road, then its barricade), ten studs a pair (nine
+		-- left the spike 4 studs from the pair behind it, inside its hitbox: refused by clear()),
+		-- growing back from the last shared point before a split and forward from the first
+		-- one after a join, so both halves of every pair stand where every enemy walks. The
+		-- places take turns: one before the split, one after the join, and so on.
+		do
+			local first, runs = sharedRuns()
+			local SPIKE, PAIR = 5, 10
+			local slots = {}
+			if first and #runs > 0 then
+				local anchors = {}
+				for _, run in ipairs(runs) do
+					-- (Eight studs clear of the spawn and of the base.)
+					local low = run.s == 1 and 8 or run.s + 2
+					local high = run.e == #first and run.e - 8 or run.e - 2
+					if run.e < #first then
+						table.insert(anchors, { at = high, step = -1, low = low, high = high, what = "before the roads split" })
+					end
+					if run.s > 1 then
+						table.insert(anchors, { at = low + SPIKE, step = 1, low = low, high = high, what = "after the roads join" })
+					end
+				end
+				local turn, more = 0, true
+				while more and #slots < 24 do
+					more = false
+					for _, anchor in ipairs(anchors) do
+						local barricade = anchor.at + anchor.step * turn * PAIR
+						if barricade - SPIKE >= anchor.low and barricade <= anchor.high then
+							table.insert(slots, { barricade = barricade, spike = barricade - SPIKE, what = anchor.what })
+							more = true
+						end
+					end
+					turn += 1
+				end
+			end
+			local function has(id, position, within)
+				for _, entry in ipairs(field) do
+					if entry.id == id and flat(entry.position, position) < within then
+						return true
+					end
+				end
+				return false
+			end
+			local function put(row, index, why)
+				for _, nudge in ipairs({ 0, 1, -1 }) do
+					local point = first[index + nudge]
+					if point and not bad[spotKey(point.position)] and clear(point.position, taken, CLEAR) then
+						local position, direction = roadSpot(first, index + nudge)
+						if position then
+							add(row, position, direction, string.format("%s (%d%% of the road)", why, math.floor(point.progress * 100)))
+							return true
+						end
+					end
+				end
+				return false
+			end
+			if #slots > 0 then
+				local left = {}
+				for _, row in ipairs(want.road) do
+					local done = false
+					for _, slot in ipairs(slots) do
+						if not done and not has("swordsmith_barricade", first[slot.barricade].position, 2.5) then
+							done = put(row, slot.barricade, "barricade " .. slot.what)
+						end
+					end
+					if not done then
+						table.insert(left, row)
+					end
+				end
+				want.road = left
+				left = {}
+				for _, row in ipairs(want.spike) do
+					local done = false
+					for _, slot in ipairs(slots) do
+						if not done and has("swordsmith_barricade", first[slot.barricade].position, 2.5) and not has("swordsmith_spike_trap", first[slot.spike].position, 2.5) then
+							done = put(row, slot.spike, "spike trap five studs before the barricade " .. slot.what)
+						end
+					end
+					if not done then
+						table.insert(left, row)
+					end
+				end
+				want.spike = left
+			end
 		end
 		if #stretch > 30 and (#want.road > 0 or #want.spike > 0) then
 			for _, row in ipairs(want.road) do
