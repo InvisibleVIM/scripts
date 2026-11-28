@@ -83,7 +83,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v298", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v299", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -23531,10 +23531,13 @@ do
 				only({ "Misty Village", "Misty Tower" })
 				slider(page, "Scarlet Ore to keep", "VillageKeepOre", 0, 2000, 10, number, "The forge and the upgrades never take your ore below this (defences are repaired and bought with ore).")
 				only({ "Misty Village", "Misty Tower" })
+				-- USER (v299): "defenses only work in misty village. so it should only be shown there."
+				-- Placing, equipping, repairing and selling defences: Misty Village only. (The
+				-- Village Shop rows stay for the tower, whose floors end with that shop.)
 				toggle(page, "Place my defences", "VillagePlace", "Places the defences you have equipped, free of charge, once your first units are down.\n\nBamboo Barricade: on the stretch of road every enemy walks, where your units reach the ground just before it.\nSpike Trap: right before a barricade.\nWhetstone, War Drum, Watchtower, Sun Lamp, Ore Cart: where their circle holds the most of your units.\nWisteria Incense: beside the road before a barricade.\n\nBroken ones are skipped. Needs Place units on.")
-				only({ "Misty Village", "Misty Tower" })
+				only({ "Misty Village" })
 				toggle(page, "Place shrines too", "VillageShrines", "Night stages only. A shrine makes the enemies in its circle tougher (more health, speed or healing) and pays Dawn Coins for each one killed there. Off: your shrines stay in the bag.")
-				only({ "Misty Village", "Misty Tower" })
+				only({ "Misty Village" })
 				toggle(page, "Buy defences from the Village Shop", "VillageShop", "The shop that opens when you win a floor: up to three defences for Scarlet Ore, and only ones your ore can pay for. Buys what is on the list below and nothing else, top of the list first, and stops at 20 held. Ore in the forge is not ore in your pocket: with Put Scarlet Ore in the forge on, the shop has nothing to offer after a visit to the lobby.")
 				only({ "Misty Village", "Misty Tower" })
 				only({ "Misty Village", "Misty Tower" }, UI.subhead(page, "Defences to buy", "Your priority list. When the shop offers more than one of these, the higher one is bought first; the rest follow while the ore lasts. Anything not on the list is never bought. The number is the price in Scarlet Ore.").Parent)
@@ -23614,8 +23617,8 @@ do
 					only({ "Misty Village", "Misty Tower" }, otherHolder)
 					-- v298: the defences to use, and the best copy of each equipped for me.
 					toggle(page, "Equip my best defences", "VillageEquipBest", "In the lobby: the best copy of every defence on the list below is equipped (for a Spike Trap the one that hits hardest, counting its level; for the others the highest grade, then most experience; a broken one only when nothing else is left or repairs are on), and anything equipped that is not on the list comes off. With nothing on the list, the kinds you have equipped now are kept and each is swapped for your best copy.")
-					only({ "Misty Village", "Misty Tower" })
-					only({ "Misty Village", "Misty Tower" }, UI.subhead(page, "Defences to use", "One line a slot, nine at most. Add the same defence again for a second copy of it. The number is how many of that kind you hold.").Parent)
+					only({ "Misty Village" })
+					only({ "Misty Village" }, UI.subhead(page, "Defences to use", "One line a slot, nine at most. Add the same defence again for a second copy of it. The number is how many of that kind you hold.").Parent)
 					local function held(id)
 						local count = 0
 						for _, entry in ipairs(Village.bag()) do
@@ -23644,8 +23647,8 @@ do
 							Village.setLoadout(list)
 						end,
 					})
-					only({ "Misty Village", "Misty Tower" }, useHolder)
-					only({ "Misty Village", "Misty Tower" }, UI.subhead(page, "Add a defence", "The tick adds one slot of it to the list above, while there is room.").Parent)
+					only({ "Misty Village" }, useHolder)
+					only({ "Misty Village" }, UI.subhead(page, "Add a defence", "The tick adds one slot of it to the list above, while there is room.").Parent)
 					local _, addHolder = UI.editList(page, {
 						action = "check",
 						empty = "No defences in the game's data.",
@@ -23673,16 +23676,16 @@ do
 							end
 						end,
 					})
-					only({ "Misty Village", "Misty Tower" }, addHolder)
-					button(page, "Equip best now", function()
+					only({ "Misty Village" }, addHolder)
+					-- (A button is no row: it has to be handed to only() itself.)
+					only({ "Misty Village" }, button(page, "Equip best now", function()
 						task.spawn(function()
 							Village.equipBest(nil, true)
 							UI.refreshAll()
 						end)
-					end)
-					only({ "Misty Village", "Misty Tower" })
+					end))
 					local equipLine = UI.note(page, "")
-					only({ "Misty Village", "Misty Tower" }, equipLine)
+					only({ "Misty Village" }, equipLine)
 					task.spawn(function()
 						while AA.alive and equipLine.Parent do
 							pcall(function()
@@ -23693,12 +23696,12 @@ do
 					end)
 					-- v292: repair and selling.
 					toggle(page, "Repair my equipped defences", "VillageRepair", "In the lobby: every equipped defence under 90% durability is repaired with Scarlet Ore, cheapest first. A full repair costs 5 to 100 ore by rarity (10 for a Bamboo Barricade or Spike Trap), less when it is only part worn. Done before the forge and the upgrades take any ore, and not held back by Scarlet Ore to keep (that ore is kept for exactly this).")
-					only({ "Misty Village", "Misty Tower" })
+					only({ "Misty Village" })
 					toggle(page, "Sell spare defences", "VillageScrap", "In the lobby: sells (the game's Discard, paid in Scarlet Ore) every defence the rules below point at. Nothing is sold without a rule. The line under the rules shows what would go right now, so set the rules first and switch this on when that line reads right.")
-					only({ "Misty Village", "Misty Tower" })
+					only({ "Misty Village" })
 					toggle(page, "Never sell equipped ones", "VillageScrapKeepEquipped", "On: a defence you have equipped is kept whatever the rules say. It still counts as one of the best you keep when it is among them.")
-					only({ "Misty Village", "Misty Tower" })
-					only({ "Misty Village", "Misty Tower" }, UI.subhead(page, "Sell rules", "One rule per defence, or one for every defence without its own. Pick the defence, the grade to sell at and below, and how many of the rest to keep, then press Save this rule. Example: Bamboo Barricade, A-, keep 3 sells every barricade graded A- or lower and all but the best three of the others.").Parent)
+					only({ "Misty Village" })
+					only({ "Misty Village" }, UI.subhead(page, "Sell rules", "One rule per defence, or one for every defence without its own. Pick the defence, the grade to sell at and below, and how many of the rest to keep, then press Save this rule. Example: Bamboo Barricade, A-, keep 3 sells every barricade graded A- or lower and all but the best three of the others.").Parent)
 					local function ruleId()
 						for _, entry in ipairs(Village.defenses()) do
 							if entry.name == Config.VillageRuleFor then
@@ -23722,7 +23725,7 @@ do
 						Config.VillageRuleBelow = rule and rule.below or "Off"
 						Config.VillageRuleKeep = rule and rule.keep or 0
 					end, "Every defence: used for any defence that has no rule of its own.")
-					only({ "Misty Village", "Misty Tower" })
+					only({ "Misty Village" })
 					UI.dropdown(page, "Sell this grade and below", function()
 						local names = { "Off" }
 						for _, grade in ipairs(Village.GRADES) do
@@ -23734,17 +23737,16 @@ do
 					end, function(name)
 						Config.VillageRuleBelow = name
 					end, "Grades run C-, C, C+, B-, B, B+, A-, A, A+, S-, S, S+, SS, SSS. Off: no grade is sold outright.")
-					only({ "Misty Village", "Misty Tower" })
+					only({ "Misty Village" })
 					slider(page, "Keep the best", "VillageRuleKeep", 0, 20, 1, function(value)
 						return value == 0 and "All of them" or tostring(value)
 					end, "Of the ones above that grade: how many to keep, best grade first, then most experience. The others are sold. All of them: only the grade line sells.")
-					only({ "Misty Village", "Misty Tower" })
-					button(page, "Save this rule", function()
+					only({ "Misty Village" })
+					only({ "Misty Village" }, button(page, "Save this rule", function()
 						local below = Village.gradeOrder(Config.VillageRuleBelow) > 0 and Config.VillageRuleBelow or nil
 						Village.setRule(ruleId(), below, math.floor(tonumber(Config.VillageRuleKeep) or 0))
 						UI.refreshAll()
-					end)
-					only({ "Misty Village", "Misty Tower" })
+					end))
 					local function ruleRows()
 						local rows = {}
 						for id, rule in pairs(Village.rules()) do
@@ -23775,9 +23777,9 @@ do
 							end
 						end,
 					})
-					only({ "Misty Village", "Misty Tower" }, ruleHolder)
+					only({ "Misty Village" }, ruleHolder)
 					local scrapLine = UI.note(page, "")
-					only({ "Misty Village", "Misty Tower" }, scrapLine)
+					only({ "Misty Village" }, scrapLine)
 					task.spawn(function()
 						while AA.alive and scrapLine.Parent do
 							pcall(function()
@@ -23793,7 +23795,7 @@ do
 							task.wait(2)
 						end
 					end)
-					only({ "Misty Village", "Misty Tower" })
+					only({ "Misty Village" })
 				end
 				local villageLine = UI.note(page, "")
 				only({ "Misty Village", "Misty Tower" }, villageLine)
