@@ -83,7 +83,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v297", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v298", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -401,6 +401,10 @@ local Config = {
 	-- v292: equipped defences repaired with Scarlet Ore; spare ones sold (scrapped) by grade.
 	-- Both spend or destroy, so both are off until switched on.
 	VillageRepair = false,
+	-- v298: the defences to use (a JSON list of defence ids, one a slot, nine at most) and
+	-- whether the best copy of each is equipped for me in the lobby.
+	VillageEquipBest = false,
+	VillageLoadout = "[]",
 	VillageScrap = false,
 	VillageScrapKeepEquipped = true,
 	VillageScrapRules = "{}",
@@ -2182,7 +2186,7 @@ do
 	---Lobby upkeep, at most once every two minutes: sell the swords on the rack, upgrade, feed the
 	---forge. Each part has its own switch; ore under "keep" is never spent.
 	function Village.upkeep()
-		if not (Config.VillageSell or Config.VillageForge or Config.VillageUpgrade or Config.VillageRepair or Config.VillageScrap) then
+		if not (Config.VillageSell or Config.VillageForge or Config.VillageUpgrade or Config.VillageRepair or Config.VillageScrap or Config.VillageEquipBest) then
 			return
 		end
 		if os.clock() - (Village.keptAt or -1e9) < 120 then
@@ -2219,6 +2223,8 @@ do
 		end
 		-- Defences before the forge and the upgrades get at the ore: spares sold first (that
 		-- pays ore), then the equipped ones repaired.
+		-- (Equip first: what goes on is then safe from the sell rules and gets repaired.)
+		pcall(Village.equipBest, log)
 		pcall(Village.scrap, log)
 		pcall(Village.repair, log)
 		local keep = math.max(tonumber(Config.VillageKeepOre) or 0, 0)
@@ -2540,6 +2546,162 @@ do
 		return ("Would be sold now: %s, for %d Scarlet Ore."):format(table.concat(parts, "; "), ore)
 	end
 	---Sells what the rules say (request_discard_defense(uuid): the game's Discard, paid in ore).
+	-- USER (v298): "add an equip best for defenses and allow me to pick which defenses i want to
+	-- use. i can have 9 total defenses." The pick is a list of kinds, one line a slot (the same
+	-- kind as often as wanted); the best copy of each goes on (grade, then experience; a broken
+	-- one last unless repairs are on) and everything else comes off. Nothing picked: the kinds
+	-- equipped now are kept, each swapped for its best copy.
+	function Village.maxEquipped()
+		return tonumber(Core.Settings.MAX_EQUIPPED_DEFENSES) or 9
+	end
+	function Village.loadout()
+		if Village.loadoutText ~= Config.VillageLoadout then
+			local ok, list = pcall(function()
+				return httpService:JSONDecode(Config.VillageLoadout)
+			end)
+			local clean = {}
+			for _, id in ipairs(ok and type(list) == "table" and list or {}) do
+				if type(id) == "string" and #clean < Village.maxEquipped() then
+					table.insert(clean, id)
+				end
+			end
+			Village.loadoutText, Village.loadoutList = Config.VillageLoadout, clean
+		end
+		return Village.loadoutList
+	end
+	function Village.setLoadout(list)
+		Config.VillageLoadout = httpService:JSONEncode(list)
+	end
+	---How strong one copy is next to another of its kind. Grade sets every figure a defence has
+	---(a spike trap's damage runs 0.8 to 1.3 from C- to SSS); levels only add damage, x1.035 a
+	---level, which soon outweighs a grade: a level 33 [A] spike trap hits about three times as
+	---hard as a new [A+] one. So damage defences go by damage, the others by grade, then experience.
+	function Village.power(entry)
+		local defs = gameRequire(replicatedStorage.src.Data.Defenses)
+		local def = type(defs) == "table" and defs[entry.id] or nil
+		local scale = math.max(entry.order - 1, 0) / (#Village.GRADES - 1)
+		local damage = type(def) == "table" and type(def.damage) == "table" and def.damage or nil
+		if not damage then
+			return 1 + scale
+		end
+		local base, growth = tonumber(Core.Settings.DEFENSE_XP_BASE) or 100, tonumber(Core.Settings.DEFENSE_XP_GROWTH) or 1.1
+		local level = math.floor(math.log(math.max(entry.xp, 0) / base + 1) / math.log(growth)) + 1
+		level = math.clamp(level, 1, tonumber(Core.Settings.DEFENSE_LEVEL_CAP) or 50)
+		local low, high = tonumber(damage[1]) or 1, tonumber(damage[2]) or 1
+		return (low + (high - low) * scale) * (tonumber(Core.Settings.DEFENSE_LEVEL_DAMAGE) or 1.035) ^ (level - 1), level
+	end
+	---What equipping the best would do: { equip = { entry }, unequip = { entry }, missing = { [id] = count } }.
+	function Village.equipPlan(bag)
+		bag = bag or Village.bag()
+		local want, picks = {}, Village.loadout()
+		if #picks > 0 then
+			for _, id in ipairs(picks) do
+				want[id] = (want[id] or 0) + 1
+			end
+		else
+			for _, entry in ipairs(bag) do
+				if entry.equipped then
+					want[entry.id] = (want[entry.id] or 0) + 1
+				end
+			end
+		end
+		local kinds = {}
+		for _, entry in ipairs(bag) do
+			kinds[entry.id] = kinds[entry.id] or {}
+			table.insert(kinds[entry.id], entry)
+		end
+		local plan = { equip = {}, unequip = {}, missing = {} }
+		local keep = {}
+		for id, count in pairs(want) do
+			local list = kinds[id] or {}
+			table.sort(list, function(a, b)
+				local aWorks, bWorks = a.durability > 0 or Config.VillageRepair == true, b.durability > 0 or Config.VillageRepair == true
+				if aWorks ~= bWorks then
+					return aWorks
+				end
+				local aPower, bPower = Village.power(a), Village.power(b)
+				if aPower ~= bPower then
+					return aPower > bPower
+				end
+				if a.xp ~= b.xp then
+					return a.xp > b.xp
+				end
+				if a.durability ~= b.durability then
+					return a.durability > b.durability
+				end
+				return tostring(a.uuid) < tostring(b.uuid)
+			end)
+			for index = 1, count do
+				local entry = list[index]
+				if entry then
+					keep[entry.uuid] = true
+					if not entry.equipped then
+						table.insert(plan.equip, entry)
+					end
+				else
+					plan.missing[id] = (plan.missing[id] or 0) + 1
+				end
+			end
+		end
+		for _, entry in ipairs(bag) do
+			if entry.equipped and not keep[entry.uuid] then
+				table.insert(plan.unequip, entry)
+			end
+		end
+		return plan
+	end
+	---One line for the menu.
+	function Village.equipText()
+		local plan = Village.equipPlan()
+		local parts = {}
+		local function names(list)
+			local out = {}
+			for _, entry in ipairs(list) do
+				table.insert(out, ("%s [%s]"):format(entry.name, entry.grade))
+			end
+			return table.concat(out, ", ")
+		end
+		if #plan.equip > 0 then
+			table.insert(parts, "Would put on: " .. names(plan.equip) .. ".")
+		end
+		if #plan.unequip > 0 then
+			table.insert(parts, "Would take off: " .. names(plan.unequip) .. ".")
+		end
+		local short = {}
+		for id, count in pairs(plan.missing) do
+			table.insert(short, ("%d %s"):format(count, (Village.defenseName(id))))
+		end
+		table.sort(short)
+		if #short > 0 then
+			table.insert(parts, "Not held: " .. table.concat(short, ", ") .. ".")
+		end
+		if #parts == 0 then
+			return "Your best of these are equipped."
+		end
+		return table.concat(parts, " ")
+	end
+	---Takes off what is not wanted, then puts on the best (lobby only; the match server refuses).
+	function Village.equipBest(log, force)
+		if not IS_LOBBY or not (Config.VillageEquipBest or force) then
+			return
+		end
+		log = log or function(text)
+			pcall(AA.appendLog, ACCOUNT_FOLDER .. "/village.txt", os.date("%m-%d %H:%M:%S ") .. "equip: " .. text .. "\n")
+		end
+		local plan = Village.equipPlan()
+		for _, entry in ipairs(plan.unequip) do
+			local ok, result = invoke("request_unequip_defense", entry.uuid)
+			log(("took off %s [%s] -> %s"):format(entry.name, entry.grade, (ok and result ~= false) and "ok" or ("refused (" .. tostring(result) .. ")")))
+			task.wait(0.4)
+		end
+		for _, entry in ipairs(plan.equip) do
+			local ok, result = invoke("request_equip_defense", entry.uuid)
+			log(("put on %s [%s] -> %s"):format(entry.name, entry.grade, (ok and result ~= false) and "ok" or ("refused (" .. tostring(result) .. ")")))
+			note("villageEquip", { id = entry.id, grade = entry.grade, ok = ok and result ~= false })
+			task.wait(0.4)
+		end
+		return #plan.unequip + #plan.equip
+	end
 	function Village.scrap(log)
 		if not Config.VillageScrap then
 			return
@@ -23450,6 +23612,85 @@ do
 						end,
 					})
 					only({ "Misty Village", "Misty Tower" }, otherHolder)
+					-- v298: the defences to use, and the best copy of each equipped for me.
+					toggle(page, "Equip my best defences", "VillageEquipBest", "In the lobby: the best copy of every defence on the list below is equipped (for a Spike Trap the one that hits hardest, counting its level; for the others the highest grade, then most experience; a broken one only when nothing else is left or repairs are on), and anything equipped that is not on the list comes off. With nothing on the list, the kinds you have equipped now are kept and each is swapped for your best copy.")
+					only({ "Misty Village", "Misty Tower" })
+					only({ "Misty Village", "Misty Tower" }, UI.subhead(page, "Defences to use", "One line a slot, nine at most. Add the same defence again for a second copy of it. The number is how many of that kind you hold.").Parent)
+					local function held(id)
+						local count = 0
+						for _, entry in ipairs(Village.bag()) do
+							if entry.id == id then
+								count += 1
+							end
+						end
+						return count
+					end
+					local _, useHolder = UI.editList(page, {
+						empty = "Nothing picked: the kinds you have equipped now are kept.",
+						get = function()
+							local names = {}
+							for _, id in ipairs(Village.loadout()) do
+								table.insert(names, (Village.defenseName(id)))
+							end
+							return names
+						end,
+						marks = function(_, index)
+							local id = Village.loadout()[index]
+							return id and (tostring(held(id)) .. " held") or ""
+						end,
+						remove = function(index)
+							local list = table.clone(Village.loadout())
+							table.remove(list, index)
+							Village.setLoadout(list)
+						end,
+					})
+					only({ "Misty Village", "Misty Tower" }, useHolder)
+					only({ "Misty Village", "Misty Tower" }, UI.subhead(page, "Add a defence", "The tick adds one slot of it to the list above, while there is room.").Parent)
+					local _, addHolder = UI.editList(page, {
+						action = "check",
+						empty = "No defences in the game's data.",
+						get = function()
+							local names = {}
+							for _, entry in ipairs(Village.defenses()) do
+								table.insert(names, entry.name)
+							end
+							return names
+						end,
+						marks = function(_, index)
+							local entry = Village.defenses()[index]
+							return entry and (tostring(held(entry.id)) .. " held") or ""
+						end,
+						detail = function(_, index)
+							local entry = Village.defenses()[index]
+							return entry and Village.describe(entry.id) or ""
+						end,
+						remove = function(index)
+							local entry = Village.defenses()[index]
+							local list = table.clone(Village.loadout())
+							if entry and #list < Village.maxEquipped() then
+								table.insert(list, entry.id)
+								Village.setLoadout(list)
+							end
+						end,
+					})
+					only({ "Misty Village", "Misty Tower" }, addHolder)
+					button(page, "Equip best now", function()
+						task.spawn(function()
+							Village.equipBest(nil, true)
+							UI.refreshAll()
+						end)
+					end)
+					only({ "Misty Village", "Misty Tower" })
+					local equipLine = UI.note(page, "")
+					only({ "Misty Village", "Misty Tower" }, equipLine)
+					task.spawn(function()
+						while AA.alive and equipLine.Parent do
+							pcall(function()
+								equipLine.Text = ("%d of %d slots picked. %s%s"):format(#Village.loadout(), Village.maxEquipped(), Village.equipText(), IS_LOBBY and "" or " (Equipping only works in the lobby.)")
+							end)
+							task.wait(2)
+						end
+					end)
 					-- v292: repair and selling.
 					toggle(page, "Repair my equipped defences", "VillageRepair", "In the lobby: every equipped defence under 90% durability is repaired with Scarlet Ore, cheapest first. A full repair costs 5 to 100 ore by rarity (10 for a Bamboo Barricade or Spike Trap), less when it is only part worn. Done before the forge and the upgrades take any ore, and not held back by Scarlet Ore to keep (that ore is kept for exactly this).")
 					only({ "Misty Village", "Misty Tower" })
