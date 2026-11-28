@@ -83,7 +83,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v292", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v293", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -2657,8 +2657,8 @@ do
 		Village.auraList, Village.auraAt = list, os.clock()
 		return list
 	end
-	---How much a spot is worth for standing in those circles: 1 with none in reach, up to 4
-	---inside every one of them, fading over 15 studs outside a circle. USER (v269): "check
+	---How much a spot is worth for standing in those circles: 1 with none in reach, plus 1 for
+	---every circle it is inside, fading over 15 studs outside a circle. USER (v269): "check
 	---placement of the defenses": the team stood at the roads' spawn, 90 studs from a whetstone
 	---and a war drum that were buffing nobody.
 	function Village.auraPull(p, auras)
@@ -2670,7 +2670,10 @@ do
 			local away = math.sqrt((p.X - aura.position.X) ^ 2 + (p.Z - aura.position.Z) ^ 2) - (aura.range - 2)
 			sum += math.clamp(1 - away / 15, 0, 1)
 		end
-		return 1 + 3 * sum / #auras
+		-- USER (v293): buffs stack, "so it's best to have all my units in the buffs area". Every
+		-- circle a spot stands in counts in full (one circle doubles a spot's worth, five make
+		-- it six times), where the average over all circles used to cap the pull at four.
+		return 1 + sum
 	end
 	---One line for the menu: the clock, what is carried, the forge.
 	function Village.text()
@@ -6137,24 +6140,70 @@ do
 		-- 3. Auras (whetstone, war drum, watchtower, sun lamp, ore cart): the ground spot whose
 		-- circle holds the most of my towers. Kept back from the kerb (5+ studs when that costs
 		-- no tower) so the road-side spots stay free for units.
-		if #circles > 0 then
+		-- USER (v293): "for buffs don't focus on only my units. put them in places where they'll
+		-- buff my units but also can buff other players units. and buffs stack so if i have a
+		-- unit that's in the radius of 5 war drums it gets buffed by all 5 so it's best to have
+		-- all my units in the buffs area." So: other players' towers count too (a little under
+		-- mine), and an aura goes where the circles already standing overlap its own, which
+		-- keeps every buff over one patch of ground for the units to stand in.
+		local allies = {}
+		for _, unit in ipairs(scanField(true).others or {}) do
+			local unitStats = unit:FindFirstChild("_stats")
+			local idValue = unitStats and unitStats:FindFirstChild("id")
+			local unitData = idValue and Units[idValue.Value]
+			if type(unitData) == "table" and not unitData._defense and unitStats:FindFirstChild("upgrade") then
+				table.insert(allies, unit:GetPivot().Position)
+			end
+		end
+		if Village.defenseData == nil then
+			Village.defenseData = gameRequire(replicatedStorage.src.Data.Defenses) or false
+		end
+		if #circles > 0 or #allies > 0 then
 			for _, row in ipairs(want.aura) do
 				local data = Units[row.id]
 				local reach = type(data) == "table" and tonumber(data.range) or 24
-				local spot, value = groundPick(function(spot)
-					local inside = 0
+				local standingAuras = {}
+				for _, entry in ipairs(field) do
+					local info = Village.defenseData and Village.defenseData[entry.id]
+					if type(info) == "table" and type(info.aura) == "table" then
+						table.insert(standingAuras, entry.position)
+					end
+				end
+				local bestMine, bestOthers, bestStack = 0, 0, 0
+				local spot = groundPick(function(spot)
+					local mine, others, stack = 0, 0, 0
 					for _, circle in ipairs(circles) do
 						if flat(circle.position, spot.position) <= reach - 1 then
-							inside += 1
+							mine += 1
 						end
 					end
-					if inside == 0 then
+					for _, position in ipairs(allies) do
+						if flat(position, spot.position) <= reach - 1 then
+							others += 1
+						end
+					end
+					if mine + others == 0 then
 						return nil
 					end
-					return inside * 100 + math.min(spot.gap, 8)
+					-- Circles that overlap by more than half share most of their ground.
+					for _, position in ipairs(standingAuras) do
+						if flat(position, spot.position) <= reach * 0.5 then
+							stack += 1
+						end
+					end
+					return mine * 100 + others * 70 + stack * 40 + math.min(spot.gap, 8), { mine, others, stack }
 				end, 3, 36)
 				if spot then
-					add(row, spot.position, nil, string.format("%s around %d of %d towers", tostring(type(data) == "table" and data.name or row.id), math.floor(value / 100), #circles))
+					for _, circle in ipairs(circles) do
+						bestMine += flat(circle.position, spot.position) <= reach - 1 and 1 or 0
+					end
+					for _, position in ipairs(allies) do
+						bestOthers += flat(position, spot.position) <= reach - 1 and 1 or 0
+					end
+					for _, position in ipairs(standingAuras) do
+						bestStack += flat(position, spot.position) <= reach * 0.5 and 1 or 0
+					end
+					add(row, spot.position, nil, string.format("%s around %d of my %d towers and %d of %d of the other players', stacked with %d buffs", tostring(type(data) == "table" and data.name or row.id), bestMine, #circles, bestOthers, #allies, bestStack))
 				end
 			end
 		end
