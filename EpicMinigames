@@ -15,7 +15,7 @@ if not shared then
 end
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local BeyRivals = { connections = {}, toggleRefreshers = {}, segmentRefreshers = {}, VERSION = "em-29", alive = true }
+local BeyRivals = { connections = {}, toggleRefreshers = {}, segmentRefreshers = {}, VERSION = "em-30", alive = true }
 if shared.EpicMinigames then
 	pcall(shared.EpicMinigames.detach)
 end
@@ -386,32 +386,94 @@ function PotentUniversal.install(host)
 		Config.UBinds = httpService:JSONEncode(all)
 		Config.UBindsRev = 2
 	end
+	-- USER (universal-3): "nothing should be saved for every game except the settings i put
+	-- keybind selection behind. the menu only/beside stuff. the rest should be saved as a per
+	-- game basis. so like if i turned on esp in anime advenutes and then join a different game
+	-- it shouldn't have esp in that game too". Every Universal setting but the P_ ones is kept
+	-- per game, in the same per-game table the keys were already in; the P_ ones are kept in a
+	-- file of their own that every script with these pages reads.
+	local PER_GAME = {}
+	for key in pairs(PotentUniversal.DEFAULTS) do
+		if key:sub(1, 2) ~= "P_" and key ~= "MenuSet" and key ~= "UBinds" and key ~= "UBindsRev" then
+			table.insert(PER_GAME, key)
+		end
+	end
+	table.sort(PER_GAME)
 	do
 		local mine = bindsRead()[GAME]
-		for _, entry in ipairs(PotentUniversal.TOGGLES) do
-			local name = "K_" .. entry.key
-			if type(mine) == "table" then
-				Config[name] = type(mine[name]) == "string" and mine[name] or "None"
-			else
-				Config[name] = PotentUniversal.BINDS[entry.key] or "None"
+		for _, key in ipairs(PER_GAME) do
+			local default = PotentUniversal.DEFAULTS[key]
+			if Config[key] ~= nil then
+				if type(mine) == "table" and type(mine[key]) == type(default) then
+					Config[key] = mine[key]
+				elseif key == "UPanicKey" then
+					Config[key] = "End"
+				elseif key:sub(1, 2) == "K_" then
+					Config[key] = PotentUniversal.BINDS[key:sub(3)] or "None"
+				elseif host.shared then
+					-- One settings file for every game (the standalone script): a game with
+					-- nothing saved for it starts from the defaults, not from the last game.
+					Config[key] = default
+				end
+				-- (A game's own script keeps its own file: what is in it is already this game's.)
 			end
 		end
-		Config.UPanicKey = type(mine) == "table" and type(mine.UPanicKey) == "string" and mine.UPanicKey or "End"
 	end
-	local function bindsStep()
-		local now = { UPanicKey = Config.UPanicKey }
+	local PIN_FILE = "Potent/universal_pins.json"
+	local function pinsText()
+		local on = {}
 		for _, entry in ipairs(PotentUniversal.TOGGLES) do
-			now["K_" .. entry.key] = Config["K_" .. entry.key]
+			if Config["P_" .. entry.key] == true then
+				table.insert(on, entry.key)
+			end
+		end
+		table.sort(on)
+		return httpService:JSONEncode(on)
+	end
+	pcall(function()
+		if isfile(PIN_FILE) then
+			local saved = httpService:JSONDecode(readfile(PIN_FILE))
+			if type(saved) == "table" then
+				for _, entry in ipairs(PotentUniversal.TOGGLES) do
+					if Config["P_" .. entry.key] ~= nil then
+						Config["P_" .. entry.key] = table.find(saved, entry.key) ~= nil
+					end
+				end
+			end
+		end
+	end)
+	local stepCount = 0
+	local function bindsStep()
+		stepCount += 1
+		if stepCount % 4 ~= 1 then
+			return
+		end
+		local now = {}
+		for _, key in ipairs(PER_GAME) do
+			now[key] = Config[key]
 		end
 		local text = httpService:JSONEncode(now)
 		if text ~= U.bindsText then
 			local first = U.bindsText == nil
 			U.bindsText = text
 			local all = bindsRead()
-			if not first or all[GAME] == nil then
+			if not first or type(all[GAME]) ~= "table" or all[GAME].UAntiAfk == nil then
 				all[GAME] = now
 				Config.UBinds = httpService:JSONEncode(all)
 			end
+		end
+		local pins = pinsText()
+		if pins ~= U.pinsText then
+			local first = U.pinsText == nil
+			U.pinsText = pins
+			pcall(function()
+				if not first or not isfile(PIN_FILE) then
+					if not isfolder("Potent") then
+						makefolder("Potent")
+					end
+					writefile(PIN_FILE, pins)
+				end
+			end)
 		end
 	end
 	local KEY_NAMES = { None = "Not set", LeftControl = "L Ctrl", RightControl = "R Ctrl", LeftShift = "L Shift", RightShift = "R Shift", LeftAlt = "L Alt", RightAlt = "R Alt" }

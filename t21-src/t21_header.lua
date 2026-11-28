@@ -15,7 +15,7 @@ if not shared then
 end
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local BeyRivals = { connections = {}, toggleRefreshers = {}, segmentRefreshers = {}, VERSION = "t21-3", alive = true }
+local BeyRivals = { connections = {}, toggleRefreshers = {}, segmentRefreshers = {}, VERSION = "t21-4", alive = true }
 if shared.TwentyOne then
 	pcall(shared.TwentyOne.detach)
 end

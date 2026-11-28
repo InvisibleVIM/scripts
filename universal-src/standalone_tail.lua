@@ -2,7 +2,7 @@
 local universalState
 do
 	local okUniversal, made = pcall(PotentUniversal.install, {
-		UI = UI, Config = Config, connections = BeyRivals.connections, gui = BeyRivals.gui,
+		UI = UI, Config = Config, connections = BeyRivals.connections, gui = BeyRivals.gui, shared = true,
 		alive = function()
 			return BeyRivals.alive
 		end,
