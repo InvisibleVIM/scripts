@@ -83,7 +83,7 @@ end
 -- Initialize Luraph globals if they do not exist.
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
 
-local AA = { VERSION = "v290", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
+local AA = { VERSION = "v291", connections = {}, errors = {}, segmentRefreshers = {}, toggleRefreshers = {} }
 -- The Visuals tab can change the numbers a placed unit shows. The script's own decisions keep
 -- reading the real ones through this.
 -- (The real number is kept on the object itself as an attribute. A weak table keyed by the
@@ -2077,7 +2077,11 @@ do
 		-- every lost run is ten minutes the day stage would have paid ore and coins.
 		local lost = type(AA.progress.villageNight) == "table" and AA.progress.villageNight or {}
 		local hour = math.floor(workspace:GetServerTimeNow() / 3600)
-		if night and pick == "Auto" and lost.hour == hour and (tonumber(lost.losses) or 0) >= 2 then
+		-- USER (v291): "in the misty village blood moon. it should be turned off for that." A
+		-- Blood Moon night is played however many times it is lost, and its losses are not
+		-- counted against the night either.
+		local blood = Config.VillageBloodMoon and Levels.swordsmith_blood_moon ~= nil and Village.bloodMoon()
+		if night and pick == "Auto" and not blood and lost.hour == hour and (tonumber(lost.losses) or 0) >= 2 then
 			return Levels.swordsmith_day and "swordsmith_day" or nil
 		end
 		if night and pick ~= "Day" and nightOpen then
@@ -9365,7 +9369,7 @@ local function finishMatch()
 			after = "Lobby"
 		end
 	end
-	if kind == "Misty Village" and not won and not gaveUp and (id == "swordsmith_night" or id == "swordsmith_blood_moon") then
+	if kind == "Misty Village" and not won and not gaveUp and id == "swordsmith_night" then
 		local hour = math.floor(workspace:GetServerTimeNow() / 3600)
 		local lost = type(AA.progress.villageNight) == "table" and AA.progress.villageNight or {}
 		AA.progress.villageNight = { hour = hour, losses = (lost.hour == hour and (tonumber(lost.losses) or 0) or 0) + 1 }
